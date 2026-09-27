@@ -110,6 +110,9 @@ void checkCrampedCaptureKeepsTheButtonsStill()
     if (parts.command == nullptr || parts.style == nullptr) {
         return;
     }
+    // The remembered tool in the user's config can open the session on another
+    // tool, so pin Select before asserting on what Select's style row does.
+    controller.chooseTool(vshot::Tool::Select);
     expect(!parts.style->isVisible(), "the Select tool starts with no style row");
     const int before = globalTop(parts.command);
 

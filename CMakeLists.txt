@@ -310,6 +310,36 @@ if(VSHOT_BUILD_CHECKS)
         target_compile_options(vshot-annotation-check PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 
+    # The high-DPI check: it renders a real overlay on a 2x screen and reads the
+    # ratio its cached rasters were built at.  A cache built at one logical
+    # pixel per pixel still looks plausible at 1x, but on a scaled display the
+    # overlay's nearest-neighbour transform magnifies it and the editor stops
+    # matching the full-resolution PNG.  Needs Widgets and the offscreen
+    # platform plugin, no compositor.
+    add_executable(vshot-dpr-check
+        ui/dpr_check.cpp
+        ui/capture_overlay.cpp
+        ui/capture_overlay.hpp
+        ui/session_protocol.cpp
+        ui/session_protocol.hpp
+        ui/config.cpp
+        ui/config.hpp
+        ui/text_size.hpp
+        ui/i18n.cpp
+        ui/i18n.hpp
+    )
+    target_link_libraries(vshot-dpr-check PRIVATE
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+        Qt6::Network
+        LayerShellQt::Interface
+    )
+    target_compile_features(vshot-dpr-check PRIVATE cxx_std_17)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(vshot-dpr-check PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
     # The file dialog check: the look of the one window Qt draws for us.  It
     # builds the real dialog through the same builder the helper uses and reads
     # the widget tree back, because both things it guards -- the palette-driven

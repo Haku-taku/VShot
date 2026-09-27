@@ -770,7 +770,9 @@ void drawMosaicBrush(QPainter *painter, const OutputSession &output, const QVect
     const double scale = static_cast<double>(scaleValue);
     const int baseRadius = std::clamp(static_cast<int>(widthLogical * scale / 2.0), 1, 512);
     const int radius = std::clamp(brushRadiusForStrength(strength, baseRadius), 1, 512);
-    const double step = std::max(1, radius / 2);
+    // The same spacing the live preview uses (`paintLiveStroke`), so a previewed
+    // mosaic brush stamps the same discs as the mark it commits.
+    const double step = std::max(1.0, radius / 2.0);
     QVector<QPointF> centers;
     centers.reserve(points.size() + 8);
     if (points.size() == 1) {
@@ -5681,14 +5683,26 @@ public:
             return;
         }
         const QByteArray key = signature(annotation, output, size);
-        if (image_.size() != clip.size() || key != key_) {
-            image_ = QImage(clip.size(), QImage::Format_ARGB32_Premultiplied);
+        // The raster holds device pixels, not logical ones: the preview painter
+        // carries the device-pixel-ratio transform while every mark is
+        // rasterized in logical coordinates, and the overlay draws with smooth
+        // transforms off.  A raster built one-logical-pixel-per-pixel would
+        // therefore be magnified with nearest-neighbour and blur the mark on a
+        // high-DPI screen.  The ratio is part of the cache's validity, so a
+        // capture that moves to another screen rebuilds it.
+        const qreal ratio = deviceRatio(painter);
+        const QSize device = (QSizeF(clip.size()) * ratio).toSize();
+        if (image_.size() != device || ratio_ != ratio || key != key_) {
+            image_ = QImage(device, QImage::Format_ARGB32_Premultiplied);
+            image_.setDevicePixelRatio(ratio);
             image_.fill(Qt::transparent);
             QPainter raster(&image_);
             raster.setRenderHint(QPainter::Antialiasing, true);
+            raster.scale(ratio, ratio);
             raster.translate(-clip.topLeft());
             draw(&raster, annotation, output, size);
             key_ = key;
+            ratio_ = ratio;
             ++rebuilds_;
         }
         painter->drawImage(clip.topLeft(), image_);
@@ -5697,6 +5711,23 @@ public:
     // How many times the pixels have been built.  Read through
     // `Annotation::rasterRebuilds` by the offline check.
     int rebuilds() const { return rebuilds_; }
+
+    // The device-pixel ratio the pixels were built at, or 0 before the first
+    // build.  Read through `Annotation::rasterDeviceRatio`.
+    qreal builtAtRatio() const { return ratio_; }
+
+    // The device-pixel ratio a raster has to be built at for this painter.  The
+    // marks are rasterized in logical coordinates, so the raster has to hold
+    // the device pixels the painter will actually touch.
+    static qreal deviceRatio(const QPainter *painter)
+    {
+        const QPaintDevice *device = painter != nullptr ? painter->device() : nullptr;
+        if (device == nullptr) {
+            return 1.0;
+        }
+        const qreal ratio = device->devicePixelRatioF();
+        return ratio > 0.0 ? ratio : 1.0;
+    }
 
 protected:
     // Local rect the mark covers, pens excluded.
@@ -5721,13 +5752,22 @@ protected:
     static void writeContext(QDataStream &stream, const OutputSession &output, const QSize &size)
     {
         const LogicalRect &surface = surfaceOf(output);
+        // The mosaic and the mosaic brush average the source image, and both
+        // locate their samples through `geometry` rather than `surface`, so a
+        // raster of either is only valid for the frame and the geometry it was
+        // built from.  Neither changes within a session today, but leaving them
+        // out of the key would freeze such a mark on stale pixels the moment
+        // one does.
         stream << size.width() << size.height() << output.id << output.scale << surface.x
-               << surface.y << surface.width << surface.height;
+               << surface.y << surface.width << surface.height << output.geometry.x
+               << output.geometry.y << output.geometry.width << output.geometry.height
+               << output.image.cacheKey();
     }
 
 private:
     QImage image_;
     QByteArray key_;
+    qreal ratio_ = 1.0;
     int rebuilds_ = 0;
 };
 
@@ -5979,6 +6019,11 @@ std::shared_ptr<AnnotationRaster> makeAnnotationRaster(const Annotation &annotat
 int Annotation::rasterRebuilds() const
 {
     return raster != nullptr ? raster->rebuilds() : -1;
+}
+
+qreal Annotation::rasterDeviceRatio() const
+{
+    return raster != nullptr ? raster->builtAtRatio() : 0.0;
 }
 
 void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
@@ -6288,6 +6333,9 @@ void OverlayController::paintLiveStroke(QPainter *painter, const OutputSession &
         : 0.0;
     const double padding = brush ? deviceRadius / scale + 2.0 : widthLogical / 2.0 + 2.0;
     const double step = std::max(1.0, deviceRadius / 2.0);
+    // The preview raster holds device pixels for the same reason the committed
+    // rasters do; see `AnnotationRaster::deviceRatio`.
+    const qreal ratio = AnnotationRaster::deviceRatio(painter);
 
     // A change of style, output or surface size invalidates the whole raster;
     // the growing point list deliberately does not, which is the point.
@@ -6298,7 +6346,7 @@ void OverlayController::paintLiveStroke(QPainter *painter, const OutputSession &
         stream << size.width() << size.height() << output.id << output.scale << surface.x
                << surface.y << surface.width << surface.height << toolName(tool_)
                << static_cast<quint32>(currentColor_.rgba()) << currentWidth_ << currentDash_
-               << mosaicStrength_ << mosaicShape_;
+               << mosaicStrength_ << mosaicShape_ << ratio;
     }
     if (key != gesture_->liveKey) {
         gesture_->liveKey = key;
@@ -6340,18 +6388,25 @@ void OverlayController::paintLiveStroke(QPainter *painter, const OutputSession &
     }
 
     // Grow the raster only when the stroke reaches past it: the old pixels are
-    // copied into the larger image at their original offset.
-    const QRect current(gesture_->liveOrigin, gesture_->liveRaster.size());
+    // copied into the larger image at their original offset.  The image holds
+    // device pixels, so the logical rect it covers is its size over the ratio.
+    const QRect current(gesture_->liveOrigin,
+                        (QSizeF(gesture_->liveRaster.size()) / ratio).toSize());
     if (gesture_->liveRaster.isNull()) {
-        gesture_->liveRaster = QImage(needed.size(), QImage::Format_ARGB32_Premultiplied);
+        gesture_->liveRaster = QImage((QSizeF(needed.size()) * ratio).toSize(),
+                                      QImage::Format_ARGB32_Premultiplied);
+        gesture_->liveRaster.setDevicePixelRatio(ratio);
         gesture_->liveRaster.fill(Qt::transparent);
         gesture_->liveOrigin = needed.topLeft();
     } else if (!current.contains(needed)) {
         const QRect grown = current.united(needed);
-        QImage resized(grown.size(), QImage::Format_ARGB32_Premultiplied);
+        QImage resized((QSizeF(grown.size()) * ratio).toSize(),
+                       QImage::Format_ARGB32_Premultiplied);
+        resized.setDevicePixelRatio(ratio);
         resized.fill(Qt::transparent);
         {
             QPainter copy(&resized);
+            copy.scale(ratio, ratio);
             copy.drawImage(current.topLeft() - grown.topLeft(), gesture_->liveRaster);
         }
         gesture_->liveRaster = resized;
@@ -6361,6 +6416,7 @@ void OverlayController::paintLiveStroke(QPainter *painter, const OutputSession &
     {
         QPainter raster(&gesture_->liveRaster);
         raster.setRenderHint(QPainter::Antialiasing, true);
+        raster.scale(ratio, ratio);
         raster.translate(-gesture_->liveOrigin);
         if (brush) {
             for (int i = gesture_->liveBaked; i < count; ++i) {

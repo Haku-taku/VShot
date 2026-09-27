@@ -101,6 +101,11 @@ struct Annotation {
     // yet.  Lets the offline check tell a repaint that reused the cache from
     // one that rasterized the mark again, without seeing the raster's type.
     int rasterRebuilds() const;
+
+    // The device-pixel ratio `raster` was built at, or 0 while it has not been
+    // built.  Lets the offline check prove a high-DPI capture rasterizes at the
+    // screen's resolution instead of blurring.
+    qreal rasterDeviceRatio() const;
 };
 
 inline bool annotationEquals(const Annotation &first, const Annotation &second)
