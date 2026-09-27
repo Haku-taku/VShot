@@ -34,7 +34,7 @@ use cli::{Action, CaptureTarget};
 use edit::{pipeline_for_annotations, EditPipeline};
 use error::{Result, VshotError};
 use geometry::Rect;
-use model::{Frame, ImageDocument, OutputSnapshot, SceneSnapshot};
+use model::{Frame, HdrFrame, ImageDocument, OutputSnapshot, SceneSnapshot};
 use wayland::topology::OutputInfo;
 use wayland::WaylandSession;
 
@@ -173,7 +173,14 @@ fn run() -> Result<()> {
             request.cursor,
             no_blend,
         )? {
-            return finish_capture(EditPipeline::new(), frame, density, &request, &mut wayland);
+            return finish_capture(
+                EditPipeline::new(),
+                frame,
+                None,
+                density,
+                &request,
+                &mut wayland,
+            );
         }
     }
 
@@ -291,6 +298,9 @@ fn run() -> Result<()> {
                     return finish_capture(
                         EditPipeline::new(),
                         result.frame,
+                        // A stitched capture has no HDR half: its rows come back
+                        // from the scroll as ordinary 8-bit pixels.
+                        None,
                         result.density,
                         &request,
                         &mut wayland,
@@ -456,7 +466,7 @@ fn run() -> Result<()> {
         }
     };
 
-    finish_capture(edits, frame, density, &request, &mut wayland)
+    finish_capture(edits, frame, None, density, &request, &mut wayland)
 }
 
 /// Reports a finished scrolling capture: what it stitched, and -- when not one
@@ -739,13 +749,20 @@ fn write_ocr_text(text: &str, destination: cli::OcrDestination) -> Result<()> {
 fn finish_capture(
     edits: EditPipeline,
     frame: Frame,
+    // The HDR half of the capture, when the source carried HDR content.  The
+    // capture backends do not hand one over yet — decoding a 10-bit HDR buffer
+    // is what would fill this — so every caller passes `None` and the ordinary
+    // single-PNG path runs unchanged.  When a backend can produce one, it
+    // enters here and `write_frame_with_hdr` writes both images.
+    hdr: Option<HdrFrame>,
     density: u32,
     request: &cli::Request,
     wayland: &mut WaylandSession,
 ) -> Result<()> {
     let document = edits.apply(ImageDocument::new(frame))?;
-    let result = output::write_frame(
+    let result = output::write_frame_with_hdr(
         document.frame(),
+        hdr.as_ref(),
         &request.destination,
         density,
         request.compression,

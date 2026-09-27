@@ -10,7 +10,7 @@ use chrono::{DateTime, Local};
 
 use crate::cli::Destination;
 use crate::error::{Result, VshotError};
-use crate::model::{Frame, PngCompression};
+use crate::model::{Frame, HdrFrame, PngCompression};
 
 /// Writes a captured frame to `destination`. `density` is the frame's device
 /// pixels per logical pixel (the scale of the output it came from); every PNG
@@ -20,8 +20,18 @@ use crate::model::{Frame, PngCompression};
 /// goes next. `compression` is the PNG encoder's level, which costs time and
 /// buys size; it does not apply to the pin destination, whose PNG only travels
 /// to the daemon through a temp file.
-pub fn write_frame(
+///
+/// `hdr` is the capture's HDR half when the source carried HDR content.  The
+/// SDR half is the ordinary PNG at `destination`; the HDR half is written to
+/// the same path with its extension replaced by `.hdr` (Radiance RGBE), so
+/// `shot.png` and `shot.hdr` name the same capture — the first is the
+/// accurately tone-mapped SDR view, the second the HDR content itself.  Only a
+/// file destination can carry the pair — stdout, the clipboard and the pin
+/// daemon all take one image — so the HDR half is written for a file and the
+/// SDR half alone goes anywhere else.
+pub fn write_frame_with_hdr(
     frame: &Frame,
+    hdr: Option<&HdrFrame>,
     destination: &Destination,
     density: u32,
     compression: PngCompression,
@@ -29,7 +39,7 @@ pub fn write_frame(
     match destination {
         Destination::File(path) => {
             let path = expand_output_path(path, Local::now());
-            write_file(&path, &frame.encode_png(Some(density), compression)?)?;
+            write_capture_files(&path, frame, hdr, density, compression)?;
             copy_file_to_clipboard(&path)
         }
         Destination::Stdout => io::stdout()
@@ -44,6 +54,30 @@ pub fn write_frame(
         // through the temp file: the default (fastest useful) level is right.
         Destination::Pin => crate::pin::pin_png(&frame.to_png()?, density),
     }
+}
+
+/// Writes the SDR PNG and, when there is one, the HDR image beside it.  Split
+/// out so the offline test can exercise the pairing without `wl-copy`.
+fn write_capture_files(
+    path: &Path,
+    frame: &Frame,
+    hdr: Option<&HdrFrame>,
+    density: u32,
+    compression: PngCompression,
+) -> Result<()> {
+    write_file(path, &frame.encode_png(Some(density), compression)?)?;
+    if let Some(hdr) = hdr {
+        write_file(&hdr_sibling_path(path), &hdr.encode_radiance())?;
+    }
+    Ok(())
+}
+
+/// The HDR half's path: the same file name with the extension replaced, so the
+/// two images of one capture sit together and differ only in their suffix.
+fn hdr_sibling_path(path: &Path) -> PathBuf {
+    let mut sibling = path.to_path_buf();
+    sibling.set_extension("hdr");
+    sibling
 }
 
 fn expand_output_path(path: &Path, now: DateTime<Local>) -> PathBuf {
@@ -165,9 +199,70 @@ mod tests {
 
     #[test]
     fn output_path_preserves_escaped_percent() {
-        let path = expand_output_path(Path::new("vshot-%%-%Y.png"), Local::now());
+        let now = Local::now();
+        let path = expand_output_path(Path::new("vshot-%%-%Y.png"), now);
         assert!(path.to_string_lossy().starts_with("vshot-%-"));
         assert!(path.to_string_lossy().ends_with(".png"));
+    }
+
+    #[test]
+    fn the_hdr_sibling_only_changes_the_suffix() {
+        assert_eq!(
+            hdr_sibling_path(Path::new("shots/vshot-2026.png")),
+            PathBuf::from("shots/vshot-2026.hdr")
+        );
+        // A path with more than one dot keeps everything but the last part.
+        assert_eq!(
+            hdr_sibling_path(Path::new("a.final.png")),
+            PathBuf::from("a.final.hdr")
+        );
+        // No extension at all: the HDR half still gets one.
+        assert_eq!(
+            hdr_sibling_path(Path::new("shot")),
+            PathBuf::from("shot.hdr")
+        );
+    }
+
+    #[test]
+    fn an_hdr_capture_writes_both_files_with_the_same_stem() {
+        let frame = Frame::solid(Size::new(2, 2), [10, 20, 30, 255]).unwrap();
+        let hdr = HdrFrame::new(Size::new(2, 2), vec![[4.0, 2.0, 1.0, 1.0]; 4]).unwrap();
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "vshot-hdr-output-test-{}-{}.png",
+            std::process::id(),
+            unique_suffix()
+        ));
+        write_capture_files(&path, &frame, Some(&hdr), 1, PngCompression::default()).unwrap();
+        let png = std::fs::read(&path).unwrap();
+        let radiance = std::fs::read(hdr_sibling_path(&path)).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(hdr_sibling_path(&path));
+        assert!(
+            png.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "the SDR half is a PNG"
+        );
+        assert!(
+            radiance.starts_with(b"#?RADIANCE"),
+            "the HDR half is Radiance"
+        );
+        assert_eq!(path.extension().unwrap(), "png");
+        assert_eq!(hdr_sibling_path(&path).extension().unwrap(), "hdr");
+    }
+
+    #[test]
+    fn a_capture_without_hdr_writes_the_sdr_file_alone() {
+        let frame = Frame::solid(Size::new(1, 1), [1, 2, 3, 255]).unwrap();
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "vshot-sdr-output-test-{}-{}.png",
+            std::process::id(),
+            unique_suffix()
+        ));
+        write_capture_files(&path, &frame, None, 1, PngCompression::default()).unwrap();
+        assert!(path.exists());
+        assert!(!hdr_sibling_path(&path).exists());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
