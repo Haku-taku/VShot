@@ -277,6 +277,35 @@ if(VSHOT_BUILD_CHECKS)
         target_compile_options(vshot-toolbar-check PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 
+    # The annotation check: it paints a real overlay offscreen and reads the
+    # per-mark rebuild count, which is where the render cache lives.  A cache
+    # that rebuilt every repaint would look identical on screen but be as slow
+    # as no cache at all, so the count is the thing worth locking down.  Needs
+    # Widgets and the offscreen platform plugin, no compositor.
+    add_executable(vshot-annotation-check
+        ui/annotation_check.cpp
+        ui/capture_overlay.cpp
+        ui/capture_overlay.hpp
+        ui/session_protocol.cpp
+        ui/session_protocol.hpp
+        ui/config.cpp
+        ui/config.hpp
+        ui/text_size.hpp
+        ui/i18n.cpp
+        ui/i18n.hpp
+    )
+    target_link_libraries(vshot-annotation-check PRIVATE
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+        Qt6::Network
+        LayerShellQt::Interface
+    )
+    target_compile_features(vshot-annotation-check PRIVATE cxx_std_17)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(vshot-annotation-check PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
     # The file dialog check: the look of the one window Qt draws for us.  It
     # builds the real dialog through the same builder the helper uses and reads
     # the widget tree back, because both things it guards -- the palette-driven

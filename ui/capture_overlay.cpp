@@ -13,6 +13,7 @@
 #include <QCloseEvent>
 #include <QConicalGradient>
 #include <QCoreApplication>
+#include <QDataStream>
 #include <QDir>
 #include <QFile>
 #include <QFont>
@@ -241,6 +242,53 @@ QSize textMetrics(const Annotation &annotation)
         width = std::max(width, metrics.horizontalAdvance(line));
     }
     return QSize(width, std::max(1, static_cast<int>(lines.size()) * metrics.lineSpacing()));
+}
+
+// The logical rect an annotation occupies, whatever its kind.  Shared by the
+// hit test, the drag clamps and the render cache so all three agree on what a
+// mark covers; `false` means there is nothing to draw or hit.
+bool annotationLogicalBounds(const Annotation &annotation, LogicalRect *bounds)
+{
+    switch (annotation.kind) {
+    case Annotation::Kind::Shape:
+        *bounds = annotation.rect;
+        return !bounds->isEmpty();
+    case Annotation::Kind::Image:
+        // The rect is where the pixels were placed, which is not the image's
+        // own size: the paste fits it to the canvas and the handles resize it.
+        *bounds = annotation.rect;
+        return !annotation.pixels.isNull() && !bounds->isEmpty();
+    case Annotation::Kind::Text: {
+        if (annotation.text.isEmpty()) {
+            return false;
+        }
+        const QSize metrics = textMetrics(annotation);
+        *bounds = LogicalRect{annotation.origin.x, annotation.origin.y,
+                              static_cast<std::uint32_t>(metrics.width()),
+                              static_cast<std::uint32_t>(metrics.height())};
+        return true;
+    }
+    case Annotation::Kind::Stroke:
+        break;
+    }
+    if (annotation.points.isEmpty()) {
+        return false;
+    }
+    std::int32_t minX = annotation.points.constFirst().x;
+    std::int32_t maxX = minX;
+    std::int32_t minY = annotation.points.constFirst().y;
+    std::int32_t maxY = minY;
+    for (const Point &point : annotation.points) {
+        minX = std::min(minX, point.x);
+        maxX = std::max(maxX, point.x);
+        minY = std::min(minY, point.y);
+        maxY = std::max(maxY, point.y);
+    }
+    bounds->x = minX;
+    bounds->y = minY;
+    bounds->width = static_cast<std::uint32_t>(static_cast<std::int64_t>(maxX) - minX + 1);
+    bounds->height = static_cast<std::uint32_t>(static_cast<std::int64_t>(maxY) - minY + 1);
+    return true;
 }
 
 QCursor cursorForHandle(int handle)
@@ -3513,43 +3561,7 @@ void OverlayController::mutateAnnotations(QVector<Annotation> next)
 
 bool OverlayController::annotationBounds(const Annotation &annotation, LogicalRect *bounds) const
 {
-    if (annotation.kind == Annotation::Kind::Shape) {
-        *bounds = annotation.rect;
-        return !bounds->isEmpty();
-    }
-    if (annotation.kind == Annotation::Kind::Image) {
-        // The rect is where the pixels were placed, which is not the image's
-        // own size: the paste fits it to the canvas and the handles resize it.
-        *bounds = annotation.rect;
-        return !annotation.pixels.isNull() && !bounds->isEmpty();
-    }
-    const bool hasText = !annotation.text.isEmpty();
-    if (annotation.kind == Annotation::Kind::Text) {
-        const QSize metrics = textMetrics(annotation);
-        bounds->x = annotation.origin.x;
-        bounds->y = annotation.origin.y;
-        bounds->width = static_cast<std::uint32_t>(metrics.width());
-        bounds->height = static_cast<std::uint32_t>(metrics.height());
-        return hasText;
-    }
-    if (annotation.points.isEmpty()) {
-        return false;
-    }
-    std::int32_t minX = annotation.points.constFirst().x;
-    std::int32_t maxX = minX;
-    std::int32_t minY = annotation.points.constFirst().y;
-    std::int32_t maxY = minY;
-    for (const Point &point : annotation.points) {
-        minX = std::min(minX, point.x);
-        maxX = std::max(maxX, point.x);
-        minY = std::min(minY, point.y);
-        maxY = std::max(maxY, point.y);
-    }
-    bounds->x = minX;
-    bounds->y = minY;
-    bounds->width = static_cast<std::uint32_t>(static_cast<std::int64_t>(maxX) - minX + 1);
-    bounds->height = static_cast<std::uint32_t>(static_cast<std::int64_t>(maxY) - minY + 1);
-    return true;
+    return annotationLogicalBounds(annotation, bounds);
 }
 
 bool OverlayController::canDrawAt(Point point) const
@@ -5572,6 +5584,337 @@ void OverlayController::setTerminalCallback(std::function<void()> callback)
     terminalCallback_ = std::move(callback);
 }
 
+// The rasterized form of one annotation, kept beside it between repaints.
+//
+// Every kind draws something different, so each one says for itself what its
+// pixels depend on -- a mosaic's bounds, strength and source image; a label's
+// text, font and size; a stroke's points.  The paint loop only asks the shared
+// question "are the cached pixels still current?" through `paint`, so it never
+// branches on the kind itself.  `Annotation` holds the cache.
+class AnnotationRaster {
+public:
+    AnnotationRaster() = default;
+    AnnotationRaster(const AnnotationRaster &) = delete;
+    AnnotationRaster &operator=(const AnnotationRaster &) = delete;
+    virtual ~AnnotationRaster() = default;
+
+    // Draws the annotation into the overlay, rasterizing it first only when
+    // something it draws has changed since the last time.
+    void paint(QPainter *painter, const Annotation &annotation, const OutputSession &output,
+               const QSize &size)
+    {
+        const int pad = padding(annotation);
+        // Inflate before testing emptiness: a perfectly horizontal or vertical
+        // stroke has a zero-thickness bounding box, which `isEmpty` rejects
+        // even though there is a line to draw.
+        const QRect clip = bounds(annotation, output, size)
+                               .adjusted(-pad, -pad, pad, pad)
+                               .toAlignedRect()
+                               .intersected(QRect(QPoint(0, 0), size));
+        if (clip.isEmpty()) {
+            return;
+        }
+        const QByteArray key = signature(annotation, output, size);
+        if (image_.size() != clip.size() || key != key_) {
+            image_ = QImage(clip.size(), QImage::Format_ARGB32_Premultiplied);
+            image_.fill(Qt::transparent);
+            QPainter raster(&image_);
+            raster.setRenderHint(QPainter::Antialiasing, true);
+            raster.translate(-clip.topLeft());
+            draw(&raster, annotation, output, size);
+            key_ = key;
+            ++rebuilds_;
+        }
+        painter->drawImage(clip.topLeft(), image_);
+    }
+
+    // How many times the pixels have been built.  Read through
+    // `Annotation::rasterRebuilds` by the offline check.
+    int rebuilds() const { return rebuilds_; }
+
+protected:
+    // Local rect the mark covers, pens excluded.
+    virtual QRectF bounds(const Annotation &annotation, const OutputSession &output,
+                          const QSize &size) const = 0;
+    // Everything the raster depends on; equal keys mean the cached pixels hold.
+    virtual QByteArray signature(const Annotation &annotation, const OutputSession &output,
+                                 const QSize &size) const = 0;
+    // Draws the mark in overlay-local coordinates; the painter is already
+    // translated so those coordinates match the overlay's own.
+    virtual void draw(QPainter *painter, const Annotation &annotation, const OutputSession &output,
+                      const QSize &size) const = 0;
+    // Room around `bounds` for antialiasing and any pen or head that reaches
+    // past the geometry itself.
+    virtual int padding(const Annotation &annotation) const
+    {
+        return static_cast<int>(annotation.width) / 2 + 2;
+    }
+
+    // The key prefix every kind shares: the output the pixels were rasterized
+    // against and the surface size they were rasterized for.
+    static void writeContext(QDataStream &stream, const OutputSession &output, const QSize &size)
+    {
+        const LogicalRect &surface = surfaceOf(output);
+        stream << size.width() << size.height() << output.id << output.scale << surface.x
+               << surface.y << surface.width << surface.height;
+    }
+
+private:
+    QImage image_;
+    QByteArray key_;
+    int rebuilds_ = 0;
+};
+
+// Rectangles, ellipses and the area mosaic.  The mosaic averages the source
+// image, so it reads the output as well as the annotation.
+class ShapeRaster final : public AnnotationRaster {
+protected:
+    QRectF bounds(const Annotation &annotation, const OutputSession &output,
+                  const QSize &size) const override
+    {
+        return localRect(output, annotation.rect, size);
+    }
+
+    QByteArray signature(const Annotation &annotation, const OutputSession &output,
+                         const QSize &size) const override
+    {
+        QByteArray data;
+        QDataStream stream(&data, QIODevice::WriteOnly);
+        writeContext(stream, output, size);
+        stream << annotation.tool << annotation.dash << annotation.width
+               << static_cast<quint32>(annotation.color.rgba()) << annotation.mask
+               << annotation.strength << static_cast<qint64>(annotation.rect.x)
+               << static_cast<qint64>(annotation.rect.y)
+               << static_cast<quint64>(annotation.rect.width)
+               << static_cast<quint64>(annotation.rect.height);
+        return data;
+    }
+
+    void draw(QPainter *painter, const Annotation &annotation, const OutputSession &output,
+              const QSize &size) const override
+    {
+        if (annotation.tool == QStringLiteral("mosaic")) {
+            drawMosaicAnnotation(painter, output, annotation.rect, annotation.mask,
+                                 annotation.strength, size);
+            return;
+        }
+        painter->setPen(penForAnnotation(annotation));
+        painter->setBrush(Qt::NoBrush);
+        const QRectF rect = localRect(output, annotation.rect, size);
+        if (annotation.tool == QStringLiteral("ellipse")) {
+            painter->drawEllipse(rect);
+        } else if (annotation.dash != QStringLiteral("solid")) {
+            // Match the final renderer's band-centerline dash walk.
+            painter->drawPolyline(
+                insetRectPolygon(rect, static_cast<double>(annotation.width)));
+        } else {
+            painter->drawRect(rect);
+        }
+    }
+};
+
+// Freehand pen strokes, arrows and the freehand mosaic brush.
+class StrokeRaster final : public AnnotationRaster {
+protected:
+    QRectF bounds(const Annotation &annotation, const OutputSession &output,
+                  const QSize &size) const override
+    {
+        LogicalRect rect;
+        if (!annotationLogicalBounds(annotation, &rect)) {
+            return QRectF();
+        }
+        return localRect(output, rect, size);
+    }
+
+    QByteArray signature(const Annotation &annotation, const OutputSession &output,
+                         const QSize &size) const override
+    {
+        QByteArray data;
+        QDataStream stream(&data, QIODevice::WriteOnly);
+        writeContext(stream, output, size);
+        stream << annotation.tool << annotation.dash << annotation.width
+               << static_cast<quint32>(annotation.color.rgba()) << annotation.size
+               << annotation.arrowStyle << annotation.strength;
+        for (const Point &point : annotation.points) {
+            stream << point.x << point.y;
+        }
+        return data;
+    }
+
+    void draw(QPainter *painter, const Annotation &annotation, const OutputSession &output,
+              const QSize &size) const override
+    {
+        if (annotation.points.isEmpty()) {
+            return;
+        }
+        if (annotation.tool == QStringLiteral("mosaic")) {
+            // Freehand mosaic brush: smear discs along the path.
+            drawMosaicBrush(painter, output, annotation.points, annotation.width,
+                            annotation.strength, size);
+            return;
+        }
+        QPolygonF polygon;
+        for (const Point &point : annotation.points) {
+            polygon.push_back(localPoint(output, point, size));
+        }
+        painter->setPen(penForAnnotation(annotation));
+        painter->drawPolyline(polygon);
+        if (annotation.tool != QStringLiteral("arrow") || polygon.size() < 2) {
+            return;
+        }
+        const double scale = output.scale > 0 ? static_cast<double>(output.scale) : 1.0;
+        // The head is always solid and scales with the annotation's size.
+        painter->setPen(QPen(annotation.color, static_cast<double>(annotation.width),
+                             Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        const QPointF end = polygon.constLast();
+        const QPointF start = polygon.at(polygon.size() - 2);
+        const QLineF line(start, end);
+        if (line.length() <= 1.0) {
+            return;
+        }
+        const double widthDevice = static_cast<double>(annotation.width) * scale;
+        const double headDevice = std::min(std::max(6.0, widthDevice * 4.0) *
+                                               static_cast<double>(annotation.size),
+                                           line.length() * scale);
+        const double wingDevice = std::max(headDevice * 0.55, widthDevice);
+        const double wing = wingDevice / scale;
+        const double unitX = (end.x() - start.x()) / line.length();
+        const double unitY = (end.y() - start.y()) / line.length();
+        const double baseX = end.x() - unitX * headDevice / scale;
+        const double baseY = end.y() - unitY * headDevice / scale;
+        const QPointF first(baseX - unitY * wing, baseY + unitX * wing);
+        const QPointF second(baseX + unitY * wing, baseY - unitX * wing);
+        if (annotation.arrowStyle == QStringLiteral("filled")) {
+            QPolygonF head;
+            head << end << first << second;
+            painter->setBrush(annotation.color);
+            painter->drawPolygon(head);
+        }
+        painter->drawLine(end, first);
+        painter->drawLine(end, second);
+    }
+
+    int padding(const Annotation &annotation) const override
+    {
+        if (annotation.tool == QStringLiteral("mosaic")) {
+            // The disc radius in local pixels.  The brush is stamped in device
+            // space as clamp(width*scale/2, .., 512) doubled for the strongest
+            // setting; scaling back down, that is at most twice width/2 for
+            // every output scale, which is what this bounds from.
+            const int base = std::clamp(static_cast<int>(annotation.width) / 2, 1, 512);
+            return std::clamp(brushRadiusForStrength(annotation.strength, base), 1, 512) + 2;
+        }
+        if (annotation.tool == QStringLiteral("arrow")) {
+            const int head = std::max(6, static_cast<int>(annotation.width) * 4) *
+                static_cast<int>(annotation.size);
+            return head + static_cast<int>(annotation.width) + 4;
+        }
+        return AnnotationRaster::padding(annotation);
+    }
+};
+
+// One text label, rasterized with the preview font so the bitmap matches the
+// final render.
+class TextRaster final : public AnnotationRaster {
+protected:
+    QRectF bounds(const Annotation &annotation, const OutputSession &output,
+                  const QSize &size) const override
+    {
+        LogicalRect rect;
+        if (!annotationLogicalBounds(annotation, &rect)) {
+            return QRectF();
+        }
+        return localRect(output, rect, size);
+    }
+
+    QByteArray signature(const Annotation &annotation, const OutputSession &output,
+                         const QSize &size) const override
+    {
+        QByteArray data;
+        QDataStream stream(&data, QIODevice::WriteOnly);
+        writeContext(stream, output, size);
+        stream << annotation.text << annotation.font << annotation.textPixels
+               << static_cast<quint32>(annotation.color.rgba()) << annotation.origin.x
+               << annotation.origin.y;
+        return data;
+    }
+
+    void draw(QPainter *painter, const Annotation &annotation, const OutputSession &output,
+              const QSize &size) const override
+    {
+        LogicalRect rect;
+        if (!annotationLogicalBounds(annotation, &rect)) {
+            return;
+        }
+        painter->setFont(annotationFont(annotation));
+        painter->setPen(annotation.color);
+        // Top-left anchored inside the measured bounds so the preview matches
+        // the Rust glyph origin and the re-edit hit test.
+        painter->drawText(localRect(output, rect, size), Qt::AlignLeft | Qt::AlignTop,
+                          annotation.text);
+    }
+
+    int padding(const Annotation &) const override { return 2; }
+};
+
+// A pasted image, drawn at the rect it was placed at.
+class ImageRaster final : public AnnotationRaster {
+protected:
+    QRectF bounds(const Annotation &annotation, const OutputSession &output,
+                  const QSize &size) const override
+    {
+        if (annotation.pixels.isNull()) {
+            return QRectF();
+        }
+        return localRect(output, annotation.rect, size);
+    }
+
+    QByteArray signature(const Annotation &annotation, const OutputSession &output,
+                         const QSize &size) const override
+    {
+        QByteArray data;
+        QDataStream stream(&data, QIODevice::WriteOnly);
+        writeContext(stream, output, size);
+        stream << annotation.pixels.cacheKey() << static_cast<qint64>(annotation.rect.x)
+               << static_cast<qint64>(annotation.rect.y)
+               << static_cast<quint64>(annotation.rect.width)
+               << static_cast<quint64>(annotation.rect.height);
+        return data;
+    }
+
+    void draw(QPainter *painter, const Annotation &annotation, const OutputSession &output,
+              const QSize &size) const override
+    {
+        if (annotation.pixels.isNull()) {
+            return;
+        }
+        painter->setRenderHint(QPainter::SmoothPixmapTransform, true);
+        painter->drawImage(localRect(output, annotation.rect, size), annotation.pixels);
+    }
+
+    int padding(const Annotation &) const override { return 2; }
+};
+
+std::shared_ptr<AnnotationRaster> makeAnnotationRaster(const Annotation &annotation)
+{
+    switch (annotation.kind) {
+    case Annotation::Kind::Shape:
+        return std::make_shared<ShapeRaster>();
+    case Annotation::Kind::Text:
+        return std::make_shared<TextRaster>();
+    case Annotation::Kind::Image:
+        return std::make_shared<ImageRaster>();
+    case Annotation::Kind::Stroke:
+        break;
+    }
+    return std::make_shared<StrokeRaster>();
+}
+
+int Annotation::rasterRebuilds() const
+{
+    return raster != nullptr ? raster->rebuilds() : -1;
+}
+
 void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
 {
     const OutputSession &output = overlay->output();
@@ -5719,8 +6062,15 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
         }
     };
 
+    // Committed marks are drawn from their cached raster: each one redraws
+    // itself only when something it draws changed, so a repaint (a selection
+    // drag, a pointer move) blits the untouched ones instead of recomputing
+    // them -- the mosaic in particular, which averages the source image.
     for (const Annotation &annotation : annotations_) {
-        drawAnnotation(annotation);
+        if (annotation.raster == nullptr) {
+            annotation.raster = makeAnnotationRaster(annotation);
+        }
+        annotation.raster->paint(painter, annotation, output, overlay->size());
     }
     if (gesture_->type == Gesture::Type::Drawing && !gesture_->points.isEmpty()) {
         Annotation preview;
@@ -5747,6 +6097,8 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
                 preview.tool = QStringLiteral("mosaic");
             }
         }
+        // The in-progress mark changes every frame, so there is nothing to
+        // cache: drawing it straight keeps the preview honest.
         drawAnnotation(preview);
     }
 
