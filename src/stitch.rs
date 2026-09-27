@@ -1129,7 +1129,7 @@ mod tests {
         let stride = W as usize * 4;
         let frame = |top: u32, faint: u8| {
             let mut bytes = bar.clone();
-            for pixel in bytes.chunks_exact_mut(4) {
+            for pixel in bytes.as_chunks_mut::<4>().0 {
                 pixel[0] = pixel[0].saturating_add(faint);
             }
             let start = (top + BAND) as usize * stride;
@@ -1246,7 +1246,7 @@ mod tests {
     fn speckled(frame: &Frame, amplitude: u8) -> Frame {
         let mut state = 0x1234_5678u32;
         let mut bytes = frame.pixels().to_vec();
-        for chunk in bytes.chunks_exact_mut(4) {
+        for chunk in bytes.as_chunks_mut::<4>().0 {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             let span = i32::from(amplitude) * 2 + 1;
             let delta = (state >> 24) as i32 % span - i32::from(amplitude);

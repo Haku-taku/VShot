@@ -1058,7 +1058,7 @@ mod tests {
     #[test]
     fn annotation_pipeline_renders_text_and_mosaic_brush() {
         let mut pixels = vec![0u8; 400];
-        for chunk in pixels.chunks_exact_mut(4) {
+        for chunk in pixels.as_chunks_mut::<4>().0 {
             chunk.copy_from_slice(&[0, 0, 0, 255]);
         }
         // A single bright pixel inside the stamp disc.

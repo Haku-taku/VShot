@@ -475,8 +475,10 @@ fn convert_premultiplied_bgra(
     for (row, frame_row) in pixels.chunks_exact_mut(row_bytes).enumerate() {
         let source_row = &bytes[row * geometry.stride..row * geometry.stride + row_bytes];
         for (destination, source) in frame_row
-            .chunks_exact_mut(4)
-            .zip(source_row.chunks_exact(4))
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(source_row.as_chunks::<4>().0.iter())
         {
             let alpha = source[3];
             let (red, green, blue) = (source[2], source[1], source[0]);
@@ -989,7 +991,12 @@ mod tests {
         // A screenshot is opaque everywhere, including the regions nothing was
         // drawn into.
         assert!(
-            frame.pixels().chunks_exact(4).all(|pixel| pixel[3] == 255),
+            frame
+                .pixels()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[3] == 255),
             "every captured pixel has to be opaque"
         );
         if let Ok(expected) = std::env::var("VSHOT_KWIN_E2E_COLOR") {

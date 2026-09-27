@@ -1054,7 +1054,7 @@ fn describe_formats(formats: &[(u32, Vec<u64>)]) -> String {
 /// bytes, and the protocol's own description is an array of `uint64_t`.
 fn modifiers_from_bytes(bytes: &[u8]) -> Vec<u64> {
     let mut modifiers = Vec::with_capacity(bytes.len() / 8);
-    for chunk in bytes.chunks_exact(8) {
+    for chunk in bytes.as_chunks::<8>().0 {
         let mut value = [0u8; 8];
         value.copy_from_slice(chunk);
         modifiers.push(u64::from_ne_bytes(value));

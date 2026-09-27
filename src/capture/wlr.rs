@@ -204,8 +204,10 @@ fn convert_shm_pixels(
         };
         let source_row = &map[source_y * stride..source_y * stride + row_bytes];
         for (destination, source) in destination_row
-            .chunks_exact_mut(4)
-            .zip(source_row.chunks_exact(4))
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(source_row.as_chunks::<4>().0.iter())
         {
             let word = u32::from_le_bytes([source[0], source[1], source[2], source[3]]);
             let ordered = if swap {

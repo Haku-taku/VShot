@@ -479,8 +479,10 @@ pub(super) fn rgba_from_memory(
             .take(height),
     ) {
         for (destination, source) in destination_row
-            .chunks_exact_mut(4)
-            .zip(source_row[..row_bytes].chunks_exact(4))
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(source_row[..row_bytes].as_chunks::<4>().0.iter())
         {
             let word = u32::from_le_bytes([source[0], source[1], source[2], source[3]]);
             let word = if swap {

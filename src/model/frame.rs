@@ -37,7 +37,7 @@ impl Frame {
                 VshotError::InvalidGeometry("RGBA frame is too large".into())
             })?
         ];
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0 {
             pixel.copy_from_slice(&rgba);
         }
         Self::new(size, pixels)

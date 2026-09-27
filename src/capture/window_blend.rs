@@ -609,7 +609,7 @@ mod tests {
         // differs from it enough that a flat-background match would still pass:
         // that is what makes the frame a regression rather than a formality.
         let mut background = vec![0u8; 900 * 700 * 4];
-        for pixel in background.chunks_exact_mut(4) {
+        for pixel in background.as_chunks_mut::<4>().0 {
             pixel.copy_from_slice(&[204, 198, 184, 255]);
         }
         let frame = Frame::new(Size::new(900, 700), background).unwrap();
