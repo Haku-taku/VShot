@@ -28,7 +28,9 @@
 #include <QApplication>
 #include <QColor>
 #include <QImage>
+#include <QLineEdit>
 #include <QPointF>
+#include <QRegion>
 #include <QScreen>
 #include <QString>
 #include <Qt>
@@ -99,6 +101,53 @@ void drag(vshot::OverlayController &controller, vshot::CaptureOverlay *overlay,
     controller.press(overlay, from, Qt::LeftButton, Qt::NoModifier);
     controller.move(overlay, to, Qt::LeftButton, Qt::NoModifier);
     controller.release(overlay, to, Qt::LeftButton, Qt::NoModifier);
+}
+
+// The area the overlay's live child widgets cover, in overlay coordinates.  The
+// floating toolbar and its buttons repaint themselves when their own state
+// changes -- Qt drives that, not the controller's invalidated region -- so a
+// difference under a child is not something the controller's rect can be blamed
+// for.
+QRegion childAreas(vshot::CaptureOverlay *overlay)
+{
+    QRegion areas;
+    for (QWidget *child : overlay->findChildren<QWidget *>()) {
+        if (child->isWindow() || !child->isVisible()) {
+            continue;
+        }
+        areas += QRect(child->mapTo(overlay, QPoint()), child->size());
+    }
+    return areas;
+}
+
+// One interactive step: full-render the overlay, run the step, full-render it
+// again, and prove every pixel the step changed lies inside the rect the step
+// asked to be repainted.  A null rect means the step repainted the whole
+// surface, so there is nothing to compare -- a full repaint is its own eraser
+// and needs no narrow region to be correct.
+void expectStepCovered(vshot::OverlayController &controller, vshot::CaptureOverlay *overlay,
+                       const QPointF &to, const char *gesture)
+{
+    QImage before(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &before);
+    controller.move(overlay, to, Qt::LeftButton, Qt::NoModifier);
+    QImage after(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &after);
+    const QRect claimed = controller.lastInteractiveUpdate();
+    if (claimed.isNull()) {
+        return;
+    }
+    const QRegion allowed = QRegion(claimed) + childAreas(overlay);
+    int outside = 0;
+    for (int y = 0; y < after.height(); ++y) {
+        for (int x = 0; x < after.width(); ++x) {
+            if (before.pixel(x, y) != after.pixel(x, y) && !allowed.contains(QPoint(x, y))) {
+                ++outside;
+            }
+        }
+    }
+    expect(outside == 0, gesture,
+           QStringLiteral("%1 px changed outside the invalidated region").arg(outside));
 }
 
 // A committed mark rasterizes once and a repaint that changes nothing reuses
@@ -375,6 +424,475 @@ void checkLiveStrokeMatchesTheCommittedMark()
     }
 }
 
+// A pure translation must not invalidate a cached raster: the mark's pixels do
+// not change, only where they are blitted.  The mosaic is the deliberate
+// exception -- it averages the source image under its absolute position -- and
+// checkRepaintsReuseTheRaster keeps that pinned down.  A moved mark that kept a
+// stale blit position would show up here as pixels left at the old place.
+void checkPureMoveReusesTheRaster()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+
+    QImage target(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    // The session frame is a coarse coloured pattern that can itself contain
+    // red-ish pixels, so the stroke uses pure green -- a channel combination
+    // the pattern (red >= 40, blue >= 30) can never produce -- and the position
+    // test looks for that.
+    const auto greenIn = [](const QImage &image, int from, int to) {
+        for (int y = from; y < to; ++y) {
+            for (int x = 40; x < 360; ++x) {
+                if (x >= image.width() || y >= image.height()) {
+                    continue;
+                }
+                const QColor pixel = image.pixelColor(x, y);
+                if (pixel.red() < 20 && pixel.green() > 200 && pixel.blue() < 20) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    // A freehand stroke: it must keep its raster when dragged, and the pixels
+    // must land at the new place rather than staying behind.  The press point
+    // is off the mark's edge handles so the drag translates instead of resizing.
+    controller.chooseTool(vshot::Tool::Pen);
+    controller.setWidth(6);
+    controller.setCurrentColor(QColor(0, 255, 0));
+    drag(controller, overlay, QPointF(60, 120), QPointF(340, 120));
+    expect(controller.annotations().size() == 1, "the stroke lands as one annotation");
+    if (controller.annotations().size() != 1) {
+        return;
+    }
+    paintOnce(overlay, &target);
+    const int strokeRebuilds = controller.annotations().at(0).rasterRebuilds();
+    expect(strokeRebuilds == 1, "the stroke rasterizes once",
+           QStringLiteral("rebuilds=%1").arg(strokeRebuilds));
+    controller.chooseTool(vshot::Tool::Select);
+    drag(controller, overlay, QPointF(150, 120), QPointF(150, 220));
+    paintOnce(overlay, &target);
+    expect(controller.annotations().at(0).rasterRebuilds() == strokeRebuilds,
+           "translating a freehand stroke reuses its cached raster",
+           QStringLiteral("rebuilds=%1").arg(controller.annotations().at(0).rasterRebuilds()));
+    expect(greenIn(target, 200, 240) && !greenIn(target, 100, 140),
+           "the translated stroke paints at its new place, not the old one");
+
+    // A rectangle outline: same cache, same translation.
+    controller.chooseTool(vshot::Tool::Rectangle);
+    controller.setWidth(4);
+    controller.setCurrentColor(QColor(30, 200, 30));
+    drag(controller, overlay, QPointF(40, 300), QPointF(180, 380));
+    expect(controller.annotations().size() == 2, "the rectangle lands as a second annotation");
+    if (controller.annotations().size() != 2) {
+        return;
+    }
+    paintOnce(overlay, &target);
+    const int rectRebuilds = controller.annotations().at(1).rasterRebuilds();
+    expect(rectRebuilds == 1, "the rectangle rasterizes once",
+           QStringLiteral("rebuilds=%1").arg(rectRebuilds));
+    controller.chooseTool(vshot::Tool::Select);
+    drag(controller, overlay, QPointF(110, 340), QPointF(210, 340));
+    paintOnce(overlay, &target);
+    expect(controller.annotations().at(1).rasterRebuilds() == rectRebuilds,
+           "translating a rectangle reuses its cached raster",
+           QStringLiteral("rebuilds=%1").arg(controller.annotations().at(1).rasterRebuilds()));
+
+    // A text label: its bitmap depends on the text and font, not on where the
+    // label sits, so a move reuses it too.
+    controller.chooseTool(vshot::Tool::Text);
+    controller.press(overlay, QPointF(60, 60), Qt::LeftButton, Qt::NoModifier);
+    QLineEdit *editor = overlay->findChild<QLineEdit *>();
+    expect(editor != nullptr, "the text tool opens its inline editor");
+    if (editor == nullptr) {
+        return;
+    }
+    editor->setText(QStringLiteral("Hi"));
+    controller.key(overlay, Qt::Key_Return, Qt::NoModifier);
+    expect(controller.annotations().size() == 3, "the label lands as a third annotation");
+    if (controller.annotations().size() != 3) {
+        return;
+    }
+    paintOnce(overlay, &target);
+    const int textRebuilds = controller.annotations().at(2).rasterRebuilds();
+    expect(textRebuilds == 1, "the label rasterizes once",
+           QStringLiteral("rebuilds=%1").arg(textRebuilds));
+    controller.chooseTool(vshot::Tool::Select);
+    drag(controller, overlay, QPointF(66, 66), QPointF(166, 66));
+    paintOnce(overlay, &target);
+    expect(controller.annotations().at(2).rasterRebuilds() == textRebuilds,
+           "translating a label reuses its cached raster",
+           QStringLiteral("rebuilds=%1").arg(controller.annotations().at(2).rasterRebuilds()));
+}
+
+// Two outputs side by side, each with its own frozen frame, so a mark can lie
+// across the seam and be painted by both overlays.
+vshot::Session twoOutputSession()
+{
+    vshot::Session session;
+    session.mode = QStringLiteral("region");
+    session.bounds = vshot::LogicalRect{0, 0, 800, 400};
+    for (int index = 0; index < 2; ++index) {
+        vshot::OutputSession output;
+        output.id = static_cast<std::uint32_t>(index + 1);
+        output.name = QStringLiteral("CHECK-%1").arg(index + 1);
+        output.geometry = vshot::LogicalRect{index * 400, 0, 400, 400};
+        output.surface = output.geometry;
+        output.scale = 1;
+        output.pixelWidth = 400;
+        output.pixelHeight = 400;
+        output.image = QImage(400, 400, QImage::Format_ARGB32);
+        output.image.fill(QColor(80, 90, 100));
+        session.outputs.push_back(output);
+    }
+    session.selection = vshot::LogicalRect{0, 0, 800, 400};
+    return session;
+}
+
+// A session that spans two screens paints the same marks on both.  A single
+// shared raster would be thrown away and rebuilt every time the paint moved from
+// one screen to the other, so each output keeps its own: the second screen
+// builds once, and both then stay cached however the repaints alternate.
+void checkEachOutputKeepsItsOwnRaster()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(twoOutputSession());
+    QString error;
+    vshot::CaptureOverlay *first = controller.addOverlay(0, screen, &error);
+    vshot::CaptureOverlay *second = controller.addOverlay(1, screen, &error);
+    if (first == nullptr || second == nullptr) {
+        expect(false, "the controller accepts two overlays", error);
+        return;
+    }
+    first->show();
+    second->show();
+    controller.beginPresetEdit();
+
+    controller.chooseTool(vshot::Tool::Rectangle);
+    controller.setWidth(4);
+    controller.setCurrentColor(QColor(255, 30, 30));
+    // Straddles the seam at x = 400, so both screens paint it.
+    drag(controller, first, QPointF(300, 100), QPointF(500, 300));
+    expect(controller.annotations().size() == 1,
+           "the straddling rectangle lands as one annotation");
+    if (controller.annotations().size() != 1) {
+        return;
+    }
+
+    QImage firstTarget(first->size(), QImage::Format_ARGB32_Premultiplied);
+    QImage secondTarget(second->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(first, &firstTarget);
+    paintOnce(second, &secondTarget);
+    const int afterBoth = controller.annotations().at(0).rasterRebuilds();
+    expect(afterBoth == 2, "each output rasterizes the mark once",
+           QStringLiteral("rebuilds=%1").arg(afterBoth));
+
+    // Alternating repaints must not throw either screen's raster away.
+    paintOnce(first, &firstTarget);
+    paintOnce(second, &secondTarget);
+    paintOnce(first, &firstTarget);
+    paintOnce(second, &secondTarget);
+    expect(controller.annotations().at(0).rasterRebuilds() == afterBoth,
+           "repainting both screens keeps both rasters",
+           QStringLiteral("rebuilds=%1").arg(controller.annotations().at(0).rasterRebuilds()));
+}
+
+// A single roomy output: the edge test has to drag a mark right up against the
+// canvas boundary, and a 400x400 session clamps the drag before it gets there.
+vshot::Session largeSession()
+{
+    vshot::Session session;
+    session.mode = QStringLiteral("region");
+    session.bounds = vshot::LogicalRect{0, 0, 1600, 1200};
+    vshot::OutputSession output;
+    output.id = 1;
+    output.name = QStringLiteral("CHECK-LARGE");
+    output.geometry = vshot::LogicalRect{0, 0, 1600, 1200};
+    output.surface = output.geometry;
+    output.scale = 1;
+    output.pixelWidth = 1600;
+    output.pixelHeight = 1200;
+    output.image = QImage(1600, 1200, QImage::Format_ARGB32);
+    output.image.fill(QColor(80, 90, 100));
+    session.outputs.push_back(output);
+    session.selection = vshot::LogicalRect{0, 0, 1600, 1200};
+    return session;
+}
+
+// Sliding a mark up against the edge of the canvas changes how much of it is
+// visible, not the pixels it draws, so the raster is not rebuilt: the blit is
+// clipped by the painter instead.  Trimming the raster to the canvas would
+// change its size as the mark reached the edge, and a size change rebuilds it.
+void checkEdgeOfCanvasKeepsTheRaster()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(largeSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+
+    QImage target(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    controller.chooseTool(vshot::Tool::Rectangle);
+    controller.setWidth(4);
+    controller.setCurrentColor(QColor(0, 255, 0));
+    // A 70x70 outline landing 30 pixels short of the corner: one drag of thirty
+    // brings its far edges exactly onto the canvas boundary, where the pen's half
+    // width and the raster's padding reach past it.
+    drag(controller, overlay, QPointF(1500, 1100), QPointF(1569, 1169));
+    expect(controller.annotations().size() == 1, "the rectangle lands as one annotation");
+    if (controller.annotations().size() != 1) {
+        return;
+    }
+    paintOnce(overlay, &target);
+    const int settled = controller.annotations().at(0).rasterRebuilds();
+    expect(settled == 1, "the rectangle rasterizes once",
+           QStringLiteral("rebuilds=%1").arg(settled));
+
+    controller.chooseTool(vshot::Tool::Select);
+    const vshot::LogicalRect before = controller.annotations().at(0).rect;
+    drag(controller, overlay, QPointF(1535, 1135), QPointF(1565, 1165));
+    // Back to the drawing tool: the select tool's white outline and handles sit
+    // exactly on the edges the colour probes below look at.
+    controller.chooseTool(vshot::Tool::Rectangle);
+    paintOnce(overlay, &target);
+    const vshot::Annotation &mark = controller.annotations().at(0);
+    expect(mark.rect.x == before.x + 30 && mark.rect.y == before.y + 30 &&
+               mark.rect.width == before.width && mark.rect.height == before.height,
+           "the drag moved the mark thirty pixels and changed nothing else",
+           QStringLiteral("before=(%1,%2 %3x%4) after=(%5,%6 %7x%8)")
+               .arg(before.x)
+               .arg(before.y)
+               .arg(before.width)
+               .arg(before.height)
+               .arg(mark.rect.x)
+               .arg(mark.rect.y)
+               .arg(mark.rect.width)
+               .arg(mark.rect.height));
+    expect(mark.rect.x + static_cast<std::int32_t>(mark.rect.width) >= 1600,
+           "the mark ends up against the canvas edge");
+    expect(mark.rasterRebuilds() == settled,
+           "a mark pushed against the canvas edge keeps its raster",
+           QStringLiteral("rebuilds=%1").arg(mark.rasterRebuilds()));
+
+    // The raster is not trimmed to the canvas, so this is what proves the blit
+    // still lands where the mark is: the drag moved it, and its near edges have
+    // to be painted at the place it moved to.  The session frame is a flat grey,
+    // so a green pixel is the mark's own.
+    const auto greenAt = [&target](int x, int y) {
+        if (x < 0 || y < 0 || x >= target.width() || y >= target.height()) {
+            return false;
+        }
+        const QColor pixel = target.pixelColor(x, y);
+        return pixel.red() < 40 && pixel.green() > 150 && pixel.blue() < 40;
+    };
+    expect(greenAt(mark.rect.x + 20, mark.rect.y) && greenAt(mark.rect.x, mark.rect.y + 20),
+           "the edges of the mark are painted where it now is",
+           QStringLiteral("top=%1 left=%2 at (%3,%4)")
+               .arg(greenAt(mark.rect.x + 20, mark.rect.y) ? 1 : 0)
+               .arg(greenAt(mark.rect.x, mark.rect.y + 20) ? 1 : 0)
+               .arg(mark.rect.x)
+               .arg(mark.rect.y));
+    expect(!greenAt(before.x, before.y + 20) && !greenAt(before.x + 20, before.y),
+           "nothing is left where the mark came from");
+}
+
+// The narrow repaints must still leave the screen correct: whatever an
+// interactive step changed has to lie inside the rect that step asked to be
+// repainted.  A rect that is too small leaves stale pixels behind -- a mark at
+// the place it came from, a magnifier that outlived the gesture.  The check does
+// not model Qt's backing store; it compares a full render of the overlay before
+// a step with one after it and counts the changed pixels the invalidated region
+// does not cover.
+void checkInteractiveUpdateCoversTheChange()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+
+    // 1. Drawing a two-point preview: the rectangle is redrawn whole from its
+    // anchor on every move, so a step has to cover the outline it drew before as
+    // well as the one it draws now.
+    controller.chooseTool(vshot::Tool::Rectangle);
+    controller.press(overlay, QPointF(60, 60), Qt::LeftButton, Qt::NoModifier);
+    expectStepCovered(controller, overlay, QPointF(140, 120),
+                      "a rectangle preview move invalidates where it drew");
+    expectStepCovered(controller, overlay, QPointF(160, 160),
+                      "a growing rectangle preview invalidates where it drew");
+    expectStepCovered(controller, overlay, QPointF(150, 140),
+                      "a shrinking rectangle preview invalidates where it drew");
+    controller.release(overlay, QPointF(150, 140), Qt::LeftButton, Qt::NoModifier);
+    expect(controller.annotations().size() == 1, "the rectangle lands as one annotation");
+    if (controller.annotations().size() != 1) {
+        return;
+    }
+
+    // 2. Moving a committed mark: the mark, its white selection chrome and the
+    // magnifier all travel, so each step has to cover the old and the new place
+    // of all three.
+    controller.chooseTool(vshot::Tool::Select);
+    const vshot::LogicalRect drawn = controller.annotations().at(0).rect;
+    const QPointF centre(drawn.x + static_cast<int>(drawn.width) / 2,
+                         drawn.y + static_cast<int>(drawn.height) / 2);
+    controller.press(overlay, centre, Qt::LeftButton, Qt::NoModifier);
+    expectStepCovered(controller, overlay, centre + QPointF(10, 8),
+                      "moving a mark invalidates where it drew");
+    expectStepCovered(controller, overlay, centre + QPointF(24, 20),
+                      "a moving mark invalidates where it draws");
+    expectStepCovered(controller, overlay, centre + QPointF(30, 30),
+                      "the moved mark invalidates its last place");
+    controller.release(overlay, centre + QPointF(30, 30), Qt::LeftButton, Qt::NoModifier);
+    const vshot::LogicalRect moved = controller.annotations().at(0).rect;
+    expect(moved.x == drawn.x + 30 && moved.y == drawn.y + 30 &&
+               moved.width == drawn.width && moved.height == drawn.height,
+           "the drag translated the mark by thirty pixels",
+           QStringLiteral("from (%1,%2) to (%3,%4)")
+               .arg(drawn.x)
+               .arg(drawn.y)
+               .arg(moved.x)
+               .arg(moved.y));
+
+    // 3. Resizing a committed mark: press on the bottom-right handle so the
+    // gesture resizes rather than moves, and cover the chrome at both sizes.
+    const QPointF corner(moved.x + static_cast<int>(moved.width) - 1,
+                         moved.y + static_cast<int>(moved.height) - 1);
+    controller.press(overlay, corner, Qt::LeftButton, Qt::NoModifier);
+    expectStepCovered(controller, overlay, corner + QPointF(10, 10),
+                      "resizing a mark invalidates where it drew");
+    expectStepCovered(controller, overlay, corner + QPointF(20, 20),
+                      "a resizing mark invalidates where it draws");
+    controller.release(overlay, corner + QPointF(20, 20), Qt::LeftButton, Qt::NoModifier);
+    const vshot::LogicalRect resized = controller.annotations().at(0).rect;
+    expect(resized.width > moved.width && resized.height > moved.height,
+           "the drag resized the mark instead of moving it",
+           QStringLiteral("%1x%2 -> %3x%4")
+               .arg(moved.width)
+               .arg(moved.height)
+               .arg(resized.width)
+               .arg(resized.height));
+
+    // 4. A freehand pen stroke: the preview grows through a raster one segment
+    // at a time, and a step may only invalidate the segment it just added.
+    controller.chooseTool(vshot::Tool::Pen);
+    controller.setWidth(5);
+    controller.press(overlay, QPointF(40, 250), Qt::LeftButton, Qt::NoModifier);
+    expectStepCovered(controller, overlay, QPointF(80, 255),
+                      "a pen stroke move invalidates where it drew");
+    expectStepCovered(controller, overlay, QPointF(120, 245),
+                      "a growing pen stroke invalidates where it drew");
+    expectStepCovered(controller, overlay, QPointF(160, 262),
+                      "a turning pen stroke invalidates where it drew");
+    expectStepCovered(controller, overlay, QPointF(200, 250),
+                      "the released pen stroke invalidates where it drew");
+    controller.release(overlay, QPointF(200, 250), Qt::LeftButton, Qt::NoModifier);
+    expect(controller.annotations().size() == 2, "the pen stroke lands as a second annotation");
+    expect(controller.annotations().size() == 2 &&
+               controller.annotations().at(1).tool == QStringLiteral("pen"),
+           "the second mark is the pen stroke");
+
+    // 5. A mosaic brush stroke: the growing-raster path again, but each step
+    // smears a disc whose radius comes from the strength, not the cursor.
+    controller.chooseTool(vshot::Tool::Mosaic);
+    controller.setMosaicShape(QStringLiteral("brush"));
+    controller.setWidth(24);
+    controller.press(overlay, QPointF(270, 60), Qt::LeftButton, Qt::NoModifier);
+    expectStepCovered(controller, overlay, QPointF(310, 72),
+                      "a mosaic brush move invalidates where it drew");
+    expectStepCovered(controller, overlay, QPointF(350, 55),
+                      "a growing mosaic brush invalidates where it drew");
+    expectStepCovered(controller, overlay, QPointF(370, 80),
+                      "the released mosaic brush invalidates where it drew");
+    controller.release(overlay, QPointF(370, 80), Qt::LeftButton, Qt::NoModifier);
+    expect(controller.annotations().size() == 3, "the mosaic brush lands as a third annotation");
+    expect(controller.annotations().size() == 3 &&
+               controller.annotations().at(2).tool == QStringLiteral("mosaic"),
+           "the third mark is the mosaic brush stroke");
+
+    // 6 & 7. The capture selection itself.  The session's selection is the whole
+    // canvas, and `moveSelection` clamps a selection to the canvas, so moving it
+    // before it is shrunk would change nothing.  The resize gesture (listed
+    // seventh) therefore runs first: shrinking from the top-left corner gives
+    // the move gesture (listed sixth) room to travel.  Both drag the selection
+    // chrome, the magnifier and the toolbar that follows the selection.
+    controller.chooseTool(vshot::Tool::Select);
+    const vshot::LogicalRect canvas = *controller.selection();
+    const QPointF topLeft(canvas.x, canvas.y);
+    controller.press(overlay, topLeft, Qt::LeftButton, Qt::NoModifier);
+    expectStepCovered(controller, overlay, topLeft + QPointF(50, 50),
+                      "resizing the capture selection invalidates where it drew");
+    expectStepCovered(controller, overlay, topLeft + QPointF(100, 100),
+                      "a resizing capture selection invalidates where it drew");
+    controller.release(overlay, topLeft + QPointF(100, 100), Qt::LeftButton, Qt::NoModifier);
+    const vshot::LogicalRect shrunk = *controller.selection();
+    expect(shrunk.x == canvas.x + 100 && shrunk.y == canvas.y + 100 &&
+               shrunk.width + 100 == canvas.width && shrunk.height + 100 == canvas.height,
+           "the drag shrank the capture selection from its top-left corner",
+           QStringLiteral("(%1,%2 %3x%4) -> (%5,%6 %7x%8)")
+               .arg(canvas.x)
+               .arg(canvas.y)
+               .arg(canvas.width)
+               .arg(canvas.height)
+               .arg(shrunk.x)
+               .arg(shrunk.y)
+               .arg(shrunk.width)
+               .arg(shrunk.height));
+
+    // A point well inside the shrunk selection, off every handle and off every
+    // mark, so the gesture is a move of the selection rather than a resize or a
+    // mark pick-up.
+    const QPointF grip(350, 350);
+    controller.press(overlay, grip, Qt::LeftButton, Qt::NoModifier);
+    expectStepCovered(controller, overlay, grip - QPointF(20, 20),
+                      "moving the capture selection invalidates where it drew");
+    expectStepCovered(controller, overlay, grip - QPointF(40, 40),
+                      "a moving capture selection invalidates where it drew");
+    controller.release(overlay, grip - QPointF(40, 40), Qt::LeftButton, Qt::NoModifier);
+    const vshot::LogicalRect shifted = *controller.selection();
+    expect(shifted.x == shrunk.x - 40 && shifted.y == shrunk.y - 40 &&
+               shifted.width == shrunk.width && shifted.height == shrunk.height,
+           "the drag moved the capture selection without resizing it",
+           QStringLiteral("(%1,%2) -> (%3,%4)")
+               .arg(shrunk.x)
+               .arg(shrunk.y)
+               .arg(shifted.x)
+               .arg(shifted.y));
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -384,7 +902,11 @@ int main(int argc, char *argv[])
     checkRepaintsReuseTheRaster();
     checkEachMarkCachesOnItsOwn();
     checkCachedPixelsLandOnTheMark();
+    checkPureMoveReusesTheRaster();
+    checkEachOutputKeepsItsOwnRaster();
+    checkEdgeOfCanvasKeepsTheRaster();
     checkLiveStrokeMatchesTheCommittedMark();
+    checkInteractiveUpdateCoversTheChange();
 
     if (failures != 0) {
         std::printf("\n%d annotation cache checks failed\n", failures);

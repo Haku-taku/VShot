@@ -5,8 +5,10 @@
 
 #include "session_protocol.hpp"
 
+#include <QByteArray>
 #include <QColor>
 #include <QElapsedTimer>
+#include <QImage>
 #include <QJsonDocument>
 #include <QPointF>
 #include <QRect>
@@ -157,6 +159,13 @@ public:
     int outputCount() const;
     const Session &session() const;
     CaptureOverlay *addOverlay(int outputIndex, QScreen *screen, QString *error);
+    // The overlay-local rect the last interactive step asked to be repainted,
+    // or a null rect when that step asked for the whole surface, which happens
+    // on the first step of a gesture.  Read by the offline check, which compares
+    // two full renders around a step and proves the pixels that changed all fall
+    // inside it; it runs a single output, so the last overlay the step reached
+    // is the one that matters.
+    QRect lastInteractiveUpdate() const;
 
     void paint(CaptureOverlay *overlay, QPainter *painter);
     void press(CaptureOverlay *overlay, const QPointF &local, Qt::MouseButton button,
@@ -318,6 +327,15 @@ private:
     Gesture *gesture_ = nullptr;
     // Freehand segments the live preview has baked for the current stroke.
     int liveStrokeBakes_ = 0;
+    // The session-space rect the last interactive step invalidated, and whether
+    // there is one.  A step has to erase what the step before painted, and the
+    // only record of that is this rect; `updateAll` clears it, a full repaint
+    // being its own eraser.  See `updateTouch`.
+    LogicalRect lastTouch_{};
+    bool hasLastTouch_ = false;
+    // The overlay-local rect that step handed to the widget, for the offline
+    // checks; see `lastInteractiveUpdate`.
+    QRect lastTouchLocal_;
     bool editing_ = false;
     bool pinEdit_ = false;
     /// `region-only`: a finished drag ends the session with the rectangle
@@ -330,6 +348,13 @@ private:
     mutable int textBitmapIndex_ = 0;
     // The same counter for pasted images' pixel files, in the same directory.
     mutable int imageBitmapIndex_ = 0;
+    // Region editor base layer: the session image with the dim veil already
+    // composited, at device resolution.  It only depends on the output, its
+    // pixel buffer, the surface and the display ratio, so a repaint (a pointer
+    // move, a selection drag) blits it rather than drawing the frame and the
+    // veil again.  `baseCompositeKey_` says when it has to be rebuilt.
+    QImage baseComposite_;
+    QByteArray baseCompositeKey_;
     // Live pin window the editor drives in pin-edit mode. The daemon answers
     // exactly one request per connection and then closes, so each move gets a
     // fresh socket instead of a reconnected one.
@@ -395,7 +420,26 @@ private:
     void updateToolbarGeometry();
     int outputIndexForSelection() const;
     void settlePanelAtGlobal(QPoint topLeft);
+    void repaintEverything();
     void updateAll();
+    // Invalidates only the part of the surface an interactive step changed.  A
+    // repaint of a 4K overlay costs about 1.7 ms per full-frame blit and the
+    // marks sit on top of two of them, so a step that touches a few hundred
+    // pixels must not ask for the whole surface; `touched` is in session
+    // coordinates and every overlay gets its own share of it.  The region the
+    // step before invalidated is included as well -- that is what erases where
+    // a dragged mark used to be -- and an empty rect falls back to `updateAll`.
+    void updateTouch(const LogicalRect &touched);
+    // The rects one interactive step can have changed, in session coordinates.
+    LogicalRect selectionTouch() const;
+    LogicalRect annotationTouch() const;
+    LogicalRect drawingTouch(int pointsBefore) const;
+    // The magnifier the editor draws around the pointer while a gesture drags
+    // something, in session coordinates.
+    LogicalRect pointerTouch() const;
+    // True for the tools whose preview builds up through the incremental raster
+    // rather than being redrawn whole from the anchor every step.
+    bool drawsGrowingStroke() const;
     void terminal(bool cancelled);
     void removeTextEditor();
     void mutateAnnotations(QVector<Annotation> next);

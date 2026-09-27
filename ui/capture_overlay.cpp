@@ -21,6 +21,7 @@
 #include <QFontMetrics>
 #include <QFrame>
 #include <QHBoxLayout>
+#include <QHash>
 #include <QIcon>
 #include <QImage>
 #include <QImageReader>
@@ -560,6 +561,57 @@ QColor averageBlockColor(const uchar *bits, qsizetype bytesPerLine,
                   static_cast<int>(sums[2] / count), static_cast<int>(sums[3] / count));
 }
 
+// Blits one solid block straight into the destination image when the painter is
+// drawing onto an ARGB32-premultiplied QImage under a pure scale-and-translate
+// transform with no clip.  `fillLogicalBlock` runs once per mosaic block, and a
+// 1080p area mosaic at the standard 12-device-pixel block is about 14k calls,
+// each of which the QPainter path pays a call and a clip test for.  The direct
+// write reproduces `QPainter::fillRect(QRectF, color)` exactly: the logical rect
+// is mapped through the painter transform and aligned outward to whole device
+// pixels (the raster engine's fill for a solid, unantialiased colour), and a
+// fully opaque colour written over the destination is the same as a source-over
+// fill of it.  Anything else -- a translucent block, a widget or pixmap target,
+// a rotation, an active clip -- returns false and lets the caller fall back.
+bool fillRectDirect(QPainter *painter, const QRectF &logical, const QColor &color)
+{
+    if (color.alpha() != 255 || painter->hasClipping()) {
+        return false;
+    }
+    QPaintDevice *device = painter->device();
+    if (device == nullptr || device->devType() != QInternal::Image) {
+        return false;
+    }
+    QImage *image = static_cast<QImage *>(device);
+    if (image->format() != QImage::Format_ARGB32_Premultiplied) {
+        return false;
+    }
+    const QTransform transform = painter->combinedTransform();
+    if (transform.type() > QTransform::TxScale) {
+        return false;
+    }
+    // The raster engine antialiases a rect whose edges land between device
+    // pixels, so only an exactly pixel-aligned block may be written directly;
+    // anything fractional (a scaled painter, a non-integer device ratio) falls
+    // back to QPainter.
+    const QRectF mapped = transform.mapRect(logical);
+    const QRect deviceRect = mapped.toAlignedRect();
+    if (mapped != QRectF(deviceRect)) {
+        return false;
+    }
+    const QRect clipped = deviceRect.intersected(QRect(0, 0, image->width(), image->height()));
+    if (clipped.isEmpty()) {
+        return true;
+    }
+    const QRgb value = qRgba(color.red(), color.green(), color.blue(), 255);
+    for (int row = clipped.top(); row <= clipped.bottom(); ++row) {
+        QRgb *line = reinterpret_cast<QRgb *>(image->scanLine(row)) + clipped.left();
+        for (int col = 0; col < clipped.width(); ++col) {
+            line[col] = value;
+        }
+    }
+    return true;
+}
+
 void fillLogicalBlock(QPainter *painter, const OutputSession &output, const LogicalRect &bounds,
                       const QSize &size, const QRect &source, int scale, int x, int y, int width,
                       int height, const QColor &color)
@@ -569,7 +621,11 @@ void fillLogicalBlock(QPainter *painter, const OutputSession &output, const Logi
     blockLogical.y = bounds.y + static_cast<std::int32_t>((y - source.y()) / scale);
     blockLogical.width = static_cast<std::uint32_t>(width / scale);
     blockLogical.height = static_cast<std::uint32_t>(height / scale);
-    painter->fillRect(localRect(output, blockLogical, size), color);
+    const QRectF logical = localRect(output, blockLogical, size);
+    if (fillRectDirect(painter, logical, color)) {
+        return;
+    }
+    painter->fillRect(logical, color);
 }
 
 // Renders a real pixelation mosaic over the annotation bounds, matching the
@@ -3947,7 +4003,7 @@ int OverlayController::sceneScale() const
     return scale;
 }
 
-void OverlayController::updateAll()
+void OverlayController::repaintEverything()
 {
     for (CaptureOverlay *overlay : overlays_) {
         overlay->update();
@@ -3956,6 +4012,202 @@ void OverlayController::updateAll()
         toolbar_->syncState();
         updateToolbarGeometry();
     }
+}
+
+void OverlayController::updateAll()
+{
+    // A full repaint erases whatever the narrow ones left, so the rect they were
+    // tracking stops being the record of what is on the surface.
+    hasLastTouch_ = false;
+    repaintEverything();
+}
+
+// How far outside a mark's own rect its pixels can reach.  The answer lives in
+// the mark's rasterizer -- the pen width, the arrow head, the mosaic brush
+// radius -- which is why it is not simply a field of the annotation.
+int annotationReach(const Annotation &annotation);
+
+// Pixels of chrome a selection drag can paint outside the selection itself: the
+// two-pixel outline and the round handles centred on its corners.
+constexpr int kSelectionChrome = 6;
+
+namespace {
+
+// The session-space union of two rects, written with the explicit 64-bit
+// arithmetic `LogicalRect`'s mixed-signed fields otherwise make awkward.  An
+// empty rect is the identity, which is what a gesture that has not touched
+// anything yet hands over.
+LogicalRect uniteLogical(const LogicalRect &first, const LogicalRect &second)
+{
+    if (first.width == 0 || first.height == 0) {
+        return second;
+    }
+    if (second.width == 0 || second.height == 0) {
+        return first;
+    }
+    const std::int64_t left = std::min<std::int64_t>(first.x, second.x);
+    const std::int64_t top = std::min<std::int64_t>(first.y, second.y);
+    const std::int64_t far = std::max(right(first), right(second));
+    const std::int64_t low = std::max(bottom(first), bottom(second));
+    return LogicalRect{static_cast<std::int32_t>(left), static_cast<std::int32_t>(top),
+                       static_cast<std::uint32_t>(far - left),
+                       static_cast<std::uint32_t>(low - top)};
+}
+
+// The same rect grown by `margin` logical pixels on every side.
+LogicalRect growBy(LogicalRect rect, int margin)
+{
+    rect.x -= static_cast<std::int32_t>(margin);
+    rect.y -= static_cast<std::int32_t>(margin);
+    rect.width += static_cast<std::uint32_t>(2 * margin);
+    rect.height += static_cast<std::uint32_t>(2 * margin);
+    return rect;
+}
+
+// How far outside its path a live preview paints.  The freehand pen reaches out
+// by half its width; the mosaic brush stamps a block whose radius comes from the
+// strength and can be far wider than the cursor.  `paintLiveStroke` builds its
+// own padding out of the same two numbers, so the two move together.
+double liveStrokeMargin(bool brush, int widthLogical, int scale, std::uint32_t strength)
+{
+    if (!brush) {
+        return widthLogical / 2.0 + 2.0;
+    }
+    const double deviceRadius = std::clamp(
+        brushRadiusForStrength(strength, std::clamp(widthLogical * scale / 2, 1, 512)), 1, 512);
+    return deviceRadius / scale + 2.0;
+}
+
+// Room for the size pill the editor pins to the selection's top-left corner: it
+// is centred on that corner, so it reaches half its width to either side and a
+// line below.  Slack rather than the measured width, because the step has to
+// invalidate before the paint knows what the text will be.
+constexpr int kInfoPillSlack = 64;
+
+} // namespace
+
+// The magnifier the editor follows the pointer with while a gesture is dragging
+// something, plus the coordinate pill that hangs under it.  The loupe sits a
+// little past the pointer and flips to the other side near an edge, so the box
+// is the pointer plus the whole reach on every side: half a diameter in x, and
+// enough in y for the pill below the circle.
+LogicalRect OverlayController::pointerTouch() const
+{
+    constexpr int kReachX = kLoupeDiameter + kLoupeMargin;
+    constexpr int kReachY = kLoupeDiameter + kInfoPillSlack + kLoupeMargin;
+    return LogicalRect{pointer_.x - kReachX, pointer_.y - kReachY, 2 * kReachX, 2 * kReachY};
+}
+
+LogicalRect OverlayController::selectionTouch() const
+{
+    if (!selection_.has_value()) {
+        return LogicalRect{};
+    }
+    return uniteLogical(growBy(*selection_, kInfoPillSlack), pointerTouch());
+}
+
+LogicalRect OverlayController::annotationTouch() const
+{
+    if (selectedAnnotation_ < 0 || selectedAnnotation_ >= annotations_.size()) {
+        return LogicalRect{};
+    }
+    const Annotation &annotation = annotations_.at(selectedAnnotation_);
+    LogicalRect bounds;
+    if (!annotationBounds(annotation, &bounds)) {
+        return LogicalRect{};
+    }
+    // The mark's own rasterizer knows how far its pixels reach; a mark that has
+    // not been painted yet has none, so the padding comes from a temporary one.
+    return uniteLogical(growBy(bounds, annotationReach(annotation) + kSelectionChrome),
+                        pointerTouch());
+}
+
+LogicalRect OverlayController::drawingTouch(int pointsBefore) const
+{
+    if (gesture_->points.isEmpty()) {
+        return LogicalRect{};
+    }
+    // A growing stroke only stamps the segments the last pointer move added; the
+    // steps before are already baked into the raster and copied, so their pixels
+    // stay on screen.  The straight tools redraw their whole shape from the
+    // anchor every step, so all of it counts as touched.
+    const int count = static_cast<int>(gesture_->points.size());
+    int first = 0;
+    if (drawsGrowingStroke()) {
+        first = std::clamp(pointsBefore - 1, 0, count - 1);
+    }
+    LogicalRect touched{gesture_->points.at(first).x, gesture_->points.at(first).y, 1u, 1u};
+    for (int index = first + 1; index < count; ++index) {
+        const Point &point = gesture_->points.at(index);
+        touched = uniteLogical(touched, LogicalRect{point.x, point.y, 1u, 1u});
+    }
+    // The preview is stamped on the output the stroke started on, and that
+    // output's scale is what turns the device-space brush radius back into
+    // logical pixels.
+    int scale = 1;
+    for (CaptureOverlay *overlay : overlays_) {
+        if (overlay->outputIndex() == gesture_->liveOutput) {
+            scale = static_cast<int>(overlay->output().scale > 0 ? overlay->output().scale : 1);
+            break;
+        }
+    }
+    const bool brush = tool_ == Tool::Mosaic;
+    const int margin = static_cast<int>(std::ceil(liveStrokeMargin(
+                           brush, std::max(1, static_cast<int>(currentWidth_)), scale,
+                           mosaicStrength_))) +
+        kSelectionChrome;
+    return growBy(touched, margin);
+}
+
+bool OverlayController::drawsGrowingStroke() const
+{
+    return (tool_ == Tool::Pen && currentColor_.alpha() == 255) ||
+           (tool_ == Tool::Mosaic && mosaicShape_ == QStringLiteral("brush"));
+}
+
+void OverlayController::updateTouch(const LogicalRect &touched)
+{
+    lastTouchLocal_ = QRect();
+    if (touched.width == 0 || touched.height == 0) {
+        updateAll();
+        return;
+    }
+    // The step before this one was a full repaint -- the press that started the
+    // gesture, a tool change -- so what is on the surface is not known from a
+    // rect.  Cover everything once, and remember this rect so that the steps
+    // which follow can be narrow: what a step has to erase is what the step
+    // before it painted, and that is exactly this rect.
+    if (!hasLastTouch_) {
+        lastTouch_ = touched;
+        hasLastTouch_ = true;
+        repaintEverything();
+        return;
+    }
+    const LogicalRect region = uniteLogical(touched, lastTouch_);
+    lastTouch_ = touched;
+    hasLastTouch_ = true;
+    for (CaptureOverlay *overlay : overlays_) {
+        LogicalRect visible;
+        if (!intersection(region, overlay->output().geometry, &visible)) {
+            continue;
+        }
+        // One pixel of slack: a mark's rounded or antialiased edge can spill
+        // past the rect its geometry reports.
+        const QRect local =
+            localRect(overlay->output(), visible, overlay->size()).toAlignedRect().adjusted(
+                -1, -1, 1, 1);
+        lastTouchLocal_ = local;
+        overlay->update(local);
+    }
+    if (toolbar_ != nullptr && toolbar_->isVisible()) {
+        toolbar_->syncState();
+        updateToolbarGeometry();
+    }
+}
+
+QRect OverlayController::lastInteractiveUpdate() const
+{
+    return lastTouchLocal_;
 }
 
 void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
@@ -4120,19 +4372,24 @@ void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::
     }
     if (gesture_->type == Gesture::Type::Selecting) {
         updateSelection(point);
+        updateTouch(selectionTouch());
     } else if (gesture_->type == Gesture::Type::Moving) {
         applySelectionMove(gesture_->origin, gesture_->anchor, point);
+        updateTouch(selectionTouch());
     } else if (gesture_->type == Gesture::Type::Resizing) {
         selection_ = resizeSelection(gesture_->origin, gesture_->handle, clampPoint(point));
+        updateTouch(selectionTouch());
     } else if (gesture_->type == Gesture::Type::MovingAnnotation ||
                gesture_->type == Gesture::Type::ResizingAnnotation) {
         updateAnnotationDrag(point);
+        updateTouch(annotationTouch());
     } else if (gesture_->type == Gesture::Type::Drawing) {
+        const int pointsBefore = gesture_->points.size();
         updateDrawing(point);
+        updateTouch(drawingTouch(pointsBefore));
     } else {
         return;
     }
-    updateAll();
 }
 
 void OverlayController::release(CaptureOverlay *overlay, const QPointF &local,
@@ -5667,19 +5924,33 @@ public:
     virtual ~AnnotationRaster() = default;
 
     // Draws the annotation into the overlay, rasterizing it first only when
-    // something it draws has changed since the last time.
+    // something it draws has changed since the last time.  `outputIndex` names
+    // the screen being painted: a session that spans several of them paints the
+    // same marks on each, and one shared raster would be thrown away and rebuilt
+    // every time the paint moved to the next screen.  Each output keeps its own.
     void paint(QPainter *painter, const Annotation &annotation, const OutputSession &output,
-               const QSize &size)
+               const QSize &size, int outputIndex)
     {
         const int pad = padding(annotation);
         // Inflate before testing emptiness: a perfectly horizontal or vertical
         // stroke has a zero-thickness bounding box, which `isEmpty` rejects
         // even though there is a line to draw.
+        //
+        // The rect is deliberately not clipped to the canvas: trimming it to the
+        // surface would change the raster's size as a mark slid over the edge of
+        // the screen, and a size change rebuilds it.  The blit is clipped by the
+        // painter anyway, so the pixels the user sees do not change.
         const QRect clip = bounds(annotation, output, size)
                                .adjusted(-pad, -pad, pad, pad)
-                               .toAlignedRect()
-                               .intersected(QRect(QPoint(0, 0), size));
-        if (clip.isEmpty()) {
+                               .toAlignedRect();
+        if (clip.isEmpty() || !clip.intersects(QRect(QPoint(0, 0), size))) {
+            return;
+        }
+        // A repaint narrowed to what a pointer move can have changed must not
+        // pay for the marks outside it: at 4K a full-frame blit is about 1.7 ms,
+        // and a capture can easily carry a hundred marks.  The clip is in the
+        // same logical coordinates the rect is.
+        if (painter->hasClipping() && !painter->clipBoundingRect().intersects(QRectF(clip))) {
             return;
         }
         const QByteArray key = signature(annotation, output, size);
@@ -5692,29 +5963,49 @@ public:
         // capture that moves to another screen rebuilds it.
         const qreal ratio = deviceRatio(painter);
         const QSize device = (QSizeF(clip.size()) * ratio).toSize();
-        if (image_.size() != device || ratio_ != ratio || key != key_) {
-            image_ = QImage(device, QImage::Format_ARGB32_Premultiplied);
-            image_.setDevicePixelRatio(ratio);
-            image_.fill(Qt::transparent);
-            QPainter raster(&image_);
+        Cache &cache = caches_[outputIndex];
+        if (cache.image.size() != device || cache.ratio != ratio) {
+            // Only a different size or screen ratio needs a new buffer: a
+            // rebuild for a changed mark redraws into the pixels it already
+            // holds instead of allocating an identical image again.
+            cache.image = QImage(device, QImage::Format_ARGB32_Premultiplied);
+            cache.image.setDevicePixelRatio(ratio);
+            cache.ratio = ratio;
+            cache.key.clear();
+        }
+        if (key != cache.key) {
+            cache.image.fill(Qt::transparent);
+            QPainter raster(&cache.image);
             raster.setRenderHint(QPainter::Antialiasing, true);
             raster.scale(ratio, ratio);
             raster.translate(-clip.topLeft());
             draw(&raster, annotation, output, size);
-            key_ = key;
-            ratio_ = ratio;
-            ++rebuilds_;
+            cache.key = key;
+            ++cache.rebuilds;
+            builtAtRatio_ = ratio;
         }
-        painter->drawImage(clip.topLeft(), image_);
+        painter->drawImage(clip.topLeft(), cache.image);
     }
 
-    // How many times the pixels have been built.  Read through
-    // `Annotation::rasterRebuilds` by the offline check.
-    int rebuilds() const { return rebuilds_; }
+    // How many times the pixels have been built, over every output.  Read
+    // through `Annotation::rasterRebuilds` by the offline check.
+    int rebuilds() const
+    {
+        int total = 0;
+        for (const Cache &cache : caches_) {
+            total += cache.rebuilds;
+        }
+        return total;
+    }
 
-    // The device-pixel ratio the pixels were built at, or 0 before the first
-    // build.  Read through `Annotation::rasterDeviceRatio`.
-    qreal builtAtRatio() const { return ratio_; }
+    // The device-pixel ratio the pixels were last built at, or 0 before the
+    // first build.  Read through `Annotation::rasterDeviceRatio`.
+    qreal builtAtRatio() const { return builtAtRatio_; }
+
+    // How far outside the rect its `bounds` reports a mark's pixels can reach,
+    // in logical pixels.  The controller sizes the region a drag has to
+    // invalidate with it, so it cannot stay behind `protected`.
+    int reach(const Annotation &annotation) const { return padding(annotation); }
 
     // The device-pixel ratio a raster has to be built at for this painter.  The
     // marks are rasterized in logical coordinates, so the raster has to hold
@@ -5765,10 +6056,16 @@ protected:
     }
 
 private:
-    QImage image_;
-    QByteArray key_;
-    qreal ratio_ = 1.0;
-    int rebuilds_ = 0;
+    // One cached raster per output.  `key` is empty while the buffer holds
+    // nothing current, and `rebuilds` counts the builds this output needed.
+    struct Cache {
+        QImage image;
+        QByteArray key;
+        qreal ratio = 1.0;
+        int rebuilds = 0;
+    };
+    QHash<int, Cache> caches_;
+    qreal builtAtRatio_ = 0.0;
 };
 
 // Rectangles, ellipses and the area mosaic.  The mosaic averages the source
@@ -5789,9 +6086,17 @@ protected:
         writeContext(stream, output, size);
         stream << annotation.tool << annotation.dash << annotation.width
                << static_cast<quint32>(annotation.color.rgba()) << annotation.mask
-               << annotation.strength << static_cast<qint64>(annotation.rect.x)
-               << static_cast<qint64>(annotation.rect.y)
-               << static_cast<quint64>(annotation.rect.width)
+               << annotation.strength;
+        // A plain shape's pixels depend only on its size and style, so a pure
+        // translation leaves the cached raster valid and the blit lands it at
+        // the new place.  The area mosaic instead averages the source image at
+        // its absolute position, so a move changes every block it draws and its
+        // top-left has to stay part of the key.
+        if (annotation.tool == QStringLiteral("mosaic")) {
+            stream << static_cast<qint64>(annotation.rect.x)
+                   << static_cast<qint64>(annotation.rect.y);
+        }
+        stream << static_cast<quint64>(annotation.rect.width)
                << static_cast<quint64>(annotation.rect.height);
         return data;
     }
@@ -5841,8 +6146,24 @@ protected:
         stream << annotation.tool << annotation.dash << annotation.width
                << static_cast<quint32>(annotation.color.rgba()) << annotation.size
                << annotation.arrowStyle << annotation.strength;
-        for (const Point &point : annotation.points) {
-            stream << point.x << point.y;
+        if (annotation.tool == QStringLiteral("mosaic")) {
+            // The freehand mosaic brush averages the source image under the
+            // path, so every point's absolute position has to stay in the key.
+            for (const Point &point : annotation.points) {
+                stream << point.x << point.y;
+            }
+        } else {
+            // A stroke's pixels depend only on the shape of its path, not on
+            // where it sits: keep the point count and each point's offset from
+            // the first, so translating the whole stroke leaves the key alone.
+            stream << annotation.points.size();
+            if (!annotation.points.isEmpty()) {
+                const Point &first = annotation.points.constFirst();
+                for (qsizetype index = 1; index < annotation.points.size(); ++index) {
+                    stream << (annotation.points.at(index).x - first.x)
+                           << (annotation.points.at(index).y - first.y);
+                }
+            }
         }
         return data;
     }
@@ -5939,9 +6260,10 @@ protected:
         QByteArray data;
         QDataStream stream(&data, QIODevice::WriteOnly);
         writeContext(stream, output, size);
+        // The text's pixels depend only on its text, font, size and colour: a
+        // move shifts where the cached bitmap is blitted, not what it holds.
         stream << annotation.text << annotation.font << annotation.textPixels
-               << static_cast<quint32>(annotation.color.rgba()) << annotation.origin.x
-               << annotation.origin.y;
+               << static_cast<quint32>(annotation.color.rgba());
         return data;
     }
 
@@ -6016,6 +6338,13 @@ std::shared_ptr<AnnotationRaster> makeAnnotationRaster(const Annotation &annotat
     return std::make_shared<StrokeRaster>();
 }
 
+int annotationReach(const Annotation &annotation)
+{
+    const std::shared_ptr<AnnotationRaster> raster =
+        annotation.raster != nullptr ? annotation.raster : makeAnnotationRaster(annotation);
+    return raster->reach(annotation);
+}
+
 int Annotation::rasterRebuilds() const
 {
     return raster != nullptr ? raster->rebuilds() : -1;
@@ -6024,6 +6353,56 @@ int Annotation::rasterRebuilds() const
 qreal Annotation::rasterDeviceRatio() const
 {
     return raster != nullptr ? raster->builtAtRatio() : 0.0;
+}
+
+// Draws the region editor's base layer -- the frozen session image plus the
+// translucent veil over it -- from a pre-composed device-pixel image.  Composing
+// the two together once turns a repaint's two full-frame passes into a single
+// 1:1 blit; the in-selection copy of the image is still drawn by the caller.
+//
+// The composite is only used when the painter maps the overlay onto its device
+// with a plain integer scale and no offset, which is what makes the cached blit
+// land pixel for pixel: the target rects become exact integer device rects, so
+// drawImage samples the composite one pixel to one device pixel.  Any other
+// transform (a fractionally scaled or offset painter) returns false so the
+// caller draws the two operations directly, keeping the output identical.
+bool drawCachedBaseLayer(QPainter *painter, const OutputSession &output, const QSize &size,
+                         const QRectF &imageRect, QImage *cache, QByteArray *cacheKey)
+{
+    const QTransform transform = painter->combinedTransform();
+    if (transform.type() > QTransform::TxScale || transform.dx() != 0.0 ||
+        transform.dy() != 0.0 || transform.m11() != transform.m22()) {
+        return false;
+    }
+    const qreal ratio = transform.m11();
+    if (ratio < 1.0 || ratio != std::floor(ratio)) {
+        return false;
+    }
+    QByteArray key;
+    {
+        QDataStream stream(&key, QIODevice::WriteOnly);
+        stream << output.id << output.image.cacheKey() << output.scale
+               << output.geometry.x << output.geometry.y << output.geometry.width
+               << output.geometry.height << output.surface.x << output.surface.y
+               << output.surface.width << output.surface.height << size.width() << size.height()
+               << static_cast<double>(ratio);
+    }
+    if (cache->isNull() || key != *cacheKey) {
+        QImage composite((QSizeF(size) * ratio).toSize(), QImage::Format_ARGB32_Premultiplied);
+        composite.setDevicePixelRatio(ratio);
+        composite.fill(Qt::transparent);
+        QPainter builder(&composite);
+        // The composite's painter carries the same device-pixel-ratio transform
+        // as the caller's, so the two operations below land on the very pixels
+        // the caller would have drawn them to.
+        builder.setRenderHint(QPainter::SmoothPixmapTransform, false);
+        builder.drawImage(imageRect, output.image);
+        builder.fillRect(QRectF(QPointF(0, 0), QSizeF(size)), QColor(0, 0, 0, 80));
+        *cache = std::move(composite);
+        *cacheKey = key;
+    }
+    painter->drawImage(QPointF(0, 0), *cache);
+    return true;
 }
 
 void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
@@ -6059,9 +6438,17 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
         }
         painter->fillPath(veil, QColor(0, 0, 0, 80));
     } else if (!pinEdit_) {
-        painter->drawImage(imageRect, output.image);
-        // The dim-out only makes sense around a selectable region.
-        painter->fillRect(target, QColor(0, 0, 0, 80));
+        // The frozen image and the veil over it do not change between repaints
+        // (only the selection does), so they are composed once and blitted;
+        // drawing them directly walks the whole frame twice per repaint.  The
+        // helper refuses any painter whose transform it cannot reproduce
+        // exactly, in which case the two operations are drawn as before.
+        if (!drawCachedBaseLayer(painter, output, overlay->size(), imageRect, &baseComposite_,
+                                 &baseCompositeKey_)) {
+            painter->drawImage(imageRect, output.image);
+            // The dim-out only makes sense around a selectable region.
+            painter->fillRect(target, QColor(0, 0, 0, 80));
+        }
         if (selection_.has_value()) {
             LogicalRect visible;
             if (intersection(*selection_, output.geometry, &visible)) {
@@ -6181,19 +6568,18 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
         if (annotation.raster == nullptr) {
             annotation.raster = makeAnnotationRaster(annotation);
         }
-        annotation.raster->paint(painter, annotation, output, overlay->size());
+        annotation.raster->paint(painter, annotation, output, overlay->size(),
+                                 overlay->outputIndex());
     }
     if (gesture_->type == Gesture::Type::Drawing && !gesture_->points.isEmpty()) {
-        const bool mosaicBrush =
-            tool_ == Tool::Mosaic && mosaicShape_ == QStringLiteral("brush");
         // Rectangle, ellipse, the area mosaic and the arrow all depend on two
         // points, so drawing them straight is already cheap.  The freehand pen
         // and the mosaic brush grow a point per move and build up through the
         // incremental raster instead; a translucent pen would double-blend
         // where consecutive round caps overlap, so it keeps the straight draw.
-        const bool buildUp =
-            (tool_ == Tool::Pen && currentColor_.alpha() == 255) || mosaicBrush;
-        if (buildUp) {
+        // The same predicate decides how much of the surface a move invalidates,
+        // so both read it from one place.
+        if (drawsGrowingStroke()) {
             paintLiveStroke(painter, output, overlay->size(), overlay->outputIndex());
         } else {
             Annotation preview;
@@ -6331,7 +6717,7 @@ void OverlayController::paintLiveStroke(QPainter *painter, const OutputSession &
                          std::clamp(static_cast<int>(widthLogical * scale / 2), 1, 512)),
                      1, 512)
         : 0.0;
-    const double padding = brush ? deviceRadius / scale + 2.0 : widthLogical / 2.0 + 2.0;
+    const double padding = liveStrokeMargin(brush, widthLogical, scale, mosaicStrength_);
     const double step = std::max(1.0, deviceRadius / 2.0);
     // The preview raster holds device pixels for the same reason the committed
     // rasters do; see `AnnotationRaster::deviceRatio`.
