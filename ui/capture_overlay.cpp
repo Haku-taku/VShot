@@ -173,6 +173,60 @@ QPointF localPoint(const OutputSession &output, const Point &point, const QSize 
                    (static_cast<double>(point.y) - surface.y) * sy);
 }
 
+// Two pi, spelled out rather than read from a platform's `M_PI`: the wave the
+// preview draws and the one the Rust renderer bakes into the PNG have to be the
+// same curve, and the constant is the one place that could silently differ.
+constexpr double kTau = 6.283185307179586476925286766559;
+
+// Samples the sine wave along the segment `start`..`end` as a polyline, exactly
+// as the Rust renderer's `wave_polyline` does, so a wave drawn here and the
+// same wave baked into the final PNG agree line for line.
+//
+// `start` and `end` are overlay-local logical pixels.  `widthLogical` is the
+// annotation's width in logical pixels; the amplitude and the wavelength are
+// its `max(width * 2, 4)` and `max(width * 6, 18)`, in logical pixels, so the
+// shape does not depend on the output's scale.  `scale` is that output's device
+// scale and sets only the sampling distance: one sample per *device* pixel
+// means a step of `1 / scale` logical pixels, which is what the Rust side's
+// `n = ceil(length_device) + 1` produces.
+//
+// The phase finishes on a whole number of cycles -- `cycles = max(1, round(L /
+// wavelength))`, with the wavelength actually used being `L / cycles` -- so both
+// ends come back onto the centre line.  Without that step the far end is left
+// wherever the phase happened to be, off to one side, and the wave stops
+// reading as one drawn from A to B.
+//
+// A zero-length segment returns the single `start` point, which the callers
+// turn into a dot.
+QVector<QPointF> wavePolyline(const QPointF &start, const QPointF &end, int widthLogical,
+                              double scale)
+{
+    const QPointF delta = end - start;
+    const double length = std::hypot(delta.x(), delta.y());
+    if (length <= 0.0) {
+        return {start};
+    }
+    const double amplitude = std::max(widthLogical * 2, 4);
+    const double wavelength = std::max(widthLogical * 6, 18);
+    // One sample per device pixel, plus both endpoints.
+    const double step = 1.0 / std::max(1.0, scale);
+    const int n = std::max(2, static_cast<int>(std::ceil(length / step)) + 1);
+    const QPointF dir(delta.x() / length, delta.y() / length);
+    // The 90-degree rotation of `dir`: the direction the wave deviates in.
+    const QPointF normal(-dir.y(), dir.x());
+    const double cycles = std::max(1.0, std::round(length / wavelength));
+    const double radiansPerPixel = kTau / (length / cycles);
+    QVector<QPointF> points;
+    points.reserve(n);
+    const double last = static_cast<double>(n - 1);
+    for (int i = 0; i < n; ++i) {
+        const double u = (static_cast<double>(i) / last) * length;
+        const double offset = amplitude * std::sin(radiansPerPixel * u);
+        points.append(start + dir * u + normal * offset);
+    }
+    return points;
+}
+
 QString toolName(Tool tool)
 {
     switch (tool) {
@@ -182,6 +236,10 @@ QString toolName(Tool tool)
         return QStringLiteral("ellipse");
     case Tool::Arrow:
         return QStringLiteral("arrow");
+    case Tool::Line:
+        return QStringLiteral("line");
+    case Tool::Wave:
+        return QStringLiteral("wave");
     case Tool::Pen:
         return QStringLiteral("pen");
     case Tool::Mosaic:
@@ -207,6 +265,12 @@ Tool toolForName(const QString &name)
     }
     if (name == QStringLiteral("arrow")) {
         return Tool::Arrow;
+    }
+    if (name == QStringLiteral("line")) {
+        return Tool::Line;
+    }
+    if (name == QStringLiteral("wave")) {
+        return Tool::Wave;
     }
     if (name == QStringLiteral("pen")) {
         return Tool::Pen;
@@ -275,6 +339,11 @@ bool annotationLogicalBounds(const Annotation &annotation, LogicalRect *bounds)
     if (annotation.points.isEmpty()) {
         return false;
     }
+    // The box of a stroke's own points.  For a wave those are its two ends and
+    // the box is the segment between them; the crests that reach off it are
+    // accounted for by the raster's padding (`StrokeRaster::padding`, read here
+    // through `annotationReach`) rather than by this box -- the same split the
+    // arrow's head already uses.
     std::int32_t minX = annotation.points.constFirst().x;
     std::int32_t maxX = minX;
     std::int32_t minY = annotation.points.constFirst().y;
@@ -342,6 +411,19 @@ QIcon toolbarIcon(Tool tool, const QColor &color = QColor(230, 225, 229),
         painter.drawLine(QPointF(11, 5), QPointF(18, 5));
         painter.drawLine(QPointF(18, 5), QPointF(18, 12));
         break;
+    case Tool::Line:
+        // The arrow's shaft without its head: a plain straight segment.
+        painter.drawLine(QPointF(4, 19), QPointF(20, 5));
+        break;
+    case Tool::Wave: {
+        QPainterPath wave;
+        wave.moveTo(3.0, 12.0);
+        for (int step = 1; step <= 18; ++step) {
+            wave.lineTo(3.0 + step, 12.0 + std::sin(step * kTau / 9.0) * 5.0);
+        }
+        painter.drawPath(wave);
+        break;
+    }
     case Tool::Pen:
         painter.drawLine(QPointF(4, 17), QPointF(8, 12));
         painter.drawLine(QPointF(8, 12), QPointF(12, 15));
@@ -517,6 +599,15 @@ QPen penForAnnotation(const Annotation &annotation)
         pen.setCapStyle(Qt::RoundCap);
     }
     return pen;
+}
+
+// The pen a wave is drawn with: always solid, whatever the style says.  The
+// Rust renderer's wave operation carries no dash -- it samples a solid sine --
+// so a dashed wave here would preview one thing and bake another.
+QPen wavePen(const Annotation &annotation)
+{
+    return QPen(annotation.color, static_cast<double>(annotation.width), Qt::SolidLine,
+                Qt::RoundCap, Qt::RoundJoin);
 }
 
 // Dashed rectangles are drawn along the stroke band centerline in the final
@@ -1985,6 +2076,8 @@ public:
         addTool(toolLayout, uiTr("Rect"), Tool::Rectangle);
         addTool(toolLayout, uiTr("Ellipse"), Tool::Ellipse);
         addTool(toolLayout, uiTr("Arrow"), Tool::Arrow);
+        addTool(toolLayout, uiTr("Line"), Tool::Line);
+        addTool(toolLayout, uiTr("Wave"), Tool::Wave);
         addTool(toolLayout, uiTr("Draw"), Tool::Pen);
         addTool(toolLayout, uiTr("Text"), Tool::Text);
         addTool(toolLayout, uiTr("Mosaic"), Tool::Mosaic);
@@ -2360,8 +2453,14 @@ public:
         const QString target = controller_->styleTargetTool();
         const bool shape = target == QStringLiteral("rectangle") ||
             target == QStringLiteral("ellipse");
-        const bool line = shape || target == QStringLiteral("arrow") ||
-            target == QStringLiteral("pen");
+        // Every tool that paints a stroked shape: the rectangle and ellipse
+        // outlines, the arrow, the pen, and the two segment tools.  They share
+        // the colour and width controls; the dash is only meaningful to the
+        // tools the Rust renderer walks with a dashes pattern -- the wave is
+        // sampled as a solid sine, so it is offered no dash control.
+        const bool stroke = shape || target == QStringLiteral("arrow") ||
+            target == QStringLiteral("pen") || target == QStringLiteral("line") ||
+            target == QStringLiteral("wave");
         const bool text = target == QStringLiteral("text");
         const bool mosaic = target == QStringLiteral("mosaic");
         const bool mosaicBrush = mosaic &&
@@ -2369,10 +2468,10 @@ public:
                                  : controller_->mosaicShape_ == QStringLiteral("brush"));
         const bool selectedMosaicShape = selected != nullptr &&
             selected->kind == Annotation::Kind::Shape && mosaic;
-        const bool showColor = line || text;
-        const bool showDash = line;
+        const bool showColor = stroke || text;
+        const bool showDash = stroke && target != QStringLiteral("wave");
         const bool showArrowHead = target == QStringLiteral("arrow");
-        const bool showWidth = line || mosaicBrush;
+        const bool showWidth = stroke || mosaicBrush;
         const bool showTextSize = text;
         const bool showFont = text;
         const bool showArrowSize = target == QStringLiteral("arrow");
@@ -2916,6 +3015,10 @@ private:
             return uiTr("Draw an elliptical annotation");
         case Tool::Arrow:
             return uiTr("Draw an arrow with an adjustable head");
+        case Tool::Line:
+            return uiTr("Draw a straight line");
+        case Tool::Wave:
+            return uiTr("Draw a wavy line");
         case Tool::Pen:
             return uiTr("Draw a freehand line");
         case Tool::Text:
@@ -3633,9 +3736,11 @@ void OverlayController::updateDrawing(Point point)
 {
     const Point bounded = clampPoint(point);
     gesture_->current = bounded;
-    if (tool_ == Tool::Arrow) {
-        // Straight arrow: only the anchor and the current point matter, so the
-        // gesture never records the wandering intermediate positions.
+    if (tool_ == Tool::Arrow || tool_ == Tool::Line || tool_ == Tool::Wave) {
+        // The two-point tools: only the anchor and the current point matter, so
+        // the gesture never records the wandering intermediate positions.  The
+        // arrow and the line are the segment between them; the wave is the sine
+        // sample of that same segment, drawn from it on every paint.
         gesture_->points = {gesture_->anchor, bounded};
         return;
     }
@@ -5371,6 +5476,27 @@ int OverlayController::annotationHitAt(Point point) const
         const double radius = annotation.tool == QStringLiteral("mosaic")
             ? std::max(1.0, annotation.width / 2.0)
             : std::max(1.0, annotation.width / 2.0);
+        if (annotation.tool == QStringLiteral("wave") && annotation.points.size() >= 2) {
+            // The ink of a wave is the sampled polyline, not the straight line
+            // between its two points: a click on a crest has to reach the wave,
+            // or a mark it plainly covers could not be selected.
+            const Point &first = annotation.points.constFirst();
+            const Point &last = annotation.points.constLast();
+            const QVector<QPointF> wave =
+                wavePolyline(QPointF(first.x, first.y), QPointF(last.x, last.y),
+                             static_cast<int>(annotation.width), 1.0);
+            for (int segment = 1; segment < wave.size(); ++segment) {
+                const auto toPoint = [](const QPointF &value) {
+                    return Point{static_cast<std::int32_t>(std::lround(value.x())),
+                                 static_cast<std::int32_t>(std::lround(value.y()))};
+                };
+                if (distanceToSegment(point, toPoint(wave.at(segment - 1)),
+                                      toPoint(wave.at(segment))) <= radius + 4.0) {
+                    return index;
+                }
+            }
+            continue;
+        }
         for (int segment = 1; segment < annotation.points.size(); ++segment) {
             if (distanceToSegment(point, annotation.points.at(segment - 1),
                                   annotation.points.at(segment)) <= radius + 4.0) {
@@ -6250,16 +6376,29 @@ protected:
                             annotation.strength, size);
             return;
         }
+        const double scale = output.scale > 0 ? static_cast<double>(output.scale) : 1.0;
         QPolygonF polygon;
-        for (const Point &point : annotation.points) {
-            polygon.push_back(localPoint(output, point, size));
+        QPen pen = penForAnnotation(annotation);
+        if (annotation.tool == QStringLiteral("wave") && annotation.points.size() >= 2) {
+            // A wave is the sine sample of the segment between its two points,
+            // not the segment itself: sample it here the same way the live
+            // preview and the Rust renderer do, and draw it solid.
+            const QVector<QPointF> wave = wavePolyline(
+                localPoint(output, annotation.points.constFirst(), size),
+                localPoint(output, annotation.points.constLast(), size),
+                static_cast<int>(annotation.width), scale);
+            polygon = QPolygonF(wave.begin(), wave.end());
+            pen = wavePen(annotation);
+        } else {
+            for (const Point &point : annotation.points) {
+                polygon.push_back(localPoint(output, point, size));
+            }
         }
-        painter->setPen(penForAnnotation(annotation));
+        painter->setPen(pen);
         painter->drawPolyline(polygon);
         if (annotation.tool != QStringLiteral("arrow") || polygon.size() < 2) {
             return;
         }
-        const double scale = output.scale > 0 ? static_cast<double>(output.scale) : 1.0;
         // The head is always solid and scales with the annotation's size.
         painter->setPen(QPen(annotation.color, static_cast<double>(annotation.width),
                              Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
@@ -6305,6 +6444,16 @@ protected:
             const int head = std::max(6, static_cast<int>(annotation.width) * 4) *
                 static_cast<int>(annotation.size);
             return head + static_cast<int>(annotation.width) + 4;
+        }
+        if (annotation.tool == QStringLiteral("wave")) {
+            // The wave's crests reach `amplitude` off the line its two points
+            // describe -- the box `annotationLogicalBounds` reports -- so the
+            // room has to cover that plus the pen's own half width and a pixel
+            // for the antialiased edge.  The controller sizes the region a drag
+            // invalidates from this, so a crest left outside it would stay on
+            // screen after the wave moved.
+            const int amplitude = std::max(static_cast<int>(annotation.width) * 2, 4);
+            return amplitude + static_cast<int>(annotation.width) / 2 + 4;
         }
         return AnnotationRaster::padding(annotation);
     }
@@ -6593,10 +6742,24 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
             return;
         }
         QPolygonF polygon;
-        for (const Point &point : annotation.points) {
-            polygon.push_back(localPoint(output, point, overlay->size()));
+        QPen pen = annotationPen;
+        if (annotation.tool == QStringLiteral("wave") && annotation.points.size() >= 2) {
+            // A wave is the sine sample of the segment between its two points,
+            // not the segment itself: sample it here exactly as the committed
+            // mark's rasterizer does -- solid, and from the same two points --
+            // so letting go changes nothing on screen.
+            const QVector<QPointF> wave = wavePolyline(
+                localPoint(output, annotation.points.constFirst(), overlay->size()),
+                localPoint(output, annotation.points.constLast(), overlay->size()),
+                static_cast<int>(annotation.width), scale);
+            polygon = QPolygonF(wave.begin(), wave.end());
+            pen = wavePen(annotation);
+        } else {
+            for (const Point &point : annotation.points) {
+                polygon.push_back(localPoint(output, point, overlay->size()));
+            }
         }
-        painter->setPen(annotationPen);
+        painter->setPen(pen);
         painter->drawPolyline(polygon);
         if (annotation.tool == QStringLiteral("arrow") && polygon.size() >= 2) {
             // The head is always solid and scales with the annotation's size.

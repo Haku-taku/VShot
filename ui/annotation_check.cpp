@@ -989,6 +989,72 @@ void checkInteractiveUpdateCoversTheChange()
                .arg(shifted.y));
 }
 
+// The wave's document form is the line's: `kind=stroke` with `tool=wave` and
+// exactly the two points the drag made.  The Rust reader parses the wave from
+// those two points and derives the crests itself, so a third point -- or any
+// name but `wave` -- would be read as a different mark and the preview would
+// stop matching the baked PNG.
+void checkWaveSerializesAsATwoPointStroke()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+
+    controller.chooseTool(vshot::Tool::Wave);
+    controller.setWidth(6);
+    controller.setCurrentColor(QColor(255, 30, 30));
+    const QPointF start(60, 200);
+    const QPointF end(340, 200);
+    drag(controller, overlay, start, end);
+    expect(controller.annotations().size() == 1, "the wave lands as one annotation");
+    if (controller.annotations().size() != 1) {
+        return;
+    }
+
+    const QJsonDocument document = controller.resultDocument();
+    const QJsonArray annotations =
+        document.object().value(QStringLiteral("annotations")).toArray();
+    expect(annotations.size() == 1, "the document carries the wave");
+    if (annotations.isEmpty()) {
+        return;
+    }
+    const QJsonObject mark = annotations.at(0).toObject();
+    expect(mark.value(QStringLiteral("kind")).toString() == QStringLiteral("stroke"),
+           "the wave serializes as a stroke",
+           mark.value(QStringLiteral("kind")).toString());
+    expect(mark.value(QStringLiteral("tool")).toString() == QStringLiteral("wave"),
+           "the wave's tool name is `wave`",
+           mark.value(QStringLiteral("tool")).toString());
+    const QJsonArray points = mark.value(QStringLiteral("points")).toArray();
+    expect(points.size() == 2, "the wave carries exactly its two endpoints",
+           QStringLiteral("points=%1").arg(points.size()));
+    if (points.size() == 2) {
+        const QJsonObject first = points.at(0).toObject();
+        const QJsonObject last = points.at(1).toObject();
+        expect(first.value(QStringLiteral("x")).toInt() == static_cast<int>(start.x()) &&
+                   first.value(QStringLiteral("y")).toInt() == static_cast<int>(start.y()) &&
+                   last.value(QStringLiteral("x")).toInt() == static_cast<int>(end.x()) &&
+                   last.value(QStringLiteral("y")).toInt() == static_cast<int>(end.y()),
+               "the two points are the ends of the drag",
+               QStringLiteral("(%1,%2)-(%3,%4)")
+                   .arg(first.value(QStringLiteral("x")).toInt())
+                   .arg(first.value(QStringLiteral("y")).toInt())
+                   .arg(last.value(QStringLiteral("x")).toInt())
+                   .arg(last.value(QStringLiteral("y")).toInt()));
+    }
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -1005,6 +1071,7 @@ int main(int argc, char *argv[])
     checkEdgeOfCanvasKeepsTheRaster();
     checkLiveStrokeMatchesTheCommittedMark();
     checkInteractiveUpdateCoversTheChange();
+    checkWaveSerializesAsATwoPointStroke();
 
     if (failures != 0) {
         std::printf("\n%d annotation cache checks failed\n", failures);

@@ -31,12 +31,16 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPoint>
+#include <QResizeEvent>
 #include <QScreen>
 #include <QString>
 #include <QWidget>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <functional>
+#include <limits>
 
 namespace {
 
@@ -48,11 +52,57 @@ constexpr int kInkR = 229;
 constexpr int kInkG = 57;
 constexpr int kInkB = 53; // 0x35: the default red is #e53935
 
-// The surface is output-sized, and deliberately wider than the toolbar: the
-// default placement below is checked against a surface the palette really fits
-// in, the way every output a user has does.
-constexpr int kSurfaceWidth = 800;
+// The surface is output-sized, and deliberately wide enough to hold the whole
+// palette on one row: the default placement below is checked against a surface
+// the palette really fits in, the way every output a user has does.  1280 is a
+// representative logical width -- a 1080p or 4K output is wider than this, and
+// the one-row palette is about 900 logical pixels -- so the row stays on one row
+// as it does on real outputs.  A narrower surface may fold the row, which is the
+// separate property `checkToolbarWrapping` pins down.
+constexpr int kSurfaceWidth = 1280;
 constexpr int kSurfaceHeight = 600;
+
+// The output widths the palette's one-row / wrapping behaviour is read at: a
+// wide output has room for the whole row and keeps it on one row, a narrow one
+// does not and makes the palette wrap.  Spelled out here like the ink below, so
+// the numbers are the check's own and not the palette's.
+constexpr int kWideSurfaceWidth = 1600;
+constexpr int kNarrowSurfaceWidth = 480;
+
+// One row of the palette: the button height plus the panel's own padding, the
+// height every normal output shows.  Spelled out on purpose: a change that
+// quietly grew the palette to two rows on every output would otherwise pass
+// every assertion here.
+constexpr int kSingleRowHeight = 40;
+
+// The two segment tools' own numbers, spelled out here rather than imported
+// from the surface, the way the ink colour is.  kLineWidth is the pen width the
+// checks set; the amplitude and wavelength are the surface's formula
+// `max(width * 2, 4)` and `max(width * 6, 18)` at that width, so a wave is
+// twelve logical pixels tall and a straight line reaches its ends.
+constexpr int kLineWidth = 6;
+constexpr int kHalfWidth = kLineWidth / 2;
+constexpr int kWaveAmplitude = 12; // max(6 * 2, 4)
+
+// Distance from a point to the segment `a`..`b`.
+double distanceToSegment(const QPointF &p, const QPointF &a, const QPointF &b)
+{
+    const QPointF ab = b - a;
+    const double length2 = ab.x() * ab.x() + ab.y() * ab.y();
+    if (length2 <= 0.0) {
+        return std::hypot(p.x() - a.x(), p.y() - a.y());
+    }
+    const double t = std::clamp(
+        ((p.x() - a.x()) * ab.x() + (p.y() - a.y()) * ab.y()) / length2, 0.0, 1.0);
+    return std::hypot(p.x() - (a.x() + t * ab.x()), p.y() - (a.y() + t * ab.y()));
+}
+
+// Counts the check's ink inside `area` that lies outside `bounds`, skipping the
+// rects the toolbar's children cover: the default red is also the palette's
+// first colour, so a whole-image pixel test that ignored the swatch would read
+// it as a stray stroke.
+int strayInk(const QImage &image, const QRect &area, const QRect &bounds,
+             const QVector<QRect> &children);
 
 void expect(const char *what, bool ok, const QString &detail = QString())
 {
@@ -107,6 +157,32 @@ bool hasInk(const QImage &image, const QRect &area)
         }
     }
     return false;
+}
+
+int strayInk(const QImage &image, const QRect &area, const QRect &bounds,
+             const QVector<QRect> &children)
+{
+    int stray = 0;
+    const QRect scan = area.intersected(image.rect());
+    for (int y = scan.top(); y <= scan.bottom(); ++y) {
+        for (int x = scan.left(); x <= scan.right(); ++x) {
+            const QPoint at(x, y);
+            if (!isInk(image, at) || bounds.contains(at)) {
+                continue;
+            }
+            bool inChild = false;
+            for (const QRect &child : children) {
+                if (child.contains(at)) {
+                    inChild = true;
+                    break;
+                }
+            }
+            if (!inChild) {
+                ++stray;
+            }
+        }
+    }
+    return stray;
 }
 
 void press(QWidget *surface, const QPoint &local)
@@ -293,9 +369,25 @@ void checkUndoRedoClear(vshot::AnnotateSurface &surface)
     expect("a clear is undoable", isInk(image, QPoint(120, 220)));
 }
 
+// Resizes a surface the way a real output appearing at that size would.  The
+// check surfaces are rendered, never shown, so Qt defers their resize event
+// until a show that never comes; the toolbar settles its place and its size
+// from that event, so it has to be delivered here.  A surface that is only ever
+// the offscreen screen's own width happens to need nothing, but every surface
+// the check gives another width -- the main one below included -- does.
+void resizeSurface(vshot::AnnotateSurface &surface, int width, int height)
+{
+    const QSize before = surface.size();
+    surface.setGeometry(0, 0, width, height);
+    QResizeEvent event(surface.size(), before);
+    QApplication::sendEvent(&surface, &event);
+}
+
 void checkToolbar(vshot::AnnotateSurface &surface)
 {
     const QRect bar = surface.toolbarRect();
+    std::printf("      output %d: toolbar %dx%d at (%d,%d)\n", surface.width(), bar.width(),
+                bar.height(), bar.x(), bar.y());
     expect("the toolbar has a rect", !bar.isEmpty(),
            QStringLiteral("%1x%2").arg(bar.width()).arg(bar.height()));
     expect("the toolbar sits along the top edge", bar.top() >= 0 && bar.top() <= 40,
@@ -339,6 +431,200 @@ void checkToolbar(vshot::AnnotateSurface &surface)
     expect("hiding the toolbar keeps the drawing", isInk(hidden, QPoint(160, 300)));
     surface.setToolbarHidden(false);
     expect("the toolbar comes back", surface.toolbarRect() == bar);
+}
+
+// The palette has to fit an output that has room for it on one row -- the
+// order, the spacing and the separators on that row are the look a user knows
+// -- and may only fold onto more rows where the output is too narrow to hold
+// the row.  Both ends are read off a real surface, so neither "it quietly
+// wraps everywhere" nor "it can never wrap" can slip through.
+void checkToolbarWrapping(QScreen *screen)
+{
+    {
+        vshot::AnnotateSurface wide(screen);
+        resizeSurface(wide, kWideSurfaceWidth, kSurfaceHeight);
+        const QRect bar = wide.toolbarRect();
+        std::printf("      wide output %d: toolbar %dx%d at (%d,%d)\n", kWideSurfaceWidth,
+                    bar.width(), bar.height(), bar.x(), bar.y());
+        expect("a wide output keeps the toolbar on one row",
+               bar.height() == kSingleRowHeight,
+               QStringLiteral("%1x%2").arg(bar.width()).arg(bar.height()));
+        expect("the one-row toolbar fits across the wide output",
+               bar.right() <= wide.width());
+    }
+    {
+        vshot::AnnotateSurface narrow(screen);
+        resizeSurface(narrow, kNarrowSurfaceWidth, kSurfaceHeight);
+        const QRect bar = narrow.toolbarRect();
+        std::printf("      narrow output %d: toolbar %dx%d at (%d,%d)\n", kNarrowSurfaceWidth,
+                    bar.width(), bar.height(), bar.x(), bar.y());
+        expect("a narrow output folds the toolbar onto more rows",
+               bar.height() > kSingleRowHeight,
+               QStringLiteral("%1x%2").arg(bar.width()).arg(bar.height()));
+        expect("the folded toolbar still fits across the narrow output",
+               bar.right() <= narrow.width());
+    }
+}
+
+// The two segment tools: a straight line is the capsule of its two points and
+// nothing wider, and a wave is the sine of that same segment -- crests reaching
+// the amplitude on both sides, crossing the line again and again, and finishing
+// back on it at both ends.  Each is drawn on its own surface so the pixel scans
+// see one mark and the toolbar (whose swatch is the same red) is skipped.
+void checkLineAndWave(QScreen *screen)
+{
+    vshot::AnnotateSurface surface(screen);
+    resizeSurface(surface, kSurfaceWidth, kSurfaceHeight);
+    const QVector<QRect> children = childAreas(surface);
+
+    // --- The line. ---
+    surface.setTool(vshot::AnnotateSurface::Tool::Line);
+    surface.setPenWidth(kLineWidth);
+    const QPoint lineStart(80, 160);
+    const QPoint lineEnd(360, 260);
+    drag(&surface, lineStart, lineEnd);
+    expect("a line drag is one stroke", surface.strokeCount() == 1,
+           QStringLiteral("strokeCount=%1").arg(surface.strokeCount()));
+
+    QImage image = renderSurface(surface);
+    expect("a line paints at its first point", isInk(image, lineStart));
+    expect("a line paints at its last point", isInk(image, lineEnd));
+
+    // Every inked pixel is within half the pen width of the segment, plus a
+    // fringe for the antialiased edge: the ink is a capsule, not a wider shape.
+    // The toolbar is skipped -- its red swatch is the same colour as the ink.
+    int outsideCapsule = 0;
+    for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+            const QPoint at(x, y);
+            bool inChild = false;
+            for (const QRect &child : children) {
+                if (child.contains(at)) {
+                    inChild = true;
+                    break;
+                }
+            }
+            if (inChild || !isInk(image, at)) {
+                continue;
+            }
+            if (distanceToSegment(QPointF(x, y), QPointF(lineStart), QPointF(lineEnd)) >
+                kHalfWidth + 1.5) {
+                ++outsideCapsule;
+            }
+        }
+    }
+    expect("a line's ink stays inside the capsule of its two points", outsideCapsule == 0,
+           QStringLiteral("%1 px outside the capsule").arg(outsideCapsule));
+
+    // strokeBounds, spelled out: the endpoints' own box grown by half the width
+    // and a pixel -- the rect the surface repaints and the eraser reaches into.
+    const QRect lineBounds = QRect(lineStart, lineEnd)
+                                 .normalized()
+                                 .adjusted(-(kHalfWidth + 1), -(kHalfWidth + 1), kHalfWidth + 1,
+                                           kHalfWidth + 1);
+    const int lineStray = strayInk(image, image.rect(), lineBounds, children);
+    expect("a line paints nothing outside its bounds", lineStray == 0,
+           QStringLiteral("%1 px outside").arg(lineStray));
+
+    // --- The wave. ---
+    surface.clear();
+    surface.setTool(vshot::AnnotateSurface::Tool::Wave);
+    surface.setPenWidth(kLineWidth);
+    const QPoint waveStart(80, 300);
+    const QPoint waveEnd(480, 300);
+    drag(&surface, waveStart, waveEnd);
+    expect("a wave drag is one stroke", surface.strokeCount() == 1,
+           QStringLiteral("strokeCount=%1").arg(surface.strokeCount()));
+    image = renderSurface(surface);
+
+    const int top = waveStart.y() - kWaveAmplitude - kHalfWidth - 3;
+    const int bottom = waveStart.y() + kWaveAmplitude + kHalfWidth + 3;
+    // The vertical extent of the ink in column `x`; `false` when the column has
+    // no ink in the band at all.
+    const auto band = [&](int x, int *minY, int *maxY) {
+        *minY = std::numeric_limits<int>::max();
+        *maxY = std::numeric_limits<int>::min();
+        for (int y = top; y <= bottom; ++y) {
+            if (isInk(image, QPoint(x, y))) {
+                *minY = std::min(*minY, y);
+                *maxY = std::max(*maxY, y);
+            }
+        }
+        return *minY <= *maxY;
+    };
+
+    int mostAbove = 0;
+    int mostBelow = 0;
+    int transitions = 0;
+    int side = 0;
+    for (int x = waveStart.x() - kHalfWidth; x <= waveEnd.x() + kHalfWidth; ++x) {
+        int minY = 0;
+        int maxY = 0;
+        if (!band(x, &minY, &maxY)) {
+            continue;
+        }
+        mostAbove = std::max(mostAbove, waveStart.y() - minY);
+        mostBelow = std::max(mostBelow, maxY - waveStart.y());
+        // "Off the line" means past the pen's own half width: a straight
+        // segment would put its ink exactly that far and no further.
+        int here = 0;
+        if (minY <= waveStart.y() - (kHalfWidth + 2)) {
+            here = -1;
+        } else if (maxY >= waveStart.y() + (kHalfWidth + 2)) {
+            here = 1;
+        }
+        if (here != 0 && here != side) {
+            ++transitions;
+            side = here;
+        }
+    }
+
+    // The outermost ink is the crest on the centre line plus the pen's half
+    // width.  That it *reaches* the amplitude is the property that proves the
+    // box the surface repaints covers the crest: a box over the two endpoints
+    // alone would clip it, and this would come up short.  The tolerance is the
+    // one pixel the antialiased edge lands on: the sampled crest sits a fraction
+    // of a pixel off the true peak, so the outermost row can fall either side of
+    // the edge.
+    const int reach = kWaveAmplitude + kHalfWidth;
+    expect("the wave reaches the amplitude on both sides of the line",
+           mostAbove >= reach - 1 && mostAbove <= reach + 1 && mostBelow >= reach - 1 &&
+               mostBelow <= reach + 1,
+           QStringLiteral("above=%1 below=%2, wanted %3").arg(mostAbove).arg(mostBelow).arg(reach));
+    // It crosses the line again and again, which a straight segment never does.
+    expect("the wave swings to both sides of the line", transitions >= 4,
+           QStringLiteral("transitions=%1").arg(transitions));
+
+    // The two ends sit on the line the drag made, which is what rounding the
+    // cycle count buys: a free-running phase leaves the far end wherever the
+    // sine happened to be, so the ink there -- and the band's centre -- would sit
+    // well off the line.  The centre is allowed a few pixels' slack because the
+    // wave is already sloping as it leaves the endpoint.
+    int startMin = 0;
+    int startMax = 0;
+    int endMin = 0;
+    int endMax = 0;
+    band(waveStart.x(), &startMin, &startMax);
+    band(waveEnd.x(), &endMin, &endMax);
+    const double startCentre = (startMin + startMax) / 2.0;
+    const double endCentre = (endMin + endMax) / 2.0;
+    expect("the wave's two ends sit on the line it was dragged along",
+           isInk(image, waveStart) && isInk(image, waveEnd) &&
+               std::abs(startCentre - waveStart.y()) <= 3.0 &&
+               std::abs(endCentre - waveEnd.y()) <= 3.0,
+           QStringLiteral("start centre %1, end centre %2, line %3")
+               .arg(startCentre)
+               .arg(endCentre)
+               .arg(waveStart.y()));
+
+    const QRect waveBounds =
+        QRect(QPoint(waveStart.x(), waveStart.y() - kWaveAmplitude),
+              QPoint(waveEnd.x(), waveStart.y() + kWaveAmplitude))
+            .normalized()
+            .adjusted(-(kHalfWidth + 1), -(kHalfWidth + 1), kHalfWidth + 1, kHalfWidth + 1);
+    const int waveStray = strayInk(image, image.rect(), waveBounds, children);
+    expect("a wave paints nothing outside its bounds", waveStray == 0,
+           QStringLiteral("%1 px outside").arg(waveStray));
 }
 
 void checkText(vshot::AnnotateSurface &surface)
@@ -484,18 +770,20 @@ int main(int argc, char **argv)
     }
 
     vshot::AnnotateSurface surface(screen);
-    surface.setGeometry(0, 0, kSurfaceWidth, kSurfaceHeight);
+    resizeSurface(surface, kSurfaceWidth, kSurfaceHeight);
 
     checkPenAndRect(surface);
     checkEraser(surface);
     checkUndoRedoClear(surface);
     checkToolbar(surface);
+    checkToolbarWrapping(screen);
+    checkLineAndWave(screen);
 
     checkStepCoverage(screen);
     checkRasterReuse(screen);
 
     vshot::AnnotateSurface text(screen);
-    text.setGeometry(0, 0, kSurfaceWidth, kSurfaceHeight);
+    resizeSurface(text, kSurfaceWidth, kSurfaceHeight);
     checkText(text);
 
     if (failures == 0) {

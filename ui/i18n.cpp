@@ -41,6 +41,8 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("Rect"), QString::fromUtf8("矩形")},
         {QStringLiteral("Ellipse"), QString::fromUtf8("椭圆")},
         {QStringLiteral("Arrow"), QString::fromUtf8("箭头")},
+        {QStringLiteral("Line"), QString::fromUtf8("直线")},
+        {QStringLiteral("Wave"), QString::fromUtf8("波浪线")},
         {QStringLiteral("Draw"), QString::fromUtf8("涂鸦")},
         {QStringLiteral("Text"), QString::fromUtf8("文本")},
         {QStringLiteral("Mosaic"), QString::fromUtf8("马赛克")},

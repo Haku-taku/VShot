@@ -51,6 +51,12 @@ public:
         Eraser,
         Rect,
         Arrow,
+        // The two straight, two-point tools: a plain segment and the same
+        // segment turned into a sine wave.  Both are drawn from exactly the two
+        // points the drag made, like the arrow, so neither accumulates points
+        // as the pointer wanders.
+        Line,
+        Wave,
         Text,
     };
 

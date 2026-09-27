@@ -12,10 +12,10 @@
 #include <QFont>
 #include <QFontMetrics>
 #include <QFrame>
-#include <QHBoxLayout>
 #include <QImage>
 #include <QKeyEvent>
 #include <QLabel>
+#include <QLayout>
 #include <QLineEdit>
 #include <QLineF>
 #include <QMouseEvent>
@@ -39,17 +39,24 @@ namespace vshot {
 
 namespace {
 
-// The palette, in logical pixels.  The panel is one horizontal row; the height
-// is fixed so the toolbar never fights the canvas for the output's top edge.
+// The palette, in logical pixels.  The panel is one horizontal row wherever an
+// output gives it room, and wraps onto more rows only where it does not; a row
+// is kToolbarHeight tall, the button height plus the same 6 logical pixels
+// above and below it the capture overlay's palette used.
 constexpr int kToolbarHeight = 40;
 constexpr int kToolbarPad = 8;
 constexpr int kGripWidth = 16;
 constexpr int kButtonHeight = 28;
+constexpr int kToolbarPadY = (kToolbarHeight - kButtonHeight) / 2;
 constexpr int kLabelPadX = 9;
 constexpr int kDotBox = 26;
 constexpr qreal kPanelRadius = 12.0;
 constexpr qreal kButtonRadius = 8.0;
 constexpr qreal kSuperellipseExponent = 5.0;
+
+// The dynamic property that marks a divider to the flow layout: a separator
+// that may not be left at the end of a row, where a wrap would strand it.
+constexpr auto kSeparatorProperty = "vshotFlowSeparator";
 
 // The label font of the panel's text buttons, at the size the capture
 // overlay's QSS used for the same row.
@@ -133,6 +140,68 @@ double pointSegmentDistance(const QPointF &p, const QPointF &a, const QPointF &b
     return std::hypot(p.x() - projection.x(), p.y() - projection.y());
 }
 
+// Two pi, spelled out rather than read from a platform's `M_PI`: the wave here
+// and the one the Rust renderer bakes into the PNG have to be the same curve,
+// and the constant is the one place that could silently differ.
+constexpr double kTau = 6.283185307179586476925286766559;
+
+// The peak deviation of a wave stroke from its centre line, in logical pixels.
+// The floor of `max(width * 2, 4)` applies to the logical width, exactly as the
+// Rust renderer's `wave_amplitude` does it, so a wave is as tall as the pen is
+// thick and never flatter than four pixels.
+double waveAmplitude(int width)
+{
+    return std::max(width * 2, 4);
+}
+
+// One full period of a wave stroke along its line, in logical pixels, floored
+// at `max(width * 6, 18)` the same way the amplitude is.
+double waveWavelength(int width)
+{
+    return std::max(width * 6, 18);
+}
+
+// Samples the sine wave along the segment `start`..`end` as a polyline, one
+// point per `step` of arc length.  `amplitude` is the peak deviation from the
+// centre line and `wavelength` one full period along the line, both in the same
+// units as the segment; `annotate_surface` works in logical pixels, so `step`
+// is one of those.
+//
+// A zero-length segment returns the single `start` point, which the caller
+// turns into a dot.
+//
+// The phase finishes on a whole number of cycles: `cycles = max(1, round(L /
+// wavelength))` and the wavelength actually used is `L / cycles`.  That is the
+// step that puts both ends back on the line the user dragged -- without it the
+// far end is left wherever the phase happened to be, smeared off to one side,
+// and the wave no longer reads as one drawn from A to B.  The Rust renderer's
+// `wave_polyline` rounds the same way, so the preview and the baked PNG agree.
+QVector<QPointF> wavePolyline(const QPointF &start, const QPointF &end, double amplitude,
+                              double wavelength, double step)
+{
+    const QPointF delta = end - start;
+    const double length = std::hypot(delta.x(), delta.y());
+    if (length <= 0.0) {
+        return {start};
+    }
+    // One sample per `step`, plus both endpoints.
+    const int n = std::max(2, static_cast<int>(std::ceil(length / std::max(step, 1e-9))) + 1);
+    const QPointF dir(delta.x() / length, delta.y() / length);
+    // The 90-degree rotation of `dir`: the direction the wave deviates in.
+    const QPointF normal(-dir.y(), dir.x());
+    const double cycles = std::max(1.0, std::round(length / std::max(wavelength, 1.0)));
+    const double radiansPerPixel = kTau / (length / cycles);
+    QVector<QPointF> points;
+    points.reserve(n);
+    const double last = static_cast<double>(n - 1);
+    for (int i = 0; i < n; ++i) {
+        const double u = (static_cast<double>(i) / last) * length;
+        const double offset = amplitude * std::sin(radiansPerPixel * u);
+        points.append(start + dir * u + normal * offset);
+    }
+    return points;
+}
+
 // Distance from a point to a rectangle's outline, zero inside it.  A rectangle
 // stroke is only its outline: the eraser must not be able to take it by
 // brushing the empty middle.
@@ -205,6 +274,27 @@ QRectF strokeBounds(AnnotateSurface::Tool tool, const QVector<QPointF> &points, 
     if (points.isEmpty()) {
         return QRectF();
     }
+    // A wave is not the straight line between its two points: its crests reach
+    // `amplitude` off that line, so its box has to come from the sampled
+    // polyline.  A box over the endpoints alone would leave every crest outside
+    // the repaint region, and the stale crest would stay on screen.  The line
+    // tool is the plain two-point case the loop below already gives: one
+    // `normalizedRect` of its endpoints.
+    if (tool == AnnotateSurface::Tool::Wave && points.size() >= 2) {
+        const QVector<QPointF> wave =
+            wavePolyline(points.constFirst(), points.constLast(), waveAmplitude(width),
+                         waveWavelength(width), 1.0);
+        // A zero-length wave samples to a single point; the generic path below
+        // then gives the dot it draws the same small box a pen dot gets.
+        if (wave.size() >= 2) {
+            QRectF waveBox = normalizedRect(wave.constFirst(), wave.at(1));
+            for (qsizetype i = 2; i < wave.size(); ++i) {
+                waveBox = waveBox.united(normalizedRect(wave.at(i - 1), wave.at(i)));
+            }
+            const qreal waveGrow = width / 2.0 + 1.0;
+            return waveBox.adjusted(-waveGrow, -waveGrow, waveGrow, waveGrow);
+        }
+    }
     QRectF box(points.constFirst(), QSizeF(0, 0));
     for (qsizetype i = 1; i < points.size(); ++i) {
         box = box.united(normalizedRect(points.at(i - 1), points.at(i)));
@@ -221,9 +311,9 @@ QRectF strokeBounds(AnnotateSurface::Tool tool, const QVector<QPointF> &points, 
     return box.adjusted(-grow, -grow, grow, grow);
 }
 
-// The one place a stroke is turned into ink.  The pen, the rectangle, the arrow
-// and the text label are drawn here, whether into the backing image or straight
-// onto the surface as a preview.
+// The one place a stroke is turned into ink.  The pen, the rectangle, the
+// arrow, the line, the wave and the text label are drawn here, whether into the
+// backing image or straight onto the surface as a preview.
 void paintStrokeInk(QPainter &painter, AnnotateSurface::Tool tool, const QVector<QPointF> &points,
                     const QColor &color, int width, const QString &text)
 {
@@ -252,6 +342,27 @@ void paintStrokeInk(QPainter &painter, AnnotateSurface::Tool tool, const QVector
                 painter.setPen(Qt::NoPen);
                 painter.setBrush(color);
                 painter.drawPolygon(head.constData(), 3);
+            }
+        }
+        break;
+    case AnnotateSurface::Tool::Line:
+        if (points.size() >= 2) {
+            // Round caps, as the Rust capsule stroke has: the two ends are
+            // half-discs, not the pen's square corners.
+            painter.drawLine(points.constFirst(), points.constLast());
+        } else if (points.size() == 1) {
+            painter.drawPoint(points.constFirst());
+        }
+        break;
+    case AnnotateSurface::Tool::Wave:
+        if (points.size() >= 2) {
+            const QVector<QPointF> wave =
+                wavePolyline(points.constFirst(), points.constLast(), waveAmplitude(width),
+                             waveWavelength(width), 1.0);
+            if (wave.size() >= 2) {
+                painter.drawPolyline(wave.constData(), wave.size());
+            } else if (wave.size() == 1) {
+                painter.drawPoint(wave.constFirst());
             }
         }
         break;
@@ -454,6 +565,168 @@ private:
     std::function<void()> onClick_;
 };
 
+// A layout that wraps its items onto as many rows as the width it is handed
+// needs.  The palette is one row on an output with room for it -- its order,
+// its spacing and its separators are the user's muscle memory and must not
+// move -- but that same row is wider than a small output, and a panel that runs
+// off the edge of the screen it annotates is unusable.  This is the Qt
+// "FlowLayout" machine: a QLayout whose height depends on its width, so the
+// panel hands it the width the output allows and takes back however many rows
+// that turns into.
+//
+// One wrinkle the Qt example does not carry: several of the palette's children
+// are fixed-size (the drag grip, the divider, the opacity slider and its value
+// label), and a widget's sizeHint does not shrink to the maximum its own
+// setFixedSize imposes.  Every item is therefore measured through `clamped()`,
+// the hint after its minimum and maximum are honoured, which is exactly the
+// size a QBoxLayout would have allocated it.
+class FlowLayout final : public QLayout {
+public:
+    explicit FlowLayout(QWidget *parent)
+        : QLayout(parent)
+    {
+    }
+
+    ~FlowLayout() override
+    {
+        while (QLayoutItem *item = takeAt(0)) {
+            delete item;
+        }
+    }
+
+    void addItem(QLayoutItem *item) override { items_.append(item); }
+
+    // A bare gap, as QBoxLayout::addSpacing leaves one: a fixed-width item that
+    // still takes the ordinary spacing on either side of it.
+    void addSpacing(int size)
+    {
+        addItem(new QSpacerItem(size, 0, QSizePolicy::Fixed, QSizePolicy::Minimum));
+    }
+
+    int count() const override { return static_cast<int>(items_.size()); }
+    QLayoutItem *itemAt(int index) const override
+    {
+        return index >= 0 && index < items_.size() ? items_.at(index) : nullptr;
+    }
+    QLayoutItem *takeAt(int index) override
+    {
+        return index >= 0 && index < items_.size() ? items_.takeAt(index) : nullptr;
+    }
+
+    // Nothing in the palette stretches: every child is a fixed-size button,
+    // dot, divider or slider, exactly the size its own hint asks for.
+    Qt::Orientations expandingDirections() const override { return {}; }
+    bool hasHeightForWidth() const override { return true; }
+    int heightForWidth(int width) const override
+    {
+        return doLayout(QRect(0, 0, width, 0), true);
+    }
+
+    // The natural size: everything on one row.  This is what "does the palette
+    // fit widthwise" is asked about, so it is the one-row width rather than the
+    // smallest size the flow could ever be squeezed into.
+    QSize sizeHint() const override
+    {
+        const QMargins margins = contentsMargins();
+        int width = margins.left() + margins.right();
+        int height = 0;
+        for (int i = 0; i < items_.size(); ++i) {
+            const QSize item = clamped(items_.at(i));
+            width += item.width();
+            if (i > 0) {
+                width += spacing();
+            }
+            height = std::max(height, item.height());
+        }
+        return QSize(width, height + margins.top() + margins.bottom());
+    }
+
+    QSize minimumSize() const override
+    {
+        const QMargins margins = contentsMargins();
+        QSize size;
+        for (const QLayoutItem *item : items_) {
+            size = size.expandedTo(clamped(item));
+        }
+        return size
+            + QSize(margins.left() + margins.right(), margins.top() + margins.bottom());
+    }
+
+    void setGeometry(const QRect &rect) override
+    {
+        QLayout::setGeometry(rect);
+        doLayout(rect, false);
+    }
+
+private:
+    // The size the layout allocates an item: its hint, never past the maximum a
+    // fixed size imposes nor below its minimum.
+    static QSize clamped(const QLayoutItem *item)
+    {
+        return item->sizeHint().boundedTo(item->maximumSize()).expandedTo(item->minimumSize());
+    }
+
+    // Whether an item is one of the palette's separators.  A separator is glued
+    // to the item it introduces so a wrap never leaves it stranded at the end
+    // of a row: it starts the next row together with the group it divides off.
+    static bool isSeparator(const QLayoutItem *item)
+    {
+        const QWidget *widget = item->widget();
+        return widget != nullptr && widget->property(kSeparatorProperty).toBool();
+    }
+
+    // Packs the items into rows inside `rect` and returns the height they take.
+    // With `testOnly` the placement is measured but nothing moves, which is
+    // what `heightForWidth` needs.
+    int doLayout(const QRect &rect, bool testOnly) const
+    {
+        const QMargins margins = contentsMargins();
+        const QRect row = rect.adjusted(margins.left(), margins.top(),
+                                        -margins.right(), -margins.bottom());
+        const int gap = spacing();
+        int x = row.x();
+        int y = row.y();
+        int rowHeight = 0;
+        int rowStart = 0;
+        for (int i = 0; i < items_.size(); ++i) {
+            const QSize size = clamped(items_.at(i));
+            int need = size.width();
+            if (isSeparator(items_.at(i)) && i + 1 < items_.size()) {
+                need += gap + clamped(items_.at(i + 1)).width();
+            }
+            if (x + need > row.right() + 1 && rowHeight > 0) {
+                if (!testOnly) {
+                    placeRow(rowStart, i, row.x(), y, rowHeight);
+                }
+                x = row.x();
+                y += rowHeight + gap;
+                rowHeight = 0;
+                rowStart = i;
+            }
+            x += size.width() + gap;
+            rowHeight = std::max(rowHeight, size.height());
+        }
+        if (!testOnly && rowStart < items_.size()) {
+            placeRow(rowStart, items_.size(), row.x(), y, rowHeight);
+        }
+        return y + rowHeight - rect.y() + margins.bottom();
+    }
+
+    // Lays one row's items out left to right, each centred against the row's
+    // tallest item the way a QBoxLayout centres its children.
+    void placeRow(int begin, int end, int left, int top, int height) const
+    {
+        int x = left;
+        for (int i = begin; i < end; ++i) {
+            const QSize size = clamped(items_.at(i));
+            items_.at(i)->setGeometry(QRect(QPoint(x, top + (height - size.height()) / 2), size));
+            x += size.width() + spacing();
+        }
+    }
+
+    QList<QLayoutItem *> items_;
+};
+
 } // namespace
 
 // The floating palette.  A child widget of the surface, so its buttons keep
@@ -472,8 +745,8 @@ public:
         // Blank panel areas are the grip; interactive children override.
         setCursor(Qt::SizeAllCursor);
 
-        auto *layout = new QHBoxLayout(this);
-        layout->setContentsMargins(kToolbarPad, 6, kToolbarPad, 6);
+        auto *layout = new FlowLayout(this);
+        layout->setContentsMargins(kToolbarPad, kToolbarPadY, kToolbarPad, kToolbarPadY);
         layout->setSpacing(4);
         layout->addWidget(new Grip(this));
         layout->addSpacing(4);
@@ -482,6 +755,8 @@ public:
         addTool(layout, uiTr("Erase"), AnnotateSurface::Tool::Eraser);
         addTool(layout, uiTr("Rect"), AnnotateSurface::Tool::Rect);
         addTool(layout, uiTr("Arrow"), AnnotateSurface::Tool::Arrow);
+        addTool(layout, uiTr("Line"), AnnotateSurface::Tool::Line);
+        addTool(layout, uiTr("Wave"), AnnotateSurface::Tool::Wave);
         addTool(layout, uiTr("Text"), AnnotateSurface::Tool::Text);
 
         addDivider(layout);
@@ -519,8 +794,10 @@ public:
         });
         layout->addWidget(quit);
 
-        setFixedHeight(kToolbarHeight);
-        adjustSize();
+        // The panel's size follows the output's width, so it is settled in
+        // updateSize() rather than fixed here; this sizes it before the first
+        // reposition() finds it a place.
+        updateSize();
         syncState();
     }
 
@@ -560,12 +837,36 @@ public:
     // resize, so a dragged panel is pulled back inside a shrunken output.
     void reposition()
     {
+        // A resize changes both how wide the panel may be and how many rows it
+        // needs, so the size is settled before the place is.
+        updateSize();
         if (surface_->toolbarOrigin_.isNull()) {
             const QPoint centered((surface_->width() - width()) / 2, kToolbarMargin);
             move(clamped(centered));
         } else {
             move(clamped(surface_->toolbarOrigin_));
         }
+    }
+
+    // Sizes the panel to the width the output can give it and lets the flow
+    // layout say how many rows that takes.  The row of items is allowed the
+    // output's whole width: an output wide enough to hold it keeps the palette
+    // on one row -- every normal output, and the look the palette has always
+    // had -- and only an output narrower than the row itself makes it wrap.  A
+    // wrapped panel then backs off the output's edges by the toolbar margin, so
+    // two rows read as a panel rather than as a band across the screen.
+    void updateSize()
+    {
+        const int output = std::max(1, surface_->width());
+        const int natural = layout()->sizeHint().width();
+        const int width = natural <= output
+            ? natural
+            : std::max(1, output - 2 * AnnotateSurface::kToolbarMargin);
+        setFixedSize(width, layout()->heightForWidth(width));
+        // A layout activates through a posted event, which an off-screen
+        // surface (the checks render one, they never show it) never gets; place
+        // the rows now so the panel's size and its rows always agree.
+        layout()->setGeometry(contentsRect());
     }
 
     void beginDrag(const QPoint &globalPos)
@@ -655,6 +956,11 @@ private:
             setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Expanding);
         }
 
+        // A box layout stretches the grip to the row it sits in, but the flow
+        // layout measures a widget by its hint: without one, the grip would
+        // measure as a fixed width with no height and vanish from its row.
+        QSize sizeHint() const override { return QSize(kGripWidth, kButtonHeight); }
+
     protected:
         void mousePressEvent(QMouseEvent *event) override
         {
@@ -705,7 +1011,7 @@ private:
         return QPoint(std::clamp(point.x(), 0, maxX), std::clamp(point.y(), 0, maxY));
     }
 
-    void addTool(QHBoxLayout *layout, const QString &label, AnnotateSurface::Tool tool)
+    void addTool(FlowLayout *layout, const QString &label, AnnotateSurface::Tool tool)
     {
         auto *button = new ToolbarButton(this, ToolbarButton::Kind::Label, label, QColor(), 0);
         button->setAccessibleName(label);
@@ -714,7 +1020,7 @@ private:
         toolButtons_.append(qMakePair(button, tool));
     }
 
-    void addSwatch(QHBoxLayout *layout, const QColor &color)
+    void addSwatch(FlowLayout *layout, const QColor &color)
     {
         auto *button =
             new ToolbarButton(this, ToolbarButton::Kind::Swatch, QString(), color, 0);
@@ -732,9 +1038,9 @@ private:
     // The opacity control, drawn beside the colours because opacity is a
     // property of the colour being drawn with.  The range is the storage range
     // (0-255); the value on screen is a percentage, which is what a user thinks
-    // in.  There is no "Alpha" caption: the panel is one row on a fixed-height
-    // bar, so the tooltip and the accessible name carry the word instead.
-    void addAlpha(QHBoxLayout *layout)
+    // in.  There is no "Alpha" caption: the panel is a compact row of controls,
+    // so the tooltip and the accessible name carry the word instead.
+    void addAlpha(FlowLayout *layout)
     {
         alphaSlider_ = new QSlider(Qt::Horizontal, this);
         alphaSlider_->setRange(0, 255);
@@ -769,7 +1075,7 @@ private:
         layout->addWidget(alphaValue_);
     }
 
-    void addWidth(QHBoxLayout *layout, int width)
+    void addWidth(FlowLayout *layout, int width)
     {
         // The dot's diameter is the width made visible, so the three dots read
         // as thin, medium and thick before they are clicked.
@@ -780,7 +1086,8 @@ private:
         widthButtons_.append(qMakePair(button, width));
     }
 
-    ToolbarButton *addText(QHBoxLayout *layout, const QString &label, std::function<void()> onClick)
+    ToolbarButton *addText(FlowLayout *layout, const QString &label,
+                           std::function<void()> onClick)
     {
         auto *button = new ToolbarButton(this, ToolbarButton::Kind::Label, label, QColor(), 0);
         button->setAccessibleName(label);
@@ -789,7 +1096,7 @@ private:
         return button;
     }
 
-    void addDivider(QHBoxLayout *layout)
+    void addDivider(FlowLayout *layout)
     {
         auto *line = new QFrame(this);
         line->setFixedSize(1, 20);
@@ -797,6 +1104,10 @@ private:
         // Transparent to the pointer: a click on the separator is a click on
         // blank panel, and drags the panel like any other gap.
         line->setAttribute(Qt::WA_TransparentForMouseEvents);
+        // Marks it for the flow layout: on one row the separator is just a
+        // divider, but where the row wraps it travels with the group it opens
+        // instead of being left dangling at the end of a row.
+        line->setProperty(kSeparatorProperty, true);
         layout->addWidget(line);
     }
 
@@ -1082,6 +1393,23 @@ bool AnnotateSurface::strokeHits(const Stroke &stroke, const QPointF &local) con
                    local, normalizedRect(stroke.points.constFirst(), stroke.points.constLast()))
             <= kEraserRadius;
     }
+    if (stroke.tool == Tool::Wave && stroke.points.size() >= 2) {
+        // The ink of a wave is the sampled polyline, not the straight line
+        // between its two points: an eraser landing on a crest has to take the
+        // stroke, so the distance is measured to the wave the painter draws.
+        const QVector<QPointF> wave =
+            wavePolyline(stroke.points.constFirst(), stroke.points.constLast(),
+                         waveAmplitude(stroke.width), waveWavelength(stroke.width), 1.0);
+        double nearest = std::numeric_limits<double>::infinity();
+        for (qsizetype i = 1; i < wave.size(); ++i) {
+            nearest = std::min(nearest,
+                               pointSegmentDistance(local, wave.at(i - 1), wave.at(i)));
+        }
+        if (wave.size() == 1) {
+            nearest = QLineF(local, wave.constFirst()).length();
+        }
+        return nearest <= kEraserRadius;
+    }
     double nearest = std::numeric_limits<double>::infinity();
     if (stroke.points.size() == 1) {
         nearest = QLineF(local, stroke.points.constFirst()).length();
@@ -1340,6 +1668,10 @@ void AnnotateSurface::mousePressEvent(QMouseEvent *event)
         break;
     case Tool::Rect:
     case Tool::Arrow:
+    case Tool::Line:
+    case Tool::Wave:
+        // The two-point tools: the drag is recorded as its anchor and its
+        // current point, never the wandering positions in between.
         pending_ = Stroke();
         pending_.tool = tool_;
         pending_.color = color_;
@@ -1389,7 +1721,8 @@ void AnnotateSurface::mouseMoveEvent(QMouseEvent *event)
         touch(grownDirtyRect(
             normalizedRect(from, local)
                 .adjusted(-pending_.width, -pending_.width, pending_.width, pending_.width)));
-    } else if (tool_ == Tool::Rect || tool_ == Tool::Arrow) {
+    } else if (tool_ == Tool::Rect || tool_ == Tool::Arrow || tool_ == Tool::Line ||
+               tool_ == Tool::Wave) {
         const QRect before = grownDirtyRect(
             strokeBounds(pending_.tool, pending_.points, pending_.width, pending_.text));
         if (pending_.points.size() >= 2) {
@@ -1421,7 +1754,8 @@ void AnnotateSurface::mouseReleaseEvent(QMouseEvent *event)
     }
     drawing_ = false;
     QRect stalePreview;
-    if (tool_ == Tool::Rect || tool_ == Tool::Arrow) {
+    if (tool_ == Tool::Rect || tool_ == Tool::Arrow || tool_ == Tool::Line ||
+        tool_ == Tool::Wave) {
         // The preview on screen was drawn where the pointer was at the last
         // motion event.  Releasing a little away from it can shrink the shape,
         // leaving the old outline outside the committed rect -- so the rect the
