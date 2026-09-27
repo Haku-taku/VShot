@@ -233,6 +233,10 @@ public:
     bool hasValidSelection() const;
     const std::optional<LogicalRect> &selection() const;
     const QVector<Annotation> &annotations() const;
+    // How many freehand segments the live preview has baked since the stroke
+    // started.  Lets the offline check prove each segment is drawn once rather
+    // than recomputed on every paint.
+    int liveStrokeBakes() const;
     QJsonDocument resultDocument(const QString &bitmapDirectory = QString(), QString *error = nullptr) const;
 
     void setTerminalCallback(std::function<void()> callback);
@@ -307,6 +311,8 @@ private:
     bool styleAdjustmentChanged_ = false;
     QVector<Annotation> styleAdjustmentSnapshot_;
     Gesture *gesture_ = nullptr;
+    // Freehand segments the live preview has baked for the current stroke.
+    int liveStrokeBakes_ = 0;
     bool editing_ = false;
     bool pinEdit_ = false;
     /// `region-only`: a finished drag ends the session with the rectangle
@@ -389,6 +395,10 @@ private:
     void removeTextEditor();
     void mutateAnnotations(QVector<Annotation> next);
     void drawLoupe(CaptureOverlay *overlay, QPainter *painter);
+    // Draws the in-progress freehand stroke from a raster that only grows by the
+    // points appended since the last paint.
+    void paintLiveStroke(QPainter *painter, const OutputSession &output, const QSize &size,
+                         int outputIndex);
     bool annotationBounds(const Annotation &annotation, LogicalRect *bounds) const;
     bool canDrawAt(Point point) const;
 };

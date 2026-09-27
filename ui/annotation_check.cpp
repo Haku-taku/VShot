@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 VShot contributors
 
-// Offline check for the annotation render cache.
+// Offline checks for the annotation render cache and the freehand preview.
 //
 // Every committed mark keeps a rasterized copy of itself and redraws it only
 // when something it draws changes.  That matters most for the mosaic, which
@@ -9,6 +9,12 @@
 // (a selection drag, a pointer move) is what made a busy capture stutter.  The
 // check paints the real overlay offscreen and reads the per-mark rebuild count,
 // so what is asserted is the cache the editor actually uses.
+//
+// The in-progress freehand stroke has the same problem in a different shape:
+// re-stroking the whole path on every move is quadratic over a long scribble.
+// It builds up through a raster that only grows by the points added since the
+// last paint, and the check proves each segment is baked once while the result
+// still matches the mark that is committed on release.
 //
 // Needs QApplication and the offscreen platform plugin; no compositor and no
 // layer shell.  `QT_QPA_PLATFORM=offscreen` supplies the one screen the overlay
@@ -27,6 +33,8 @@
 #include <QString>
 #include <Qt>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 
 namespace {
@@ -64,7 +72,15 @@ vshot::Session editingSession()
     output.pixelWidth = 400;
     output.pixelHeight = 400;
     output.image = QImage(400, 400, QImage::Format_ARGB32);
-    output.image.fill(QColor(70, 90, 120));
+    // A coarse pattern rather than a flat fill, so the mosaic and the brush have
+    // something to average: a uniform frame would hide a wrong sample point.
+    for (int y = 0; y < 400; ++y) {
+        for (int x = 0; x < 400; ++x) {
+            output.image.setPixelColor(x, y,
+                                       QColor(40 + (x / 8 * 7) % 60, 30 + (y / 8 * 53) % 200,
+                                              30 + ((x + y) / 8 * 29) % 200));
+        }
+    }
     session.outputs.push_back(output);
     session.selection = vshot::LogicalRect{0, 0, 400, 400};
     return session;
@@ -232,6 +248,133 @@ void checkCachedPixelsLandOnTheMark()
     expect(hasStrokePixels(target), "the cached stroke blits to the same place");
 }
 
+// A serpentine of many moves, so the live raster is baked in many steps.
+QVector<QPointF> serpentine()
+{
+    QVector<QPointF> path;
+    for (int i = 0; i < 80; ++i) {
+        const double t = i / 79.0;
+        path.append(QPointF(30 + t * 340, 200 + std::sin(t * 18.0) * 70));
+    }
+    return path;
+}
+
+// Paints the stroke as the editor does -- one paint per move -- and keeps both
+// the in-progress image and the committed one.
+void renderFreehand(vshot::OverlayController &controller, vshot::CaptureOverlay *overlay,
+                    const QVector<QPointF> &path, QImage *live, QImage *committed)
+{
+    *live = QImage(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    controller.press(overlay, path.constFirst(), Qt::LeftButton, Qt::NoModifier);
+    for (int i = 1; i < path.size(); ++i) {
+        controller.move(overlay, path.at(i), Qt::LeftButton, Qt::NoModifier);
+        paintOnce(overlay, live);
+    }
+    controller.release(overlay, path.constLast(), Qt::LeftButton, Qt::NoModifier);
+    *committed = QImage(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, committed);
+}
+
+int differingPixels(const QImage &first, const QImage &second)
+{
+    int diff = 0;
+    for (int y = 0; y < first.height(); ++y) {
+        for (int x = 0; x < first.width(); ++x) {
+            const QColor a = first.pixelColor(x, y);
+            const QColor b = second.pixelColor(x, y);
+            if (std::max({std::abs(a.red() - b.red()), std::abs(a.green() - b.green()),
+                          std::abs(a.blue() - b.blue())}) > 30) {
+                ++diff;
+            }
+        }
+    }
+    return diff;
+}
+
+// The incremental preview must draw the same stroke as the committed mark, so
+// letting go changes nothing on screen.  The live raster is baked one move at a
+// time; only antialiasing at the shared joints differs, so the tolerance is a
+// few pixels per vertex rather than none.
+void checkLiveStrokeMatchesTheCommittedMark()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    const QVector<QPointF> path = serpentine();
+    const int tolerance = 8 * path.size();
+
+    const auto open = [&](vshot::OverlayController &controller, vshot::CaptureOverlay **overlay) {
+        QString error;
+        *overlay = controller.addOverlay(0, screen, &error);
+        if (*overlay == nullptr) {
+            expect(false, "the controller accepts an overlay", error);
+            return false;
+        }
+        (*overlay)->show();
+        controller.beginPresetEdit();
+        return true;
+    };
+
+    {
+        vshot::OverlayController controller(editingSession());
+        vshot::CaptureOverlay *overlay = nullptr;
+        if (!open(controller, &overlay)) {
+            return;
+        }
+        controller.chooseTool(vshot::Tool::Pen);
+        controller.setWidth(5);
+        controller.setCurrentColor(QColor(255, 30, 30));
+        QImage live;
+        QImage committed;
+        renderFreehand(controller, overlay, path, &live, &committed);
+        const int diff = differingPixels(live, committed);
+        expect(diff < tolerance, "the incremental preview matches the committed solid stroke",
+               QStringLiteral("%1 pixels differ").arg(diff));
+        expect(controller.liveStrokeBakes() == path.size() - 1,
+               "each freehand segment is baked once, not on every paint",
+               QStringLiteral("baked %1 for %2 segments")
+                   .arg(controller.liveStrokeBakes())
+                   .arg(path.size() - 1));
+    }
+
+    {
+        vshot::OverlayController controller(editingSession());
+        vshot::CaptureOverlay *overlay = nullptr;
+        if (!open(controller, &overlay)) {
+            return;
+        }
+        controller.chooseTool(vshot::Tool::Pen);
+        controller.setWidth(5);
+        controller.setCurrentColor(QColor(255, 30, 30));
+        controller.setDash(QStringLiteral("dashed"));
+        QImage live;
+        QImage committed;
+        renderFreehand(controller, overlay, path, &live, &committed);
+        const int diff = differingPixels(live, committed);
+        expect(diff < tolerance, "the incremental preview matches the committed dashed stroke",
+               QStringLiteral("%1 pixels differ").arg(diff));
+    }
+
+    {
+        vshot::OverlayController controller(editingSession());
+        vshot::CaptureOverlay *overlay = nullptr;
+        if (!open(controller, &overlay)) {
+            return;
+        }
+        controller.chooseTool(vshot::Tool::Mosaic);
+        controller.setMosaicShape(QStringLiteral("brush"));
+        controller.setWidth(24);
+        QImage live;
+        QImage committed;
+        renderFreehand(controller, overlay, path, &live, &committed);
+        const int diff = differingPixels(live, committed);
+        expect(diff < tolerance, "the incremental preview matches the committed mosaic brush",
+               QStringLiteral("%1 pixels differ").arg(diff));
+    }
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -241,6 +384,7 @@ int main(int argc, char *argv[])
     checkRepaintsReuseTheRaster();
     checkEachMarkCachesOnItsOwn();
     checkCachedPixelsLandOnTheMark();
+    checkLiveStrokeMatchesTheCommittedMark();
 
     if (failures != 0) {
         std::printf("\n%d annotation cache checks failed\n", failures);
