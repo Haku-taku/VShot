@@ -247,6 +247,36 @@ if(VSHOT_BUILD_CHECKS)
         target_compile_options(vshot-paste-check PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 
+    # The toolbar check: it drives the real editor and reads the floating
+    # toolbar's widget geometry, which is where the placement rules for a
+    # capture that nearly fills the display live.  A wrong edge there drags the
+    # buttons around as the style row shows and hides, which no unit of the
+    # arithmetic would catch.  Needs Widgets and the offscreen platform plugin,
+    # no compositor: no layer surface is ever shown.
+    add_executable(vshot-toolbar-check
+        ui/toolbar_check.cpp
+        ui/capture_overlay.cpp
+        ui/capture_overlay.hpp
+        ui/session_protocol.cpp
+        ui/session_protocol.hpp
+        ui/config.cpp
+        ui/config.hpp
+        ui/text_size.hpp
+        ui/i18n.cpp
+        ui/i18n.hpp
+    )
+    target_link_libraries(vshot-toolbar-check PRIVATE
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+        Qt6::Network
+        LayerShellQt::Interface
+    )
+    target_compile_features(vshot-toolbar-check PRIVATE cxx_std_17)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(vshot-toolbar-check PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
     # The file dialog check: the look of the one window Qt draws for us.  It
     # builds the real dialog through the same builder the helper uses and reads
     # the widget tree back, because both things it guards -- the palette-driven

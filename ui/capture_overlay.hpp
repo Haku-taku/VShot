@@ -272,11 +272,10 @@ private:
     std::uint32_t mosaicStrength_ = 2;
     bool panelPinned_ = false;
     // Automatic toolbar placement anchor: while the selection stays put, the
-    // panel keeps the edge adjacent to the selection fixed so style-row
-    // toggles never shift the command bar.
+    // side of the selection the command bar was placed on stays fixed, so a
+    // style-row toggle only grows the panel the other way.
     QRect toolbarAnchorSelection_;
     QPoint toolbarAnchor_;
-    int toolbarAnchorHeight_ = 0;
     bool toolbarAnchorBelow_ = false;
     bool toolbarAnchorValid_ = false;
     // Selected annotation adjustment (move/resize under the Select tool).
