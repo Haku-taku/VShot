@@ -1065,22 +1065,30 @@ fn parse_annotation(annotation: QtAnnotation) -> Result<Annotation> {
     }
 }
 
-/// Parses a `#RRGGBB` helper color into RGBA8 with full alpha.
+/// Parses a `#RRGGBB` or `#RRGGBBAA` helper color into RGBA8.
+///
+/// The eight-digit form spells alpha last, the CSS order that `ui/config.cpp`'s
+/// `readColor` writes and re-reads by hand. Qt's own `QColor(QString)` reads
+/// eight hex digits as `#AARRGGBB` instead, so `#ff8800ff` would come out as
+/// purple; parsing the pairs here keeps the Rust side on the same convention.
 fn parse_color(value: Option<&str>, default: [u8; 4]) -> Result<[u8; 4]> {
     let Some(hex) = value else {
         return Ok(default);
     };
     let hex = hex.strip_prefix('#').unwrap_or(hex);
-    if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    // With the `#` off, six digits are `rrggbb` and eight are `rrggbbaa`.
+    if (hex.len() != 6 && hex.len() != 8) || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(VshotError::Selection(format!(
-            "Qt annotation color `{value:?}` is not a #RRGGBB value"
+            "Qt annotation color `{value:?}` is not a #RRGGBB or #RRGGBBAA value"
         )));
     }
     let channel = |range: std::ops::Range<usize>| {
         u8::from_str_radix(&hex[range], 16)
             .map_err(|_| VshotError::Selection("Qt annotation color is invalid".into()))
     };
-    Ok([channel(0..2)?, channel(2..4)?, channel(4..6)?, 255])
+    // Eight digits append the alpha pair; six keep the old opaque default.
+    let alpha = if hex.len() == 8 { channel(6..8)? } else { 255 };
+    Ok([channel(0..2)?, channel(2..4)?, channel(4..6)?, alpha])
 }
 
 /// Clamps a helper stroke width into a sane logical-pixel range.
@@ -1273,6 +1281,72 @@ mod tests {
             ),
             Err(VshotError::Selection(_))
         ));
+    }
+
+    #[test]
+    fn parses_six_digit_colors_as_opaque() {
+        // The old spelling keeps its exact behaviour: six digits, full alpha.
+        assert_eq!(
+            parse_color(Some("#ff8800"), [0, 0, 0, 255]).unwrap(),
+            [255, 136, 0, 255]
+        );
+        assert_eq!(
+            parse_color(Some("112233"), [0, 0, 0, 255]).unwrap(),
+            [17, 34, 51, 255]
+        );
+        assert_eq!(parse_color(None, [9, 8, 7, 6]).unwrap(), [9, 8, 7, 6]);
+    }
+
+    #[test]
+    fn parses_eight_digit_colors_with_alpha_last() {
+        // `#RRGGBBAA`, the CSS order `ui/config.cpp` writes: alpha is the last
+        // pair. `#ff880080` is orange `#ff8800` at half alpha; its blue pair is
+        // `00`, so the third channel is 0, not 128.
+        assert_eq!(
+            parse_color(Some("#ff880080"), [0, 0, 0, 255]).unwrap(),
+            [255, 136, 0, 128]
+        );
+        // The four-tuple `#ff888080` -- `ff 88 80 80` -- is the other spelling
+        // of the same shape, with blue 0x80 and alpha 0x80.
+        assert_eq!(
+            parse_color(Some("#ff888080"), [0, 0, 0, 255]).unwrap(),
+            [255, 136, 128, 128]
+        );
+        // All four pairs differ, so a Qt `#AARRGGBB` reading -- which would
+        // return [128, 255, 64, 17] here -- cannot slip through.
+        assert_eq!(
+            parse_color(Some("#1180ff40"), [0, 0, 0, 255]).unwrap(),
+            [17, 128, 255, 64]
+        );
+        assert_eq!(
+            parse_color(Some("#00000000"), [1, 2, 3, 4]).unwrap(),
+            [0, 0, 0, 0]
+        );
+        // A fully transparent eight-digit also works without the leading `#`.
+        assert_eq!(
+            parse_color(Some("11223344"), [0, 0, 0, 255]).unwrap(),
+            [17, 34, 51, 68]
+        );
+    }
+
+    #[test]
+    fn rejects_colors_that_are_not_six_or_eight_digits() {
+        for bad in [
+            "#ff880",     // five digits
+            "#ff88008",   // seven digits
+            "#ff8800880", // nine digits
+            "#ff88zz",    // six digits, not hex
+            "#112233zz",  // eight digits, not hex
+            "#",          // no digits
+        ] {
+            assert!(
+                matches!(
+                    parse_color(Some(bad), [0, 0, 0, 255]),
+                    Err(VshotError::Selection(_))
+                ),
+                "`{bad}` should be rejected"
+            );
+        }
     }
 
     #[test]
