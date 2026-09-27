@@ -44,10 +44,16 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("Draw"), QString::fromUtf8("涂鸦")},
         {QStringLiteral("Text"), QString::fromUtf8("文本")},
         {QStringLiteral("Mosaic"), QString::fromUtf8("马赛克")},
+        {QStringLiteral("Erase"), QString::fromUtf8("橡皮")},
 
         // Action buttons and their tooltips.
         {QStringLiteral("Undo"), QString::fromUtf8("撤销")},
         {QStringLiteral("Redo"), QString::fromUtf8("重做")},
+        // The annotation overlay's own controls: its clear button, the way out
+        // of the background process, and the toolbar's grip.
+        {QStringLiteral("Clear"), QString::fromUtf8("清除")},
+        {QStringLiteral("Quit annotation"), QString::fromUtf8("退出标注")},
+        {QStringLiteral("Drag to move"), QString::fromUtf8("拖动移动")},
         {QStringLiteral("OK"), QString::fromUtf8("确定")},
         {QStringLiteral("Cancel"), QString::fromUtf8("取消")},
         {QStringLiteral("Undo last change (Ctrl+Z)"),

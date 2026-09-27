@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 VShot contributors
 
+mod annotate;
 mod capture;
 mod cli;
 mod cli_i18n;
@@ -74,6 +75,12 @@ fn run() -> Result<()> {
             // Internal: render a pin-edit session, no Wayland capture needed.
             return pin::apply_edit(&session);
         }
+        Action::Annotate(action) => {
+            // The annotation overlay is a resident daemon of its own: drawing on
+            // the live screen needs no capture and no scene from here, only a
+            // socket to talk to, exactly like pin management.
+            return annotate::run(action);
+        }
         Action::Settings => {
             // The settings window is a plain toplevel over the config file: no
             // capture, no scene, no Wayland connection of our own.
@@ -138,6 +145,15 @@ fn run() -> Result<()> {
     let topology = wayland.output_infos();
     let known_outputs: &[OutputInfo] = topology.as_deref().unwrap_or(&[]);
     let mut capture = Capturer::connect()?;
+
+    // Everything below freezes the desktop, and the annotation overlay is a
+    // window like any other: left alone, its toolbar would be baked into the
+    // frozen frame and then into the file.  The guard hides it for as long as
+    // this process lives, so it covers every route here -- and it drops on the
+    // way out, error or not, so nothing stays hidden.  Annotations themselves
+    // are meant to be in the picture, which is why this hides the toolbar and
+    // not the overlay.
+    let _annotate = annotate::CaptureGuard::for_screenshot();
 
     // niri picks the window itself and then hands over its picture, which is
     // the only way there: its IPC reports no position for a tiled window, so

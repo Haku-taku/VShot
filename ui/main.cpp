@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 VShot contributors
 
+#include "annotate_server.hpp"
 #include "capture_overlay.hpp"
 #include "hint_window.hpp"
 #include "i18n.hpp"
@@ -141,13 +142,30 @@ int main(int argc, char **argv)
         return saveMode ? vshot::runSaveDialog(suggested, screenName)
                         : vshot::runOpenDialog(suggested, screenName);
     }
+    // The annotation daemon: one transparent layer surface per output, driven
+    // over a socket by `vshot annotate` and living until that socket says quit.
+    // It is the pin daemon's shape, so it takes the same argument and keeps the
+    // same "no window closing ends me" rule.
+    if (argc == 3 && QString::fromLocal8Bit(argv[1]) == QStringLiteral("--annotate-server")) {
+        const QString socketPath = QString::fromLocal8Bit(argv[2]);
+        if (!socketPath.startsWith(QLatin1Char('/'))) {
+            std::fprintf(stderr,
+                         "vshot-qt-ui: annotation socket path must be absolute\n");
+            return 2;
+        }
+        QApplication app(argc, argv);
+        QApplication::setQuitOnLastWindowClosed(false);
+        vshot::initUiLanguage();
+        return vshot::runAnnotateServer(socketPath);
+    }
     if (argc != 3 || QString::fromLocal8Bit(argv[1]) != QStringLiteral("--session")) {
         reportError(QStringLiteral("usage: vshot-qt-ui --session <absolute-json-path>\n"
                                    "       vshot-qt-ui --settings\n"
                                    "       vshot-qt-ui --pin-edit <absolute-json-path>\n"
                                    "       vshot-qt-ui --save-dialog <suggested-path> [output]\n"
                                    "       vshot-qt-ui --open-dialog <suggested-path> [output]\n"
-                                   "       vshot-qt-ui --pin-server <absolute-socket-path>"));
+                                   "       vshot-qt-ui --pin-server <absolute-socket-path>\n"
+                                   "       vshot-qt-ui --annotate-server <absolute-socket-path>"));
         return 2;
     }
     const QString sessionPath = QString::fromLocal8Bit(argv[2]);

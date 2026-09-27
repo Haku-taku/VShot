@@ -13,6 +13,10 @@ find_package(LayerShellQt REQUIRED)
 
 add_executable(vshot-qt-ui
     ui/main.cpp
+    ui/annotate_server.cpp
+    ui/annotate_server.hpp
+    ui/annotate_surface.cpp
+    ui/annotate_surface.hpp
     ui/config.cpp
     ui/config.hpp
     ui/text_size.hpp
@@ -275,5 +279,30 @@ if(VSHOT_BUILD_CHECKS)
     target_compile_features(vshot-file-dialog-check PRIVATE cxx_std_17)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(vshot-file-dialog-check PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    # The annotation check: it drives a real AnnotateSurface with synthetic
+    # pointer events and reads the result back as pixels, so what is checked is
+    # what the user would see -- a stroke that reaches the canvas, an eraser
+    # that spares the neighbouring stroke, an undo that empties it, a text
+    # annotation that lands, and a drag on the toolbar that draws nothing.
+    # Needs Widgets and the offscreen platform plugin, no compositor: the
+    # layer-shell call is never made.
+    add_executable(vshot-annotate-check
+        ui/annotate_check.cpp
+        ui/annotate_surface.cpp
+        ui/annotate_surface.hpp
+        ui/i18n.cpp
+        ui/i18n.hpp
+    )
+    target_link_libraries(vshot-annotate-check PRIVATE
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+        LayerShellQt::Interface
+    )
+    target_compile_features(vshot-annotate-check PRIVATE cxx_std_17)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(vshot-annotate-check PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 endif()

@@ -80,6 +80,8 @@ const COMMANDS: &[(&str, &str, &str)] = &[
   record mics|stop             一次录制能用的音频输入
   replay start|save|status|stop
                                内存里留着的最近一段画面
+  annotate toggle|show|hide|clear|quit|status
+                               通过 daemon 在实时屏幕上涂画
 
 输出目标（每次捕获恰好去其中一个）
   -o, --output PATH   写到 PATH 的 PNG，展开 strftime
@@ -99,11 +101,13 @@ org.kde.KWin.ScreenShot2，只授给「已安装的 desktop 文件声明了
 报不出平铺窗口的位置，那里的 `window active` 与 `window pick` 用它自己的截图与十字选窗。
 
 `vshot pin` 自己不截屏：它驱动常驻 pin daemon，可以 pin 图片文件或 --clipboard 里的东西，
-没有 pin 时 daemon 自己退出。
+没有 pin 时 daemon 自己退出。`vshot annotate` 也不截屏：它驱动常驻的标注浮层，在实时屏幕上
+涂画，并在截图或录屏期间把自己的工具栏收起来。
 
 环境变量：VSHOT_QT_HELPER（用哪份 vshot-qt-ui）、VSHOT_LANG（界面语言）、
 VSHOT_PIXEL_DEBUG=1、VSHOT_SESSION_DEBUG=1、VSHOT_LONG_DEBUG_DIR=<dir>、
-VSHOT_PIN_DEBUG=1、VSHOT_PIN_FOCUS_DEBUG=1、VSHOT_PIN_SOCKET、VSHOT_PIN_DENSITY=N。
+VSHOT_PIN_DEBUG=1、VSHOT_PIN_FOCUS_DEBUG=1、VSHOT_PIN_SOCKET、VSHOT_PIN_DENSITY=N、
+VSHOT_ANNOTATE_SOCKET、VSHOT_ANNOTATE_DEBUG=1。
 
 $XDG_CONFIG_HOME/vshot/config.json（或 ~/.config/vshot/config.json）可选：`editor` 是标注
 编辑器样式，`cli` 给没写出来的参数提供默认值——命令行永远压过文件。文件损坏时回退内置默认。
@@ -167,6 +171,41 @@ VSHOT_PIN_SOCKET 覆盖 daemon 监听的 socket，VSHOT_PIN_DENSITY=N 指定每�
 与 --density 相同。VSHOT_PIN_DEBUG=1 与 VSHOT_PIN_FOCUS_DEBUG=1 把密度判定和渲染面的焦点
 踪迹打到 stderr。"#,
     ),
+    (
+        "annotate",
+        "在实时屏幕上涂画：一个常驻浮层，带自己的工具栏",
+        r#"浮层是一个常驻 daemon：`toggle` 把它拉起来，它一直活到你 `quit` 或点它工具栏上的 ✕。
+每块输出各有一张透明浮层、各自的一份画，也各有自己的小工具栏——Draw、Erase、Rect、Arrow、
+Text、六个颜色、三档线宽、Undo、Redo、Clear、Quit——默认贴在那块输出的顶边，按住手柄可以
+拖到任何位置。
+
+`hide` 把画的东西留着，`show` 就把它们带回来，`clear` 直接忘掉。没有 daemon 在跑时 `show`
+与 `toggle` 会顺手启动一个，`hide`、`clear`、`quit`、`status` 不会。截图或录屏会自己收起
+工具栏：画面里有标注，没有工具栏。
+
+浮层开着的时候，那块输出上的每一次点击都归它——「随便画」就是这个意思——所以再绑一个键到
+`toggle` 或 `hide` 才是把指针要回来的办法。Wayland 客户端收不到全局按键，请在合成器里自己
+绑热键，例如 Hyprland：
+    bind = SUPER, A, exec, vshot annotate toggle
+    bind = SUPER SHIFT, A, exec, vshot annotate quit
+
+VSHOT_ANNOTATE_SOCKET 覆盖 daemon 的 socket，VSHOT_ANNOTATE_DEBUG=1 把它的诊断留在
+stderr。"#,
+    ),
+    (
+        "annotate toggle",
+        "翻动标注浮层：藏着的显示出来，显示着的收起来",
+        "",
+    ),
+    (
+        "annotate show",
+        "显示标注浮层，没有在跑就把 daemon 拉起来",
+        "",
+    ),
+    ("annotate hide", "收起标注浮层，画的东西留着", ""),
+    ("annotate clear", "忘掉每一块输出上的全部标注", ""),
+    ("annotate quit", "退出标注 daemon，连同画的内容一起", ""),
+    ("annotate status", "报告 daemon 在不在跑、手里握着什么", ""),
     (
         "settings",
         "用窗口来改记住的设置：标注编辑器样式与命令行默认值，两者都在同一个配置文件里",

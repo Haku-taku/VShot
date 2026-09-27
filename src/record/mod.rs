@@ -601,6 +601,15 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
             "a recording is already running (pid {pid}); stop it with `vshot record stop` first"
         )));
     }
+    // A recording grabs the screen frame after frame, so the annotation
+    // overlay's toolbar would be in every one of them: hide it for the whole
+    // session, before the first route is chosen, and let the guard put it back
+    // however this returns.  The guard carries this process's pid, which is what
+    // restores the toolbar if the recorder is killed instead of stopping
+    // cleanly.  Replay is deliberately left alone: it grabs continuously for as
+    // long as it runs, and hiding the toolbar for that whole time would make
+    // the overlay unusable while a replay session is up.
+    let _annotate = crate::annotate::CaptureGuard::for_recording();
     // The portal route takes its frames from the compositor's screen-cast
     // service instead of its capture protocols, and the compositor's own
     // picker decides what is recorded — so a window recording goes through

@@ -91,6 +91,10 @@ vshot pin --close-all
 vshot pin --list
 vshot pin --quit
 
+vshot annotate toggle                       # 屏幕标注：显隐浮层（顺手拉起 daemon）
+vshot annotate clear                        # 清空全部标注
+vshot annotate quit                         # 退出 daemon（连标注一起）
+
 vshot settings                              # 设置：开窗口改编辑器样式与命令行默认值（写进 config.json）
 
 vshot ocr                                   # OCR：框选，文字到 stdout
@@ -388,6 +392,29 @@ bind = SUPER, P, exec, vshot pin --toggle
 bind = SUPER SHIFT, P, exec, vshot pin --close-all
 ```
 
+## 屏幕标注
+`vshot annotate` 把桌面变成一块可以随手画的画布：一个**常驻 daemon** 在每块输出上铺一张 layer-shell 浮层（Overlay 层，与 pin 浮层同一套），鼠标直接画在**实时桌面**上。每块输出有自己的画布、自己的工具栏，画在哪块就留在哪块。首次 `show` / `toggle` 连不上 socket 时，daemon 由 `vshot-qt-ui --annotate-server <绝对 socket 路径>` 分离式拉起，与 pin daemon 一样；`show` 与 `toggle` 会顺手拉起 daemon，`hide`、`clear`、`quit`、`status` 都不会。
+
+```sh
+vshot annotate toggle     # 显隐浮层（没有 daemon 时顺手拉起）
+vshot annotate show       # 显示（同样会拉起 daemon）
+vshot annotate hide       # 隐藏，画的东西留着
+vshot annotate clear      # 清空每块输出上的全部标注
+vshot annotate quit       # 退出 daemon，连标注一起
+vshot annotate status     # daemon 在不在、握着几条笔画
+```
+
+工具栏是沿该输出**顶边居中**排的一小条横向调色板，左边一个把手可以把它拖到任意位置，内容依次是 Draw（自由画笔）、Erase、Rect、Arrow、Text、六个颜色、三档线宽、Undo、Redo、Clear，以及最右边那个退出 daemon 的 ✕。**Erase 拖过哪条笔画就删掉哪条**（可撤销），不是擦像素；**Text** 在你点击的地方开一个内联文本框，Enter 落笔、Esc 取消，输入法打出的中文照样收下。撤销/重做也管擦除与清空，所以误按一次 Clear 只需一次撤销。
+
+浮层显示期间它会**吃掉那块输出上的每一次点击**——「随便画」就是这个意思——所以要拿回指针，得在合成器里另绑一个跑 `toggle` 或 `hide` 的快捷键（Wayland 客户端收不到全局按键；KWin/Plasma 建一条自定义快捷键，niri 写一条 `binds` 条目）。浮层**刻意不抓键盘**：只有内联文本框会临时升起键盘交互性，关掉就还回去，所以在别的窗口里打字照常。
+
+```
+bind = SUPER, A, exec, vshot annotate toggle
+bind = SUPER SHIFT, A, exec, vshot annotate quit
+```
+
+标注是**要入镜**的：截图或录屏会自己把**工具栏**藏起来（画的笔画不藏），所以冻结下来的画面上有笔画、没有工具栏；就算录制进程被杀掉，daemon 盯着请求方的 pid，也会把工具栏还回来。**回录（`vshot replay start`）不在这个范围内**——它一开着就持续抓帧，整个会话都藏工具栏会让浮层没法用，所以标注和回录本就不打算一起跑。这套功能只在 **Hyprland** 上实测过，且和 pin 浮层一样需要 `wlr-layer-shell`，没有 layer shell 的合成器根本画不出来。最后是和 pin daemon 一样的警告、一样的道理：**不要用 `pkill` / `kill -9` 结束标注 daemon**——它持有 layer-shell surface，被强杀时部分合成器会残留已映射的 surface 卡住 screencopy（pin daemon 上在 Hyprland 0.56 实测过）。请用 `vshot annotate quit`，它退出前会 unmap 全部；daemon 也已处理 `SIGTERM` / `SIGINT` 走同一条路。
+
 ## 图像与输出映射
 **落在单个输出内的矩形一律从那块输出自己那份原生帧裁剪，并按那块屏的 scale 写密度**：`region` 的 `--geometry` 与交互选择、`window active`、`window pick` 以及像素识别给出的矩形都走这条路，只有**跨接缝**的矩形才回落到合成场景；`all` 是整块桌面，只能由场景给出。内部帧统一为 RGBA8、top-left origin，多输出合成支持负 logical origin 和输出间空隙（场景画布用最高输出 scale，较低 scale 的输出用 nearest-neighbor 放大）。当前要求正整数 scale、`transform=normal` 以及可安全证明的 logical/pixel 映射；fractional scale、旋转和无法证明的映射会清晰失败，而不是生成疑似错误的截图。这个校验只在**需要把输出合成为场景**的路径上生效，所以 KWin 与 niri 直接给窗口像素的两条路在旋转/翻转输出上仍然可用。
 
@@ -426,6 +453,7 @@ X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
 | `--app-audio` 取窗口 pid | `hyprctl clients -j` | ✅ `niri msg windows` 报 pid | ✅ scripting 探针的 `pid` 字段 | ❌ 无 | ❌ 无 |
 | pin 落在哪块屏 | `hyprctl cursorpos` + `monitors -j` | `focused-output`（只跟键盘焦点） | `org.kde.KWin.activeOutputName` | `swaymsg -t get_outputs` | ❌ 无 |
 | 滚动注入 | wlr 虚拟指针 | wlr 虚拟指针 | portal / uinput | wlr 虚拟指针 | uinput |
+| **屏幕标注**（`annotate`） | ✅ wlr-layer-shell（实测） | ⚠️ 未测试 | ⚠️ 未测试 | ⚠️ 未测试 | ⚠️ 未测试 |
 
 没有适配的地方会**自动降级**而不是报错：没有窗口列表就落到像素识别，问不到指针在哪块屏就落到 Qt 报的主屏。
 
@@ -434,6 +462,7 @@ X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
 - **逐应用音频 / 麦克风**——在 Hyprland 上实测过隔离（两个 mpv 分别播 880 Hz 与 220 Hz，`--app-audio` 只录到所录窗口的那一路）与混音（`--mic --app-audio` 出**单条** AAC 音轨，两路同时检出）；niri 与 KWin 的 pid 路径只有单元测试与无头实测，未在真实音频会话上验证隔离；Sway 与 labwc 没有窗口 pid 来源，会明确拒绝。**跟随焦点（`--follow`）** 在 Hyprland 上实测过（两个不同尺寸/音调的 mpv，切焦点得到一个连续文件）；**报不出焦点的合成器未实测**。
 - **niri**——平铺与浮窗两条**截图**路径已实机验证（`--no-blend` 可绕开浮窗定位）；**窗口录制/回录走合成器自己的 ScreenCast 服务**（`org.gnome.Mutter.ScreenCast`，不需要 portal、没有 picker、没有授权弹窗），4K 窗口录制、中途改尺寸、窗口关闭收尾、回录的 `status`/`save`/`stop` 都实测过；`--follow` 在这条路上不可用（服务 cast 的是启动时那一扇窗）。**注意一个 niri 侧的限流**：它的 cast 是在**输出渲染循环**里画的，所以会话不活动时渲染基本停摆（实测掉到约 1.3fps）；要让 niri 以正常帧率录制，它的 VT 必须是当前活动 VT。**KWin/Plasma** 的 D-Bus 采集、窗口列表、长截图、窗口录制与回录都已在**无头 `--virtual` KWin** 上实测（含授权被 ksycoca 重写临时拒绝时的重试规则）；**仍未验证**：`--cursor`、窗口点选时的 `--pick` 整段交互、以及滚动注入（需要 KDE 上验收）。
 - **Sway / labwc / GNOME**——Sway 只有探针实现与单元测试，**没有现场验证**；**labwc 等其它提供 wlr-screencopy 的合成器**理论上基础截屏可用，但没有窗口列表与 pin 落点探针，且**没有现场验证**；**GNOME** 不支持，没有实现计划（Mutter 不提供 wlr-screencopy、KWin 那套 D-Bus 服务，也没有 layer-shell）。
+- **屏幕标注（`annotate`）**——只在 **Hyprland** 上实测（画笔、擦除、文字、撤销/重做、每块输出各自的画布与工具栏、截图/录屏时自动藏工具栏）；niri、KWin/Plasma、Sway、labwc 均**未经测试**。
 
 ### 光标（`--cursor`）
 vshot 自己从不画光标，`--cursor` 只是给合成器的捕获请求置一个"叠加指针"标志（`wlr-screencopy` 的 `overlay_cursor`，KWin 是 `include-cursor`），画不画、画在哪、什么时候画，全由合成器决定；它对 `long` 无效（见下一条），KWin 上是否真的画出光标也未验证。
@@ -595,6 +624,8 @@ pin 同样是 layer surface，里面只有图片，所以圆角、身下的阴�
 | `VSHOT_PIN_DEBUG=1` | daemon 打印每张 pin 的密度判定 |
 | `VSHOT_PIN_FOCUS_DEBUG=1` | daemon 打印 pin 渲染面每一次焦点变化 |
 | `VSHOT_PIN_SOURCE_FILE` | 覆盖截图工具记录的路径（默认 `/tmp/screenshot-path`） |
+| `VSHOT_ANNOTATE_SOCKET` | 标注 daemon 监听的 socket（默认 `$XDG_RUNTIME_DIR/vshot-annotate-<uid>.sock`） |
+| `VSHOT_ANNOTATE_DEBUG=1` | 让标注 daemon 把自己的诊断留在 stderr |
 | `VSHOT_RECORD_PIDFILE` | `vshot record stop` 读取的 pid 文件路径（默认 `$XDG_RUNTIME_DIR/vshot-record-<uid>.pid`） |
 | `VSHOT_RECORD_DEBUG=1` | 录制/回录循环打印每帧的阶段（抓取/编码/入封装）与所用 libavcodec 版本 |
 | `VSHOT_PORTAL_SHM=1` | `record --portal` 改为要内存帧而不是 dma-buf（合成器的缓冲导入不了时的备用路线） |
@@ -611,6 +642,7 @@ pin 同样是 layer surface，里面只有图片，所以圆角、身下的阴�
 - **文本**：Qt 文本框接受任意 Unicode（含输入法提交的 CJK）；未携带位图的旧 helper 结果回退到 Rust 内置 5x7 字体，该回退路径仅支持可打印 ASCII；
 - **`monitor current`** 依赖 overlay 上收到 pointer enter/motion；通用 Wayland 没有可读取的全局鼠标坐标，因此不会用第一个 output 猜测；
 - **回录**：`replay start --portal` 尚不支持（portal 的出帧循环还没接到内存环，会明确拒绝）；一次只跑一个会话；
+- **屏幕标注**：`vshot replay start` 期间**不会**自动隐藏工具栏（回录一开就持续抓帧，整段会话都藏会让浮层没法用），所以标注与回录不打算一起跑；和 pin 浮层一样需要 `wlr-layer-shell`，没有 layer shell 的合成器画不出来；只在 **Hyprland** 上实测过，其它桌面未经测试。
 - 原生 screencopy 等待合成器返回帧最多 10 秒，超时返回错误而不是永久阻塞。
 
 ## 验证
@@ -621,7 +653,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --release --locked
 ```
 
-Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**（默认不构建，加 `-DVSHOT_BUILD_CHECKS=ON`），覆盖配置读写与设置窗口、字号换算、剪贴板颜色解析与色卡渲染、pin 的图片自述密度与描边、文字卡片留白、色卡右键菜单、贴图的导出格式：
+Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**（默认不构建，加 `-DVSHOT_BUILD_CHECKS=ON`），覆盖配置读写与设置窗口、字号换算、剪贴板颜色解析与色卡渲染、pin 的图片自述密度与描边、文字卡片留白、色卡右键菜单、贴图的导出格式、标注浮层的五个工具与撤销/清除/工具栏位置：
 
 ```sh
 cmake -S . -B build-qt -DVSHOT_BUILD_CHECKS=ON && cmake --build build-qt
@@ -634,6 +666,7 @@ QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-outline-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-text-card-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-menu-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-paste-check
+QT_QPA_PLATFORM=offscreen build-qt/vshot-annotate-check
 ```
 
 另有 5 个默认**不执行**（`#[ignore]`）的集成测试，需要真实环境：KWin 的 D-Bus 采集与后端选择（见 `src/capture/kwin.rs` 的注释，起无头 KWin 即可：虚拟输出名 `Virtual-0`、1024x768、无 pointer capability，只覆盖到 D-Bus 采集这一层）、活跃输出探针（需要任一真实会话）、`/dev/uinput` 滚动注入（需要写权限）、以及**内置 OCR 引擎读一张画出来的文字**（需要那 30 MB 模型在盘上，`cargo test` 没地方去下）。跑法：

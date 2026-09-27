@@ -91,6 +91,10 @@ vshot pin --close-all
 vshot pin --list
 vshot pin --quit
 
+vshot annotate toggle                       # Screen annotation: flip the overlay (starts a daemon)
+vshot annotate clear                        # forget every annotation
+vshot annotate quit                         # quit the daemon, drawing and all
+
 vshot settings                              # Settings: a window for the editor style and the command-line defaults
 
 vshot ocr                                   # OCR: frame a region, text to stdout
@@ -388,6 +392,29 @@ bind = SUPER, P, exec, vshot pin --toggle
 bind = SUPER SHIFT, P, exec, vshot pin --close-all
 ```
 
+## Screen annotation
+`vshot annotate` turns the desktop into a canvas you can draw on: a **resident daemon** lays one layer-shell overlay surface (Overlay layer, the same kind the pin overlay uses) on every output, and the mouse draws straight onto the **live desktop**. Each output has its own canvas and its own toolbar, so a stroke stays on the output it was made on. The daemon is spawned detached as `vshot-qt-ui --annotate-server <absolute socket path>` the first time `show` / `toggle` cannot reach the socket, exactly like the pin daemon; `show` and `toggle` start a daemon, while `hide`, `clear`, `quit` and `status` never do.
+
+```sh
+vshot annotate toggle     # flip the overlay (starts a daemon if none runs)
+vshot annotate show       # show it (also starts a daemon)
+vshot annotate hide       # hide it, keeping everything drawn
+vshot annotate clear      # forget every annotation, on every output
+vshot annotate quit       # quit the daemon, drawing and all
+vshot annotate status     # is the daemon running, how many strokes it holds
+```
+
+The toolbar is a small horizontal palette sitting centred along its output's top edge; a grip on its left drags it anywhere. It holds Draw (freehand pen), Erase, Rect, Arrow, Text, six colours, three line widths, Undo, Redo, Clear, and the ✕ at the right that quits the daemon. **Erase removes a whole stroke it is dragged across** (undoable) rather than rubbing out pixels; **Text** opens an inline text box where you click, Enter commits and Escape cancels, and whatever the input method produces — Chinese included — is taken. Undo/redo cover erasing and clearing too, so a stray Clear costs one undo.
+
+While the overlay is shown it **takes every click on that output** — that is what "draw anywhere" means — so getting your pointer back means binding a second compositor hotkey that runs `toggle` or `hide` (a Wayland client receives no global keys; on KWin/Plasma make a custom shortcut, on niri add a `binds` entry). The overlay deliberately **does not hold the keyboard**: only the inline text box raises keyboard interactivity, and it gives it back when it closes, so typing in other windows keeps working.
+
+```
+bind = SUPER, A, exec, vshot annotate toggle
+bind = SUPER SHIFT, A, exec, vshot annotate quit
+```
+
+The annotations are meant to be in the picture: a screenshot or a recording hides the **toolbar** by itself (not the drawing), so what is frozen has the strokes and not the toolbar; even a killed recorder gets the toolbar back, because the daemon watches the requesting process's pid. **A replay session (`vshot replay start`) is not covered by that hiding** — it grabs continuously for as long as it runs, and hiding the toolbar for its whole life would make the overlay unusable, so annotate and replay are not meant to run together. The feature was verified on **Hyprland** only, and like the pin overlay it needs `wlr-layer-shell`, so a compositor without layer shell cannot draw it at all. Finally, the same warning the pin daemon carries, for the same reason: **never end the annotation daemon with `pkill` / `kill -9`** — it owns layer-shell surfaces, and a force-killed client can leave a mapped surface behind that wedges screencopy on some compositors (measured for the pin daemon on Hyprland 0.56). Use `vshot annotate quit`, which unmaps everything first; the daemon also handles `SIGTERM` / `SIGINT` the same way.
+
 ## Images and output mapping
 **A rectangle that falls inside a single output is always cropped from that output's own native frame and written with that screen's scale as its density**: `region`'s `--geometry` and interactive selections, `window active`, `window pick`, and rectangles from pixel detection all take this route, and only rectangles **crossing a seam** fall back to the composed scene; `all` is the whole desktop and can only come from the scene. Internal frames are uniformly RGBA8 with a top-left origin, and multi-output composition supports negative logical origins and gaps between outputs (the scene canvas uses the highest output scale, with lower-scale outputs enlarged by nearest-neighbor). Positive integer scales, `transform=normal`, and a provably safe logical/pixel mapping are currently required; fractional scale, rotation, and mappings that cannot be proven fail clearly rather than producing a plausibly wrong screenshot. This validation applies only to the routes that **need to compose outputs into a scene**, so KWin's and niri's two routes that hand over window pixels directly still work on a rotated or flipped output.
 
@@ -426,6 +453,7 @@ X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
 | Window pid for `--app-audio` | `hyprctl clients -j` | ✅ `niri msg windows` reports one | ✅ the scripting probe's `pid` field | ❌ none | ❌ none |
 | Which screen a pin lands on | `hyprctl cursorpos` + `monitors -j` | `focused-output` (keyboard focus only) | `org.kde.KWin.activeOutputName` | `swaymsg -t get_outputs` | ❌ none |
 | Scroll injection | wlr virtual pointer | wlr virtual pointer | portal / uinput | wlr virtual pointer | uinput |
+| **Screen annotation** (`annotate`) | ✅ wlr-layer-shell (verified) | ⚠️ untested | ⚠️ untested | ⚠️ untested | ⚠️ untested |
 
 Where nothing is adapted, vshot **degrades automatically instead of erroring**: with no window list it falls back to pixel detection, and when it cannot ask which screen the pointer is on it falls back to the primary screen Qt reports.
 
@@ -434,6 +462,7 @@ Where nothing is adapted, vshot **degrades automatically instead of erroring**: 
 - **Per-application audio / microphone** — the isolation was measured on Hyprland (two mpv players at 880 Hz and 220 Hz, `--app-audio` capturing only the recorded window's stream) and so was the mix (`--mic --app-audio` produces **one** AAC track carrying both); the niri and KWin pid paths have unit tests and headless runs but no isolation measurement against a real audio session; Sway and labwc have no pid source and refuse plainly. **Focus following (`--follow`)** was measured on Hyprland (two mpv windows of different size and tone, one continuous file across a focus switch); a compositor that cannot report its focus is untested here.
 - **niri** — both the tiled and floating **screenshot** paths were verified on a real session (`--no-blend` bypasses the floating-window locating step); **a window recording and a window replay go through the compositor's own screen-cast service** (`org.gnome.Mutter.ScreenCast` — no portal, no picker, no permission prompt), and a 4K window recording, a mid-recording resize, the end of a recording on window close, and the replay's `status`/`save`/`stop` were all measured; `--follow` is unavailable on that route (the service casts the window it was started with). **One throttling caveat on niri's side**: it draws the cast inside its **output render loop**, so an inactive session barely renders at all (measured at about 1.3 fps); for a normal frame rate, niri's VT has to be the active one. **KWin/Plasma**: D-Bus capture, the window list, long screenshots, and window recording and replay were all measured against a **headless `--virtual` KWin** (including the retry rule for authorizations transiently refused while ksycoca is rewritten); **still unverified**: `--cursor`, the full `--pick` interaction on a window click, and scroll injection (that needs acceptance on KDE).
 - **Sway / labwc / GNOME** — Sway is probe implementations and unit tests only, with **no live verification**; **labwc and other compositors providing wlr-screencopy** should work for basic capture in theory, but there is no window list and no pin-landing probe, and there is **no live verification**; **GNOME** is unsupported, with no plan to implement it (Mutter provides neither wlr-screencopy nor KWin's D-Bus service, and not even layer-shell).
+- **Screen annotation (`annotate`)** — verified on **Hyprland** only (drawing, erasing, text, undo/redo, a separate canvas and toolbar per output, and the toolbar hiding itself during a capture or recording); niri, KWin/Plasma, Sway and labwc are all **untested**.
 
 ### The cursor (`--cursor`)
 vshot never draws a cursor itself; `--cursor` only sets an "overlay the pointer" flag on the compositor's capture request (`wlr-screencopy`'s `overlay_cursor`, KWin's `include-cursor`), and whether, where, and when it is drawn is entirely up to the compositor; it has no effect on `long` (see the next entry), and whether KWin really draws a cursor is unverified.
@@ -595,6 +624,8 @@ The default is **square corners with a shadow**: a screenshot is a picture of a 
 | `VSHOT_PIN_DEBUG=1` | The daemon prints every pin's density decision |
 | `VSHOT_PIN_FOCUS_DEBUG=1` | The daemon prints every focus change of every pin render surface |
 | `VSHOT_PIN_SOURCE_FILE` | Overrides the screenshot tool's record path (default `/tmp/screenshot-path`) |
+| `VSHOT_ANNOTATE_SOCKET` | The socket the annotation daemon listens on (default `$XDG_RUNTIME_DIR/vshot-annotate-<uid>.sock`) |
+| `VSHOT_ANNOTATE_DEBUG=1` | Keep the annotation daemon's diagnostics on stderr |
 | `VSHOT_RECORD_PIDFILE` | The pid file `vshot record stop` reads (default `$XDG_RUNTIME_DIR/vshot-record-<uid>.pid`) |
 | `VSHOT_RECORD_DEBUG=1` | The recording/replay loop traces each frame's stage (grab/encode/mux) and the libavcodec version in use |
 | `VSHOT_PORTAL_SHM=1` | `record --portal` asks for memory frames instead of dma-bufs (the fallback when a compositor's buffers cannot be imported) |
@@ -611,6 +642,7 @@ The default is **square corners with a shadow**: a screenshot is a picture of a 
 - **Text**: the Qt text box accepts arbitrary Unicode (including CJK submitted by an input method); a result from an old helper that carries no bitmap falls back to Rust's built-in 5x7 font, which only supports printable ASCII;
 - **`monitor current`** depends on receiving pointer enter/motion on the overlay; generic Wayland has no readable global mouse position, so vshot never guesses with the first output;
 - **Replay**: `replay start --portal` is not supported yet (the portal's frame loop is not wired to the ring, and it refuses with a sentence saying so); one session runs at a time;
+- **Screen annotation**: the toolbar is **not** hidden automatically while `vshot replay start` runs (a replay grabs continuously, and hiding it for the whole session would make the overlay unusable), so annotate and replay are not meant to run together; like the pin overlay it needs `wlr-layer-shell`, so a compositor without layer shell cannot draw it; verified on **Hyprland** only, other desktops untested.
 - Native screencopy waits up to 10 seconds for the compositor to return a frame, and times out with an error instead of blocking forever.
 
 ## Verification
@@ -621,7 +653,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --release --locked
 ```
 
-The Qt helper has no test framework, only **offscreen checks that need no compositor** (not built by default; add `-DVSHOT_BUILD_CHECKS=ON`), covering config reads and writes with the settings window, the text size conversion, clipboard color parsing and color card rendering, a pin's self-declared density and outline, text card padding, the color card's right-click menu, and the export format of a pasted image:
+The Qt helper has no test framework, only **offscreen checks that need no compositor** (not built by default; add `-DVSHOT_BUILD_CHECKS=ON`), covering config reads and writes with the settings window, the text size conversion, clipboard color parsing and color card rendering, a pin's self-declared density and outline, text card padding, the color card's right-click menu, the export format of a pasted image, and the annotation overlay's five tools with undo, clear and the toolbar's placement:
 
 ```sh
 cmake -S . -B build-qt -DVSHOT_BUILD_CHECKS=ON && cmake --build build-qt
@@ -634,6 +666,7 @@ QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-outline-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-text-card-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-menu-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-paste-check
+QT_QPA_PLATFORM=offscreen build-qt/vshot-annotate-check
 ```
 
 There are also 5 integration tests that are **not run** by default (`#[ignore]`), needing a real environment: KWin's D-Bus capture and backend selection (see the comments in `src/capture/kwin.rs`; a headless KWin suffices — virtual output named `Virtual-0`, 1024x768, no pointer capability — so it only covers the D-Bus capture layer), the active output probe (needs any real session), `/dev/uinput` scroll injection (needs write access), and **the built-in OCR engine reading drawn text** (needs those 30 MB of models on disk, which `cargo test` has nowhere to fetch them from). To run them:

@@ -77,6 +77,11 @@ pub enum VshotError {
     Clipboard(String),
     #[error("pin failed: {0}")]
     Pin(String),
+    /// Screen annotation: the resident overlay daemon, its socket, or the Qt
+    /// helper behind it.  The message is a complete sentence because the
+    /// failures span an optional helper process the user may never have built.
+    #[error("screen annotation failed: {0}")]
+    Annotate(String),
     #[error("text recognition failed: {0}")]
     Ocr(String),
     /// Scrolling capture: the frames could not be stitched, or what was asked

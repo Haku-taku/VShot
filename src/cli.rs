@@ -27,6 +27,8 @@ Capture targets
   record mics|stop             the audio inputs a recording could take
   replay start|save|status|stop
                                the last stretch of the screen kept in memory
+  annotate toggle|show|hide|clear|quit|status
+                               draw on the live screen through a daemon
 
 Destination (every capture above goes to exactly one)
   -o, --output PATH   PNG at PATH, strftime-expanded
@@ -49,11 +51,14 @@ active` and `window pick` there use niri's own screenshot and crosshair.
 
 `vshot pin` captures nothing: it drives the resident pin daemon, which pins
 image files or whatever --clipboard holds, and exits once nothing is pinned.
+`vshot annotate` captures nothing either: it drives the resident annotation
+overlay, which draws on the live screen and hides its toolbar while a capture or
+a recording runs.
 
 Environment: VSHOT_QT_HELPER (which vshot-qt-ui), VSHOT_LANG (UI language),
 VSHOT_PIXEL_DEBUG=1, VSHOT_SESSION_DEBUG=1, VSHOT_LONG_DEBUG_DIR=<dir>,
 VSHOT_PIN_DEBUG=1, VSHOT_PIN_FOCUS_DEBUG=1, VSHOT_PIN_SOCKET,
-VSHOT_PIN_DENSITY=N.
+VSHOT_PIN_DENSITY=N, VSHOT_ANNOTATE_SOCKET, VSHOT_ANNOTATE_DEBUG=1.
 
 $XDG_CONFIG_HOME/vshot/config.json (or ~/.config/vshot/config.json) is
 optional: `editor` is the annotation editor's style, `cli` supplies defaults for
@@ -244,6 +249,34 @@ VSHOT_PIN_FOCUS_DEBUG=1 trace density decisions and surface focus to stderr."#
         /// and write the result back onto the pin. Not for interactive use.
         #[arg(long = "apply", hide = true, conflicts_with_all = ["toggle", "show", "hide", "close_all", "quit", "list", "density"])]
         apply: Option<PathBuf>,
+    },
+
+    /// Draw on the live screen: a resident overlay with its own toolbar.
+    #[command(
+        after_help = r#"The overlay is a resident daemon: `toggle` starts it, and it stays until `quit`
+or the ✕ on its toolbar. Each output gets its own transparent surface and its
+own drawing, with its own small toolbar -- Draw, Erase, Rect, Arrow, Text, six
+colours, three widths, Undo, Redo, Clear, Quit -- placed along the top edge and
+dragged anywhere by its grip.
+
+`hide` keeps what is drawn, so `show` brings it back, and `clear` forgets it.
+`show` and `toggle` start the daemon when none is running; `hide`, `clear`,
+`quit` and `status` never do. A screenshot or a recording hides the toolbar by
+itself, so the annotations are in the picture and the toolbar is not.
+
+While the overlay is up it takes every click on the output -- that is what
+"draw anywhere" means -- so a second key to `toggle` or `hide` is what gives the
+pointer back. Wayland clients cannot receive global keys, so bind them in your
+compositor, e.g. Hyprland:
+    bind = SUPER, A, exec, vshot annotate toggle
+    bind = SUPER SHIFT, A, exec, vshot annotate quit
+
+VSHOT_ANNOTATE_SOCKET overrides the daemon's socket, VSHOT_ANNOTATE_DEBUG=1
+keeps its diagnostics on stderr."#
+    )]
+    Annotate {
+        #[command(subcommand)]
+        action: AnnotateCommandLine,
     },
 
     /// Edit the remembered settings in a window: the annotation editor's style
@@ -482,6 +515,24 @@ stdout. See the README's OCR section."#
         #[arg(long, value_name = "PATH", conflicts_with_all = ["geometry", "interactive"])]
         input: Option<PathBuf>,
     },
+}
+
+/// What `vshot annotate` was asked of the resident overlay daemon.  The
+/// mapping onto the socket's own vocabulary lives in `src/annotate.rs`.
+#[derive(Debug, Subcommand)]
+pub enum AnnotateCommandLine {
+    /// Flip the overlay: hidden becomes shown, shown becomes hidden.
+    Toggle,
+    /// Show the overlay, starting the daemon when it is not running.
+    Show,
+    /// Hide the overlay, keeping everything that is drawn.
+    Hide,
+    /// Forget every annotation, on every output.
+    Clear,
+    /// Quit the annotation daemon, drawing and all.
+    Quit,
+    /// Report whether the daemon is running, and what it holds.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -769,6 +820,9 @@ pub enum Action {
     Pin(crate::pin::PinInvocation),
     /// Internal: render one pin-edit session and write the result back.
     PinApply(std::path::PathBuf),
+    /// Control the resident annotation overlay: toggle, show, hide, clear, quit,
+    /// or ask what it holds.
+    Annotate(crate::annotate::AnnotateAction),
     /// Show the settings window and wait for it to close.
     Settings,
     /// Read the text out of a region, to stdout or the clipboard.
@@ -1382,6 +1436,25 @@ impl Cli {
                 }
             };
         }
+        if let Command::Annotate { action } = &self.command {
+            // The overlay draws on the live screen instead of capturing it, so
+            // it has no destination to argue about -- the same refusal
+            // `settings` makes.
+            if self.output.is_some() || self.pin || self.clipboard {
+                return Err(VshotError::InvalidDestination(
+                    "--output, --clipboard and --pin do not apply to the annotate subcommand"
+                        .into(),
+                ));
+            }
+            return Ok(Action::Annotate(match action {
+                AnnotateCommandLine::Toggle => crate::annotate::AnnotateAction::Toggle,
+                AnnotateCommandLine::Show => crate::annotate::AnnotateAction::Show,
+                AnnotateCommandLine::Hide => crate::annotate::AnnotateAction::Hide,
+                AnnotateCommandLine::Clear => crate::annotate::AnnotateAction::Clear,
+                AnnotateCommandLine::Quit => crate::annotate::AnnotateAction::Quit,
+                AnnotateCommandLine::Status => crate::annotate::AnnotateAction::Status,
+            }));
+        }
         if let Command::Settings = &self.command {
             // Nothing else applies: this subcommand captures nothing and has
             // no destination to argue about.
@@ -1552,6 +1625,11 @@ impl Cli {
             Command::Settings => {
                 return Err(VshotError::InvalidDestination(
                     "the settings subcommand is not a capture target".into(),
+                ))
+            }
+            Command::Annotate { .. } => {
+                return Err(VshotError::InvalidDestination(
+                    "the annotate subcommand is not a capture target".into(),
                 ))
             }
             Command::Ocr { .. } => {
@@ -2084,6 +2162,42 @@ mod tests {
             error.to_string().contains("mutually exclusive")
                 || error.to_string().contains("cannot be used")
         );
+    }
+
+    #[test]
+    fn annotate_maps_every_subcommand_onto_its_daemon_command() {
+        use crate::annotate::AnnotateAction;
+
+        let cases: &[(&str, AnnotateAction)] = &[
+            ("toggle", AnnotateAction::Toggle),
+            ("show", AnnotateAction::Show),
+            ("hide", AnnotateAction::Hide),
+            ("clear", AnnotateAction::Clear),
+            ("quit", AnnotateAction::Quit),
+            ("status", AnnotateAction::Status),
+        ];
+        for (word, expected) in cases {
+            assert_eq!(
+                Cli::try_parse_action_from(["vshot", "annotate", word]).unwrap(),
+                Action::Annotate(*expected),
+                "`annotate {word}`"
+            );
+        }
+
+        // The overlay draws on the screen instead of capturing it, so the
+        // destination flags are a mistake worth naming rather than one to
+        // ignore: a user who wrote `-o` expected a file somewhere.
+        let error = Cli::try_parse_action_from(["vshot", "annotate", "show", "--output", "a.png"])
+            .unwrap_err();
+        assert!(error.to_string().contains("--output"), "{error}");
+        let error =
+            Cli::try_parse_action_from(["vshot", "annotate", "show", "--clipboard"]).unwrap_err();
+        assert!(error.to_string().contains("--clipboard"), "{error}");
+        let error = Cli::try_parse_action_from(["vshot", "annotate", "show", "--pin"]).unwrap_err();
+        assert!(error.to_string().contains("--pin"), "{error}");
+        // A subcommand is not optional: `vshot annotate` alone has nothing to
+        // ask the daemon.
+        assert!(Cli::try_parse_action_from(["vshot", "annotate"]).is_err());
     }
 
     #[test]
