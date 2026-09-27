@@ -15,6 +15,7 @@
 #include <QWidget>
 
 #include <functional>
+#include <memory>
 #include <optional>
 
 class QPainter;
@@ -28,6 +29,12 @@ class QSocketNotifier;
 class QTimer;
 
 namespace vshot {
+
+// Rasterizes one annotation and remembers the result.  Defined in the Qt
+// helper; `Annotation` only holds its cache.  Forward-declared so the cache
+// stays a `std::shared_ptr` and a copy of an annotation (an undo snapshot, a
+// drag ghost) stays cheap.
+class AnnotationRaster;
 
 struct Point {
     std::int32_t x = 0;
@@ -81,6 +88,19 @@ struct Annotation {
     std::uint32_t deviceRatio = 1;
     // The pasted image itself, at its own resolution (`Kind::Image` only).
     QImage pixels;
+    // The last rasterized form of this annotation, kept so a repaint can blit
+    // it instead of drawing the mark again.  A mosaic preview averages the
+    // source image block by block, so redrawing every mark on every pointer
+    // move is what made a busy capture stutter; the raster rebuilds itself
+    // only when something the mark draws changes.  Shared (so copies are
+    // cheap) and deliberately ignored by `annotationEquals`: it is derived
+    // state, not content.
+    mutable std::shared_ptr<AnnotationRaster> raster;
+
+    // How many times `raster` has been built, or -1 when it has not been built
+    // yet.  Lets the offline check tell a repaint that reused the cache from
+    // one that rasterized the mark again, without seeing the raster's type.
+    int rasterRebuilds() const;
 };
 
 inline bool annotationEquals(const Annotation &first, const Annotation &second)
