@@ -24,6 +24,7 @@
 #include <QScreen>
 #include <QSize>
 #include <QSizePolicy>
+#include <QTransform>
 #include <QWindow>
 
 #include <algorithm>
@@ -932,39 +933,48 @@ double AnnotateSurface::deviceRatio() const
     return screen_ != nullptr ? screen_->devicePixelRatio() : 1.0;
 }
 
-QImage &AnnotateSurface::canvas()
-{
-    const double ratio = deviceRatio();
-    const QSize target(std::max(1, qRound(width() * ratio)),
-                       std::max(1, qRound(height() * ratio)));
-    if (canvas_.isNull() || canvas_.size() != target) {
-        rebuildCanvas();
-    }
-    return canvas_;
-}
-
-void AnnotateSurface::rebuildCanvas()
-{
-    const double ratio = deviceRatio();
-    const QSize target(std::max(1, qRound(width() * ratio)),
-                       std::max(1, qRound(height() * ratio)));
-    // A brand-new image rather than a clear: the old one held strokes that may
-    // have been removed, and reusing its storage buys nothing.
-    canvas_ = QImage(target, QImage::Format_ARGB32_Premultiplied);
-    canvas_.fill(Qt::transparent);
-    QPainter painter(&canvas_);
-    // The canvas is in device pixels while strokes are in logical ones, so the
-    // painter is scaled once here and every stroke is drawn in logical space.
-    painter.setRenderHint(QPainter::Antialiasing, true);
-    painter.scale(ratio, ratio);
-    for (const Stroke &stroke : strokes_) {
-        paintStroke(painter, stroke);
-    }
-}
-
 void AnnotateSurface::paintStroke(QPainter &painter, const Stroke &stroke) const
 {
     paintStrokeInk(painter, stroke.tool, stroke.points, stroke.color, stroke.width, stroke.text);
+}
+
+const AnnotateSurface::StrokeRaster *AnnotateSurface::rasterFor(Stroke &stroke)
+{
+    if (stroke.tool == Tool::Eraser) {
+        return nullptr;
+    }
+    const QRectF bounds = strokeBounds(stroke.tool, stroke.points, stroke.width, stroke.text);
+    if (bounds.isNull()) {
+        return nullptr;
+    }
+    const double ratio = deviceRatio();
+    if (stroke.raster != nullptr && stroke.raster->ratio == ratio) {
+        return stroke.raster.get();
+    }
+    const QRect device = deviceDirtyRect(stroke);
+    if (device.isEmpty()) {
+        return nullptr;
+    }
+    auto raster = std::make_shared<StrokeRaster>();
+    raster->logicalBounds = bounds;
+    raster->origin = device.topLeft();
+    raster->ratio = ratio;
+    raster->image = QImage(device.size(), QImage::Format_ARGB32_Premultiplied);
+    raster->image.fill(Qt::transparent);
+    {
+        QPainter painter(&raster->image);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        // Scaled by the device ratio and shifted by whole device pixels, so the
+        // ink lands on exactly the pixels it landed on when every stroke was
+        // drawn into one canvas: same scale, same antialiasing phase.
+        painter.setTransform(QTransform(ratio, 0.0, 0.0, ratio,
+                                        -static_cast<qreal>(device.x()),
+                                        -static_cast<qreal>(device.y())));
+        paintStroke(painter, stroke);
+    }
+    ++rasterBuilds_;
+    stroke.raster = raster;
+    return stroke.raster.get();
 }
 
 QRect AnnotateSurface::deviceDirtyRect(const Stroke &stroke) const
@@ -984,9 +994,13 @@ QRect AnnotateSurface::deviceDirtyRect(const Stroke &stroke) const
 
 void AnnotateSurface::touch(const QRect &logical)
 {
-    if (logical.isValid()) {
-        update(logical);
+    if (!logical.isValid()) {
+        return;
     }
+    // Accumulated as well as sent: the checks compare one interactive step's
+    // repaint region against the pixels that step changed.
+    invalidated_ = invalidated_.united(logical);
+    update(logical);
 }
 
 bool AnnotateSurface::strokeHits(const Stroke &stroke, const QPointF &local) const
@@ -1043,12 +1057,10 @@ bool AnnotateSurface::eraseStrokeAt(const QPointF &local)
         const QRectF box =
             strokeBounds(stroke.tool, stroke.points, stroke.width, stroke.text);
         const QRect dirty = grownDirtyRect(box);
-        pushHistory();
+        pushHistory(dirty);
+        // Dropping the stroke out of the list is the whole change: every other
+        // stroke owns its own cached ink, so nothing else has to be rebuilt.
         strokes_.removeAt(i);
-        // The whole image is rebuilt because a removal cannot be expressed as a
-        // patch, but only the removed stroke's rect is repainted: every other
-        // pixel of the new canvas is identical to the old one.
-        rebuildCanvas();
         touch(dirty);
         if (toolbar_ != nullptr) {
             toolbar_->syncState();
@@ -1058,9 +1070,9 @@ bool AnnotateSurface::eraseStrokeAt(const QPointF &local)
     return false;
 }
 
-void AnnotateSurface::pushHistory()
+void AnnotateSurface::pushHistory(const QRect &dirty)
 {
-    undoStack_.append(strokes_);
+    undoStack_.append(HistoryEntry{strokes_, dirty});
     // Any fresh change makes the redo branch unreachable.
     redoStack_.clear();
 }
@@ -1070,10 +1082,12 @@ void AnnotateSurface::undo()
     if (undoStack_.isEmpty()) {
         return;
     }
-    redoStack_.append(strokes_);
-    strokes_ = undoStack_.takeLast();
-    rebuildCanvas();
-    update();
+    const HistoryEntry entry = undoStack_.takeLast();
+    // The state being replaced keeps the entry's rect: the region that differs
+    // is the same in both directions.
+    redoStack_.append(HistoryEntry{strokes_, entry.dirty});
+    strokes_ = entry.strokes;
+    touch(entry.dirty);
     if (toolbar_ != nullptr) {
         toolbar_->syncState();
     }
@@ -1084,10 +1098,12 @@ void AnnotateSurface::redo()
     if (redoStack_.isEmpty()) {
         return;
     }
-    undoStack_.append(strokes_);
-    strokes_ = redoStack_.takeLast();
-    rebuildCanvas();
-    update();
+    const HistoryEntry entry = redoStack_.takeLast();
+    // Symmetric to undo: the entry's rect is the region that has to be
+    // repainted, whichever way the step goes.
+    undoStack_.append(HistoryEntry{strokes_, entry.dirty});
+    strokes_ = entry.strokes;
+    touch(entry.dirty);
     if (toolbar_ != nullptr) {
         toolbar_->syncState();
     }
@@ -1098,10 +1114,14 @@ void AnnotateSurface::clear()
     if (strokes_.isEmpty()) {
         return;
     }
-    pushHistory();
+    QRect dirty;
+    for (const Stroke &stroke : strokes_) {
+        dirty = dirty.united(grownDirtyRect(
+            strokeBounds(stroke.tool, stroke.points, stroke.width, stroke.text)));
+    }
+    pushHistory(dirty);
     strokes_.clear();
-    rebuildCanvas();
-    update();
+    touch(dirty);
     if (toolbar_ != nullptr) {
         toolbar_->syncState();
     }
@@ -1182,16 +1202,10 @@ void AnnotateSurface::finishText(bool accept)
     stroke.text = value;
     const QRect dirty = grownDirtyRect(strokeBounds(stroke.tool, stroke.points, stroke.width,
                                                     stroke.text));
-    pushHistory();
+    pushHistory(dirty);
+    // The label's ink is built on the next paint by `rasterFor`, like any other
+    // stroke's.
     strokes_.append(stroke);
-    {
-        const double ratio = deviceRatio();
-        QPainter painter(&canvas());
-        painter.setRenderHint(QPainter::Antialiasing, true);
-        painter.setClipRect(deviceDirtyRect(stroke));
-        painter.scale(ratio, ratio);
-        paintStroke(painter, stroke);
-    }
     touch(dirty);
     if (toolbar_ != nullptr) {
         toolbar_->syncState();
@@ -1200,23 +1214,35 @@ void AnnotateSurface::finishText(bool accept)
 
 void AnnotateSurface::paintEvent(QPaintEvent *event)
 {
-    Q_UNUSED(event);
     QPainter painter(this);
-    // Clear the dirty region to transparent first: the canvas is blitted with
-    // SourceOver, which would leave the previous frame's pixels wherever the
-    // canvas is transparent (the whole output, most of the time).
+    // Clear the repainted region to transparent first: the strokes are blitted
+    // with SourceOver, and apart from its ink this surface is see-through.
     painter.setCompositionMode(QPainter::CompositionMode_Source);
-    painter.fillRect(rect(), Qt::transparent);
+    painter.fillRect(event->rect(), Qt::transparent);
     painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
-    // The canvas is this surface at device resolution, so on a 2x output this
-    // is a clean 2:1 blit; smoothing would only cost time and soften strokes.
+    // Each stroke is a device-pixel image blitted at 1:1, so smoothing would
+    // only cost time and soften the ink.
     painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
-    painter.drawImage(rect(), canvas());
-    // Rect and Arrow are the only tools whose in-progress shape is not already
-    // in the canvas: their whole shape lives in `pending_` and is drawn here,
-    // with the previous preview's rect repainted when the shape changes.  The
-    // pen has already put its segments into the canvas and must not be redrawn.
-    if (drawing_ && (tool_ == Tool::Rect || tool_ == Tool::Arrow)) {
+    // A repaint narrowed to what a gesture touched must not pay for the strokes
+    // outside it.  The clip is in this widget's logical coordinates, the same
+    // ones a stroke's bounds are in.
+    const QRectF exposed = painter.hasClipping() ? painter.clipBoundingRect() : QRectF(rect());
+    for (Stroke &stroke : strokes_) {
+        const StrokeRaster *raster = rasterFor(stroke);
+        if (raster == nullptr || !raster->logicalBounds.intersects(exposed)) {
+            continue;
+        }
+        const double ratio = raster->ratio;
+        const QRectF target(static_cast<qreal>(raster->origin.x()) / ratio,
+                            static_cast<qreal>(raster->origin.y()) / ratio,
+                            static_cast<qreal>(raster->image.width()) / ratio,
+                            static_cast<qreal>(raster->image.height()) / ratio);
+        painter.drawImage(target, raster->image, QRectF(raster->image.rect()));
+    }
+    // The stroke being drawn lives only in `pending_`: the preview is the one
+    // thing this surface paints from the model rather than from cached ink, and
+    // every tool goes through it now.
+    if (drawing_) {
         painter.setRenderHint(QPainter::Antialiasing, true);
         paintStroke(painter, pending_);
     }
@@ -1242,7 +1268,10 @@ void AnnotateSurface::mousePressEvent(QMouseEvent *event)
         pending_.width = width_;
         pending_.points = {local};
         drawing_ = true;
-        canvas(); // make sure the backing image exists before the first motion
+        // The preview paints the first dot straight away; nothing is committed
+        // until the button comes up.
+        touch(grownDirtyRect(
+            strokeBounds(pending_.tool, pending_.points, pending_.width, pending_.text)));
         break;
     case Tool::Rect:
     case Tool::Arrow:
@@ -1290,20 +1319,11 @@ void AnnotateSurface::mouseMoveEvent(QMouseEvent *event)
     if (tool_ == Tool::Pen) {
         const QPointF from = pending_.points.constLast();
         pending_.points.append(local);
-        // Only the new segment is drawn into the canvas.  Re-drawing the whole
-        // polyline per motion event would repaint a 4K image sixty times a
-        // second for a two-pixel segment.
-        const double ratio = deviceRatio();
-        QPainter painter(&canvas());
-        painter.setRenderHint(QPainter::Antialiasing, true);
-        painter.scale(ratio, ratio);
-        painter.setPen(QPen(pending_.color, pending_.width, Qt::SolidLine, Qt::RoundCap,
-                            Qt::RoundJoin));
-        painter.drawLine(from, local);
-        touch(normalizedRect(from, local)
-                  .adjusted(-pending_.width, -pending_.width, pending_.width, pending_.width)
-                  .toAlignedRect()
-                  .adjusted(-2, -2, 2, 2));
+        // The preview paints the whole polyline from the model, so only the part
+        // this step can have changed needs repainting.
+        touch(grownDirtyRect(
+            normalizedRect(from, local)
+                .adjusted(-pending_.width, -pending_.width, pending_.width, pending_.width)));
     } else if (tool_ == Tool::Rect || tool_ == Tool::Arrow) {
         const QRect before = grownDirtyRect(
             strokeBounds(pending_.tool, pending_.points, pending_.width, pending_.text));
@@ -1347,18 +1367,6 @@ void AnnotateSurface::mouseReleaseEvent(QMouseEvent *event)
             pending_.points.last() = event->position();
         }
     }
-    const bool penDot = tool_ == Tool::Pen && pending_.points.size() == 1;
-    if (penDot) {
-        // A click that never moved: the incremental path saw no segment, so the
-        // dot is put into the canvas here.
-        const double ratio = deviceRatio();
-        QPainter painter(&canvas());
-        painter.setRenderHint(QPainter::Antialiasing, true);
-        painter.scale(ratio, ratio);
-        painter.setPen(QPen(pending_.color, pending_.width, Qt::SolidLine, Qt::RoundCap,
-                            Qt::RoundJoin));
-        painter.drawPoint(pending_.points.constFirst());
-    }
     if (!pending_.points.isEmpty()) {
         const Stroke committed = pending_;
         pending_ = Stroke();
@@ -1367,23 +1375,11 @@ void AnnotateSurface::mouseReleaseEvent(QMouseEvent *event)
         if (stalePreview.isValid()) {
             dirty = dirty.united(stalePreview);
         }
-        pushHistory();
+        pushHistory(dirty);
         strokes_.append(committed);
-        if (committed.tool != Tool::Pen) {
-            // The pen's ink is already in the canvas; a shape's is not, so it is
-            // rasterized now, clipped to the rect it can have touched.
-            const double ratio = deviceRatio();
-            QPainter painter(&canvas());
-            painter.setRenderHint(QPainter::Antialiasing, true);
-            painter.setClipRect(deviceDirtyRect(committed));
-            painter.scale(ratio, ratio);
-            paintStroke(painter, committed);
-        }
-        if (penDot || committed.tool != Tool::Pen) {
-            // The pen's segments were repainted as they were drawn; a pen dot
-            // and every shape need this region repainted.
-            touch(dirty);
-        }
+        // The stroke appears in one go at release, so its whole rect has to be
+        // repainted: the preview is gone and the committed ink is drawn instead.
+        touch(dirty);
         if (toolbar_ != nullptr) {
             toolbar_->syncState();
         }
@@ -1395,9 +1391,8 @@ void AnnotateSurface::mouseReleaseEvent(QMouseEvent *event)
 void AnnotateSurface::resizeEvent(QResizeEvent *event)
 {
     QWidget::resizeEvent(event);
-    // The canvas is tied to the surface's size, so a resize rebuilds it from the
-    // stroke list rather than trying to scale the old one.
-    rebuildCanvas();
+    // Nothing to rebuild: a stroke's cached ink is sized in device pixels and
+    // does not depend on the surface's size, so a resize only moves the toolbar.
     if (toolbar_ != nullptr) {
         toolbar_->reposition();
     }
@@ -1412,14 +1407,13 @@ void AnnotateSurface::keyPressEvent(QKeyEvent *event)
             return;
         }
         if (drawing_) {
-            // Drop the in-progress stroke.  For Rect and Arrow it lived only in
-            // `pending_`; for the pen the ink is already in the canvas, so the
-            // canvas is rebuilt from the committed strokes.  Either way the
-            // unfinished stroke never reaches the model.
+            // Drop the in-progress stroke.  It lives only in `pending_`, which
+            // the preview paints, so repainting its rect is the whole undo.
+            const QRect dirty = grownDirtyRect(
+                strokeBounds(pending_.tool, pending_.points, pending_.width, pending_.text));
             drawing_ = false;
             pending_ = Stroke();
-            rebuildCanvas();
-            update();
+            touch(dirty);
             event->accept();
             return;
         }

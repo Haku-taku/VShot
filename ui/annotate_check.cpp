@@ -36,6 +36,7 @@
 #include <QWidget>
 
 #include <cstdio>
+#include <functional>
 
 namespace {
 
@@ -144,6 +145,61 @@ void drag(QWidget *surface, const QPoint &from, const QPoint &to)
         moveTo(surface, at);
     }
     release(surface, to);
+}
+
+// The area the surface's live child widgets cover, in surface coordinates.  The
+// toolbar and its buttons repaint themselves when their own state changes -- Qt
+// drives that, not the surface's invalidated region -- so a difference under a
+// child is not something the surface's rect can be blamed for.
+QVector<QRect> childAreas(const QWidget &surface)
+{
+    QVector<QRect> areas;
+    for (QWidget *child : surface.findChildren<QWidget *>()) {
+        if (child->isWindow() || child->isHidden()) {
+            continue;
+        }
+        areas.append(QRect(child->mapTo(&surface, QPoint()), child->size()));
+    }
+    return areas;
+}
+
+// Every pixel an interactive step changes has to fall inside the region the
+// step asked to repaint: a pixel outside it is one this surface would have left
+// stale on screen.  Pixels inside a child widget (the toolbar repaints itself
+// through syncState) are not the surface's to repaint.
+void expectStepCovered(vshot::AnnotateSurface &surface, const char *what,
+                       const std::function<void()> &step)
+{
+    const QImage before = renderSurface(surface);
+    surface.clearInvalidatedRect();
+    step();
+    const QImage after = renderSurface(surface);
+    const QRect allowed = surface.invalidatedRect().adjusted(-1, -1, 1, 1);
+    const QVector<QRect> children = childAreas(surface);
+    int outside = 0;
+    for (int y = 0; y < after.height(); ++y) {
+        for (int x = 0; x < after.width(); ++x) {
+            if (before.pixel(x, y) == after.pixel(x, y)) {
+                continue;
+            }
+            const QPoint at(x, y);
+            if (allowed.contains(at)) {
+                continue;
+            }
+            bool inChild = false;
+            for (const QRect &child : children) {
+                if (child.contains(at)) {
+                    inChild = true;
+                    break;
+                }
+            }
+            if (!inChild) {
+                ++outside;
+            }
+        }
+    }
+    expect(what, outside == 0,
+           QStringLiteral("%1 px changed outside the invalidated region").arg(outside));
 }
 
 void checkPenAndRect(vshot::AnnotateSurface &surface)
@@ -309,6 +365,111 @@ void checkText(vshot::AnnotateSurface &surface)
            QStringLiteral("strokeCount=%1").arg(surface.strokeCount()));
 }
 
+// The repaint region of every interactive step has to cover the pixels the step
+// changed: a pixel it changed outside that region is one the surface would have
+// left stale until something else repainted it.
+void checkStepCoverage(QScreen *screen)
+{
+    // A pen drag: the press paints the first dot, every motion extends it.
+    {
+        vshot::AnnotateSurface surface(screen);
+        surface.setGeometry(0, 0, kSurfaceWidth, kSurfaceHeight);
+        surface.setTool(vshot::AnnotateSurface::Tool::Pen);
+        surface.setPenWidth(6);
+        expectStepCovered(surface, "a pen press repaints the dot it starts",
+                          [&] { press(&surface, QPoint(40, 120)); });
+        expectStepCovered(surface, "the pen's first motion repaints what it added",
+                          [&] { moveTo(&surface, QPoint(80, 120)); });
+        expectStepCovered(surface, "the pen's next motion repaints what it added",
+                          [&] { moveTo(&surface, QPoint(140, 120)); });
+        release(&surface, QPoint(140, 120));
+    }
+
+    // The eraser: a drag step drops a whole stroke out of the list.
+    {
+        vshot::AnnotateSurface surface(screen);
+        surface.setGeometry(0, 0, kSurfaceWidth, kSurfaceHeight);
+        surface.setTool(vshot::AnnotateSurface::Tool::Pen);
+        surface.setPenWidth(6);
+        drag(&surface, QPoint(40, 120), QPoint(200, 120));
+        drag(&surface, QPoint(40, 220), QPoint(200, 220));
+        surface.setTool(vshot::AnnotateSurface::Tool::Eraser);
+        press(&surface, QPoint(120, 260));
+        expectStepCovered(surface, "an eraser motion repaints only the stroke it takes",
+                          [&] { moveTo(&surface, QPoint(120, 180)); });
+        release(&surface, QPoint(120, 180));
+    }
+
+    // A rectangle: the drag grows the preview, the release commits a shape that
+    // can be smaller than the preview it replaces.
+    {
+        vshot::AnnotateSurface surface(screen);
+        surface.setGeometry(0, 0, kSurfaceWidth, kSurfaceHeight);
+        surface.setTool(vshot::AnnotateSurface::Tool::Rect);
+        surface.setPenWidth(6);
+        press(&surface, QPoint(40, 40));
+        expectStepCovered(surface, "a rect drag repaints the shape it grew",
+                          [&] { moveTo(&surface, QPoint(160, 90)); });
+        expectStepCovered(surface, "a shape release repaints the old preview and the new shape",
+                          [&] { release(&surface, QPoint(120, 70)); });
+    }
+
+    // Escape drops the in-progress stroke, which lives only in the preview.
+    {
+        vshot::AnnotateSurface surface(screen);
+        surface.setGeometry(0, 0, kSurfaceWidth, kSurfaceHeight);
+        surface.setTool(vshot::AnnotateSurface::Tool::Pen);
+        surface.setPenWidth(6);
+        press(&surface, QPoint(40, 120));
+        moveTo(&surface, QPoint(200, 120));
+        expectStepCovered(surface, "Escape repaints the in-progress stroke it drops", [&] {
+            QKeyEvent escape(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
+            QApplication::sendEvent(&surface, &escape);
+        });
+    }
+}
+
+// A stroke rasterizes once and a repaint that changes nothing reuses it;
+// removing one stroke leaves every other stroke's ink cached.
+void checkRasterReuse(QScreen *screen)
+{
+    vshot::AnnotateSurface surface(screen);
+    surface.setGeometry(0, 0, kSurfaceWidth, kSurfaceHeight);
+    surface.setTool(vshot::AnnotateSurface::Tool::Pen);
+    surface.setPenWidth(6);
+    const int rows[] = {120, 220, 320, 420};
+    for (const int y : rows) {
+        drag(&surface, QPoint(60, y), QPoint(220, y));
+    }
+    expect("four separate strokes were drawn", surface.strokeCount() == 4,
+           QStringLiteral("strokeCount=%1").arg(surface.strokeCount()));
+
+    // A stroke's ink is built lazily, on its first paint, so the count is only
+    // meaningful after one render.
+    renderSurface(surface);
+    const int builds = surface.rasterBuilds();
+    expect("four strokes rasterized once each", builds == 4,
+           QStringLiteral("rasterBuilds=%1").arg(builds));
+
+    // A repaint that changes nothing must not rebuild anything.
+    renderSurface(surface);
+    renderSurface(surface);
+    expect("a repaint that changes nothing rebuilds nothing",
+           surface.rasterBuilds() == builds,
+           QStringLiteral("rasterBuilds=%1").arg(surface.rasterBuilds()));
+
+    // Erase exactly one stroke, then repaint: the remaining three keep the ink
+    // they already built, so the repaint adds nothing to the count.
+    surface.setTool(vshot::AnnotateSurface::Tool::Eraser);
+    drag(&surface, QPoint(120, 260), QPoint(120, 180));
+    renderSurface(surface);
+    expect("erasing removed one stroke", surface.strokeCount() == 3,
+           QStringLiteral("strokeCount=%1").arg(surface.strokeCount()));
+    expect("removing one stroke leaves the others' ink cached",
+           surface.rasterBuilds() == builds,
+           QStringLiteral("rasterBuilds=%1").arg(surface.rasterBuilds()));
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -329,6 +490,9 @@ int main(int argc, char **argv)
     checkEraser(surface);
     checkUndoRedoClear(surface);
     checkToolbar(surface);
+
+    checkStepCoverage(screen);
+    checkRasterReuse(screen);
 
     vshot::AnnotateSurface text(screen);
     text.setGeometry(0, 0, kSurfaceWidth, kSurfaceHeight);

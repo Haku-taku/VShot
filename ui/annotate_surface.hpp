@@ -13,6 +13,7 @@
 #include <QWidget>
 
 #include <functional>
+#include <memory>
 
 class QLineEdit;
 class QScreen;
@@ -30,11 +31,12 @@ namespace vshot {
 // once and stays still, so every stroke can be re-rendered from its own model
 // on each repaint.  Here the desktop below is alive: the user may be pointing
 // at a video, a game or a terminal, and the annotation has to appear with the
-// pointer, not a frame later.  So each finished stroke is rasterized into a
-// backing image at the very moment it is drawn, and a repaint only re-blits the
-// part of that image the change touched.  The stroke list is kept next to the
-// image for the operations that cannot be expressed as a patch -- undo, redo,
-// clear and the eraser -- which rebuild the image from scratch.
+// pointer, not a frame later.  So every committed stroke keeps its own
+// device-pixel ink, built on first paint and reused after that, and a repaint
+// blits only the strokes that fall inside the region being repainted.  There is
+// no monolithic canvas to rebuild: removing a stroke is dropping it out of the
+// list, so the eraser, undo, redo and clear cost nothing beyond the repaint of
+// the rect they touch.
 //
 // The surface owns the whole output on purpose: "draw anywhere" means every
 // click has to arrive here, so no input mask is installed while it is visible.
@@ -84,6 +86,17 @@ public:
     int strokeCount() const;
     bool isEmpty() const;
 
+    // How many times a stroke's ink has been rasterized into its own image.
+    // Each stroke is rasterized once and then reused, which is what makes the
+    // eraser, an undo and a redo cheap; the checks read this to see that it
+    // holds.
+    int rasterBuilds() const { return rasterBuilds_; }
+    // The union of the logical rects invalidated since `clearInvalidatedRect()`.
+    // Every pixel an interactive step changes has to fall inside it -- a pixel
+    // outside is one this surface would leave stale on screen.
+    QRect invalidatedRect() const { return invalidated_; }
+    void clearInvalidatedRect() { invalidated_ = QRect(); }
+
     // Hides or shows the toolbar without touching the drawing.  Used while a
     // capture or a recording is running: the toolbar is a window like any
     // other and would be baked into the picture, while the annotation itself is
@@ -107,6 +120,18 @@ protected:
     void keyPressEvent(QKeyEvent *event) override;
 
 private:
+    // The device-pixel ink of one committed stroke.  `image` is tightly sized to
+    // the stroke and `origin` is where its top-left lands in this surface's
+    // device pixels, so blitting it is a straight copy at 1:1.
+    struct StrokeRaster {
+        QImage image;
+        // The stroke's logical box, kept so a repaint can skip the stroke
+        // without walking its points again.
+        QRectF logicalBounds;
+        QPoint origin;
+        double ratio = 1.0;
+    };
+
     // One annotation.  A point list for every tool but the text one, which
     // carries its string and its anchor instead; the eraser never produces one.
     struct Stroke {
@@ -115,6 +140,12 @@ private:
         int width = 3;
         QVector<QPointF> points;
         QString text;
+        // The ink of this stroke, rasterized into its own image on first paint.
+        // A committed stroke is never modified, so the only thing that can
+        // invalidate this is a change of device ratio; the shared pointer means
+        // an undo or redo snapshot carries the raster with it instead of
+        // rasterizing the stroke a second time.
+        std::shared_ptr<StrokeRaster> raster;
     };
 
     // The floating palette.  Defined in the .cpp: it is a nested widget with a
@@ -132,19 +163,23 @@ private:
     // Stroke widths the toolbar offers, in logical pixels.
     static constexpr int kWidths[] = {3, 6, 12};
 
-    // The device-pixel backing image, grown to this surface's size on demand.
-    QImage &canvas();
-    // Rasterizes one stroke into the backing image, clipped to `into`.  A null
-    // `into` means the whole surface.
+    // Turns one stroke into ink on a painter, in logical coordinates.  This is
+    // the only path from a stroke to ink: both the live preview and the
+    // per-stroke raster builder draw through it.
     void paintStroke(QPainter &painter, const Stroke &stroke) const;
-    // Rebuilds the backing image from `strokes_`.
-    void rebuildCanvas();
+    // The stroke's own cached ink, built on first use and reused until the
+    // device ratio changes.  Returns null for a stroke with nothing to draw.
+    // Deliberately non-const and given a mutable reference: it stores the raster
+    // in the stroke it was handed.
+    const StrokeRaster *rasterFor(Stroke &stroke);
     // Records the state `strokes_` is in before it is changed, so one undo can
-    // step back over it.  Snapshots rather than per-tool inverse operations:
-    // an eraser drag, a text edit and a clear all have to be undoable, and a
-    // stroke list is small enough that copying it is the cheapest way to make
-    // that one mechanism instead of four.
-    void pushHistory();
+    // step back over it.  `dirty` is the region the change about to be made can
+    // affect; it travels with the snapshot so stepping back over it repaints
+    // that region instead of the whole output.  Snapshots rather than per-tool
+    // inverse operations: an eraser drag, a text edit and a clear all have to be
+    // undoable, and a stroke list is small enough that copying it is the
+    // cheapest way to make that one mechanism instead of four.
+    void pushHistory(const QRect &dirty);
     // The rect a stroke can have touched, in device pixels, grown by its width
     // and the arrow head's reach.  This is the repaint region of a new stroke,
     // and the reason a drag does not repaint a 4K output sixty times a second.
@@ -164,15 +199,22 @@ private:
     // surface that held it would stop the user from typing anywhere else.
     void setKeyboardWanted(bool wanted);
     // Whether this surface's own device ratio is not 1, i.e. whether a logical
-    // rect needs scaling before it can index the backing image.
+    // rect needs scaling before it can index a stroke's device-pixel ink.
     double deviceRatio() const;
 
     QVector<Stroke> strokes_;
-    // Undo and redo as whole-canvas snapshots, oldest first, newest last.  The
+    // One undo step: the stroke list as it was, plus the rect the change that
+    // followed it touched.  The rect travels with the snapshot so stepping back
+    // or forward repaints that rect instead of the whole output.
+    struct HistoryEntry {
+        QVector<Stroke> strokes;
+        QRect dirty;
+    };
+    // Undo and redo as stroke-list snapshots, oldest first, newest last.  The
     // state before each change is pushed; an undo moves the current state onto
     // the redo stack and restores the top of the undo stack.
-    QVector<QVector<Stroke>> undoStack_;
-    QVector<QVector<Stroke>> redoStack_;
+    QVector<HistoryEntry> undoStack_;
+    QVector<HistoryEntry> redoStack_;
     // The stroke the pointer is dragging out, if any.  Drawn last, on top, and
     // only from the widget's own paint: it is not part of the model until the
     // button comes up.
@@ -182,7 +224,13 @@ private:
     QPointF eraseFrom_;
     bool erasing_ = false;
 
-    QImage canvas_;
+    // The union of the logical rects `touch()` has been asked to repaint since
+    // the last `clearInvalidatedRect()`.  Read by the checks to prove a step
+    // repainted everything it changed.
+    QRect invalidated_;
+    // How many stroke inks have been rasterized, ever.  The checks read it
+    // through `rasterBuilds()`.
+    int rasterBuilds_ = 0;
     Tool tool_ = Tool::Pen;
     QColor color_{229, 57, 53};
     int width_ = kWidths[1];
