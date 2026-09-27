@@ -60,27 +60,12 @@ pub enum Primaries {
     Bt2020,
 }
 
-/// How an HDR frame is brought down to SDR.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ToneMap {
-    /// Straight clip: highlights above white flatten.  Fast, and the choice
-    /// when the content is barely over SDR.
-    Clip,
-    /// Extended Reinhard with the frame's own peak as the white point, so the
-    /// brightest sample lands on white and nothing clips: hue is preserved
-    /// because the whole triple is scaled by one factor.
-    Reinhard,
-}
-
-// --- the output -----------------------------------------------------------
-
 /// The colour properties of one output, as the compositor describes them over
 /// `wp_color_manager_v1`.
 ///
 /// This is the Wayland analogue of the display facts Starward reads on Windows:
 /// `reference_nits` is the SDR white level, the light level a code of 1.0 stands
-/// for and the level above which a capture really is HDR.  Detection compares a
-/// capture's peak against it rather than guessing from the buffer's bit depth.
+/// for and the level above which a capture really is HDR.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OutputColor {
     /// The transfer function the output expects content in.
@@ -89,9 +74,6 @@ pub struct OutputColor {
     pub primaries: Primaries,
     /// The luminance one unit of content means, in cd/m² (the reference white).
     pub reference_nits: f32,
-    /// The darkest and brightest the output can show, in cd/m².
-    pub min_nits: f32,
-    pub max_nits: f32,
 }
 
 impl OutputColor {
@@ -309,10 +291,6 @@ impl HdrFrame {
         self.size
     }
 
-    pub fn pixels(&self) -> &[[f32; 4]] {
-        &self.pixels
-    }
-
     pub fn pixel(&self, x: u32, y: u32) -> Option<[f32; 4]> {
         if x >= self.size.width || y >= self.size.height {
             return None;
@@ -334,81 +312,6 @@ impl HdrFrame {
     /// Whether the frame actually carries light beyond SDR white.
     pub fn is_hdr(&self) -> bool {
         self.peak() > 1.0 + HDR_WHITE_EPSILON
-    }
-
-    /// Decodes an ordinary 8-bit sRGB frame into linear light.
-    pub fn from_srgb(frame: &Frame) -> Self {
-        let size = frame.size();
-        let source = frame.pixels();
-        let mut pixels = Vec::with_capacity(source.len() / 4);
-        for rgba in source.chunks_exact(4) {
-            pixels.push([
-                srgb_eotf(f32::from(rgba[0]) / 255.0),
-                srgb_eotf(f32::from(rgba[1]) / 255.0),
-                srgb_eotf(f32::from(rgba[2]) / 255.0),
-                f32::from(rgba[3]) / 255.0,
-            ]);
-        }
-        Self { size, pixels }
-    }
-
-    /// Decodes RGBA `u16` samples (PNG's own 16-bit order) with a declared
-    /// transfer function and primaries into linear scRGB, measured against
-    /// `reference_nits` — the light level 1.0 stands for.
-    ///
-    /// The colour-triple samples go through their transfer function; the alpha
-    /// sample never does — alpha is linear whatever the colour encoding is.
-    pub fn from_samples(
-        samples: &[u16],
-        size: Size,
-        transfer: Transfer,
-        primaries: Primaries,
-        reference_nits: f32,
-    ) -> Result<Self> {
-        let expected = size
-            .area()?
-            .checked_mul(4)
-            .ok_or_else(|| VshotError::InvalidGeometry("HDR sample buffer is too large".into()))?;
-        if samples.len() != expected {
-            return Err(VshotError::InvalidGeometry(format!(
-                "HDR frame has {} samples, expected {expected}",
-                samples.len()
-            )));
-        }
-        let mut pixels = Vec::with_capacity(size.area()?);
-        for rgba in samples.chunks_exact(4) {
-            let mut rgb = [
-                decode_transfer(f32::from(rgba[0]) / 65535.0, transfer, reference_nits),
-                decode_transfer(f32::from(rgba[1]) / 65535.0, transfer, reference_nits),
-                decode_transfer(f32::from(rgba[2]) / 65535.0, transfer, reference_nits),
-            ];
-            if primaries == Primaries::Bt2020 {
-                rgb = multiply(BT2020_TO_BT709, rgb);
-            }
-            pixels.push([rgb[0], rgb[1], rgb[2], f32::from(rgba[3]) / 65535.0]);
-        }
-        Self::new(size, pixels)
-    }
-
-    /// Decodes a big-endian RGBA `u16` byte buffer, which is how PNG stores
-    /// 16-bit samples.  HDR10 (BT.2020 + PQ) is the format this is for.
-    pub fn from_hdr10_be_bytes(bytes: &[u8], size: Size) -> Result<Self> {
-        if !bytes.len().is_multiple_of(2) {
-            return Err(VshotError::InvalidGeometry(
-                "HDR byte buffer is not a whole number of 16-bit samples".into(),
-            ));
-        }
-        let samples: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
-            .collect();
-        Self::from_samples(
-            &samples,
-            size,
-            Transfer::Pq,
-            Primaries::Bt2020,
-            REFERENCE_WHITE_NITS,
-        )
     }
 
     /// Decodes 10-bit RGB packed the way DRM's `XRGB2101010`/`ARGB2101010`
@@ -448,6 +351,11 @@ impl HdrFrame {
                 ),
                 decode_transfer((word & 0x3ff) as f32 / 1023.0, transfer, reference_nits),
             ];
+            // HLG needs the whole triple: BT.2100's opto-optical transfer takes
+            // the frame's own luma, so it cannot ride on a per-channel decode.
+            if transfer == Transfer::Hlg {
+                rgb = hlg_ootf(rgb, reference_nits);
+            }
             if primaries == Primaries::Bt2020 {
                 rgb = multiply(BT2020_TO_BT709, rgb);
             }
@@ -461,20 +369,53 @@ impl HdrFrame {
         Self::new(size, pixels)
     }
 
-    /// Tone-maps the whole frame to an 8-bit sRGB frame, the SDR half of the
-    /// pair.  Alpha is carried through unchanged (these captures are opaque).
-    pub fn tone_map_to_srgb(&self, operator: ToneMap) -> Result<Frame> {
-        let white = match operator {
-            ToneMap::Clip => 1.0,
-            ToneMap::Reinhard => self.peak().max(1.0),
+    /// Encodes the frame as the ten-bit pixels a colour-managed surface reads:
+    /// BT.2020 primaries with the PQ (ST 2084) transfer, packed the way
+    /// `wl_shm`'s `ARGB2101010` family packs them (alpha in bits 30..32, red in
+    /// 20..30, green in 10..20, blue in 0..10).
+    ///
+    /// `reference_nits` is the light level the frame's `1.0` stands for — the
+    /// output's own SDR white — so a code comes back out at the absolute
+    /// luminance it was captured at.  This is the inverse of
+    /// [`HdrFrame::from_rgb10`], and what puts a frozen frame onto an HDR
+    /// overlay surface.
+    ///
+    /// The alpha bits are set: these words go into a *surface* buffer, where
+    /// the two bits are a real alpha channel and a zero would make every pixel
+    /// transparent.  A capture buffer reads them as the `X`/`A` padding and
+    /// ignores them either way, which is why the decode side takes `alpha
+    /// false` here.
+    pub fn to_rgb10_pq(&self, reference_nits: f32) -> Vec<u32> {
+        let reference = if reference_nits.is_finite() && reference_nits > 0.0 {
+            reference_nits
+        } else {
+            REFERENCE_WHITE_NITS
         };
+        let code = |linear: f32| -> u32 {
+            (pq_oetf(linear * reference / PQ_PEAK_NITS) * 1023.0)
+                .round()
+                .clamp(0.0, 1023.0) as u32
+        };
+        self.pixels
+            .iter()
+            .map(|pixel| {
+                let rgb = multiply(BT709_TO_BT2020, [pixel[0], pixel[1], pixel[2]]);
+                (3 << 30) | (code(rgb[0]) << 20) | (code(rgb[1]) << 10) | code(rgb[2])
+            })
+            .collect()
+    }
+
+    /// Tone-maps the whole frame to an 8-bit sRGB frame, the SDR half of the
+    /// pair, with extended Reinhard and the frame's own peak as the white point:
+    /// the brightest sample lands on white and nothing clips, and hue is kept
+    /// because the whole triple is scaled by one factor.  Alpha is quantised to
+    /// a byte like every other channel (a capture is opaque).
+    pub fn tone_map_to_srgb(&self) -> Result<Frame> {
+        let white = self.peak().max(1.0);
         let mut bytes = Vec::with_capacity(self.pixels.len() * 4);
         for pixel in &self.pixels {
             let mut rgb = [pixel[0].max(0.0), pixel[1].max(0.0), pixel[2].max(0.0)];
-            if operator == ToneMap::Reinhard && white > 1.0 {
-                // Extended Reinhard with `white` mapping to 1.0.  Scaling the
-                // whole triple by one factor keeps the hue; only the highlights
-                // roll off.
+            if white > 1.0 {
                 let luminance = rgb[0].max(rgb[1]).max(rgb[2]);
                 if luminance > 0.0 {
                     let mapped =
@@ -495,7 +436,8 @@ impl HdrFrame {
     /// transparent) over this frame **in linear light**: annotation colours are
     /// decoded to linear scRGB and blended there, which is what makes a mark on
     /// an HDR image keep its brightness instead of being crushed by the SDR
-    /// curve.  The layer must be the same size.
+    /// curve.  The layer must be the same size.  This is an ordinary source-over
+    /// on straight alpha, so it also holds for a frame that is not opaque.
     pub fn composite_srgb_layer(&mut self, layer: &Frame) -> Result<()> {
         if layer.size() != self.size {
             return Err(VshotError::InvalidGeometry(format!(
@@ -516,11 +458,17 @@ impl HdrFrame {
                 srgb_eotf(f32::from(rgba[1]) / 255.0),
                 srgb_eotf(f32::from(rgba[2]) / 255.0),
             ];
-            let keep = 1.0 - alpha;
-            destination[0] = source[0] * alpha + destination[0] * keep;
-            destination[1] = source[1] * alpha + destination[1] * keep;
-            destination[2] = source[2] * alpha + destination[2] * keep;
-            destination[3] = alpha + destination[3] * keep;
+            let below = destination[3];
+            let out_alpha = alpha + below * (1.0 - alpha);
+            if out_alpha <= 0.0 {
+                continue;
+            }
+            for channel in 0..3 {
+                destination[channel] = (source[channel] * alpha
+                    + destination[channel] * below * (1.0 - alpha))
+                    / out_alpha;
+            }
+            destination[3] = out_alpha;
         }
         Ok(())
     }
@@ -827,11 +775,37 @@ fn decode_transfer(value: f32, transfer: Transfer, reference_nits: f32) -> f32 {
     match transfer {
         Transfer::Linear => value,
         Transfer::Srgb => srgb_eotf(value),
-        // PQ and HLG are absolute: the code names a light level, so bring it
-        // into the reference-white-relative scale the rest of the pipeline uses.
+        // PQ is absolute: the code names a light level, so bring it into the
+        // reference-white-relative scale the rest of the pipeline uses.
         Transfer::Pq => pq_eotf(value) * (PQ_PEAK_NITS / reference),
-        Transfer::Hlg => hlg_inverse_oetf(value) * (HLG_PEAK_NITS / reference),
+        // HLG is not: the inverse OETF only gives the scene-linear signal, and
+        // [`hlg_ootf`] has to turn it into display light.  It needs the whole
+        // pixel, so it runs after the triple is decoded.
+        Transfer::Hlg => hlg_inverse_oetf(value),
     }
+}
+
+/// BT.2100's opto-optical transfer for HLG: the scene-linear signal
+/// [`decode_transfer`] produced, to the light a display shows.
+///
+/// `F_D = α · Y_S^(γ−1) · E_S`, per channel, with `Y_S` the signal's own luma and
+/// α the nominal peak (`HLG_PEAK_NITS`).  One factor on all three channels keeps
+/// hue, and the property the standard is built around falls out: a 75 % signal —
+/// HLG's reference white — lands on 203 cd/m² of a 1 000-nit display, the BT.2408
+/// reference white, which the test pins.  The result is brought into the same
+/// reference-white-relative scale as PQ's.
+fn hlg_ootf(scene: [f32; 3], reference_nits: f32) -> [f32; 3] {
+    // The BT.2020 luma weights, which is the space the signal is in here.
+    let luma = 0.2627 * scene[0] + 0.6780 * scene[1] + 0.0593 * scene[2];
+    // A 1 000-nit HLG system, the reference display the curve is scaled for.
+    const SYSTEM_GAMMA: f32 = 1.2;
+    let reference = if reference_nits.is_finite() && reference_nits > 0.0 {
+        reference_nits
+    } else {
+        REFERENCE_WHITE_NITS
+    };
+    let factor = HLG_PEAK_NITS * luma.max(0.0).powf(SYSTEM_GAMMA - 1.0) / reference;
+    [scene[0] * factor, scene[1] * factor, scene[2] * factor]
 }
 
 fn to_u8(value: f32) -> u8 {
@@ -892,28 +866,6 @@ fn encode_rle_plane(plane: &[u8], out: &mut Vec<u8>) {
         out.push((index - start) as u8);
         out.extend_from_slice(&plane[start..index]);
     }
-}
-
-/// Recognises HDR content from the facts a capture or a file provides: the
-/// transfer function and primaries it declared, and whether it carried more
-/// than 8 bits.  This is the metadata test a decoder can make before any pixel
-/// is examined — the same one Starward uses (BT.2020 + PQ + >8 bits is HDR10).
-pub const fn looks_like_hdr(transfer: Transfer, primaries: Primaries, bits_per_pixel: u32) -> bool {
-    matches!(transfer, Transfer::Pq | Transfer::Hlg)
-        && matches!(primaries, Primaries::Bt2020)
-        && bits_per_pixel > 8
-}
-
-/// The BT.709→BT.2020 matrix, exposed for an encoder that has to write HDR10
-/// back out (the reverse of what [`HdrFrame::from_samples`] applies).
-pub fn scrgb_to_bt2020(rgb: [f32; 3]) -> [f32; 3] {
-    multiply(BT709_TO_BT2020, rgb)
-}
-
-/// Encodes linear scRGB into a PQ code, normalised to 10 000 cd/m², which is
-/// what an HDR10 output sample holds.
-pub fn srgb_to_pq_code(linear: f32) -> f32 {
-    pq_oetf(linear * REFERENCE_WHITE_NITS / PQ_PEAK_NITS)
 }
 
 #[cfg(test)]
@@ -993,47 +945,103 @@ mod tests {
 
     #[test]
     fn a_1000_nit_pq_sample_decodes_to_scrgb_reference_white() {
-        // 1000 nits is 1000 / 203 of the reference white, so scRGB 4.926.
+        // 1000 nits is 1000 / 203 of the reference white, so scRGB 4.926.  The
+        // word is the ten-bit code nearest the exact PQ code, so the assertion
+        // carries the quantisation of a ten-bit channel.
         let code = pq_oetf(1000.0 / 10_000.0);
-        let sample = (code * 65535.0).round() as u16;
-        let frame = HdrFrame::from_samples(
-            &[sample, sample, sample, 65535],
+        let sample = (code * 1023.0).round() as u32;
+        let word = (sample << 20) | (sample << 10) | sample;
+        let frame = HdrFrame::from_rgb10(
+            &[word],
             Size::new(1, 1),
             Transfer::Pq,
             Primaries::Bt709,
+            false,
             REFERENCE_WHITE_NITS,
         )
         .unwrap();
         let pixel = frame.pixel(0, 0).unwrap();
         let expected = 1000.0 / REFERENCE_WHITE_NITS;
-        assert!((pixel[0] - expected).abs() < 0.01, "got {}", pixel[0]);
+        assert!(
+            (pixel[0] - expected).abs() < expected * 0.01,
+            "got {}",
+            pixel[0]
+        );
         assert_eq!(pixel[3], 1.0);
+    }
+
+    #[test]
+    fn hlg_reference_white_and_peak_land_where_broadcast_says() {
+        // BT.2408 anchors HLG on the 75 % signal: on a 1000-nit system that is
+        // the 203 cd/m² reference white, i.e. 1.0 in the relative scale.  A
+        // bare inverse OETF (no opto-optical transfer) would read it as 4.6 and
+        // wash the whole picture out.
+        let white_code = (0.75f32 * 1023.0).round() as u32;
+        let word = (white_code << 20) | (white_code << 10) | white_code;
+        let frame = HdrFrame::from_rgb10(
+            &[word],
+            Size::new(1, 1),
+            Transfer::Hlg,
+            Primaries::Bt2020,
+            false,
+            REFERENCE_WHITE_NITS,
+        )
+        .unwrap();
+        assert!((frame.pixel(0, 0).unwrap()[0] - 1.0).abs() < 0.02);
+        assert!(!frame.is_hdr());
+
+        // The top signal is the nominal 1000-nit peak, 1000 / 203 of white.
+        let frame = HdrFrame::from_rgb10(
+            &[0x3fff_ffff],
+            Size::new(1, 1),
+            Transfer::Hlg,
+            Primaries::Bt2020,
+            false,
+            REFERENCE_WHITE_NITS,
+        )
+        .unwrap();
+        let expected = HLG_PEAK_NITS / REFERENCE_WHITE_NITS;
+        assert!((frame.pixel(0, 0).unwrap()[0] - expected).abs() < 0.05);
     }
 
     #[test]
     fn bt2020_white_becomes_bt709_white() {
         // The 2020->709 matrix has rows that sum to one, so a neutral stays
         // neutral; without that a white HDR pixel would come out tinted.
-        let frame = HdrFrame::from_samples(
-            &[65535, 65535, 65535, 65535],
+        let frame = HdrFrame::from_rgb10(
+            &[0x3fff_ffff],
             Size::new(1, 1),
             Transfer::Linear,
             Primaries::Bt2020,
+            false,
             REFERENCE_WHITE_NITS,
         )
         .unwrap();
         let pixel = frame.pixel(0, 0).unwrap();
-        assert!((pixel[0] - 1.0).abs() < 1e-4, "{}", pixel[0]);
-        assert!((pixel[1] - 1.0).abs() < 1e-4, "{}", pixel[1]);
-        assert!((pixel[2] - 1.0).abs() < 1e-4, "{}", pixel[2]);
+        assert!((pixel[0] - 1.0).abs() < 1e-3, "{}", pixel[0]);
+        assert!((pixel[1] - 1.0).abs() < 1e-3, "{}", pixel[1]);
+        assert!((pixel[2] - 1.0).abs() < 1e-3, "{}", pixel[2]);
     }
 
     #[test]
-    fn detection_needs_pq_or_hlg_and_wide_primaries_and_depth() {
-        assert!(looks_like_hdr(Transfer::Pq, Primaries::Bt2020, 10));
-        assert!(!looks_like_hdr(Transfer::Srgb, Primaries::Bt2020, 10));
-        assert!(!looks_like_hdr(Transfer::Pq, Primaries::Bt709, 10));
-        assert!(!looks_like_hdr(Transfer::Pq, Primaries::Bt2020, 8));
+    fn an_hdr_output_is_one_whose_transfer_is_pq_or_hlg() {
+        // Detection asks the display, not the buffer: it is the transfer
+        // function the compositor named, never the bit depth or the pixels.
+        assert!(hdr_output().is_hdr());
+        for transfer in [Transfer::Pq, Transfer::Hlg] {
+            let color = OutputColor {
+                transfer,
+                ..hdr_output()
+            };
+            assert!(color.is_hdr(), "{transfer:?}");
+        }
+        for transfer in [Transfer::Srgb, Transfer::Linear] {
+            let color = OutputColor {
+                transfer,
+                ..hdr_output()
+            };
+            assert!(!color.is_hdr(), "{transfer:?}");
+        }
     }
 
     #[test]
@@ -1082,8 +1090,6 @@ mod tests {
             transfer: Transfer::Pq,
             primaries: Primaries::Bt2020,
             reference_nits: 203.0,
-            min_nits: 0.0,
-            max_nits: 417.0,
         }
     }
 
@@ -1132,16 +1138,47 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_encodes_back_to_the_ten_bit_codes_it_came_from() {
+        // The backdrop surface reads what the encoder writes, so light that
+        // goes out to the compositor has to come back as the light it holds.
+        let color = hdr_output();
+        let words = vec![
+            rgb10(0, 0, 0),
+            rgb10(1023, 1023, 1023),
+            rgb10(300, 500, 800),
+        ];
+        let frame = HdrFrame::from_rgb10(
+            &words,
+            Size::new(3, 1),
+            color.transfer,
+            color.primaries,
+            false,
+            color.reference_nits,
+        )
+        .unwrap();
+        for (before, after) in words.iter().zip(&frame.to_rgb10_pq(color.reference_nits)) {
+            for shift in [20, 10, 0] {
+                let was = ((before >> shift) & 0x3ff) as i64;
+                let now = ((after >> shift) & 0x3ff) as i64;
+                assert!(
+                    (was - now).abs() <= 2,
+                    "{before:08x} -> {after:08x} (field {shift})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn tone_mapping_reinhard_lands_the_peak_on_white_and_leaves_sdr_alone() {
         let frame = one_pixel([4.0, 2.0, 1.0, 1.0]);
-        let sdr = frame.tone_map_to_srgb(ToneMap::Reinhard).unwrap();
+        let sdr = frame.tone_map_to_srgb().unwrap();
         assert_eq!(sdr.pixel(Point::new(0, 0)).unwrap()[0], 255);
         // The mid 2.0 is pulled down but stays bright.
         assert!(sdr.pixel(Point::new(0, 0)).unwrap()[1] > 180);
 
         // A frame already inside SDR white does not get compressed.
         let flat = one_pixel([0.5, 0.5, 0.5, 1.0]);
-        let sdr = flat.tone_map_to_srgb(ToneMap::Reinhard).unwrap();
+        let sdr = flat.tone_map_to_srgb().unwrap();
         let expected = to_u8(srgb_oetf(0.5));
         assert_eq!(sdr.pixel(Point::new(0, 0)).unwrap()[0], expected);
     }
@@ -1164,13 +1201,14 @@ mod tests {
         .unwrap();
         let encoded = frame.encode_radiance();
         let decoded = decode_radiance(&encoded, 16, 1);
-        for (index, expected) in frame.pixels().iter().enumerate() {
-            let got = decoded[index];
+        for x in 0..16u32 {
+            let expected = frame.pixel(x, 0).unwrap();
+            let got = decoded[x as usize];
             let scale = expected[0].max(expected[1]).max(expected[2]).max(1e-6);
             for channel in 0..3 {
                 assert!(
                     (got[channel] - expected[channel]).abs() <= scale * 0.02 + 1e-4,
-                    "pixel {index} channel {channel}: {} vs {}",
+                    "pixel {x} channel {channel}: {} vs {}",
                     got[channel],
                     expected[channel]
                 );
@@ -1189,6 +1227,7 @@ mod tests {
         let pixel = frame.pixel(0, 0).unwrap();
         let expected = 1.0 * (128.0 / 255.0) + 0.25 * (1.0 - 128.0 / 255.0);
         assert!((pixel[0] - expected).abs() < 1e-3, "{}", pixel[0]);
+        assert!((pixel[3] - 1.0).abs() < 1e-3, "{}", pixel[3]);
     }
 
     #[test]
@@ -1243,25 +1282,6 @@ mod tests {
         }
         assert_eq!(frame.pixel(0, 0).unwrap()[0], 0.0);
         assert_eq!(frame.pixel(2, 2).unwrap()[0], 8.0);
-    }
-
-    #[test]
-    fn hdr10_bytes_decode_big_endian() {
-        // A neutral 0xFFFF triple is the top PQ code (10 000 nits); the matrix
-        // leaves a neutral neutral, so it comes out at the reference white
-        // scaled to 10 000 nits.
-        let bytes = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
-        let frame = HdrFrame::from_hdr10_be_bytes(&bytes, Size::new(1, 1)).unwrap();
-        let pixel = frame.pixel(0, 0).unwrap();
-        let expected = PQ_PEAK_NITS / REFERENCE_WHITE_NITS;
-        assert!((pixel[0] - expected).abs() < 0.1, "{}", pixel[0]);
-        assert!((pixel[1] - expected).abs() < 0.1, "{}", pixel[1]);
-        assert!((pixel[2] - expected).abs() < 0.1, "{}", pixel[2]);
-        assert_eq!(pixel[3], 1.0);
-        // And a black sample is black, whatever the byte order bug might do.
-        let frame = HdrFrame::from_hdr10_be_bytes(&[0, 0, 0, 0, 0, 0, 0xff, 0xff], Size::new(1, 1))
-            .unwrap();
-        assert!(frame.pixel(0, 0).unwrap()[0].abs() < 1e-6);
     }
 
     /// A tiny Radiance RGBE decoder, enough to check the encoder: header,

@@ -77,10 +77,16 @@ impl Capturer {
     /// One output as HDR content, when this backend and session can hand it
     /// over.  `Ok(None)` means "this output is not offering HDR" and the caller
     /// keeps the SDR frame it already has; KWin answers `None` outright, since
-    /// its screenshots arrive as SDR PNG over D-Bus.
-    pub fn capture_output_hdr(&mut self, name: &str, cursor: bool) -> Result<Option<HdrFrame>> {
+    /// its screenshots arrive as SDR PNG over D-Bus.  `color` is the output's
+    /// own description, which `output_color` already read.
+    pub fn capture_output_hdr(
+        &mut self,
+        name: &str,
+        cursor: bool,
+        color: OutputColor,
+    ) -> Result<Option<HdrFrame>> {
         match self {
-            Self::Wlr(capture) => capture.capture_output_hdr(name, cursor),
+            Self::Wlr(capture) => capture.capture_output_hdr(name, cursor, color),
             Self::Kwin(_) => Ok(None),
         }
     }

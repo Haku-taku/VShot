@@ -8349,9 +8349,14 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
     // window's outline and label pill are drawn below; the click ends the
     // session, and the frame it is captured into comes from Rust after that.
     const bool livePick = pickMode_;
+    // The backdrop case: VShot is showing the frozen frame on its own HDR
+    // surface underneath this one, at the screen's own light levels.  The
+    // overlay's part is then only the veil, cut open at the selection — drawing
+    // the SDR frame here as well would paint over the better picture.
+    const bool backdrop = output.backdrop;
     // In pin-edit mode the pinned window itself shows the image: the editor
     // only draws the marks on top, so there is exactly one copy on screen.
-    if (livePick) {
+    if (livePick || backdrop) {
         QPainterPath veil;
         veil.addRect(target);
         if (selection_.has_value()) {

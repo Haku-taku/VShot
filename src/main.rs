@@ -34,10 +34,10 @@ use cli::{Action, CaptureTarget};
 use edit::{pipeline_for_annotations, EditPipeline};
 use error::{Result, VshotError};
 use geometry::Rect;
-use model::hdr::ToneMap;
-use model::{Frame, HdrFrame, ImageDocument, OutputSnapshot, SceneSnapshot};
+use model::hdr::{Primaries, Transfer, REFERENCE_WHITE_NITS};
+use model::{Frame, HdrFrame, ImageDocument, OutputColor, OutputSnapshot, SceneSnapshot};
 use wayland::topology::OutputInfo;
-use wayland::WaylandSession;
+use wayland::{BackdropFrame, WaylandSession};
 
 /// How long `window pick` waits for the picker's layer surfaces to leave the
 /// screen before capturing the frame the user is looking at.  The helper hides
@@ -287,7 +287,10 @@ fn run() -> Result<()> {
                 (frame, density)
             }
             CaptureTarget::RegionInteractive => {
-                let outcome = qt_overlay::select_and_edit(&scene)?;
+                // The frame the helper draws is shown on an HDR backdrop when
+                // there is one to show, and the helper is told to leave it out.
+                let backdrop = show_hdr_backdrop(&mut wayland, &scene, &hdr_outputs);
+                let outcome = qt_overlay::select_and_edit(&scene, &backdrop)?;
                 let geometry = selection::validate_selection(&scene, outcome.rect)?;
                 // The editor's other answer is a scrolling capture: the region
                 // is scrolled and stitched instead of kept as one frame.  Any
@@ -452,13 +455,20 @@ fn run() -> Result<()> {
                 // against the windows that exist at this point in time.
                 std::thread::sleep(PICK_SETTLE);
                 let scene = capture_scene(&mut capture, &output_infos, request.cursor)?;
+                // A picked window is captured as the SDR/HDR pair like any
+                // other, and its frozen frame gets the same backdrop treatment
+                // as a dragged selection.
+                let hdr_outputs = capture_hdr_outputs(&mut capture, &scene, request.cursor);
+                let backdrop = show_hdr_backdrop(&mut wayland, &scene, &hdr_outputs);
                 let geometry = picked
                     .point
                     .and_then(|point| ProcessWindowProvider.window_at(point))
                     .unwrap_or(picked.rect);
-                let (geometry, annotations) = qt_overlay::edit_selection(&scene, geometry)?;
+                let (geometry, annotations) =
+                    qt_overlay::edit_selection(&scene, geometry, &backdrop)?;
                 let geometry = selection::validate_selection(&scene, geometry)?;
                 let (frame, density) = crop_native(&scene, geometry)?;
+                hdr_frame = hdr_for_region(&hdr_outputs, &scene, geometry);
                 // Same reason as the interactive region above: the editor is
                 // shared, so its text bitmaps are in scene device pixels.
                 edits = pipeline_for_annotations(annotations, geometry, density, scene.scale())?;
@@ -813,14 +823,19 @@ fn sdr_and_hdr(
         None => None,
     };
     match hdr {
-        Some(hdr) => Ok((hdr.tone_map_to_srgb(ToneMap::Reinhard)?, Some(hdr))),
+        Some(hdr) => Ok((hdr.tone_map_to_srgb()?, Some(hdr))),
         None => Ok((edits.apply(ImageDocument::new(frame))?.into_frame(), None)),
     }
 }
 
-/// Whether a target can keep an HDR half.  Only the routes that end in one
-/// output's own pixels can: a composed desktop or a reconstructed window has no
-/// single 10-bit buffer behind it.
+/// Whether a target keeps an HDR half **from the first capture**.  Only the
+/// routes that end in one output's own pixels can: a composed desktop or a
+/// reconstructed window has no single 10-bit buffer behind it.
+///
+/// `window pick` is not one of them here — the click decides the window on a
+/// live desktop, so it takes its HDR half from the second capture, once the
+/// window is known (see the `WindowPick` arm of [`run`]); running the first
+/// capture HDR as well would only be thrown away.
 fn target_wants_hdr(target: &CaptureTarget) -> bool {
     matches!(
         target,
@@ -831,6 +846,19 @@ fn target_wants_hdr(target: &CaptureTarget) -> bool {
     )
 }
 
+/// One output's HDR half, kept together with what the compositor said about the
+/// output it came from.
+struct HdrOutput {
+    name: String,
+    frame: HdrFrame,
+    /// The light the frame's `1.0` stands for, from the output's own description
+    /// (or VShot's own when the compositor named none).
+    reference_nits: f32,
+    /// The output's own description: the encoding the frame's pixels are in, and
+    /// what decides whether a backdrop surface can carry them.
+    color: OutputColor,
+}
+
 /// Captures the HDR view of every output that offers one, keyed by output name.
 /// Best effort: an output with no 10-bit buffer, or a backend that cannot hand
 /// HDR pixels over at all, is simply absent, and the SDR path stands alone.
@@ -838,24 +866,37 @@ fn capture_hdr_outputs(
     capture: &mut Capturer,
     scene: &SceneSnapshot,
     cursor: bool,
-) -> Vec<(String, HdrFrame)> {
+) -> Vec<HdrOutput> {
     let debug = std::env::var_os("VSHOT_HDR_DEBUG").is_some();
     let mut outputs = Vec::new();
     for output in scene.outputs() {
         // Only an output the compositor itself describes as HDR can carry an
         // HDR half.  This is the Wayland reading of Starward's Windows rule —
         // ask the display, do not guess from the capture buffer — and it keeps
-        // a 10-bit SDR output (which some compositors offer) from producing a
-        // bogus `.hdr`.
+        // a 10-bit SDR output (which some compositors offer) or an undescribed
+        // one from producing a bogus `.hdr`.
         let color = capture.output_color(&output.name).ok().flatten();
         if debug {
             eprintln!("vshot: hdr: output {} colour {color:?}", output.name);
         }
-        if color.is_some_and(|color| !color.is_hdr()) {
+        let Some(color) = color.filter(OutputColor::is_hdr) else {
             continue;
-        }
-        match capture.capture_output_hdr(&output.name, cursor) {
-            Ok(Some(hdr)) => outputs.push((output.name.clone(), hdr)),
+        };
+        // The reference white is what turns the frame's `1.0` back into an
+        // absolute luminance, which the backdrop surface needs; a compositor
+        // that describes no reference leaves VShot's own.
+        let reference_nits = if color.reference_nits.is_finite() && color.reference_nits > 0.0 {
+            color.reference_nits
+        } else {
+            REFERENCE_WHITE_NITS
+        };
+        match capture.capture_output_hdr(&output.name, cursor, color) {
+            Ok(Some(hdr)) => outputs.push(HdrOutput {
+                name: output.name.clone(),
+                frame: hdr,
+                reference_nits,
+                color,
+            }),
             Ok(None) => {
                 if debug {
                     eprintln!("vshot: hdr: {} offered no HDR buffer", output.name);
@@ -874,7 +915,7 @@ fn capture_hdr_outputs(
 /// The HDR half of one rectangle, cropped from the output that wholly contains
 /// it, or `None` when no such output offered HDR.
 fn hdr_for_region(
-    hdr_outputs: &[(String, HdrFrame)],
+    hdr_outputs: &[HdrOutput],
     scene: &SceneSnapshot,
     geometry: Rect,
 ) -> Option<HdrFrame> {
@@ -895,11 +936,64 @@ fn hdr_for_region(
 }
 
 /// The HDR half of a whole output, or `None` when it offered none.
-fn hdr_for_name(hdr_outputs: &[(String, HdrFrame)], name: &str) -> Option<HdrFrame> {
+fn hdr_for_name(hdr_outputs: &[HdrOutput], name: &str) -> Option<HdrFrame> {
     hdr_outputs
         .iter()
-        .find(|(candidate, _)| candidate == name)
-        .map(|(_, hdr)| hdr.clone())
+        .find(|output| output.name == name)
+        .map(|output| output.frame.clone())
+}
+
+/// Puts the frozen HDR half of each output on a backdrop surface below the Qt
+/// helper's overlay, and answers which outputs are shown that way.
+///
+/// The overlay then leaves the frame to the backdrop, so the picture behind the
+/// selection is the light the screen showed rather than the tone map of it.
+/// Best effort throughout: a session without colour management, or an output
+/// without an HDR half, simply keeps the SDR overlay it always had.
+fn show_hdr_backdrop(
+    wayland: &mut WaylandSession,
+    scene: &SceneSnapshot,
+    hdr_outputs: &[HdrOutput],
+) -> Vec<String> {
+    if hdr_outputs.is_empty() {
+        return Vec::new();
+    }
+    // The backdrop's surfaces are built from the scene, so the session needs it
+    // even on the routes that hand the frame to the helper instead.
+    wayland.set_scene(scene.clone());
+    let frames = hdr_outputs
+        .iter()
+        // The surface declares the output's own description while the buffer is
+        // written as PQ over BT.2020 (`HdrFrame::to_rgb10_pq`), so only an
+        // output whose description is exactly that can be shown this way; any
+        // other pair would declare one encoding and carry another, and the
+        // helper draws the SDR frame there instead.
+        .filter(|output| {
+            output.color.transfer == Transfer::Pq && output.color.primaries == Primaries::Bt2020
+        })
+        .map(|output| BackdropFrame {
+            name: output.name.clone(),
+            frame: output.frame.clone(),
+            reference_nits: output.reference_nits,
+        })
+        .collect::<Vec<_>>();
+    if frames.is_empty() {
+        return Vec::new();
+    }
+    match wayland.show_hdr_backdrop(&frames) {
+        Ok(shown) => {
+            if !shown.is_empty() && std::env::var_os("VSHOT_HDR_DEBUG").is_some() {
+                eprintln!("vshot: hdr: backdrop on {}", shown.join(", "));
+            }
+            shown
+        }
+        Err(error) => {
+            if std::env::var_os("VSHOT_HDR_DEBUG").is_some() {
+                eprintln!("vshot: hdr: no backdrop ({error}); the overlay stays SDR");
+            }
+            Vec::new()
+        }
+    }
 }
 
 /// niri's own capture of the focused window: niri names it, then draws it
@@ -1329,11 +1423,26 @@ mod tests {
         .unwrap()
     }
 
+    /// One output's HDR half for the tests: a flat luminance over an output the
+    /// compositor described exactly the way the backdrop needs.
+    fn hdr_output_half(name: &str, width: u32, height: u32, value: f32) -> HdrOutput {
+        HdrOutput {
+            name: name.to_owned(),
+            frame: hdr_half(width, height, value),
+            reference_nits: REFERENCE_WHITE_NITS,
+            color: OutputColor {
+                transfer: Transfer::Pq,
+                primaries: Primaries::Bt2020,
+                reference_nits: REFERENCE_WHITE_NITS,
+            },
+        }
+    }
+
     /// A two-screen scene — a 2x screen on the right, a 1x one on the left —
     /// each with its own HDR half, the shape `hdr_for_region` has to choose
     /// between.  Kept tiny: the rule only looks at geometry and scale, and a
     /// realistic 4K pair would cost hundreds of megabytes per test.
-    fn hdr_scene() -> (SceneSnapshot, Vec<(String, HdrFrame)>) {
+    fn hdr_scene() -> (SceneSnapshot, Vec<HdrOutput>) {
         let dense = OutputSnapshot::new(
             1,
             "DP-2",
@@ -1352,8 +1461,8 @@ mod tests {
         .unwrap();
         let scene = SceneSnapshot::from_outputs(vec![dense, plain]).unwrap();
         let hdr = vec![
-            ("DP-2".to_owned(), hdr_half(32, 32, 4.0)),
-            ("DP-3".to_owned(), hdr_half(16, 16, 2.0)),
+            hdr_output_half("DP-2", 32, 32, 4.0),
+            hdr_output_half("DP-3", 16, 16, 2.0),
         ];
         (scene, hdr)
     }
@@ -1386,7 +1495,7 @@ mod tests {
     fn a_screen_that_offered_no_hdr_leaves_its_region_without_one() {
         let (scene, _) = hdr_scene();
         // Only the dense screen produced an HDR half this time.
-        let hdr = vec![("DP-2".to_owned(), hdr_half(32, 32, 4.0))];
+        let hdr = vec![hdr_output_half("DP-2", 32, 32, 4.0)];
         assert!(hdr_for_region(&hdr, &scene, Rect::new(2, 3, 5, 4)).is_none());
         // The one that did still answers for its own screen.
         assert!(hdr_for_region(&hdr, &scene, Rect::new(66, 3, 5, 4)).is_some());
@@ -1394,7 +1503,7 @@ mod tests {
 
     #[test]
     fn hdr_for_name_finds_only_a_named_output() {
-        let hdr = vec![("DP-2".to_owned(), hdr_half(4, 4, 4.0))];
+        let hdr = vec![hdr_output_half("DP-2", 4, 4, 4.0)];
         assert_eq!(hdr_for_name(&hdr, "DP-2").unwrap().size(), Size::new(4, 4));
         assert!(hdr_for_name(&hdr, "eDP-1").is_none());
     }
@@ -1449,7 +1558,9 @@ mod tests {
     fn only_targets_ending_in_one_output_keep_an_hdr_half() {
         // The HDR half must be one output's own 10-bit buffer, so a composed
         // desktop, a reconstructed window and a scrolling stitch — none of
-        // which has a single such buffer behind it — keep none.
+        // which has a single such buffer behind it — keep none.  `window pick`
+        // is a refuser here because it takes its HDR half from its own second
+        // capture, after the click picked the window.
         let window = CaptureTarget::ActiveWindow {
             pixel_detect: false,
             no_blend: false,

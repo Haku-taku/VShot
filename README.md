@@ -426,6 +426,13 @@ bind = SUPER SHIFT, A, exec, vshot annotate quit
 ## 图像与输出映射
 **落在单个输出内的矩形一律从那块输出自己那份原生帧裁剪，并按那块屏的 scale 写密度**：`region` 的 `--geometry` 与交互选择、`window active`、`window pick` 以及像素识别给出的矩形都走这条路，只有**跨接缝**的矩形才回落到合成场景；`all` 是整块桌面，只能由场景给出。内部帧统一为 RGBA8、top-left origin，多输出合成支持负 logical origin 和输出间空隙（场景画布用最高输出 scale，较低 scale 的输出用 nearest-neighbor 放大）。当前要求正整数 scale、`transform=normal` 以及可安全证明的 logical/pixel 映射；fractional scale、旋转和无法证明的映射会清晰失败，而不是生成疑似错误的截图。这个校验只在**需要把输出合成为场景**的路径上生效，所以 KWin 与 niri 直接给窗口像素的两条路在旋转/翻转输出上仍然可用。
 
+### HDR
+输出自己被合成器描述为 HDR（PQ 或 HLG）时，一次截图产出**两份**：`<name>.png` 是同一份内容的 SDR 色调映射（扩展 Reinhard，以画面的峰值定白点），`<name>.hdr` 是 Radiance RGBE 的 HDR 原样；有标注时标注在**线性光**里合成到 HDR 那一份上，SDR 那一份再由它映射而来，两份因此描述同一束光、同一批标记。内容本身没有超过 SDR 白时不会写 `.hdr`。
+
+颜色一律问显示器，不猜像素：10-bit 缓冲区在 HDR 输出上就是那块输出自己的像素，按它宣告的传递函数与参考白解码（`wp_color_manager_v1` 的输出描述，参考白即该输出的 SDR 白）。Hyprland 上这是 `misc:screencopy_hdr` 打开时**才**成立的约定——关掉时合成器只交 8-bit sRGB，此时不会写 `.hdr`。
+
+冻结帧在交互界面上也按原样显示：VShot 在 overlay 下面另起一层 surface，挂的是**那块输出自己的 image description**（不是照着它造一个像的），所以合成器既不转换也不做色调映射，选中的区域就是屏幕上原本的光；overlay 自己只画遮罩（选区挖空）、标注与工具条。别的路线是造一份“像”的描述，那不够：compositor 会把它当成另一个空间，往面板自己的范围里做一次色调映射，整幅画面会一起变暗。
+
 ## 截图后端与 KDE 授权
 启动时探测一次：先连 `wlr-screencopy-unstable-v1`，只有它以「缺少 `zwlr_screencopy_manager_v1`」失败时才说明这个合成器不提供该协议；再试 **KWin ScreenShot2**——KWin 的私有会话总线服务 `org.kde.KWin.ScreenShot2`（KWin 既没有 screencopy，也没有 `ext-image-copy-capture`）。vshot 传一根管道的写端，KWin 把像素写进管道并在回复里给出 `width` / `height` / `stride` / `format` / `scale`；像素是预乘 alpha 的 BGRA，输出截图把 alpha 归一为 255，窗口截图原样保留。
 
@@ -661,7 +668,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --release --locked
 ```
 
-Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**（默认不构建，加 `-DVSHOT_BUILD_CHECKS=ON`），覆盖配置读写与设置窗口、字号换算、剪贴板颜色解析与色卡渲染、文件对话框的样式表与缩略图、pin 的图片自述密度与描边、文字卡片留白、色卡右键菜单、贴图的导出格式、标注浮层的落笔/橡皮/撤销与工具栏上误拖不落笔、编辑器浮动工具栏的落位、标注渲染缓存的命中、高 DPI 屏上的缓存分辨率，以及文字层——它解析 `vshot ocr --json` 打印的 JSON（这套线格式一头在 `src/ocr.rs`、一头在 Qt 侧），并且不建控件，因此不需要 `QT_QPA_PLATFORM`：
+Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**（默认不构建，加 `-DVSHOT_BUILD_CHECKS=ON`），覆盖配置读写与设置窗口、字号换算、剪贴板颜色解析与色卡渲染、文件对话框的样式表与缩略图、pin 的图片自述密度与描边、文字卡片留白、色卡右键菜单、贴图的导出格式、标注浮层的五个工具与撤销/清除/工具栏位置、overlay 是否把冻结帧留给 backdrop、工具栏的落位、标注渲染缓存的命中、高 DPI 屏上的缓存分辨率，以及文字层——它解析 `vshot ocr --json` 打印的 JSON（这套线格式一头在 `src/ocr.rs`、一头在 Qt 侧），并且不建控件，因此不需要 `QT_QPA_PLATFORM`：
 
 ```sh
 cmake -S . -B build-qt -DVSHOT_BUILD_CHECKS=ON && cmake --build build-qt
@@ -676,6 +683,7 @@ QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-menu-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-paste-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-file-dialog-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-annotate-check
+QT_QPA_PLATFORM=offscreen build-qt/vshot-backdrop-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-toolbar-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-annotation-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-dpr-check

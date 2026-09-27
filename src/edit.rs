@@ -690,7 +690,11 @@ impl EditPipeline {
         let mut frame = frame;
         for operation in &self.operations {
             match operation {
-                EditOperation::Crop(rect) => frame = frame.crop(*rect)?,
+                EditOperation::Crop(_) => {
+                    // Already applied: the HDR frame arrives cropped the same way
+                    // the SDR document is (see the note above), so running the
+                    // crop again would cut it twice.
+                }
                 EditOperation::Mosaic { rect, block_size } => frame.mosaic(*rect, *block_size)?,
                 EditOperation::MosaicEllipse { rect, block_size } => {
                     frame.mosaic_ellipse(*rect, *block_size)?

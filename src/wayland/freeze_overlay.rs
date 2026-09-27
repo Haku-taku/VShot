@@ -175,6 +175,42 @@ impl ShmSlot {
         self.render_editor(frame, selection, output_geometry, scale, None, None)
     }
 
+    /// Blits packed `XRGB2101010` words into this slot.  This is the HDR
+    /// backdrop's render: the words already carry the encoding the surface's
+    /// colour description names (PQ over BT.2020, for `HdrFrame::to_rgb10_pq`),
+    /// so nothing is converted here, and no dimming or annotation cache applies
+    /// — the backdrop is the untouched frozen frame and the editor's marks are
+    /// drawn over it by the helper.
+    pub(crate) fn render_words(&mut self, words: &[u32]) -> Result<()> {
+        let expected = u64::from(self.width)
+            .checked_mul(u64::from(self.height))
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(|| VshotError::WaylandProtocol("SHM slot size overflows".into()))?;
+        if words.len() != expected {
+            return Err(VshotError::WaylandProtocol(format!(
+                "backdrop frame has {} pixels, but the layer surface buffer is {expected}",
+                words.len()
+            )));
+        }
+        let map_len = checked_buffer_len(self.stride, self.width, self.height)?;
+        if self.map.len() < map_len {
+            return Err(VshotError::WaylandProtocol(
+                "SHM map is smaller than its declared dimensions".into(),
+            ));
+        }
+        let (words_out, _) = self.map[..map_len].as_chunks_mut::<4>();
+        for (destination, word) in words_out.iter_mut().zip(words) {
+            *destination = word.to_le_bytes();
+        }
+        self.dimmed = None;
+        self.editor_dimmed = None;
+        self.editor_bgra = None;
+        self.editor_annotations = None;
+        self.content_mode = ContentMode::Raw;
+        self.last_selection = None;
+        Ok(())
+    }
+
     fn validate_frame(&self, frame: &Frame) -> Result<usize> {
         if frame.size().width != self.width || frame.size().height != self.height {
             return Err(VshotError::WaylandProtocol(format!(
@@ -1365,6 +1401,27 @@ pub(crate) struct OverlaySurface {
     pub(crate) height: u32,
     pub(crate) slots: Vec<ShmSlot>,
     pub(crate) pending_parent_redraw: bool,
+    /// The colour-management objects an HDR backdrop hangs on its surface,
+    /// held so they outlive it.
+    pub(crate) color: Option<OverlayColor>,
+}
+
+/// An HDR backdrop surface's colour management: the output the description came
+/// from, the description itself, and the surface object it was set on.
+///
+/// The description is the **output's own** — what
+/// `wp_color_management_output_v1.get_image_description()` hands back — not one
+/// built to look like it.  The compositor dedupes descriptions by content, so
+/// this is the very object it uses for the monitor; a surface carrying it needs
+/// no conversion and, more to the point, no tone map, which is what makes the
+/// frozen frame show at the light levels the screen showed.
+#[derive(Debug)]
+pub(crate) struct OverlayColor {
+    pub(crate) _output:
+        wayland_protocols::wp::color_management::v1::client::wp_color_management_output_v1::WpColorManagementOutputV1,
+    pub(crate) _description:
+        wayland_protocols::wp::color_management::v1::client::wp_image_description_v1::WpImageDescriptionV1,
+    pub(crate) _surface: wayland_protocols::wp::color_management::v1::client::wp_color_management_surface_v1::WpColorManagementSurfaceV1,
 }
 
 impl std::fmt::Debug for OverlaySurface {

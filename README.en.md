@@ -426,6 +426,13 @@ The annotations are meant to be in the picture: a screenshot or a recording hide
 ## Images and output mapping
 **A rectangle that falls inside a single output is always cropped from that output's own native frame and written with that screen's scale as its density**: `region`'s `--geometry` and interactive selections, `window active`, `window pick`, and rectangles from pixel detection all take this route, and only rectangles **crossing a seam** fall back to the composed scene; `all` is the whole desktop and can only come from the scene. Internal frames are uniformly RGBA8 with a top-left origin, and multi-output composition supports negative logical origins and gaps between outputs (the scene canvas uses the highest output scale, with lower-scale outputs enlarged by nearest-neighbor). Positive integer scales, `transform=normal`, and a provably safe logical/pixel mapping are currently required; fractional scale, rotation, and mappings that cannot be proven fail clearly rather than producing a plausibly wrong screenshot. This validation applies only to the routes that **need to compose outputs into a scene**, so KWin's and niri's two routes that hand over window pixels directly still work on a rotated or flipped output.
 
+### HDR
+When the compositor describes the output itself as HDR (PQ or HLG), one capture produces **two** files: `<name>.png` is an SDR tone map of the same content (extended Reinhard, with the frame's own peak as the white point) and `<name>.hdr` holds the HDR content as Radiance RGBE. Annotations are composited **in linear light** onto the HDR one, and the SDR one is mapped down from it, so both describe one set of marks over one set of light. Content that never rises above SDR white gets no `.hdr` at all.
+
+Colour is asked of the display, never guessed from the pixels: a 10-bit buffer on an HDR output *is* that output's own pixels, decoded with the transfer function and reference white it publishes (`wp_color_manager_v1`'s output description, whose reference is the output's own SDR white). On Hyprland that holds only while `misc:screencopy_hdr` is on — with it off the compositor hands over 8-bit sRGB, and no `.hdr` is written.
+
+The frozen frame is shown the same way in the interactive overlay: VShot puts up a surface *underneath* it carrying **the output's own image description** — not one built to resemble it — so the compositor neither converts nor tone-maps it, and the selection is the light the screen actually showed. The overlay draws only the veil (cut open at the selection), the annotations, and the toolbar. A description that merely resembles the output's is not enough: the compositor treats it as a different space and tone-maps it into the panel's own range, dimming the whole picture.
+
 ## Capture backends and KDE authorization
 Probed once at startup: `wlr-screencopy-unstable-v1` is tried first, and only a failure of "missing `zwlr_screencopy_manager_v1`" means this compositor does not provide the protocol; then **KWin ScreenShot2** — KWin's private session-bus service `org.kde.KWin.ScreenShot2` (KWin has neither screencopy nor `ext-image-copy-capture`). vshot passes the write end of a pipe, and KWin writes the pixels into it and reports `width` / `height` / `stride` / `format` / `scale` in its reply; the pixels are premultiplied-alpha BGRA, output screenshots normalize alpha to 255, and window screenshots keep it as is.
 
@@ -661,7 +668,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --release --locked
 ```
 
-The Qt helper has no test framework, only **offscreen checks that need no compositor** (not built by default; add `-DVSHOT_BUILD_CHECKS=ON`), covering config reads and writes with the settings window, the text size conversion, clipboard color parsing and color card rendering, a pin's self-declared density and outline, text card padding, the color card's right-click menu, the export format of a pasted image, the file dialog's stylesheet and thumbnail grid, the annotation surface's ink, eraser and undo with a stray drag across its toolbar, where the editor's floating toolbar lands, the annotation render cache being hit, the resolution that cache is built at on a high-DPI screen, and the text layer — which parses the JSON `vshot ocr --json` prints (so the wire format has one end in `src/ocr.rs` and one on the Qt side) and, building no widget, needs no `QT_QPA_PLATFORM`:
+The Qt helper has no test framework, only **offscreen checks that need no compositor** (not built by default; add `-DVSHOT_BUILD_CHECKS=ON`), covering config reads and writes with the settings window, the text size conversion, clipboard color parsing and color card rendering, the file dialog's stylesheet and thumbnail grid, a pin's self-declared density and outline, text card padding, the color card's right-click menu, the export format of a pasted image, the annotation overlay's five tools with undo, clear and the toolbar's placement, whether the overlay leaves the frozen frame to a backdrop, where the toolbar lands, the annotation render cache being hit, the resolution that cache is built at on a high-DPI screen, and the text layer — which parses the JSON `vshot ocr --json` prints (so the wire format has one end in `src/ocr.rs` and one on the Qt side) and, building no widget, needs no `QT_QPA_PLATFORM`:
 
 ```sh
 cmake -S . -B build-qt -DVSHOT_BUILD_CHECKS=ON && cmake --build build-qt
@@ -676,6 +683,7 @@ QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-menu-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-paste-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-file-dialog-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-annotate-check
+QT_QPA_PLATFORM=offscreen build-qt/vshot-backdrop-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-toolbar-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-annotation-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-dpr-check

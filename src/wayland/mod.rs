@@ -6,6 +6,7 @@ pub mod input;
 pub mod topology;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wayland_client::protocol::{
@@ -13,6 +14,10 @@ use wayland_client::protocol::{
     wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+use wayland_protocols::wp::color_management::v1::client::{
+    wp_color_management_output_v1, wp_color_management_surface_v1, wp_color_manager_v1,
+    wp_image_description_v1,
+};
 use wayland_protocols::wp::cursor_shape::v1::client::{
     wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
 };
@@ -21,11 +26,11 @@ use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_l
 
 use crate::error::{Result, VshotError};
 use crate::geometry::{Point, Rect};
-use crate::model::SceneSnapshot;
+use crate::model::{HdrFrame, SceneSnapshot};
 
 use self::freeze_overlay::{
-    release_buffer_if_current, BufferToken, BufferUserData, LayerSurfaceUserData, OverlaySurface,
-    PoolUserData, ShmSlot, SurfaceUserData,
+    release_buffer_if_current, BufferToken, BufferUserData, LayerSurfaceUserData, OverlayColor,
+    OverlaySurface, PoolUserData, ShmSlot, SurfaceUserData,
 };
 use self::input::{
     global_point, EditorState, ResizeHandle, SelectionEvent, SelectionResult, SelectionTracker,
@@ -44,11 +49,38 @@ pub struct WaylandSession {
     state: WaylandState,
 }
 
+/// One output's HDR half, as a backdrop surface needs it: the frozen frame and
+/// the light level its `1.0` stands for — the output's own SDR white — which is
+/// what turns the frame back into the absolute PQ codes the surface shows.
+#[derive(Clone, Debug)]
+pub struct BackdropFrame {
+    pub name: String,
+    pub frame: HdrFrame,
+    pub reference_nits: f32,
+}
+
+/// One output's backdrop pixels, encoded once.  A backdrop never re-renders,
+/// so the surface's two buffers share the same words rather than encoding the
+/// frame twice.
+#[derive(Clone, Debug)]
+struct HdrBackdrop {
+    words: Arc<Vec<u32>>,
+}
+
 #[derive(Debug, Default)]
 struct WaylandState {
     topology: TopologyState,
     scene: Option<SceneSnapshot>,
     overlays: HashMap<u32, OverlaySurface>,
+    /// Set while the overlays are an HDR backdrop rather than the SDR freeze
+    /// editor: the pixels to show, keyed by output id.  A backdrop surface sits
+    /// on the top layer, below the Qt helper's overlay layer, hands the pointer
+    /// nothing, and carries the output's own colour description.
+    hdr_backdrop: HashMap<u32, HdrBackdrop>,
+    /// Output ids whose image description came back `ready`, and those whose
+    /// query failed, between `get_image_description` and the flood of events.
+    cm_ready: HashSet<u32>,
+    cm_failed: HashSet<u32>,
     ready_outputs: HashSet<u32>,
     pointer_output: Option<u32>,
     pointer_grab_output: Option<u32>,
@@ -138,6 +170,7 @@ impl WaylandState {
         self.interaction_redraw_pending = false;
         self.keyboard_focus_output = None;
         self.overlays.clear();
+        self.hdr_backdrop.clear();
         self.ready_outputs.clear();
     }
 
@@ -456,6 +489,7 @@ impl WaylandSession {
                     height: info.geometry.size.height,
                     slots: Vec::new(),
                     pending_parent_redraw: false,
+                    color: None,
                 },
             );
         }
@@ -472,6 +506,235 @@ impl WaylandSession {
             return Err(VshotError::TopologyChanged);
         }
         Ok(())
+    }
+
+    /// Shows each output's HDR frame on a backdrop surface, so the frozen
+    /// picture behind the Qt helper's overlay is the light the screen showed
+    /// rather than its SDR map.
+    ///
+    /// The surface carries the **output's own** colour description.  That is
+    /// what makes the compositor hand the pixels through untouched: it is the
+    /// very description the monitor itself uses, so there is nothing to convert
+    /// — and, the point of it, nothing to tone-map.  A description that merely
+    /// resembles the output's, which is all a `QSurfaceFormat` colour space
+    /// gives Qt, is a different one, and the compositor tone-maps it into the
+    /// panel's own range, dimming the whole picture instead of showing it.
+    ///
+    /// The surfaces sit on the top layer — below the helper's overlay layer,
+    /// above every window — and take no input.  The answer is the outputs that
+    /// really carry an HDR backdrop, by name: an empty list means none was
+    /// wanted or possible, and the caller keeps its SDR overlay.  An output
+    /// whose description never became ready is left out of the list as well —
+    /// its ten-bit buffer would be read as sRGB, far darker than the screen, and
+    /// the caller draws its own SDR frame there instead.
+    pub fn show_hdr_backdrop(&mut self, frames: &[BackdropFrame]) -> Result<Vec<String>> {
+        if frames.is_empty() || self.state.topology.color_manager.is_none() {
+            return Ok(Vec::new());
+        }
+        if self.state.topology.shm_format_10bit().is_none() {
+            return Ok(Vec::new());
+        }
+        let scene = self.state.scene.clone().ok_or_else(|| {
+            VshotError::WaylandProtocol("cannot show a backdrop without a scene snapshot".into())
+        })?;
+        let infos = self.state.topology.output_infos()?;
+        if infos.len() != scene.outputs().len() {
+            return Err(VshotError::TopologyChanged);
+        }
+        let mut wanted = HashMap::new();
+        for info in &infos {
+            if let Some(frame) = frames.iter().find(|frame| frame.name == info.name) {
+                // Encoded once: a backdrop never re-renders, and the surface's
+                // two buffers share the words.
+                wanted.insert(
+                    info.global_id,
+                    HdrBackdrop {
+                        words: Arc::new(frame.frame.to_rgb10_pq(frame.reference_nits)),
+                    },
+                );
+            }
+        }
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !self.state.overlays.is_empty() {
+            self.destroy_overlays()?;
+        }
+        self.state.selection.reset();
+        self.state.pointer_output = None;
+        self.state.pointer_grab_output = None;
+        self.state.keyboard_focus_output = None;
+        self.state.selection_mode = false;
+        self.state.editor = None;
+        self.state.interaction_redraw_pending = false;
+        self.state.selection_outcome = None;
+        self.state.ready_outputs.clear();
+        self.state.cm_ready.clear();
+        self.state.cm_failed.clear();
+        self.state.error = None;
+        let qh = self.event_queue.handle();
+        let compositor = self
+            .state
+            .topology
+            .compositor
+            .clone()
+            .ok_or_else(|| VshotError::MissingCapability("wl_compositor".into()))?;
+        let layer_shell = self
+            .state
+            .topology
+            .layer_shell
+            .clone()
+            .ok_or_else(|| VshotError::MissingCapability("zwlr_layer_shell_v1".into()))?;
+
+        // Only the outputs that carry a frame get a surface: another output's
+        // own overlay is drawn by the helper, and a second, undescribed copy
+        // here would be a duplicate render of the same picture.
+        for info in infos
+            .iter()
+            .filter(|info| wanted.contains_key(&info.global_id))
+        {
+            let output = self
+                .state
+                .topology
+                .output_proxies
+                .get(&info.global_id)
+                .cloned()
+                .ok_or(VshotError::TopologyChanged)?;
+            let surface = compositor.create_surface(
+                &qh,
+                SurfaceUserData {
+                    output_id: info.global_id,
+                },
+            );
+            surface.set_buffer_scale(i32::try_from(info.scale).map_err(|_| {
+                VshotError::UnsupportedOutput(format!("output {} scale is too large", info.name))
+            })?);
+            let layer_surface = layer_shell.get_layer_surface(
+                &surface,
+                Some(&output),
+                // Below the helper's overlay layer, above every window.
+                zwlr_layer_shell_v1::Layer::Top,
+                "vshot".to_string(),
+                &qh,
+                LayerSurfaceUserData {
+                    output_id: info.global_id,
+                },
+            );
+            // Zero dimensions plus all four anchors asks the compositor for the full output.
+            layer_surface.set_size(0, 0);
+            layer_surface.set_anchor(zwlr_layer_surface_v1::Anchor::all());
+            layer_surface.set_exclusive_zone(-1);
+            // A picture takes no input: the helper's overlay layer is above
+            // this one and owns the pointer and the keyboard.
+            layer_surface
+                .set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
+            surface.commit();
+            self.state.overlays.insert(
+                info.global_id,
+                OverlaySurface {
+                    output_id: info.global_id,
+                    surface,
+                    _layer_surface: layer_surface,
+                    configured: false,
+                    closed: false,
+                    width: info.geometry.size.width,
+                    height: info.geometry.size.height,
+                    slots: Vec::new(),
+                    pending_parent_redraw: false,
+                    color: None,
+                },
+            );
+        }
+
+        self.state.hdr_backdrop = wanted;
+        self.dispatch_until(
+            Instant::now() + Duration::from_secs(10),
+            VshotError::OverlayTimeout,
+            |state| state.ready_outputs.len() == state.overlays.len(),
+        )?;
+        let colored = self.attach_backdrop_color()?;
+        if let Some(error) = self.state.error.take() {
+            return Err(error);
+        }
+        if self.state.topology.topology_changed {
+            return Err(VshotError::TopologyChanged);
+        }
+        Ok(infos
+            .iter()
+            .filter(|info| colored.contains(&info.global_id))
+            .map(|info| info.name.clone())
+            .collect())
+    }
+
+    /// Gives each backdrop surface its output's own colour description, and
+    /// answers which outputs got one.
+    ///
+    /// The objects are created on this connection — a surface's description has
+    /// to come from the same client — and kept on the overlay so they outlive
+    /// the surface.  An output whose description never became ready is left off
+    /// the answer: its surface reads as sRGB, which would show a PQ buffer far
+    /// darker than the screen, so the caller paints the SDR frame there instead.
+    fn attach_backdrop_color(&mut self) -> Result<HashSet<u32>> {
+        let mut colored = HashSet::new();
+        let Some(manager) = self.state.topology.color_manager.clone() else {
+            return Ok(colored);
+        };
+        let qh = self.event_queue.handle();
+        let mut pending = Vec::new();
+        let ids = self.state.hdr_backdrop.keys().copied().collect::<Vec<_>>();
+        for global_id in ids {
+            let Some(output) = self.state.topology.output_proxies.get(&global_id).cloned() else {
+                continue;
+            };
+            let color_output = manager.get_output(&output, &qh, global_id);
+            let description = color_output.get_image_description(&qh, global_id);
+            pending.push((global_id, color_output, description));
+        }
+        if pending.is_empty() {
+            return Ok(colored);
+        }
+        let expected = pending.len();
+        self.dispatch_until(
+            Instant::now() + Duration::from_secs(5),
+            VshotError::OverlayTimeout,
+            |state| state.cm_ready.len() + state.cm_failed.len() >= expected,
+        )?;
+        let debug = std::env::var_os("VSHOT_HDR_DEBUG").is_some();
+        for (global_id, color_output, description) in pending {
+            if !self.state.cm_ready.contains(&global_id) {
+                if debug {
+                    eprintln!(
+                        "vshot: hdr: output {global_id} image description not ready; showing its \
+                         SDR frame instead"
+                    );
+                }
+                continue;
+            }
+            let Some(overlay) = self.state.overlays.get_mut(&global_id) else {
+                continue;
+            };
+            let color_surface = manager.get_surface(&overlay.surface, &qh, ());
+            color_surface
+                .set_image_description(&description, wp_color_manager_v1::RenderIntent::Perceptual);
+            // The description is double-buffered, so the commit that already
+            // attached the buffer has to be followed by another one for it to
+            // take effect.
+            overlay.surface.commit();
+            overlay.color = Some(OverlayColor {
+                _output: color_output,
+                _description: description,
+                _surface: color_surface,
+            });
+            colored.insert(global_id);
+        }
+        // Requests only leave on a flush, and nothing here dispatches again
+        // before the caller draws: without this the compositor keeps the
+        // surface's default (sRGB) description, which reads a PQ buffer as SDR
+        // and shows a picture far darker than the screen's.
+        self.event_queue
+            .flush()
+            .map_err(|error| VshotError::WaylandProtocol(error.to_string()))?;
+        Ok(colored)
     }
 
     /// The output the pointer is on: the one thing here that needs a pointer,
@@ -699,7 +962,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                 "wp_cursor_shape_manager_v1" if state.topology.cursor_shape_manager.is_none() => {
                     state.topology.cursor_shape_manager =
                         Some(registry.bind(name, version.min(2), qh, ()));
-                    ensure_cursor_shape_device(state, qh);
+                }
+                "wp_color_manager_v1" if state.topology.color_manager.is_none() => {
+                    // Version 1 is enough: the backdrop only asks an output for
+                    // its own image description and sets that on a surface.
+                    state.topology.color_manager =
+                        Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 "zxdg_output_manager_v1" if state.topology.xdg_output_manager.is_none() => {
                     state.topology.xdg_output_manager =
@@ -757,6 +1025,68 @@ impl Dispatch<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1, ()> for WaylandS
     }
 }
 
+impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for WaylandState {
+    fn event(
+        _: &mut Self,
+        _: &wp_color_manager_v1::WpColorManagerV1,
+        _: wp_color_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // The supported-feature and done events only describe what the
+        // compositor can do; a backdrop only asks an output for its own
+        // description, which every version of the protocol has.
+    }
+}
+
+impl Dispatch<wp_color_management_output_v1::WpColorManagementOutputV1, u32> for WaylandState {
+    fn event(
+        _: &mut Self,
+        _: &wp_color_management_output_v1::WpColorManagementOutputV1,
+        _: wp_color_management_output_v1::Event,
+        _: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // An output that changes its description mid-session leaves the
+        // backdrop with the one it was given; the next run asks again.
+    }
+}
+
+impl Dispatch<wp_image_description_v1::WpImageDescriptionV1, u32> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _: &wp_image_description_v1::WpImageDescriptionV1,
+        event: wp_image_description_v1::Event,
+        data: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wp_image_description_v1::Event::Ready { .. } => {
+                state.cm_ready.insert(*data);
+            }
+            wp_image_description_v1::Event::Failed { .. } => {
+                state.cm_failed.insert(*data);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wp_color_management_surface_v1::WpColorManagementSurfaceV1, ()> for WaylandState {
+    fn event(
+        _: &mut Self,
+        _: &wp_color_management_surface_v1::WpColorManagementSurfaceV1,
+        _: wp_color_management_surface_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 impl Dispatch<wl_compositor::WlCompositor, ()> for WaylandState {
     fn event(
         _: &mut Self,
@@ -785,6 +1115,8 @@ impl Dispatch<wl_shm::WlShm, ()> for WaylandState {
             match format {
                 wl_shm::Format::Argb8888 => state.topology.shm_argb8888 = true,
                 wl_shm::Format::Xrgb8888 => state.topology.shm_xrgb8888 = true,
+                wl_shm::Format::Argb2101010 => state.topology.shm_argb2101010 = true,
+                wl_shm::Format::Xrgb2101010 => state.topology.shm_xrgb2101010 = true,
                 _ => {}
             }
         }
@@ -1179,11 +1511,31 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, LayerSurfaceUserData> f
                     state.fail(VshotError::MissingCapability("wl_shm".into()));
                     return;
                 };
-                let Some(shm_format) = state.topology.shm_format() else {
-                    state.fail(VshotError::MissingCapability(
-                        "wl_shm ARGB8888 or XRGB8888 format".into(),
-                    ));
-                    return;
+                // An HDR backdrop shows the output's own ten-bit frame; the SDR
+                // freeze editor shows the composed scene at eight bits.
+                let backdrop = state
+                    .hdr_backdrop
+                    .get(&data.output_id)
+                    .map(|backdrop| Arc::clone(&backdrop.words));
+                let shm_format = match &backdrop {
+                    Some(_) => match state.topology.shm_format_10bit() {
+                        Some(format) => format,
+                        None => {
+                            state.fail(VshotError::MissingCapability(
+                                "wl_shm XRGB2101010 format".into(),
+                            ));
+                            return;
+                        }
+                    },
+                    None => match state.topology.shm_format() {
+                        Some(format) => format,
+                        None => {
+                            state.fail(VshotError::MissingCapability(
+                                "wl_shm ARGB8888 or XRGB8888 format".into(),
+                            ));
+                            return;
+                        }
+                    },
                 };
                 let mut slots = Vec::new();
                 for _ in 0..2 {
@@ -1206,8 +1558,12 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, LayerSurfaceUserData> f
                         qh,
                     ) {
                         Ok(mut slot) => {
-                            let result =
-                                slot.render(&output.frame, None, output.geometry, output.scale);
+                            let result = match &backdrop {
+                                Some(words) => slot.render_words(words),
+                                None => {
+                                    slot.render(&output.frame, None, output.geometry, output.scale)
+                                }
+                            };
                             if let Err(error) = result {
                                 state.fail(error);
                                 return;

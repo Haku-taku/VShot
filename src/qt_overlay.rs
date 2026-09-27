@@ -377,6 +377,12 @@ struct QtOutput<'a> {
     pixel_width: u32,
     pixel_height: u32,
     path: String,
+    // Set when VShot is showing this output's HDR half on a backdrop surface
+    // below the overlay.  The helper then leaves the frozen frame out and
+    // veils the backdrop instead, so what shows through the selection is the
+    // real light rather than the SDR map of it.
+    #[serde(default)]
+    backdrop: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -443,8 +449,8 @@ struct QtAnnotation {
     bitmap: Option<String>,
 }
 
-pub fn select_and_edit(scene: &SceneSnapshot) -> Result<SelectionOutcome> {
-    let (_directory, session_path) = write_session(scene, "region", &[], None, true)?;
+pub fn select_and_edit(scene: &SceneSnapshot, backdrop: &[String]) -> Result<SelectionOutcome> {
+    let (_directory, session_path) = write_session(scene, "region", &[], None, true, backdrop)?;
     let helper = helper_program()?;
     let output = run_helper(&helper, &session_path)?;
     parse_outcome(output, scene.bounds())
@@ -472,7 +478,7 @@ pub fn pick_window(
     candidates: &[WindowCandidate],
     refresh: impl Fn() -> Option<Vec<WindowCandidate>>,
 ) -> Result<PickedWindow> {
-    let (_directory, session_path) = write_session(scene, "window-pick", candidates, None, false)?;
+    let (_directory, session_path) = write_session(scene, "window-pick", candidates, None, false, &[])?;
     let helper = helper_program()?;
     let output = run_pick_helper(&helper, &session_path, &refresh)?;
     parse_picked_window(output, scene.bounds())
@@ -481,9 +487,13 @@ pub fn pick_window(
 /// Re-opens a captured scene for annotation with `selection` already made, so
 /// the window the user picked is edited on the frame that was captured after
 /// the pick — not on the one the picking itself started from.
-pub fn edit_selection(scene: &SceneSnapshot, selection: Rect) -> Result<(Rect, Vec<Annotation>)> {
+pub fn edit_selection(
+    scene: &SceneSnapshot,
+    selection: Rect,
+    backdrop: &[String],
+) -> Result<(Rect, Vec<Annotation>)> {
     let (_directory, session_path) =
-        write_session(scene, "region", &[], Some(selection.into()), false)?;
+        write_session(scene, "region", &[], Some(selection.into()), false, backdrop)?;
     let helper = helper_program()?;
     let output = run_helper(&helper, &session_path)?;
     parse_result(output, scene.bounds())
@@ -493,7 +503,7 @@ pub fn edit_selection(scene: &SceneSnapshot, selection: Rect) -> Result<(Rect, V
 /// what this is for: the frame that gets stitched does not exist yet, so there
 /// is nothing to mark up at selection time.
 pub fn select_region(scene: &SceneSnapshot) -> Result<Rect> {
-    let (_directory, session_path) = write_session(scene, "region-only", &[], None, false)?;
+    let (_directory, session_path) = write_session(scene, "region-only", &[], None, false, &[])?;
     let helper = helper_program()?;
     let output = run_helper(&helper, &session_path)?;
     let (selection, _annotations) = parse_result(output, scene.bounds())?;
@@ -762,6 +772,9 @@ pub(crate) fn write_pin_edit_session(spec: &PinEditSpec<'_>) -> Result<(TempDir,
             pixel_width: spec.frame.size().width,
             pixel_height: spec.frame.size().height,
             path: raw_path.to_string_lossy().into_owned(),
+            // A pinned image is its own SDR picture, with no frozen screen
+            // behind it to show better.
+            backdrop: false,
         }],
     };
     let session_path = directory.path().join("session.json");
@@ -858,7 +871,13 @@ fn write_session(
     mode: &str,
     candidates: &[WindowCandidate],
     selection: Option<WireRect>,
+    // Whether the editor offers the scrolling-capture action: only the plain
+    // region session does, because the other modes have already decided what
+    // they are for.
     long_allowed: bool,
+    // The outputs whose frozen frame the helper should leave to an HDR backdrop
+    // surface below it, rather than drawing itself.
+    backdrop: &[String],
 ) -> Result<(TempDir, PathBuf)> {
     let directory = tempfile::Builder::new()
         .prefix("vshot-qt-")
@@ -888,6 +907,7 @@ fn write_session(
             pixel_width: output.frame.size().width,
             pixel_height: output.frame.size().height,
             path: raw_path.to_string_lossy().into_owned(),
+            backdrop: backdrop.iter().any(|name| name == &output.name),
         });
     }
 

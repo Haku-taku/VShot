@@ -65,9 +65,18 @@ fn write_capture_files(
     density: u32,
     compression: PngCompression,
 ) -> Result<()> {
-    write_file(path, &frame.encode_png(Some(density), compression)?)?;
+    // The SDR half is the destination the user named and the HDR half sits
+    // beside it.  When the destination already ends in `.hdr` the two names
+    // would be the same file, so the named path is taken for the HDR half and
+    // the PNG goes to its sibling — the pair still differs only in its suffix,
+    // and neither image overwrites the other.
+    let (png_path, hdr_path) = match hdr {
+        Some(_) if hdr_sibling_path(path) == path => (png_sibling_path(path), path.to_path_buf()),
+        _ => (path.to_path_buf(), hdr_sibling_path(path)),
+    };
+    write_file(&png_path, &frame.encode_png(Some(density), compression)?)?;
     if let Some(hdr) = hdr {
-        write_file(&hdr_sibling_path(path), &hdr.encode_radiance())?;
+        write_file(&hdr_path, &hdr.encode_radiance())?;
     }
     Ok(())
 }
@@ -77,6 +86,13 @@ fn write_capture_files(
 fn hdr_sibling_path(path: &Path) -> PathBuf {
     let mut sibling = path.to_path_buf();
     sibling.set_extension("hdr");
+    sibling
+}
+
+/// The SDR half's path, for a destination that named the HDR one outright.
+fn png_sibling_path(path: &Path) -> PathBuf {
+    let mut sibling = path.to_path_buf();
+    sibling.set_extension("png");
     sibling
 }
 
@@ -248,6 +264,35 @@ mod tests {
         );
         assert_eq!(path.extension().unwrap(), "png");
         assert_eq!(hdr_sibling_path(&path).extension().unwrap(), "hdr");
+    }
+
+    #[test]
+    fn a_destination_named_for_the_hdr_half_does_not_overwrite_the_png() {
+        // A destination that already ends in `.hdr` names the HDR half; the PNG
+        // goes beside it rather than to the same path, so neither file is lost.
+        let frame = Frame::solid(Size::new(2, 2), [10, 20, 30, 255]).unwrap();
+        let hdr = HdrFrame::new(Size::new(2, 2), vec![[4.0, 2.0, 1.0, 1.0]; 4]).unwrap();
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "vshot-hdr-destination-test-{}-{}.hdr",
+            std::process::id(),
+            unique_suffix()
+        ));
+        write_capture_files(&path, &frame, Some(&hdr), 1, PngCompression::default()).unwrap();
+        let png_path = png_sibling_path(&path);
+        let png = std::fs::read(&png_path).unwrap();
+        let radiance = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&png_path);
+        assert!(
+            png.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "the SDR half is a PNG"
+        );
+        assert!(
+            radiance.starts_with(b"#?RADIANCE"),
+            "the HDR half is Radiance"
+        );
+        assert_eq!(png_path.extension().unwrap(), "png");
     }
 
     #[test]

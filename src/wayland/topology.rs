@@ -55,6 +55,12 @@ pub(crate) struct TopologyState {
     pub(crate) shm: Option<wayland_client::protocol::wl_shm::WlShm>,
     pub(crate) shm_argb8888: bool,
     pub(crate) shm_xrgb8888: bool,
+    // Ten-bit shm formats, what an HDR backdrop surface is written in.
+    pub(crate) shm_argb2101010: bool,
+    pub(crate) shm_xrgb2101010: bool,
+    // `wp_color_manager_v1`, when the compositor offers it: the backdrop sets
+    // an output's own image description on its surface through this.
+    pub(crate) color_manager: Option<wayland_protocols::wp::color_management::v1::client::wp_color_manager_v1::WpColorManagerV1>,
     pub(crate) layer_shell: Option<wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::ZwlrLayerShellV1>,
     pub(crate) cursor_shape_manager: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
     pub(crate) cursor_shape_device: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
@@ -100,6 +106,27 @@ impl TopologyState {
             Some(wayland_client::protocol::wl_shm::Format::Argb8888)
         } else if self.shm_xrgb8888 {
             Some(wayland_client::protocol::wl_shm::Format::Xrgb8888)
+        } else {
+            None
+        }
+    }
+
+    /// The ten-bit shm format a backdrop surface is written in.  Ten bits is
+    /// what a PQ code wants: it is the depth an HDR capture arrives at, and
+    /// rounding it to eight would band the very gradients the backdrop exists
+    /// to show.  `None` means the compositor offers none, and the backdrop
+    /// falls back to the SDR overlay.
+    ///
+    /// Only the `…rgb…`-ordered forms are usable: the backdrop's words are
+    /// packed ``XRGB2101010``-wise (see [`crate::model::HdrFrame::to_rgb10_pq`]),
+    /// and the buffer is written straight from them.  A compositor that offers
+    /// only the `…bgr…` pair therefore falls back to the SDR overlay; the
+    /// capture side reads all four, but it can swap the fields as it decodes.
+    pub(crate) fn shm_format_10bit(&self) -> Option<wayland_client::protocol::wl_shm::Format> {
+        if self.shm_argb2101010 {
+            Some(wayland_client::protocol::wl_shm::Format::Argb2101010)
+        } else if self.shm_xrgb2101010 {
+            Some(wayland_client::protocol::wl_shm::Format::Xrgb2101010)
         } else {
             None
         }
