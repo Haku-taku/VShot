@@ -669,42 +669,40 @@ void drawMosaicAnnotation(QPainter *painter, const OutputSession &output,
     }
 }
 
-// Smears mosaic discs along the path, mirroring Frame::mosaic_brush: device
-// space, radius = width/2, stamps every radius/2 pixels, each stamp averaged
-// from the pristine source image.
-void drawMosaicBrush(QPainter *painter, const OutputSession &output, const QVector<Point> &points,
-                     std::uint32_t widthLogical, std::uint32_t strength, const QSize &size)
+// Appends the device-space stamp centers of one segment, plus the segment's own
+// start when it is the first one, to `centers`.  Each segment's stamps depend
+// only on its two endpoints, which is what lets a growing freehand stroke stamp
+// a segment once and never touch it again.
+void appendMosaicCenters(QVector<QPointF> &centers, const OutputSession &output,
+                         const Point &first, const Point &second, bool includeFirst, double scale,
+                         double step)
+{
+    const QPointF a((first.x - output.geometry.x) * scale, (first.y - output.geometry.y) * scale);
+    const QPointF b((second.x - output.geometry.x) * scale,
+                    (second.y - output.geometry.y) * scale);
+    if (includeFirst) {
+        centers.append(a);
+    }
+    const double length = std::hypot(b.x() - a.x(), b.y() - a.y());
+    const int count = std::max(1, static_cast<int>(std::ceil(length / step)));
+    for (int k = 1; k <= count; ++k) {
+        const double t = static_cast<double>(k) / count;
+        centers.append(a + (b - a) * t);
+    }
+}
+
+// Averages the source image under each stamp center and paints the disc.  The
+// whole-path brush and the incremental one share this so both smear alike.
+void stampMosaicDiscs(QPainter *painter, const OutputSession &output,
+                      const QVector<QPointF> &centers, int radius, double scale, const QSize &size)
 {
     const QImage &image = output.image;
-    if (image.isNull() || points.isEmpty()) {
+    if (image.isNull() || centers.isEmpty()) {
         return;
     }
-    const std::uint32_t scaleValue = output.scale > 0 ? output.scale : 1;
-    const double scale = static_cast<double>(scaleValue);
-    const int baseRadius = std::clamp(static_cast<int>(widthLogical * scale / 2.0), 1, 512);
-    const int radius = std::clamp(brushRadiusForStrength(strength, baseRadius), 1, 512);
-    const double step = std::max(1, radius / 2);
     const uchar *bits = image.constBits();
     const qsizetype bytesPerLine = image.bytesPerLine();
     const double radiusSquared = static_cast<double>(radius) * radius;
-
-    QVector<QPointF> centers;
-    centers.reserve(points.size());
-    centers.append(QPointF((points.constFirst().x - output.geometry.x) * scale,
-                           (points.constFirst().y - output.geometry.y) * scale));
-    for (int index = 0; index + 1 < points.size(); ++index) {
-        const QPointF first((points.at(index).x - output.geometry.x) * scale,
-                            (points.at(index).y - output.geometry.y) * scale);
-        const QPointF second((points.at(index + 1).x - output.geometry.x) * scale,
-                             (points.at(index + 1).y - output.geometry.y) * scale);
-        const double length = std::hypot(second.x() - first.x(), second.y() - first.y());
-        const int count = std::max(1, static_cast<int>(std::ceil(length / step)));
-        for (int k = 1; k <= count; ++k) {
-            const double t = static_cast<double>(k) / count;
-            centers.append(first + (second - first) * t);
-        }
-    }
-
     const bool antialiased = painter->testRenderHint(QPainter::Antialiasing);
     painter->setRenderHint(QPainter::Antialiasing, false);
     for (const QPointF &center : centers) {
@@ -746,6 +744,45 @@ void drawMosaicBrush(QPainter *painter, const OutputSession &output, const QVect
         painter->drawEllipse(local, radius / scale, radius / scale);
     }
     painter->setRenderHint(QPainter::Antialiasing, antialiased);
+}
+
+// Stamps one segment of the brush, the unit the incremental freehand raster
+// bakes one at a time.
+void stampMosaicSegment(QPainter *painter, const OutputSession &output, const Point &first,
+                        const Point &second, bool includeFirst, int radius, double scale,
+                        double step, const QSize &size)
+{
+    QVector<QPointF> centers;
+    appendMosaicCenters(centers, output, first, second, includeFirst, scale, step);
+    stampMosaicDiscs(painter, output, centers, radius, scale, size);
+}
+
+// Smears mosaic discs along the path, mirroring Frame::mosaic_brush: device
+// space, radius = width/2, stamps every radius/2 pixels, each stamp averaged
+// from the pristine source image.
+void drawMosaicBrush(QPainter *painter, const OutputSession &output, const QVector<Point> &points,
+                     std::uint32_t widthLogical, std::uint32_t strength, const QSize &size)
+{
+    if (output.image.isNull() || points.isEmpty()) {
+        return;
+    }
+    const std::uint32_t scaleValue = output.scale > 0 ? output.scale : 1;
+    const double scale = static_cast<double>(scaleValue);
+    const int baseRadius = std::clamp(static_cast<int>(widthLogical * scale / 2.0), 1, 512);
+    const int radius = std::clamp(brushRadiusForStrength(strength, baseRadius), 1, 512);
+    const double step = std::max(1, radius / 2);
+    QVector<QPointF> centers;
+    centers.reserve(points.size() + 8);
+    if (points.size() == 1) {
+        centers.append(QPointF((points.constFirst().x - output.geometry.x) * scale,
+                               (points.constFirst().y - output.geometry.y) * scale));
+    } else {
+        for (int index = 0; index + 1 < points.size(); ++index) {
+            appendMosaicCenters(centers, output, points.at(index), points.at(index + 1),
+                                index == 0, scale, step);
+        }
+    }
+    stampMosaicDiscs(painter, output, centers, radius, scale, size);
 }
 
 // Superellipse (squircle) outline path, matching the ProcessManager cards
@@ -1735,6 +1772,16 @@ struct OverlayController::Gesture {
     LogicalRect origin;
     int handle = 0;
     QVector<Point> points;
+    // The in-progress freehand stroke, rasterized incrementally.  Re-stroking
+    // the whole path on every paint is O(points) each time -- quadratic over a
+    // long scribble -- so each paint adds only the points appended since the
+    // last one and blits the accumulated image instead.
+    QImage liveRaster;
+    QPoint liveOrigin;
+    int liveOutput = -1;
+    int liveBaked = 0;     // points already in liveRaster
+    double liveLength = 0.0; // local path length up to the last baked point
+    QByteArray liveKey;    // style/output/size the raster was built for
 };
 
 class OverlayController::FloatingToolbar final : public QWidget {
@@ -3445,6 +3492,13 @@ void OverlayController::beginDrawing(Point point)
     gesture_->current = gesture_->anchor;
     gesture_->points.clear();
     gesture_->points.push_back(gesture_->anchor);
+    // The live raster starts over with each stroke.
+    gesture_->liveRaster = QImage();
+    gesture_->liveOrigin = QPoint();
+    gesture_->liveBaked = 1;
+    gesture_->liveLength = 0.0;
+    gesture_->liveKey.clear();
+    liveStrokeBakes_ = 0;
 }
 
 void OverlayController::updateDrawing(Point point)
@@ -3470,6 +3524,10 @@ void OverlayController::finishDrawing(Point point)
     const Tool drawingTool = tool_;
     gesture_->type = Gesture::Type::None;
     gesture_->points.clear();
+    gesture_->liveRaster = QImage();
+    gesture_->liveKey.clear();
+    gesture_->liveBaked = 0;
+    gesture_->liveLength = 0.0;
     if (points.isEmpty()) {
         return;
     }
@@ -3995,6 +4053,9 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
             return;
         }
         beginDrawing(point);
+        // The live raster is local to the overlay the stroke starts on; a
+        // stroke that wanders onto another output is clipped away there anyway.
+        gesture_->liveOutput = overlay->outputIndex();
     }
     updateAll();
 }
@@ -5365,6 +5426,11 @@ const QVector<Annotation> &OverlayController::annotations() const
     return annotations_;
 }
 
+int OverlayController::liveStrokeBakes() const
+{
+    return liveStrokeBakes_;
+}
+
 QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
                                                 QString *error) const
 {
@@ -6073,33 +6139,47 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
         annotation.raster->paint(painter, annotation, output, overlay->size());
     }
     if (gesture_->type == Gesture::Type::Drawing && !gesture_->points.isEmpty()) {
-        Annotation preview;
-        preview.tool = toolName(tool_);
-        preview.color = currentColor_;
-        preview.width = currentWidth_;
-        preview.dash = currentDash_;
-        preview.size = arrowSize_;
-        preview.arrowStyle = currentArrowStyle_;
-        preview.mask = mosaicShape_;
-        preview.strength = mosaicStrength_;
-        if (tool_ == Tool::Rectangle || tool_ == Tool::Ellipse ||
-            (tool_ == Tool::Mosaic && mosaicShape_ != QStringLiteral("brush"))) {
-            preview.kind = Annotation::Kind::Shape;
-            preview.rect = selectionBetween(gesture_->points.constFirst(),
-                                            gesture_->points.constLast());
-            if (tool_ == Tool::Mosaic) {
-                preview.tool = QStringLiteral("mosaic");
-            }
+        const bool mosaicBrush =
+            tool_ == Tool::Mosaic && mosaicShape_ == QStringLiteral("brush");
+        // Rectangle, ellipse, the area mosaic and the arrow all depend on two
+        // points, so drawing them straight is already cheap.  The freehand pen
+        // and the mosaic brush grow a point per move and build up through the
+        // incremental raster instead; a translucent pen would double-blend
+        // where consecutive round caps overlap, so it keeps the straight draw.
+        const bool buildUp =
+            (tool_ == Tool::Pen && currentColor_.alpha() == 255) || mosaicBrush;
+        if (buildUp) {
+            paintLiveStroke(painter, output, overlay->size(), overlay->outputIndex());
         } else {
-            preview.kind = Annotation::Kind::Stroke;
-            preview.points = gesture_->points;
-            if (tool_ == Tool::Mosaic) {
-                preview.tool = QStringLiteral("mosaic");
+            Annotation preview;
+            preview.tool = toolName(tool_);
+            preview.color = currentColor_;
+            preview.width = currentWidth_;
+            preview.dash = currentDash_;
+            preview.size = arrowSize_;
+            preview.arrowStyle = currentArrowStyle_;
+            preview.mask = mosaicShape_;
+            preview.strength = mosaicStrength_;
+            if (tool_ == Tool::Rectangle || tool_ == Tool::Ellipse ||
+                (tool_ == Tool::Mosaic && mosaicShape_ != QStringLiteral("brush"))) {
+                preview.kind = Annotation::Kind::Shape;
+                preview.rect = selectionBetween(gesture_->points.constFirst(),
+                                                gesture_->points.constLast());
+                if (tool_ == Tool::Mosaic) {
+                    preview.tool = QStringLiteral("mosaic");
+                }
+            } else {
+                preview.kind = Annotation::Kind::Stroke;
+                preview.points = gesture_->points;
+                if (tool_ == Tool::Mosaic) {
+                    preview.tool = QStringLiteral("mosaic");
+                }
             }
+            // Shapes, the arrow and a translucent pen draw straight: the first
+            // three are two-point previews, and the last would double-blend
+            // where consecutive round caps overlap.
+            drawAnnotation(preview);
         }
-        // The in-progress mark changes every frame, so there is nothing to
-        // cache: drawing it straight keeps the preview honest.
-        drawAnnotation(preview);
     }
 
     // Highlight the selected annotation with handles while the Select tool is
@@ -6189,6 +6269,134 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
         drawLoupe(overlay, painter);
     }
     painter->restore();
+}
+
+void OverlayController::paintLiveStroke(QPainter *painter, const OutputSession &output,
+                                        const QSize &size, int outputIndex)
+{
+    if (outputIndex != gesture_->liveOutput || gesture_->points.isEmpty()) {
+        return;
+    }
+    const bool brush = tool_ == Tool::Mosaic;
+    const int widthLogical = std::max(1, static_cast<int>(currentWidth_));
+    const int scale = static_cast<int>(output.scale > 0 ? output.scale : 1);
+    const double deviceRadius = brush
+        ? std::clamp(brushRadiusForStrength(
+                         mosaicStrength_,
+                         std::clamp(static_cast<int>(widthLogical * scale / 2), 1, 512)),
+                     1, 512)
+        : 0.0;
+    const double padding = brush ? deviceRadius / scale + 2.0 : widthLogical / 2.0 + 2.0;
+    const double step = std::max(1.0, deviceRadius / 2.0);
+
+    // A change of style, output or surface size invalidates the whole raster;
+    // the growing point list deliberately does not, which is the point.
+    QByteArray key;
+    {
+        QDataStream stream(&key, QIODevice::WriteOnly);
+        const LogicalRect &surface = surfaceOf(output);
+        stream << size.width() << size.height() << output.id << output.scale << surface.x
+               << surface.y << surface.width << surface.height << toolName(tool_)
+               << static_cast<quint32>(currentColor_.rgba()) << currentWidth_ << currentDash_
+               << mosaicStrength_ << mosaicShape_;
+    }
+    if (key != gesture_->liveKey) {
+        gesture_->liveKey = key;
+        gesture_->liveRaster = QImage();
+        gesture_->liveOrigin = QPoint();
+        gesture_->liveBaked = 1;
+        gesture_->liveLength = 0.0;
+    }
+
+    const int count = gesture_->points.size();
+    // The local-space room the segments added since the last paint need.
+    QRectF fresh;
+    for (int i = gesture_->liveBaked; i < count; ++i) {
+        const QPointF a = localPoint(output, gesture_->points.at(i - 1), size);
+        const QPointF b = localPoint(output, gesture_->points.at(i), size);
+        const QRectF segment = QRectF(a, b).normalized();
+        fresh = fresh.isNull() ? segment : fresh.united(segment);
+    }
+    const QRect needed = fresh.isNull()
+        ? QRect()
+        : fresh.adjusted(-padding, -padding, padding, padding)
+              .toAlignedRect()
+              .intersected(QRect(QPoint(0, 0), size));
+
+    if (needed.isEmpty()) {
+        // Nothing new is visible on this overlay, but the path length still has
+        // to advance so a later visible segment's dash phase lines up.
+        for (int i = gesture_->liveBaked; i < count; ++i) {
+            const QPointF a = localPoint(output, gesture_->points.at(i - 1), size);
+            const QPointF b = localPoint(output, gesture_->points.at(i), size);
+            gesture_->liveLength += std::hypot(b.x() - a.x(), b.y() - a.y());
+        }
+        liveStrokeBakes_ += std::max(0, count - gesture_->liveBaked);
+        gesture_->liveBaked = count;
+        if (!gesture_->liveRaster.isNull()) {
+            painter->drawImage(gesture_->liveOrigin, gesture_->liveRaster);
+        }
+        return;
+    }
+
+    // Grow the raster only when the stroke reaches past it: the old pixels are
+    // copied into the larger image at their original offset.
+    const QRect current(gesture_->liveOrigin, gesture_->liveRaster.size());
+    if (gesture_->liveRaster.isNull()) {
+        gesture_->liveRaster = QImage(needed.size(), QImage::Format_ARGB32_Premultiplied);
+        gesture_->liveRaster.fill(Qt::transparent);
+        gesture_->liveOrigin = needed.topLeft();
+    } else if (!current.contains(needed)) {
+        const QRect grown = current.united(needed);
+        QImage resized(grown.size(), QImage::Format_ARGB32_Premultiplied);
+        resized.fill(Qt::transparent);
+        {
+            QPainter copy(&resized);
+            copy.drawImage(current.topLeft() - grown.topLeft(), gesture_->liveRaster);
+        }
+        gesture_->liveRaster = resized;
+        gesture_->liveOrigin = grown.topLeft();
+    }
+
+    {
+        QPainter raster(&gesture_->liveRaster);
+        raster.setRenderHint(QPainter::Antialiasing, true);
+        raster.translate(-gesture_->liveOrigin);
+        if (brush) {
+            for (int i = gesture_->liveBaked; i < count; ++i) {
+                stampMosaicSegment(&raster, output, gesture_->points.at(i - 1),
+                                   gesture_->points.at(i), i == 1, static_cast<int>(deviceRadius),
+                                   static_cast<double>(scale), step, size);
+            }
+        } else {
+            Annotation style;
+            style.kind = Annotation::Kind::Stroke;
+            style.tool = toolName(tool_);
+            style.color = currentColor_;
+            style.width = currentWidth_;
+            style.dash = currentDash_;
+            const QPen pen = penForAnnotation(style);
+            const bool dashed = currentDash_ != QStringLiteral("solid");
+            for (int i = gesture_->liveBaked; i < count; ++i) {
+                const QPointF a = localPoint(output, gesture_->points.at(i - 1), size);
+                const QPointF b = localPoint(output, gesture_->points.at(i), size);
+                QPen segmentPen = pen;
+                if (dashed) {
+                    // Continue the dash pattern where the previous segment left
+                    // it (`dashOffset` is measured in pen widths).  A solid pen
+                    // must not be touched: setDashOffset would turn it into a
+                    // custom-dash pen with no pattern, which draws nothing.
+                    segmentPen.setDashOffset(gesture_->liveLength / widthLogical);
+                }
+                raster.setPen(segmentPen);
+                raster.drawLine(a, b);
+                gesture_->liveLength += std::hypot(b.x() - a.x(), b.y() - a.y());
+            }
+        }
+    }
+    liveStrokeBakes_ += std::max(0, count - gesture_->liveBaked);
+    gesture_->liveBaked = count;
+    painter->drawImage(gesture_->liveOrigin, gesture_->liveRaster);
 }
 
 void OverlayController::drawLoupe(CaptureOverlay *overlay, QPainter *painter)
