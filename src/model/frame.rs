@@ -192,6 +192,7 @@ impl Frame {
     ) -> Result<()> {
         let (left, top, right, bottom) = checked_rect_bounds(rect)?;
         validate_stroke_width(width)?;
+        let frame = self.size;
         if dash != LineDash::Solid {
             // Walk the band centerline so dashed squares cover the same pixels
             // the solid band would.
@@ -206,27 +207,15 @@ impl Frame {
                 Point::new(inset_left as i32, inset_bottom as i32 - 1),
                 Point::new(inset_left as i32, inset_top as i32),
             ];
-            self.stamp_dashed_polyline(&path, color, width, dash);
+            let bounds = polyline_bounds(&path, i64::from(width) + 1);
+            stroke_with_coverage(self, color, bounds, |ink| {
+                rasterize_dashed_polyline(ink, frame, &path, width, dash);
+            });
             return Ok(());
         }
-        let stroke_width = i64::from(width);
-        let Some((x_start, x_end)) = clip_range(left, right, self.size.width) else {
-            return Ok(());
-        };
-        let Some((y_start, y_end)) = clip_range(top, bottom, self.size.height) else {
-            return Ok(());
-        };
-        for y in y_start..y_end {
-            for x in x_start..x_end {
-                if x - left < stroke_width
-                    || right - x <= stroke_width
-                    || y - top < stroke_width
-                    || bottom - y <= stroke_width
-                {
-                    self.blend_pixel_at(x, y, color);
-                }
-            }
-        }
+        stroke_with_coverage(self, color, (left, top, right, bottom), |ink| {
+            rasterize_rect_border(ink, frame, left, top, right, bottom, width);
+        });
         Ok(())
     }
 
@@ -243,33 +232,20 @@ impl Frame {
             ));
         }
         validate_stroke_width(width)?;
-        let radius = i128::from(radius);
+        let frame = self.size;
         let stroke_width = i128::from(width);
-        let outer_radius = radius + (stroke_width + 1) / 2;
+        let outer_radius = i128::from(radius) + (stroke_width + 1) / 2;
         let center_x = i128::from(center.x);
         let center_y = i128::from(center.y);
-        let x_start = (center_x - outer_radius).max(0);
-        let x_end = (center_x + outer_radius + 1).min(i128::from(self.size.width));
-        let y_start = (center_y - outer_radius).max(0);
-        let y_end = (center_y + outer_radius + 1).min(i128::from(self.size.height));
-        if x_start >= x_end || y_start >= y_end {
-            return Ok(());
-        }
-
-        let inner_radius_twice = (radius * 2 - stroke_width).max(0);
-        let outer_radius_twice = radius * 2 + stroke_width;
-        let inner_distance = inner_radius_twice * inner_radius_twice;
-        let outer_distance = outer_radius_twice * outer_radius_twice;
-        for y in y_start..y_end {
-            for x in x_start..x_end {
-                let dx = x - center_x;
-                let dy = y - center_y;
-                let distance = 4 * (dx * dx + dy * dy);
-                if distance >= inner_distance && distance <= outer_distance {
-                    self.blend_pixel_at(x as i64, y as i64, color);
-                }
-            }
-        }
+        let bounds = (
+            clamp_i64(center_x - outer_radius),
+            clamp_i64(center_y - outer_radius),
+            clamp_i64(center_x + outer_radius + 1),
+            clamp_i64(center_y + outer_radius + 1),
+        );
+        stroke_with_coverage(self, color, bounds, |ink| {
+            rasterize_circle(ink, frame, center, radius, width);
+        });
         Ok(())
     }
 
@@ -282,50 +258,40 @@ impl Frame {
     ) -> Result<()> {
         let (left, top, right, bottom) = checked_rect_bounds(rect)?;
         validate_stroke_width(width)?;
-        if dash != LineDash::Solid {
-            self.stamp_dashed_ellipse((left, top, right, bottom), color, width, dash);
-            return Ok(());
-        }
+        let frame = self.size;
         let rect_width = i128::from(right - left);
         let rect_height = i128::from(bottom - top);
         let stroke_width = i128::from(width);
         let center_x = i128::from(left) + rect_width / 2;
         let center_y = i128::from(top) + rect_height / 2;
-        let outer_a = (rect_width + stroke_width) / 2;
-        let outer_b = (rect_height + stroke_width) / 2;
-        let inner_a = rect_width.saturating_sub(stroke_width) / 2;
-        let inner_b = rect_height.saturating_sub(stroke_width) / 2;
-        let outer_a_squared = outer_a * outer_a;
-        let outer_b_squared = outer_b * outer_b;
-        let inner_a_squared = inner_a * inner_a;
-        let inner_b_squared = inner_b * inner_b;
-        let outer_threshold = outer_a_squared * outer_b_squared;
-        let inner_threshold = inner_a_squared * inner_b_squared;
-        let has_inner = inner_a > 0 && inner_b > 0;
-        let x_start = (center_x - outer_a).max(0);
-        let x_end = (center_x + outer_a + 1).min(i128::from(self.size.width));
-        let y_start = (center_y - outer_b).max(0);
-        let y_end = (center_y + outer_b + 1).min(i128::from(self.size.height));
-        if x_start >= x_end || y_start >= y_end {
+        if dash != LineDash::Solid {
+            // The dashed walk stamps `width`-wide squares on the ring, so the
+            // mask has to reach the ring midline plus that radius.
+            let half_width = rect_width / 2;
+            let half_height = rect_height / 2;
+            let pad = stroke_width + 1;
+            let bounds = (
+                clamp_i64(center_x - half_width - pad),
+                clamp_i64(center_y - half_height - pad),
+                clamp_i64(center_x + half_width + pad),
+                clamp_i64(center_y + half_height + pad),
+            );
+            stroke_with_coverage(self, color, bounds, |ink| {
+                rasterize_dashed_ellipse(ink, frame, (left, top, right, bottom), width, dash);
+            });
             return Ok(());
         }
-        for y in y_start..y_end {
-            for x in x_start..x_end {
-                let dx = x - center_x;
-                let dy = y - center_y;
-                // Pixel is inside the outer ellipse and outside the inner ellipse:
-                // dx²/a² + dy²/b² <= 1 is equivalent to dx²·b² + dy²·a² <= a²·b².
-                if dx * dx * outer_b_squared + dy * dy * outer_a_squared > outer_threshold {
-                    continue;
-                }
-                if has_inner
-                    && dx * dx * inner_b_squared + dy * dy * inner_a_squared < inner_threshold
-                {
-                    continue;
-                }
-                self.blend_pixel_at(x as i64, y as i64, color);
-            }
-        }
+        let outer_a = (rect_width + stroke_width) / 2;
+        let outer_b = (rect_height + stroke_width) / 2;
+        let bounds = (
+            clamp_i64(center_x - outer_a),
+            clamp_i64(center_y - outer_b),
+            clamp_i64(center_x + outer_a + 1),
+            clamp_i64(center_y + outer_b + 1),
+        );
+        stroke_with_coverage(self, color, bounds, |ink| {
+            rasterize_ellipse(ink, frame, left, top, right, bottom, width);
+        });
         Ok(())
     }
 
@@ -361,12 +327,6 @@ impl Frame {
                 "arrow endpoints must be different".into(),
             ));
         }
-        if dash == LineDash::Solid {
-            self.stroke_segment(start, end, color, width);
-        } else {
-            self.stamp_dashed_polyline(&[start, end], color, width, dash);
-        }
-
         let unit_x = dx / length;
         let unit_y = dy / length;
         let head_size = f64::from(head.clamp(1, 8));
@@ -384,11 +344,24 @@ impl Frame {
             base_x - perpendicular_x * wing_length,
             base_y - perpendicular_y * wing_length,
         );
-        if style == ArrowStyle::Filled {
-            self.fill_triangle(end, left, right, color);
-        }
-        self.stroke_segment(end, left, color, width);
-        self.stroke_segment(end, right, color, width);
+
+        // The stem, the filled head and both wings all meet at the tip, so one
+        // mask spans them: a translucent arrow then keeps a single alpha there
+        // instead of darkening where the pieces overlap.
+        let frame = self.size;
+        let bounds = polyline_bounds(&[start, end, left, right], i64::from(width) + 1);
+        stroke_with_coverage(self, color, bounds, |ink| {
+            if dash == LineDash::Solid {
+                rasterize_capsule(ink, frame, start, end, width);
+            } else {
+                rasterize_dashed_polyline(ink, frame, &[start, end], width, dash);
+            }
+            if style == ArrowStyle::Filled {
+                rasterize_triangle(ink, frame, end, left, right);
+            }
+            rasterize_capsule(ink, frame, end, left, width);
+            rasterize_capsule(ink, frame, end, right, width);
+        });
         Ok(())
     }
 
@@ -405,17 +378,29 @@ impl Frame {
                 "freehand path must contain at least one point".into(),
             ));
         }
+        let frame = self.size;
         if dash != LineDash::Solid && points.len() >= 2 {
-            self.stamp_dashed_polyline(points, color, width, dash);
+            let bounds = polyline_bounds(points, i64::from(width) + 1);
+            stroke_with_coverage(self, color, bounds, |ink| {
+                rasterize_dashed_polyline(ink, frame, points, width, dash);
+            });
             return Ok(());
         }
+        let capsule_pad = i64::from(width.div_ceil(2)) + 1;
         if points.len() == 1 {
-            self.stroke_segment(points[0], points[0], color, width);
+            let point = points[0];
+            stroke_with_coverage(self, color, polyline_bounds(points, capsule_pad), |ink| {
+                rasterize_capsule(ink, frame, point, point, width);
+            });
             return Ok(());
         }
-        for segment in points.windows(2) {
-            self.stroke_segment(segment[0], segment[1], color, width);
-        }
+        // Successive capsules share every joint; the mask unions them, so a
+        // translucent stroke keeps one alpha through the corner.
+        stroke_with_coverage(self, color, polyline_bounds(points, capsule_pad), |ink| {
+            for segment in points.windows(2) {
+                rasterize_capsule(ink, frame, segment[0], segment[1], width);
+            }
+        });
         Ok(())
     }
 
@@ -894,178 +879,6 @@ impl Frame {
         Ok(())
     }
 
-    fn stamp_square(&mut self, center_x: i64, center_y: i64, size: u32, color: [u8; 4]) {
-        let size = i64::from(size.max(1));
-        let half = (size - 1) / 2;
-        let x_start = (center_x - half).max(0);
-        let y_start = (center_y - half).max(0);
-        let x_end = (center_x - half + size).min(i64::from(self.size.width));
-        let y_end = (center_y - half + size).min(i64::from(self.size.height));
-        for y in y_start..y_end {
-            for x in x_start..x_end {
-                self.blend_pixel_at(x, y, color);
-            }
-        }
-    }
-
-    /// Walks the polyline at 1px steps, stamping `size`-wide squares wherever
-    /// the cumulative distance falls inside the dash pattern's on phase.
-    fn stamp_dashed_polyline(
-        &mut self,
-        points: &[Point],
-        color: [u8; 4],
-        size: u32,
-        dash: LineDash,
-    ) {
-        let (on, off) = dash.pattern(size);
-        let on_draw = i64::from(dash.drawn_on(size)).max(1);
-        let period = i64::from(on.max(1) + off).max(1);
-        let mut base = 0.0_f64;
-        for segment in points.windows(2) {
-            let ax = f64::from(segment[0].x);
-            let ay = f64::from(segment[0].y);
-            let bx = f64::from(segment[1].x);
-            let by = f64::from(segment[1].y);
-            let length = (bx - ax).hypot(by - ay);
-            let steps = (length.ceil() as i64).max(1);
-            for k in 0..=steps {
-                let t = k as f64 / steps as f64;
-                let x = (ax + (bx - ax) * t).round() as i64;
-                let y = (ay + (by - ay) * t).round() as i64;
-                let distance = base + length * (k as f64) / steps as f64;
-                if (distance.floor() as i64).rem_euclid(period) < on_draw {
-                    self.stamp_square(x, y, size, color);
-                }
-            }
-            base += length;
-        }
-    }
-
-    /// Stamps dashes along the ellipse inscribed in the rect, mirroring the
-    /// solid ring's midline so dashed and solid ellipses overlap exactly.
-    /// `bounds` holds the exclusive `(left, top, right, bottom)` device edges.
-    fn stamp_dashed_ellipse(
-        &mut self,
-        bounds: (i64, i64, i64, i64),
-        color: [u8; 4],
-        width: u32,
-        dash: LineDash,
-    ) {
-        let (left, top, right, bottom) = bounds;
-        let center_x = left as f64 + (right - left) as f64 / 2.0;
-        let center_y = top as f64 + (bottom - top) as f64 / 2.0;
-        let a = (right - left) as f64 / 2.0;
-        let b = (bottom - top) as f64 / 2.0;
-        let perimeter =
-            std::f64::consts::PI * (3.0 * (a + b) - ((3.0 * a + b) * (a + 3.0 * b)).sqrt());
-        let steps = (perimeter.ceil() as i64).clamp(32, 1 << 20).max(1);
-        let (on, off) = dash.pattern(width);
-        let on_draw = i64::from(dash.drawn_on(width)).max(1);
-        let period = i64::from(on.max(1) + off).max(1);
-        for k in 0..steps {
-            let angle = 2.0 * std::f64::consts::PI * (k as f64) / (steps as f64);
-            let x = (center_x + a * angle.cos()).round() as i64;
-            let y = (center_y + b * angle.sin()).round() as i64;
-            let distance = perimeter * (k as f64) / (steps as f64);
-            if (distance.floor() as i64).rem_euclid(period) < on_draw {
-                self.stamp_square(x, y, width, color);
-            }
-        }
-    }
-
-    fn fill_triangle(&mut self, first: Point, second: Point, third: Point, color: [u8; 4]) {
-        let min_x = i64::from(first.x)
-            .min(i64::from(second.x))
-            .min(i64::from(third.x))
-            .max(0);
-        let max_x = i64::from(first.x)
-            .max(i64::from(second.x))
-            .max(i64::from(third.x))
-            .min(i64::from(self.size.width).saturating_sub(1));
-        let min_y = i64::from(first.y)
-            .min(i64::from(second.y))
-            .min(i64::from(third.y))
-            .max(0);
-        let max_y = i64::from(first.y)
-            .max(i64::from(second.y))
-            .max(i64::from(third.y))
-            .min(i64::from(self.size.height).saturating_sub(1));
-        if min_x > max_x || min_y > max_y {
-            return;
-        }
-
-        let edge = |a: Point, b: Point, x: i64, y: i64| {
-            (i128::from(b.x) - i128::from(a.x)) * (i128::from(y) - i128::from(a.y))
-                - (i128::from(b.y) - i128::from(a.y)) * (i128::from(x) - i128::from(a.x))
-        };
-        let area = edge(first, second, i64::from(third.x), i64::from(third.y));
-        if area == 0 {
-            return;
-        }
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                let first_edge = edge(first, second, x, y);
-                let second_edge = edge(second, third, x, y);
-                let third_edge = edge(third, first, x, y);
-                let inside = if area > 0 {
-                    first_edge >= 0 && second_edge >= 0 && third_edge >= 0
-                } else {
-                    first_edge <= 0 && second_edge <= 0 && third_edge <= 0
-                };
-                if inside {
-                    self.blend_pixel_at(x, y, color);
-                }
-            }
-        }
-    }
-
-    fn stroke_segment(&mut self, start: Point, end: Point, color: [u8; 4], width: u32) {
-        let padding = (i128::from(width) + 1) / 2;
-        let start_x = i128::from(start.x);
-        let start_y = i128::from(start.y);
-        let end_x = i128::from(end.x);
-        let end_y = i128::from(end.y);
-        let x_start = (start_x.min(end_x) - padding).max(0);
-        let x_end = (start_x.max(end_x) + padding + 1).min(i128::from(self.size.width));
-        let y_start = (start_y.min(end_y) - padding).max(0);
-        let y_end = (start_y.max(end_y) + padding + 1).min(i128::from(self.size.height));
-        if x_start >= x_end || y_start >= y_end {
-            return;
-        }
-
-        let x1 = f64::from(start.x);
-        let y1 = f64::from(start.y);
-        let x2 = f64::from(end.x);
-        let y2 = f64::from(end.y);
-        let dx = x2 - x1;
-        let dy = y2 - y1;
-        let length_squared = dx.mul_add(dx, dy * dy);
-        let threshold = f64::from(width) / 2.0;
-        let threshold_squared = threshold * threshold;
-        for y in y_start..y_end {
-            for x in x_start..x_end {
-                let px = x as f64;
-                let py = y as f64;
-                let distance_squared = if length_squared == 0.0 {
-                    let delta_x = px - x1;
-                    let delta_y = py - y1;
-                    delta_x.mul_add(delta_x, delta_y * delta_y)
-                } else {
-                    let projection = ((px - x1) * dx + (py - y1) * dy) / length_squared;
-                    let projection = projection.clamp(0.0, 1.0);
-                    let nearest_x = x1 + projection * dx;
-                    let nearest_y = y1 + projection * dy;
-                    let delta_x = px - nearest_x;
-                    let delta_y = py - nearest_y;
-                    delta_x.mul_add(delta_x, delta_y * delta_y)
-                };
-                if distance_squared <= threshold_squared {
-                    self.blend_pixel_at(x as i64, y as i64, color);
-                }
-            }
-        }
-    }
-
     fn pixel_index_at(&self, x: i64, y: i64) -> Option<usize> {
         if x < 0 || y < 0 || x >= i64::from(self.size.width) || y >= i64::from(self.size.height) {
             return None;
@@ -1248,6 +1061,437 @@ fn point_from_f64(x: f64, y: f64) -> Point {
     }
 
     Point::new(coordinate(x), coordinate(y))
+}
+
+/// Rasterizes one stroke, compositing a translucent colour exactly once per
+/// covered pixel.
+///
+/// An opaque stroke keeps the original single-pass drawing: every plot blends
+/// straight onto the frame, byte-for-byte what the segment routines used to do.
+/// Only a translucent stroke pays for a coverage mask, and that mask spans
+/// nothing larger than the path's own bounding box.
+fn stroke_with_coverage(
+    frame: &mut Frame,
+    color: [u8; 4],
+    bounds: (i64, i64, i64, i64),
+    rasterize: impl FnOnce(&mut Ink<'_>),
+) {
+    if color[3] == 255 {
+        let mut ink = Ink::Direct { frame, color };
+        rasterize(&mut ink);
+        return;
+    }
+    let mut mask = StrokeMask::new(bounds, frame.size);
+    if mask.is_empty() {
+        return;
+    }
+    rasterize(&mut Ink::Mask(&mut mask));
+    mask.composite(frame, color);
+}
+
+/// Where a stroke rasterizer sends the pixels it covers.
+///
+/// An opaque stroke plots straight onto the frame; a translucent one records
+/// coverage instead, so no pixel is composited twice no matter how many
+/// segments overlap it.
+enum Ink<'a> {
+    /// Blend `color` onto the frame, source-over, once per plot.
+    Direct {
+        frame: &'a mut Frame,
+        color: [u8; 4],
+    },
+    /// Mark coverage; `StrokeMask::composite` paints it afterwards.
+    Mask(&'a mut StrokeMask),
+}
+
+impl Ink<'_> {
+    #[inline]
+    fn plot(&mut self, x: i64, y: i64) {
+        match self {
+            Ink::Direct { frame, color } => frame.blend_pixel_at(x, y, *color),
+            Ink::Mask(mask) => mask.plot(x, y),
+        }
+    }
+}
+
+/// A bounding-box-limited coverage mask for a single stroke.
+///
+/// A rasterizer marks every pixel the path covers. Coverage is a hard edge — a
+/// pixel is in or out, never an anti-aliased fraction — so marking a shared
+/// pixel once is exactly the union of the path's pixels. That is why an opaque
+/// stroke composites to the same bytes it would have got by blending each
+/// segment separately: at alpha 255 a source-over blend is a plain copy, so
+/// "keep the maximum at overlaps" and "blend every segment" land the same
+/// result.
+struct StrokeMask {
+    x0: i64,
+    y0: i64,
+    width: usize,
+    height: usize,
+    covered: Vec<bool>,
+}
+
+impl StrokeMask {
+    /// Allocates a mask over `bounds` (exclusive right/bottom), clipped to the
+    /// frame so it never exceeds the frame's own pixel count.
+    fn new(bounds: (i64, i64, i64, i64), frame: Size) -> Self {
+        let (bounds_left, bounds_top, bounds_right, bounds_bottom) = bounds;
+        let x0 = bounds_left.max(0);
+        let y0 = bounds_top.max(0);
+        let x1 = bounds_right.min(i64::from(frame.width)).max(x0);
+        let y1 = bounds_bottom.min(i64::from(frame.height)).max(y0);
+        let width = (x1 - x0) as usize;
+        let height = (y1 - y0) as usize;
+        Self {
+            x0,
+            y0,
+            width,
+            height,
+            covered: vec![false; width * height],
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+
+    #[inline]
+    fn plot(&mut self, x: i64, y: i64) {
+        let local_x = x - self.x0;
+        let local_y = y - self.y0;
+        if local_x < 0 || local_y < 0 {
+            return;
+        }
+        let (local_x, local_y) = (local_x as usize, local_y as usize);
+        if local_x >= self.width || local_y >= self.height {
+            return;
+        }
+        self.covered[local_y * self.width + local_x] = true;
+    }
+
+    fn composite(&self, frame: &mut Frame, color: [u8; 4]) {
+        for row in 0..self.height {
+            for column in 0..self.width {
+                if self.covered[row * self.width + column] {
+                    frame.blend_pixel_at(self.x0 + column as i64, self.y0 + row as i64, color);
+                }
+            }
+        }
+    }
+}
+
+/// The exclusive bounding box of `points`, grown by `pad` on every side so it
+/// holds the whole stroke the polyline rasterizers will draw. Shared by the
+/// freehand, dashed and arrow paths, and by the wave/bezier tools that sample
+/// down to a polyline and reuse this entry point.
+fn polyline_bounds(points: &[Point], pad: i64) -> (i64, i64, i64, i64) {
+    let Some(first) = points.first() else {
+        return (0, 0, 0, 0);
+    };
+    let mut min_x = i64::from(first.x);
+    let mut min_y = i64::from(first.y);
+    let mut max_x = min_x;
+    let mut max_y = min_y;
+    for point in &points[1..] {
+        min_x = min_x.min(i64::from(point.x));
+        min_y = min_y.min(i64::from(point.y));
+        max_x = max_x.max(i64::from(point.x));
+        max_y = max_y.max(i64::from(point.y));
+    }
+    (min_x - pad, min_y - pad, max_x + pad + 1, max_y + pad + 1)
+}
+
+/// Narrows a computed coordinate to `i64`, saturating instead of wrapping so a
+/// far-off-canvas shape only ever yields an empty bounding box.
+fn clamp_i64(value: i128) -> i64 {
+    value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+/// Fills the `width`-thick border of the rectangle `(left, top, right, bottom)`
+/// — the solid rectangle stroke, as a rasterizer.
+fn rasterize_rect_border(
+    ink: &mut Ink<'_>,
+    frame: Size,
+    left: i64,
+    top: i64,
+    right: i64,
+    bottom: i64,
+    width: u32,
+) {
+    let stroke_width = i64::from(width);
+    let Some((x_start, x_end)) = clip_range(left, right, frame.width) else {
+        return;
+    };
+    let Some((y_start, y_end)) = clip_range(top, bottom, frame.height) else {
+        return;
+    };
+    for y in y_start..y_end {
+        for x in x_start..x_end {
+            if x - left < stroke_width
+                || right - x <= stroke_width
+                || y - top < stroke_width
+                || bottom - y <= stroke_width
+            {
+                ink.plot(x, y);
+            }
+        }
+    }
+}
+
+/// Draws the ring of a circle as a rasterizer.
+fn rasterize_circle(ink: &mut Ink<'_>, frame: Size, center: Point, radius: u32, width: u32) {
+    let radius = i128::from(radius);
+    let stroke_width = i128::from(width);
+    let outer_radius = radius + (stroke_width + 1) / 2;
+    let center_x = i128::from(center.x);
+    let center_y = i128::from(center.y);
+    let x_start = (center_x - outer_radius).max(0);
+    let x_end = (center_x + outer_radius + 1).min(i128::from(frame.width));
+    let y_start = (center_y - outer_radius).max(0);
+    let y_end = (center_y + outer_radius + 1).min(i128::from(frame.height));
+    if x_start >= x_end || y_start >= y_end {
+        return;
+    }
+
+    let inner_radius_twice = (radius * 2 - stroke_width).max(0);
+    let outer_radius_twice = radius * 2 + stroke_width;
+    let inner_distance = inner_radius_twice * inner_radius_twice;
+    let outer_distance = outer_radius_twice * outer_radius_twice;
+    for y in y_start..y_end {
+        for x in x_start..x_end {
+            let dx = x - center_x;
+            let dy = y - center_y;
+            let distance = 4 * (dx * dx + dy * dy);
+            if distance >= inner_distance && distance <= outer_distance {
+                ink.plot(x as i64, y as i64);
+            }
+        }
+    }
+}
+
+/// Draws the ring of the ellipse inscribed in `(left, top, right, bottom)`.
+fn rasterize_ellipse(
+    ink: &mut Ink<'_>,
+    frame: Size,
+    left: i64,
+    top: i64,
+    right: i64,
+    bottom: i64,
+    width: u32,
+) {
+    let rect_width = i128::from(right - left);
+    let rect_height = i128::from(bottom - top);
+    let stroke_width = i128::from(width);
+    let center_x = i128::from(left) + rect_width / 2;
+    let center_y = i128::from(top) + rect_height / 2;
+    let outer_a = (rect_width + stroke_width) / 2;
+    let outer_b = (rect_height + stroke_width) / 2;
+    let inner_a = rect_width.saturating_sub(stroke_width) / 2;
+    let inner_b = rect_height.saturating_sub(stroke_width) / 2;
+    let outer_a_squared = outer_a * outer_a;
+    let outer_b_squared = outer_b * outer_b;
+    let inner_a_squared = inner_a * inner_a;
+    let inner_b_squared = inner_b * inner_b;
+    let outer_threshold = outer_a_squared * outer_b_squared;
+    let inner_threshold = inner_a_squared * inner_b_squared;
+    let has_inner = inner_a > 0 && inner_b > 0;
+    let x_start = (center_x - outer_a).max(0);
+    let x_end = (center_x + outer_a + 1).min(i128::from(frame.width));
+    let y_start = (center_y - outer_b).max(0);
+    let y_end = (center_y + outer_b + 1).min(i128::from(frame.height));
+    if x_start >= x_end || y_start >= y_end {
+        return;
+    }
+    for y in y_start..y_end {
+        for x in x_start..x_end {
+            let dx = x - center_x;
+            let dy = y - center_y;
+            // Pixel is inside the outer ellipse and outside the inner ellipse:
+            // dx²/a² + dy²/b² <= 1 is equivalent to dx²·b² + dy²·a² <= a²·b².
+            if dx * dx * outer_b_squared + dy * dy * outer_a_squared > outer_threshold {
+                continue;
+            }
+            if has_inner && dx * dx * inner_b_squared + dy * dy * inner_a_squared < inner_threshold
+            {
+                continue;
+            }
+            ink.plot(x as i64, y as i64);
+        }
+    }
+}
+
+/// Stamps the `size`-wide square centred on `(center_x, center_y)`.
+fn rasterize_square(ink: &mut Ink<'_>, frame: Size, center_x: i64, center_y: i64, size: u32) {
+    let size = i64::from(size.max(1));
+    let half = (size - 1) / 2;
+    let x_start = (center_x - half).max(0);
+    let y_start = (center_y - half).max(0);
+    let x_end = (center_x - half + size).min(i64::from(frame.width));
+    let y_end = (center_y - half + size).min(i64::from(frame.height));
+    for y in y_start..y_end {
+        for x in x_start..x_end {
+            ink.plot(x, y);
+        }
+    }
+}
+
+/// Walks the polyline at 1px steps, stamping `size`-wide squares wherever the
+/// cumulative distance falls inside the dash pattern's on phase.
+fn rasterize_dashed_polyline(
+    ink: &mut Ink<'_>,
+    frame: Size,
+    points: &[Point],
+    size: u32,
+    dash: LineDash,
+) {
+    let (on, off) = dash.pattern(size);
+    let on_draw = i64::from(dash.drawn_on(size)).max(1);
+    let period = i64::from(on.max(1) + off).max(1);
+    let mut base = 0.0_f64;
+    for segment in points.windows(2) {
+        let ax = f64::from(segment[0].x);
+        let ay = f64::from(segment[0].y);
+        let bx = f64::from(segment[1].x);
+        let by = f64::from(segment[1].y);
+        let length = (bx - ax).hypot(by - ay);
+        let steps = (length.ceil() as i64).max(1);
+        for k in 0..=steps {
+            let t = k as f64 / steps as f64;
+            let x = (ax + (bx - ax) * t).round() as i64;
+            let y = (ay + (by - ay) * t).round() as i64;
+            let distance = base + length * (k as f64) / steps as f64;
+            if (distance.floor() as i64).rem_euclid(period) < on_draw {
+                rasterize_square(ink, frame, x, y, size);
+            }
+        }
+        base += length;
+    }
+}
+
+/// Stamps dashes along the ellipse inscribed in `bounds`, mirroring the solid
+/// ring's midline so dashed and solid ellipses overlap exactly. `bounds` holds
+/// the exclusive `(left, top, right, bottom)` device edges.
+fn rasterize_dashed_ellipse(
+    ink: &mut Ink<'_>,
+    frame: Size,
+    bounds: (i64, i64, i64, i64),
+    width: u32,
+    dash: LineDash,
+) {
+    let (left, top, right, bottom) = bounds;
+    let center_x = left as f64 + (right - left) as f64 / 2.0;
+    let center_y = top as f64 + (bottom - top) as f64 / 2.0;
+    let a = (right - left) as f64 / 2.0;
+    let b = (bottom - top) as f64 / 2.0;
+    let perimeter = std::f64::consts::PI * (3.0 * (a + b) - ((3.0 * a + b) * (a + 3.0 * b)).sqrt());
+    let steps = (perimeter.ceil() as i64).clamp(32, 1 << 20).max(1);
+    let (on, off) = dash.pattern(width);
+    let on_draw = i64::from(dash.drawn_on(width)).max(1);
+    let period = i64::from(on.max(1) + off).max(1);
+    for k in 0..steps {
+        let angle = 2.0 * std::f64::consts::PI * (k as f64) / (steps as f64);
+        let x = (center_x + a * angle.cos()).round() as i64;
+        let y = (center_y + b * angle.sin()).round() as i64;
+        let distance = perimeter * (k as f64) / (steps as f64);
+        if (distance.floor() as i64).rem_euclid(period) < on_draw {
+            rasterize_square(ink, frame, x, y, width);
+        }
+    }
+}
+
+/// Fills the triangle `first, second, third`.
+fn rasterize_triangle(ink: &mut Ink<'_>, frame: Size, first: Point, second: Point, third: Point) {
+    let min_x = i64::from(first.x)
+        .min(i64::from(second.x))
+        .min(i64::from(third.x))
+        .max(0);
+    let max_x = i64::from(first.x)
+        .max(i64::from(second.x))
+        .max(i64::from(third.x))
+        .min(i64::from(frame.width).saturating_sub(1));
+    let min_y = i64::from(first.y)
+        .min(i64::from(second.y))
+        .min(i64::from(third.y))
+        .max(0);
+    let max_y = i64::from(first.y)
+        .max(i64::from(second.y))
+        .max(i64::from(third.y))
+        .min(i64::from(frame.height).saturating_sub(1));
+    if min_x > max_x || min_y > max_y {
+        return;
+    }
+
+    let edge = |a: Point, b: Point, x: i64, y: i64| {
+        (i128::from(b.x) - i128::from(a.x)) * (i128::from(y) - i128::from(a.y))
+            - (i128::from(b.y) - i128::from(a.y)) * (i128::from(x) - i128::from(a.x))
+    };
+    let area = edge(first, second, i64::from(third.x), i64::from(third.y));
+    if area == 0 {
+        return;
+    }
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let first_edge = edge(first, second, x, y);
+            let second_edge = edge(second, third, x, y);
+            let third_edge = edge(third, first, x, y);
+            let inside = if area > 0 {
+                first_edge >= 0 && second_edge >= 0 && third_edge >= 0
+            } else {
+                first_edge <= 0 && second_edge <= 0 && third_edge <= 0
+            };
+            if inside {
+                ink.plot(x, y);
+            }
+        }
+    }
+}
+
+/// Draws the capsule — the `width`-thick stroke of the segment `start..end`.
+fn rasterize_capsule(ink: &mut Ink<'_>, frame: Size, start: Point, end: Point, width: u32) {
+    let padding = (i128::from(width) + 1) / 2;
+    let start_x = i128::from(start.x);
+    let start_y = i128::from(start.y);
+    let end_x = i128::from(end.x);
+    let end_y = i128::from(end.y);
+    let x_start = (start_x.min(end_x) - padding).max(0);
+    let x_end = (start_x.max(end_x) + padding + 1).min(i128::from(frame.width));
+    let y_start = (start_y.min(end_y) - padding).max(0);
+    let y_end = (start_y.max(end_y) + padding + 1).min(i128::from(frame.height));
+    if x_start >= x_end || y_start >= y_end {
+        return;
+    }
+
+    let x1 = f64::from(start.x);
+    let y1 = f64::from(start.y);
+    let x2 = f64::from(end.x);
+    let y2 = f64::from(end.y);
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let length_squared = dx.mul_add(dx, dy * dy);
+    let threshold = f64::from(width) / 2.0;
+    let threshold_squared = threshold * threshold;
+    for y in y_start..y_end {
+        for x in x_start..x_end {
+            let px = x as f64;
+            let py = y as f64;
+            let distance_squared = if length_squared == 0.0 {
+                let delta_x = px - x1;
+                let delta_y = py - y1;
+                delta_x.mul_add(delta_x, delta_y * delta_y)
+            } else {
+                let projection = ((px - x1) * dx + (py - y1) * dy) / length_squared;
+                let projection = projection.clamp(0.0, 1.0);
+                let nearest_x = x1 + projection * dx;
+                let nearest_y = y1 + projection * dy;
+                let delta_x = px - nearest_x;
+                let delta_y = py - nearest_y;
+                delta_x.mul_add(delta_x, delta_y * delta_y)
+            };
+            if distance_squared <= threshold_squared {
+                ink.plot(x as i64, y as i64);
+            }
+        }
+    }
 }
 
 fn blend_source_over(destination: &mut [u8], source: [u8; 4]) {
@@ -1723,6 +1967,29 @@ mod tests {
             .unwrap();
         assert_eq!(frame.pixel(Point::new(0, 2)), Some([255, 255, 0, 255]));
         assert_eq!(frame.pixel(Point::new(2, 4)), Some([255, 255, 0, 255]));
+    }
+
+    #[test]
+    fn translucent_polyline_keeps_one_alpha_through_its_join() {
+        let mut frame = Frame::solid(Size::new(12, 12), [0, 0, 0, 0]).unwrap();
+        frame
+            .draw_freehand(
+                &[Point::new(2, 2), Point::new(8, 2), Point::new(8, 8)],
+                [255, 0, 0, 128],
+                3,
+                LineDash::Solid,
+            )
+            .unwrap();
+        // The 90-degree corner (8, 2) is covered by both capsules; without the
+        // coverage mask it composited twice and came out darker. It has to
+        // match the once-covered middle of a segment.
+        let midpoint = frame.pixel(Point::new(5, 2)).unwrap();
+        let corner = frame.pixel(Point::new(8, 2)).unwrap();
+        assert_eq!(midpoint[3], 128, "one 128-alpha coat stays 128");
+        assert_eq!(
+            corner[3], midpoint[3],
+            "the join must not blend a second time"
+        );
     }
 
     #[test]
