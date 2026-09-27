@@ -291,6 +291,84 @@ pub const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
 /// The DRM fourcc of XRGB8888 (little-endian `XR24`).
 pub const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
 
+/// The packed 10-bit formats an HDR output is copied out in (DRM's `XR30`,
+/// `AR30`, `XB30`, `AB30`).  The 10-bit channels are 2 bits of padding or
+/// alpha, then R, G, B or B, G, R depending on the name, exactly like the
+/// 8-bit family above.
+pub const DRM_FORMAT_XRGB2101010: u32 = 0x3033_5258;
+pub const DRM_FORMAT_ARGB2101010: u32 = 0x3033_5241;
+pub const DRM_FORMAT_XBGR2101010: u32 = 0x3033_4258;
+pub const DRM_FORMAT_ABGR2101010: u32 = 0x3033_4241;
+
+/// Whether a DRM fourcc is one of the packed 10-bit RGB formats, i.e. the HDR
+/// buffer a compositor offers for a high-bit-depth output.
+pub const fn is_hdr_fourcc(fourcc: u32) -> bool {
+    matches!(
+        fourcc,
+        DRM_FORMAT_XRGB2101010
+            | DRM_FORMAT_ARGB2101010
+            | DRM_FORMAT_XBGR2101010
+            | DRM_FORMAT_ABGR2101010
+    )
+}
+
+impl DmabufFrame {
+    /// Reads a packed 10-bit dma-buf back as RGBA words with R in bits 20..30,
+    /// G in 10..20 and B in 0..10 — the order that already matches
+    /// [`crate::model::HdrFrame::from_rgb10`].  The `…bgr…` formats store B and
+    /// R the other way round, so those two fields are swapped on the way out.
+    /// This is one `mmap` and one 32-bit read per pixel; it is the HDR route's
+    /// CPU readback, the price of not having a 10-bit zero-copy encoder.
+    pub fn read_rgb10(&self) -> Result<Vec<u32>> {
+        if !is_hdr_fourcc(self.fourcc) {
+            return Err(VshotError::UnsupportedOutput(format!(
+                "dma-buf fourcc 0x{:08x} is not a 10-bit HDR format",
+                self.fourcc
+            )));
+        }
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let stride = self.stride as usize;
+        let offset = self.offset as usize;
+        let row_bytes = width * 4;
+        let length = offset + stride.saturating_mul(height.saturating_sub(1)) + row_bytes;
+        // SAFETY: as in `GbmBuffer::read_rgba`: the buffer is a dma-buf this
+        // process owns and the compositor has finished writing into it.
+        let map =
+            unsafe { memmap2::MmapOptions::new().len(length).map(self.fd) }.map_err(|error| {
+                VshotError::WaylandProtocol(format!(
+                    "could not map the HDR capture buffer for a CPU readback: {error}"
+                ))
+            })?;
+        let swap = matches!(self.fourcc, DRM_FORMAT_XBGR2101010 | DRM_FORMAT_ABGR2101010);
+        let mut words = vec![0u32; width * height];
+        for row in 0..height {
+            let source = &map[offset + row * stride..][..row_bytes];
+            for x in 0..width {
+                let word = u32::from_le_bytes([
+                    source[x * 4],
+                    source[x * 4 + 1],
+                    source[x * 4 + 2],
+                    source[x * 4 + 3],
+                ]);
+                words[row * width + x] = if swap { swap_red_blue_10(word) } else { word };
+            }
+        }
+        Ok(words)
+    }
+}
+
+/// Swaps the 10-bit red and blue fields of a packed `…bgr…` word, leaving the
+/// green pair and the top two bits where they are.  Shared with the shm capture
+/// path, which meets the same `…bgr…` packings through `wl_shm`.
+pub(crate) const fn swap_red_blue_10(word: u32) -> u32 {
+    let red = (word >> 20) & 0x3ff;
+    let blue = word & 0x3ff;
+    let green = word & 0x000f_fc00;
+    let top = word & 0xc000_0000;
+    top | (blue << 20) | green | red
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

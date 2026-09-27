@@ -20,10 +20,15 @@
 //! implementation this follows (Starward's `HdrToneMapEffect`/`HDR10ToScRGB`).
 
 use crate::error::{Result, VshotError};
-use crate::geometry::Size;
+use crate::geometry::{Point, Rect, Size};
 use crate::model::Frame;
 
-/// The HDR reference white: linear value 1.0 is this many cd/m².
+/// The scRGB reference white: linear value 1.0 is this many cd/m².
+///
+/// It is the white a frame is measured against by default.  A compositor that
+/// describes its own SDR white (see [`OutputColor::reference_nits`]) makes a
+/// capture use that instead, so that 1.0 always stands for the content's own
+/// white and a plain SDR pixel is never read as light above it.
 pub const REFERENCE_WHITE_NITS: f32 = 203.0;
 /// The peak the PQ curve is defined to (ST 2084).
 pub const PQ_PEAK_NITS: f32 = 10_000.0;
@@ -65,6 +70,126 @@ pub enum ToneMap {
     /// brightest sample lands on white and nothing clips: hue is preserved
     /// because the whole triple is scaled by one factor.
     Reinhard,
+}
+
+// --- the output -----------------------------------------------------------
+
+/// The colour properties of one output, as the compositor describes them over
+/// `wp_color_manager_v1`.
+///
+/// This is the Wayland analogue of the display facts Starward reads on Windows:
+/// `reference_nits` is the SDR white level, the light level a code of 1.0 stands
+/// for and the level above which a capture really is HDR.  Detection compares a
+/// capture's peak against it rather than guessing from the buffer's bit depth.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OutputColor {
+    /// The transfer function the output expects content in.
+    pub transfer: Transfer,
+    /// The primaries the output expects content in.
+    pub primaries: Primaries,
+    /// The luminance one unit of content means, in cd/m² (the reference white).
+    pub reference_nits: f32,
+    /// The darkest and brightest the output can show, in cd/m².
+    pub min_nits: f32,
+    pub max_nits: f32,
+}
+
+impl OutputColor {
+    /// Whether the output is showing HDR content (a PQ or HLG transfer).
+    pub fn is_hdr(&self) -> bool {
+        matches!(self.transfer, Transfer::Pq | Transfer::Hlg)
+    }
+}
+
+// --- reading an unlabelled buffer -----------------------------------------
+//
+// A 10-bit screencopy buffer carries no transfer function: `zwlr_screencopy_v1`
+// names a format and a depth, nothing more.  It must not be guessed from the
+// pixels either.  PQ content on a compositor that passes a client's absolute
+// HDR through — Hyprland does, it only converts between transfer functions and
+// never tone-maps into the panel's range — reaches ten-bit full scale, so it
+// looks exactly like sRGB white to any statistic of the buffer; reading such a
+// capture as sRGB on that evidence is what turned a correct HDR capture grey.
+//
+// The encoding is instead fixed by the format, one layer down: a compositor
+// hands a client a 10-bit buffer *only* when it means to fill it with the
+// output's own HDR pixels, and offers 8-bit sRGB on an HDR output otherwise.
+// Hyprland upholds that in `CMonitor::getPreferredReadFormat` — with
+// `misc:screencopy_hdr` off an HDR output is read back as `XRGB8888` — so the
+// capture side reads a 10-bit buffer on an output the compositor describes as
+// HDR as the output's own transfer function, and never inspects the pixels to
+// decide.  [`Rgb10Summary`] exists only to log what a capture held.
+
+/// The ten-bit code from which a sample counts as near sRGB white in the debug
+/// summary; just below full scale, so a dithered edge still counts.
+const SUMMARY_NEAR_WHITE: u16 = 1000;
+
+/// The percentile of the per-pixel maximum channel the summary reports, high
+/// so a few dithered or blown samples do not move it.
+const SUMMARY_P999_PERMILLE: u64 = 999; // 99.9 %
+
+/// A compact reading of a 10-bit buffer's per-pixel maximum channel: a couple of
+/// percentiles, the largest code seen, and how much of the frame sits at sRGB
+/// white.  It drives no decision — see the section comment above — and is only
+/// logged (behind `VSHOT_HDR_DEBUG`) so a capture can be checked against what
+/// produced it.
+#[derive(Clone, Copy, Debug)]
+pub struct Rgb10Summary {
+    pub median: u16,
+    pub p999: u16,
+    pub max: u16,
+    /// Share of pixels at or above [`SUMMARY_NEAR_WHITE`].
+    pub white_share: f32,
+}
+
+impl Rgb10Summary {
+    /// Measures `words`, which are DRM `XRGB2101010`-packed pixels.
+    pub fn of(words: &[u32]) -> Self {
+        let mut histogram = [0u32; 1024];
+        for word in words {
+            let red = (word >> 20) & 0x3ff;
+            let green = (word >> 10) & 0x3ff;
+            let blue = word & 0x3ff;
+            // A histogram index is a ten-bit code, always in range.
+            histogram[(red.max(green).max(blue) & 0x3ff) as usize] += 1;
+        }
+
+        let total = u64::try_from(words.len()).unwrap_or(u64::MAX);
+        let percentile = |permille: u64| {
+            let target = (total * permille).div_ceil(1000);
+            let mut seen = 0u64;
+            for (code, &count) in histogram.iter().enumerate() {
+                seen += u64::from(count);
+                if seen >= target {
+                    // The loop index is a ten-bit code, always in range.
+                    return code as u16;
+                }
+            }
+            1023
+        };
+
+        let mut max = 0u16;
+        let mut white = 0u64;
+        for (code, &count) in histogram.iter().enumerate() {
+            if count > 0 {
+                max = code as u16;
+            }
+            if code as u16 >= SUMMARY_NEAR_WHITE {
+                white += u64::from(count);
+            }
+        }
+
+        Self {
+            median: percentile(500),
+            p999: percentile(SUMMARY_P999_PERMILLE),
+            max,
+            white_share: if total == 0 {
+                0.0
+            } else {
+                white as f32 / total as f32
+            },
+        }
+    }
 }
 
 // --- transfer functions ---------------------------------------------------
@@ -228,7 +353,8 @@ impl HdrFrame {
     }
 
     /// Decodes RGBA `u16` samples (PNG's own 16-bit order) with a declared
-    /// transfer function and primaries into linear scRGB.
+    /// transfer function and primaries into linear scRGB, measured against
+    /// `reference_nits` — the light level 1.0 stands for.
     ///
     /// The colour-triple samples go through their transfer function; the alpha
     /// sample never does — alpha is linear whatever the colour encoding is.
@@ -237,6 +363,7 @@ impl HdrFrame {
         size: Size,
         transfer: Transfer,
         primaries: Primaries,
+        reference_nits: f32,
     ) -> Result<Self> {
         let expected = size
             .area()?
@@ -251,9 +378,9 @@ impl HdrFrame {
         let mut pixels = Vec::with_capacity(size.area()?);
         for rgba in samples.chunks_exact(4) {
             let mut rgb = [
-                decode_transfer(f32::from(rgba[0]) / 65535.0, transfer),
-                decode_transfer(f32::from(rgba[1]) / 65535.0, transfer),
-                decode_transfer(f32::from(rgba[2]) / 65535.0, transfer),
+                decode_transfer(f32::from(rgba[0]) / 65535.0, transfer, reference_nits),
+                decode_transfer(f32::from(rgba[1]) / 65535.0, transfer, reference_nits),
+                decode_transfer(f32::from(rgba[2]) / 65535.0, transfer, reference_nits),
             ];
             if primaries == Primaries::Bt2020 {
                 rgb = multiply(BT2020_TO_BT709, rgb);
@@ -275,21 +402,29 @@ impl HdrFrame {
             .chunks_exact(2)
             .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
             .collect();
-        Self::from_samples(&samples, size, Transfer::Pq, Primaries::Bt2020)
+        Self::from_samples(
+            &samples,
+            size,
+            Transfer::Pq,
+            Primaries::Bt2020,
+            REFERENCE_WHITE_NITS,
+        )
     }
 
     /// Decodes 10-bit RGB packed the way DRM's `XRGB2101010`/`ARGB2101010`
     /// pack it (bits 20..30, 10..20, 0..10, alpha in the top two).  This is the
-    /// shape a compositor's HDR screencopy buffer arrives in, so it is the
-    /// decode the capture side will use once it negotiates such a buffer.
-    /// With `alpha` false the top bits are the `X` padding and the pixel is
-    /// taken as opaque.
+    /// shape a compositor's HDR screencopy buffer arrives in.  With `alpha`
+    /// false the top bits are the `X` padding and the pixel is taken as opaque.
+    ///
+    /// `reference_nits` is the light level 1.0 stands for — the compositor's
+    /// own SDR white, when it describes one.
     pub fn from_rgb10(
         words: &[u32],
         size: Size,
         transfer: Transfer,
         primaries: Primaries,
         alpha: bool,
+        reference_nits: f32,
     ) -> Result<Self> {
         let expected = size.area()?;
         if words.len() != expected {
@@ -301,9 +436,17 @@ impl HdrFrame {
         let mut pixels = Vec::with_capacity(expected);
         for word in words {
             let mut rgb = [
-                decode_transfer(((word >> 20) & 0x3ff) as f32 / 1023.0, transfer),
-                decode_transfer(((word >> 10) & 0x3ff) as f32 / 1023.0, transfer),
-                decode_transfer((word & 0x3ff) as f32 / 1023.0, transfer),
+                decode_transfer(
+                    ((word >> 20) & 0x3ff) as f32 / 1023.0,
+                    transfer,
+                    reference_nits,
+                ),
+                decode_transfer(
+                    ((word >> 10) & 0x3ff) as f32 / 1023.0,
+                    transfer,
+                    reference_nits,
+                ),
+                decode_transfer((word & 0x3ff) as f32 / 1023.0, transfer, reference_nits),
             ];
             if primaries == Primaries::Bt2020 {
                 rgb = multiply(BT2020_TO_BT709, rgb);
@@ -417,14 +560,277 @@ impl HdrFrame {
     }
 }
 
-fn decode_transfer(value: f32, transfer: Transfer) -> f32 {
+impl HdrFrame {
+    /// Crops to `requested`, clipped to the frame, the way [`Frame::crop`] is.
+    pub fn crop(&self, requested: Rect) -> Result<Self> {
+        let bounds = Rect::new(0, 0, self.size.width, self.size.height);
+        let crop = requested.intersection(bounds).ok_or_else(|| {
+            VshotError::InvalidGeometry("HDR crop does not intersect the frame".into())
+        })?;
+        let x = crop.origin.x as usize;
+        let y = crop.origin.y as usize;
+        let width = crop.size.width as usize;
+        let height = crop.size.height as usize;
+        let source_width = self.size.width as usize;
+        let mut pixels = Vec::with_capacity(width * height);
+        for row in 0..height {
+            let start = (y + row) * source_width + x;
+            pixels.extend_from_slice(&self.pixels[start..start + width]);
+        }
+        Self::new(Size::new(crop.size.width, crop.size.height), pixels)
+    }
+
+    /// Pixelates `rect` with a rect-aligned block grid, averaging the **linear**
+    /// values.  This is the mosaic of an HDR capture: the same geometry as
+    /// [`Frame::mosaic`], but the average is taken in light rather than in
+    /// gamma-encoded bytes, so a bright block stays bright in the HDR file.
+    pub fn mosaic(&mut self, rect: Rect, block_size: u32) -> Result<()> {
+        let (left, top, right, bottom) = self.block_bounds(rect, block_size)?;
+        let (Some((visible_left, visible_right)), Some((visible_top, visible_bottom))) = (
+            clip_axis(left, right, self.size.width),
+            clip_axis(top, bottom, self.size.height),
+        ) else {
+            return Ok(());
+        };
+        let block = i64::from(block_size);
+        let first_x = left + (visible_left - left).div_euclid(block) * block;
+        let first_y = top + (visible_top - top).div_euclid(block) * block;
+        let mut block_y = first_y;
+        while block_y < visible_bottom {
+            let y_start = block_y.max(visible_top);
+            let y_end = (block_y + block).min(visible_bottom);
+            let mut block_x = first_x;
+            while block_x < visible_right {
+                let x_start = block_x.max(visible_left);
+                let x_end = (block_x + block).min(visible_right);
+                if let Some(average) = self.average_region(x_start, y_start, x_end, y_end, None) {
+                    self.fill_region(x_start, y_start, x_end, y_end, average, None);
+                }
+                block_x += block;
+            }
+            block_y += block;
+        }
+        Ok(())
+    }
+
+    /// Pixelates the ellipse inscribed in `rect` with the same block grid.
+    /// Boundary blocks are averaged over the pixels inside the ellipse and
+    /// filled per pixel, matching [`Frame::mosaic_ellipse`].
+    pub fn mosaic_ellipse(&mut self, rect: Rect, block_size: u32) -> Result<()> {
+        let (left, top, right, bottom) = self.block_bounds(rect, block_size)?;
+        let (Some((visible_left, visible_right)), Some((visible_top, visible_bottom))) = (
+            clip_axis(left, right, self.size.width),
+            clip_axis(top, bottom, self.size.height),
+        ) else {
+            return Ok(());
+        };
+        let block = i64::from(block_size);
+        let center_x = left + (right - left) / 2;
+        let center_y = top + (bottom - top) / 2;
+        let a = ((right - left).max(2) / 2) as f64;
+        let b = ((bottom - top).max(2) / 2) as f64;
+        let threshold = a * a * b * b;
+        let inside = |x: i64, y: i64| -> bool {
+            let dx = (x - center_x) as f64;
+            let dy = (y - center_y) as f64;
+            dx * dx * b * b + dy * dy * a * a <= threshold
+        };
+        let first_x = left + (visible_left - left) / block * block;
+        let first_y = top + (visible_top - top) / block * block;
+        let mut block_y = first_y;
+        while block_y < visible_bottom {
+            let y_start = block_y.max(visible_top);
+            let y_end = (block_y + block).min(visible_bottom);
+            let mut block_x = first_x;
+            while block_x < visible_right {
+                let x_start = block_x.max(visible_left);
+                let x_end = (block_x + block).min(visible_right);
+                if let Some(average) =
+                    self.average_region(x_start, y_start, x_end, y_end, Some(&inside))
+                {
+                    self.fill_region(x_start, y_start, x_end, y_end, average, Some(&inside));
+                }
+                block_x += block;
+            }
+            block_y += block;
+        }
+        Ok(())
+    }
+
+    /// Smears mosaic discs of `radius` along the path, each averaged from a
+    /// pre-mosaic snapshot of the frame, mirroring [`Frame::mosaic_brush`].
+    pub fn mosaic_brush(&mut self, points: &[Point], radius: u32) -> Result<()> {
+        if points.is_empty() {
+            return Err(VshotError::InvalidGeometry(
+                "HDR mosaic brush path must contain at least one point".into(),
+            ));
+        }
+        if radius == 0 {
+            return Err(VshotError::InvalidGeometry(
+                "HDR mosaic brush radius must be greater than zero".into(),
+            ));
+        }
+        let snapshot = self.clone();
+        let radius = i64::from(radius.min(512));
+        let step = (radius / 2).max(1) as f64;
+        let mut centers: Vec<(i64, i64)> = Vec::with_capacity(points.len());
+        centers.push((i64::from(points[0].x), i64::from(points[0].y)));
+        for segment in points.windows(2) {
+            let (ax, ay) = (f64::from(segment[0].x), f64::from(segment[0].y));
+            let (bx, by) = (f64::from(segment[1].x), f64::from(segment[1].y));
+            let length = (bx - ax).hypot(by - ay);
+            let count = ((length / step).ceil() as usize).max(1);
+            for k in 1..=count {
+                let t = k as f64 / count as f64;
+                centers.push((
+                    (ax + (bx - ax) * t).round() as i64,
+                    (ay + (by - ay) * t).round() as i64,
+                ));
+            }
+        }
+        let radius_squared = radius * radius;
+        for (center_x, center_y) in centers {
+            let mut sums = [0f64; 4];
+            let mut count = 0u64;
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    if dx * dx + dy * dy > radius_squared {
+                        continue;
+                    }
+                    if let Some(index) = snapshot.index_at(center_x + dx, center_y + dy) {
+                        for (channel, sum) in sums.iter_mut().enumerate() {
+                            *sum += f64::from(snapshot.pixels[index][channel]);
+                        }
+                        count += 1;
+                    }
+                }
+            }
+            if count == 0 {
+                continue;
+            }
+            let average = average_of(sums, count);
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    if dx * dx + dy * dy > radius_squared {
+                        continue;
+                    }
+                    if let Some(index) = self.index_at(center_x + dx, center_y + dy) {
+                        self.pixels[index] = average;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn block_bounds(&self, rect: Rect, block_size: u32) -> Result<(i64, i64, i64, i64)> {
+        if rect.is_empty() {
+            return Err(VshotError::InvalidGeometry(
+                "mosaic rectangle dimensions must be greater than zero".into(),
+            ));
+        }
+        if block_size == 0 {
+            return Err(VshotError::InvalidGeometry(
+                "mosaic block size must be greater than zero".into(),
+            ));
+        }
+        let left = i64::from(rect.origin.x);
+        let top = i64::from(rect.origin.y);
+        Ok((
+            left,
+            top,
+            left + i64::from(rect.size.width),
+            top + i64::from(rect.size.height),
+        ))
+    }
+
+    fn index_at(&self, x: i64, y: i64) -> Option<usize> {
+        let width = i64::from(self.size.width);
+        let height = i64::from(self.size.height);
+        if x < 0 || y < 0 || x >= width || y >= height {
+            return None;
+        }
+        usize::try_from(y * width + x).ok()
+    }
+
+    fn average_region(
+        &self,
+        x_start: i64,
+        y_start: i64,
+        x_end: i64,
+        y_end: i64,
+        include: Option<&dyn Fn(i64, i64) -> bool>,
+    ) -> Option<[f32; 4]> {
+        let mut sums = [0f64; 4];
+        let mut count = 0u64;
+        for y in y_start..y_end {
+            for x in x_start..x_end {
+                if include.is_some_and(|inside| !inside(x, y)) {
+                    continue;
+                }
+                if let Some(index) = self.index_at(x, y) {
+                    for (channel, sum) in sums.iter_mut().enumerate() {
+                        *sum += f64::from(self.pixels[index][channel]);
+                    }
+                    count += 1;
+                }
+            }
+        }
+        (count > 0).then(|| average_of(sums, count))
+    }
+
+    fn fill_region(
+        &mut self,
+        x_start: i64,
+        y_start: i64,
+        x_end: i64,
+        y_end: i64,
+        value: [f32; 4],
+        include: Option<&dyn Fn(i64, i64) -> bool>,
+    ) {
+        for y in y_start..y_end {
+            for x in x_start..x_end {
+                if include.is_some_and(|inside| !inside(x, y)) {
+                    continue;
+                }
+                if let Some(index) = self.index_at(x, y) {
+                    self.pixels[index] = value;
+                }
+            }
+        }
+    }
+}
+
+/// Clips `[start, end)` to `[0, limit)`, mirroring `frame::clip_range`.
+fn clip_axis(start: i64, end: i64, limit: u32) -> Option<(i64, i64)> {
+    let start = start.max(0);
+    let end = end.min(i64::from(limit));
+    (start < end).then_some((start, end))
+}
+
+fn average_of(sums: [f64; 4], count: u64) -> [f32; 4] {
+    let count = count as f64;
+    [
+        (sums[0] / count) as f32,
+        (sums[1] / count) as f32,
+        (sums[2] / count) as f32,
+        (sums[3] / count) as f32,
+    ]
+}
+
+fn decode_transfer(value: f32, transfer: Transfer, reference_nits: f32) -> f32 {
+    let reference = if reference_nits.is_finite() && reference_nits > 0.0 {
+        reference_nits
+    } else {
+        REFERENCE_WHITE_NITS
+    };
     match transfer {
         Transfer::Linear => value,
         Transfer::Srgb => srgb_eotf(value),
         // PQ and HLG are absolute: the code names a light level, so bring it
         // into the reference-white-relative scale the rest of the pipeline uses.
-        Transfer::Pq => pq_eotf(value) * (PQ_PEAK_NITS / REFERENCE_WHITE_NITS),
-        Transfer::Hlg => hlg_inverse_oetf(value) * (HLG_PEAK_NITS / REFERENCE_WHITE_NITS),
+        Transfer::Pq => pq_eotf(value) * (PQ_PEAK_NITS / reference),
+        Transfer::Hlg => hlg_inverse_oetf(value) * (HLG_PEAK_NITS / reference),
     }
 }
 
@@ -549,6 +955,7 @@ mod tests {
             Transfer::Pq,
             Primaries::Bt2020,
             true,
+            REFERENCE_WHITE_NITS,
         )
         .unwrap();
         let pixel = frame.pixel(0, 0).unwrap();
@@ -564,6 +971,7 @@ mod tests {
             Transfer::Pq,
             Primaries::Bt2020,
             false,
+            REFERENCE_WHITE_NITS,
         )
         .unwrap();
         assert_eq!(frame.pixel(0, 0).unwrap()[3], 1.0);
@@ -575,6 +983,7 @@ mod tests {
             Transfer::Linear,
             Primaries::Bt709,
             false,
+            REFERENCE_WHITE_NITS,
         )
         .unwrap();
         let pixel = frame.pixel(0, 0).unwrap();
@@ -592,6 +1001,7 @@ mod tests {
             Size::new(1, 1),
             Transfer::Pq,
             Primaries::Bt709,
+            REFERENCE_WHITE_NITS,
         )
         .unwrap();
         let pixel = frame.pixel(0, 0).unwrap();
@@ -609,6 +1019,7 @@ mod tests {
             Size::new(1, 1),
             Transfer::Linear,
             Primaries::Bt2020,
+            REFERENCE_WHITE_NITS,
         )
         .unwrap();
         let pixel = frame.pixel(0, 0).unwrap();
@@ -631,6 +1042,93 @@ mod tests {
         assert!(!sdr.is_hdr());
         let hdr = one_pixel([4.0, 3.0, 2.0, 1.0]);
         assert!(hdr.is_hdr());
+    }
+
+    #[test]
+    fn a_capture_is_measured_against_the_outputs_own_white() {
+        // SDR white rendered at 300 cd/m², the compositor's reference: decoded
+        // against it a plain SDR pixel is 1.0 and carries no HDR, even though it
+        // sits well above the scRGB reference white of 203.
+        let code = pq_oetf(300.0 / 10_000.0);
+        let sample = (code * 1023.0).round() as u32;
+        let word = (sample << 20) | (sample << 10) | sample;
+        let frame = HdrFrame::from_rgb10(
+            &[word],
+            Size::new(1, 1),
+            Transfer::Pq,
+            Primaries::Bt709,
+            false,
+            300.0,
+        )
+        .unwrap();
+        assert!((frame.pixel(0, 0).unwrap()[0] - 1.0).abs() < 0.01);
+        assert!(!frame.is_hdr());
+
+        // The same word against the default reference white is light above it.
+        let frame = HdrFrame::from_rgb10(
+            &[word],
+            Size::new(1, 1),
+            Transfer::Pq,
+            Primaries::Bt709,
+            false,
+            REFERENCE_WHITE_NITS,
+        )
+        .unwrap();
+        assert!(frame.is_hdr());
+    }
+
+    fn hdr_output() -> OutputColor {
+        OutputColor {
+            transfer: Transfer::Pq,
+            primaries: Primaries::Bt2020,
+            reference_nits: 203.0,
+            min_nits: 0.0,
+            max_nits: 417.0,
+        }
+    }
+
+    fn rgb10(red: u32, green: u32, blue: u32) -> u32 {
+        ((red & 0x3ff) << 20) | ((green & 0x3ff) << 10) | (blue & 0x3ff)
+    }
+
+    #[test]
+    fn a_ten_bit_buffer_on_an_hdr_output_is_read_as_the_outputs_own_encoding() {
+        // The contract the capture side relies on: a 10-bit buffer on an output
+        // the compositor describes as HDR is read with that output's transfer
+        // function, whatever the codes are.  Full scale is PQ's own top
+        // (10 000 cd/m²), *not* sRGB white — reading it as sRGB white is what
+        // turned a correct HDR capture grey.
+        let color = hdr_output();
+        let words = [rgb10(1023, 1023, 1023)];
+        let frame = HdrFrame::from_rgb10(
+            &words,
+            Size::new(1, 1),
+            color.transfer,
+            color.primaries,
+            false,
+            color.reference_nits,
+        )
+        .unwrap();
+        // 10 000 cd/m² against a 203-nit reference white is about 49 units;
+        // an sRGB read of the same word would have given 1.0.
+        assert!(frame.pixel(0, 0).unwrap()[0] > 45.0);
+        assert!(frame.is_hdr());
+    }
+
+    #[test]
+    fn the_debug_summary_measures_the_codes_a_capture_holds() {
+        // The summary is diagnostics only — it decides nothing — but it has to
+        // report what a capture held, so a grey result can be told apart from a
+        // wrong reading.
+        let words = [
+            rgb10(0, 0, 0),
+            rgb10(300, 300, 300),
+            rgb10(1023, 1023, 1023),
+        ];
+        let summary = Rgb10Summary::of(&words);
+        assert_eq!(summary.max, 1023);
+        assert_eq!(summary.median, 300);
+        assert!(summary.white_share > 0.3 && summary.white_share < 0.4);
     }
 
     #[test]
@@ -691,6 +1189,60 @@ mod tests {
         let pixel = frame.pixel(0, 0).unwrap();
         let expected = 1.0 * (128.0 / 255.0) + 0.25 * (1.0 - 128.0 / 255.0);
         assert!((pixel[0] - expected).abs() < 1e-3, "{}", pixel[0]);
+    }
+
+    #[test]
+    fn crop_takes_the_requested_region() {
+        let frame = HdrFrame::new(
+            Size::new(2, 2),
+            vec![
+                [0.0, 0.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0, 1.0],
+                [2.0, 0.0, 0.0, 1.0],
+                [3.0, 0.0, 0.0, 1.0],
+            ],
+        )
+        .unwrap();
+        let cropped = frame.crop(Rect::new(1, 0, 1, 2)).unwrap();
+        assert_eq!(cropped.size(), Size::new(1, 2));
+        assert_eq!(cropped.pixel(0, 0).unwrap()[0], 1.0);
+        assert_eq!(cropped.pixel(0, 1).unwrap()[0], 3.0);
+    }
+
+    #[test]
+    fn a_mosaic_averages_in_linear_light() {
+        // One dark and one bright pixel in a 2-pixel block: the block average
+        // is the linear mean (2.0), not the gamma-encoded mean.
+        let mut frame = HdrFrame::new(
+            Size::new(2, 1),
+            vec![[0.0, 0.0, 0.0, 1.0], [4.0, 0.0, 0.0, 1.0]],
+        )
+        .unwrap();
+        frame.mosaic(Rect::new(0, 0, 2, 1), 2).unwrap();
+        assert!((frame.pixel(0, 0).unwrap()[0] - 2.0).abs() < 1e-5);
+        assert!((frame.pixel(1, 0).unwrap()[0] - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_mosaic_brush_smears_discs_of_linear_light() {
+        let mut frame = HdrFrame::new(
+            Size::new(3, 3),
+            (0..9).map(|index| [index as f32, 0.0, 0.0, 1.0]).collect(),
+        )
+        .unwrap();
+        frame.mosaic_brush(&[Point::new(1, 1)], 1).unwrap();
+        // The radius-1 disc covers the centre and its four neighbours; those
+        // five pixels average to 4.0, and the corners outside the disc keep
+        // their own values.
+        for (x, y) in [(1, 1), (0, 1), (2, 1), (1, 0), (1, 2)] {
+            assert!(
+                (frame.pixel(x, y).unwrap()[0] - 4.0).abs() < 1e-5,
+                "{x},{y} = {}",
+                frame.pixel(x, y).unwrap()[0]
+            );
+        }
+        assert_eq!(frame.pixel(0, 0).unwrap()[0], 0.0);
+        assert_eq!(frame.pixel(2, 2).unwrap()[0], 8.0);
     }
 
     #[test]

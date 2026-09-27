@@ -10,6 +10,10 @@ use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
+use wayland_protocols::wp::color_management::v1::client::{
+    wp_color_management_output_v1, wp_color_manager_v1, wp_image_description_info_v1,
+    wp_image_description_v1,
+};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
 };
@@ -19,9 +23,15 @@ use wayland_protocols_wlr::screencopy::v1::client::{
 
 use crate::error::{Result, VshotError};
 use crate::geometry::{Rect, Size};
-use crate::model::Frame;
+use crate::model::hdr::{
+    OutputColor, Primaries, Rgb10Summary, ToneMap, Transfer, REFERENCE_WHITE_NITS,
+};
+use crate::model::{Frame, HdrFrame};
 
-use super::dmabuf::{DmabufFrame, GbmBuffer};
+use super::dmabuf::{
+    is_hdr_fourcc, swap_red_blue_10, DmabufFrame, GbmBuffer, DRM_FORMAT_ABGR2101010,
+    DRM_FORMAT_ARGB2101010,
+};
 
 #[derive(Debug)]
 struct CaptureBuffer {
@@ -50,14 +60,19 @@ impl CaptureBuffer {
         // are BGRA in memory and the `…bgr…` ones RGBA, while the fourth byte
         // is alpha in the `A…` forms and padding in the `X…` ones.  wlroots
         // with the pixman renderer — a headless or software-rendered session —
-        // offers XBGR8888, which is why the `…bgr…` pair is here at all.
+        // offers XBGR8888, which is why the `…bgr…` pair is here at all.  A
+        // 10-bit offer (the `…2101010` four) is read as 8-bit sRGB in
+        // `decode_10bit_shm`: the compositor renders an sRGB image into it even
+        // at that depth.  Every layout is four bytes per pixel, so the buffer
+        // maths below is the same for all.
         if !matches!(
             format,
             wl_shm::Format::Argb8888
                 | wl_shm::Format::Xrgb8888
                 | wl_shm::Format::Abgr8888
                 | wl_shm::Format::Xbgr8888
-        ) {
+        ) && !is_10bit_shm(format)
+        {
             return Err(VshotError::UnsupportedOutput(format!(
                 "wlr-screencopy returned unsupported wl_shm format {format:?}"
             )));
@@ -134,6 +149,22 @@ impl CaptureBuffer {
             y_invert,
         )
     }
+
+    /// Reads this 10-bit buffer's pixels as DRM `XRGB2101010`-packed words —
+    /// red in bits 20..30, green in 10..20, blue in 0..10.
+    ///
+    /// Both the sRGB fallback ([`decode_10bit_shm`]) and the HDR decode start
+    /// here; only the transfer function they apply differs.
+    fn words(&self, y_invert: bool) -> Result<Vec<u32>> {
+        ten_bit_words(
+            &self.map,
+            self.width,
+            self.height,
+            self.stride,
+            self.format,
+            y_invert,
+        )
+    }
 }
 
 fn convert_shm_pixels(
@@ -144,6 +175,9 @@ fn convert_shm_pixels(
     format: wl_shm::Format,
     y_invert: bool,
 ) -> Result<Frame> {
+    if is_10bit_shm(format) {
+        return decode_10bit_shm(map, width, height, stride, format, y_invert);
+    }
     if !matches!(
         format,
         wl_shm::Format::Argb8888
@@ -220,6 +254,135 @@ fn convert_shm_pixels(
         }
     }
     Frame::new(Size::new(width as u32, height as u32), pixels)
+}
+
+/// Whether a `wl_shm` format is one of the packed 10-bit layouts.  All four are
+/// four bytes per pixel, like the 8-bit family, so a shm offer of one allocates
+/// exactly the buffer the 8-bit path would; only the decode differs.
+fn is_10bit_shm(format: wl_shm::Format) -> bool {
+    matches!(
+        format,
+        wl_shm::Format::Argb2101010
+            | wl_shm::Format::Xrgb2101010
+            | wl_shm::Format::Abgr2101010
+            | wl_shm::Format::Xbgr2101010
+    )
+}
+
+/// Reads a packed 10-bit shm capture into DRM `XRGB2101010`-ordered words
+/// — red in bits 20..30, green in 10..20, blue in 0..10 — undoing the red/blue
+/// swap the `…bgr…` layouts carry.
+///
+/// Both the sRGB fallback ([`decode_10bit_shm`]) and the HDR decode (in
+/// [`WlrCapture::capture`] and [`WlrCapture::capture_output_hdr`]) start from
+/// these words; only the transfer function they apply differs.
+fn ten_bit_words(
+    map: &[u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    format: wl_shm::Format,
+    y_invert: bool,
+) -> Result<Vec<u32>> {
+    // Which way round the red and blue fields sit.
+    let bgr = match format {
+        wl_shm::Format::Xrgb2101010 | wl_shm::Format::Argb2101010 => false,
+        wl_shm::Format::Xbgr2101010 | wl_shm::Format::Abgr2101010 => true,
+        _ => unreachable!("only 10-bit formats are decoded here"),
+    };
+    let width = usize::try_from(width)
+        .map_err(|_| VshotError::WaylandProtocol("capture width is too large".into()))?;
+    let height = usize::try_from(height)
+        .map_err(|_| VshotError::WaylandProtocol("capture height is too large".into()))?;
+    let row_bytes = width
+        .checked_mul(4)
+        .ok_or_else(|| VshotError::WaylandProtocol("capture stride overflows".into()))?;
+    if stride < row_bytes {
+        return Err(VshotError::WaylandProtocol(
+            "capture stride is smaller than the frame width".into(),
+        ));
+    }
+    let expected = stride
+        .checked_mul(height)
+        .ok_or_else(|| VshotError::WaylandProtocol("capture buffer size overflows".into()))?;
+    if map.len() < expected {
+        return Err(VshotError::WaylandProtocol(
+            "capture SHM mapping is smaller than the advertised stride".into(),
+        ));
+    }
+    let mut words = Vec::with_capacity(width * height);
+    for destination_y in 0..height {
+        let source_y = if y_invert {
+            height - 1 - destination_y
+        } else {
+            destination_y
+        };
+        let source_row = &map[source_y * stride..source_y * stride + row_bytes];
+        for source in source_row.chunks_exact(4) {
+            let word = u32::from_le_bytes([source[0], source[1], source[2], source[3]]);
+            words.push(if bgr { swap_red_blue_10(word) } else { word });
+        }
+    }
+    Ok(words)
+}
+
+/// Decodes a packed 10-bit shm capture into the 8-bit `Frame` the scene is
+/// composed in.
+///
+/// This is the *SDR* reading of a 10-bit buffer: a compositor offers ten-bit
+/// channels for a 10-bit SDR output too (no HDR description on it), and the
+/// pixels are then ordinary sRGB at more depth.  The ten-bit channels are
+/// rounded down to the eight-bit sRGB the rest of the pipeline speaks.  A
+/// buffer that holds HDR is caught first — by the output's own colour
+/// description, in [`WlrCapture::capture`] and
+/// [`WlrCapture::capture_output_hdr`] — so the 8-bit scene never shows HDR
+/// pixels read as sRGB.
+fn decode_10bit_shm(
+    map: &[u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    format: wl_shm::Format,
+    y_invert: bool,
+) -> Result<Frame> {
+    let words = ten_bit_words(map, width, height, stride, format, y_invert)?;
+    let mut pixels = vec![0u8; words.len() * 4];
+    for (destination, word) in pixels.chunks_exact_mut(4).zip(words) {
+        destination[0] = ten_to_eight((word >> 20) & 0x3ff);
+        destination[1] = ten_to_eight((word >> 10) & 0x3ff);
+        destination[2] = ten_to_eight(word & 0x3ff);
+        // A capture is opaque; the `A…` alpha is the compositor's, not a
+        // transparency the screenshot should carry.
+        destination[3] = 255;
+    }
+    if std::env::var_os("VSHOT_HDR_DEBUG").is_some() {
+        eprintln!(
+            "vshot: hdr: {width}x{height} {format:?} capture read as 8-bit sRGB \
+             (the compositor offered no HDR to the dma-buf route)"
+        );
+    }
+    Frame::new(Size::new(width, height), pixels)
+}
+
+/// A 10-bit channel code to the 8-bit byte nearest it, rounded rather than
+/// truncated so a flat band does not drift a level darker.
+fn ten_to_eight(code: u32) -> u8 {
+    ((code * 255 + 511) / 1023) as u8
+}
+
+/// Logs what a 10-bit capture held, behind `VSHOT_HDR_DEBUG`.  The reading
+/// decides nothing — the encoding comes from the format, not the pixels (see
+/// the note in `model::hdr`) — but it lets a capture be checked against what
+/// produced it.
+fn trace_rgb10(name: &str, width: u32, height: u32, format: wl_shm::Format, words: &[u32]) {
+    if std::env::var_os("VSHOT_HDR_DEBUG").is_none() {
+        return;
+    }
+    let summary = Rgb10Summary::of(words);
+    eprintln!(
+        "vshot: hdr shm {name}: {width}x{height} {format:?} median={} p999={} max={} white={:.4} read as the output's own encoding",
+        summary.median, summary.p999, summary.max, summary.white_share
+    );
 }
 
 impl Drop for CaptureBuffer {
@@ -300,6 +463,53 @@ struct OutputUserData {
     global_id: u32,
 }
 
+/// One in-flight `wp_color_manager_v1` output query, filled by the events its
+/// objects send.  The output's description and the description's information
+/// arrive asynchronously, so the query's parts are collected here between
+/// dispatches (see [`WlrCapture::output_color`]).
+#[derive(Debug, Default)]
+struct ColorQuery {
+    // Held so the output object outlives the description made from it.
+    _output: Option<wp_color_management_output_v1::WpColorManagementOutputV1>,
+    description: Option<wp_image_description_v1::WpImageDescriptionV1>,
+    info: Option<wp_image_description_info_v1::WpImageDescriptionInfoV1>,
+    ready: bool,
+    failed: bool,
+    done: bool,
+    transfer: Option<u32>,
+    primaries: Option<u32>,
+    min_nits: Option<f32>,
+    max_nits: Option<f32>,
+    reference_nits: Option<f32>,
+    target_max_nits: Option<f32>,
+    max_cll: Option<u32>,
+}
+
+impl ColorQuery {
+    /// The collected events as an [`OutputColor`], or `None` if the description
+    /// never said what its reference white is (some parametric descriptions omit
+    /// the transfer or the luminances).
+    fn into_output_color(self) -> Option<OutputColor> {
+        let transfer = match self.transfer? {
+            11 => Transfer::Pq,
+            13 => Transfer::Hlg,
+            5 => Transfer::Linear,
+            _ => Transfer::Srgb,
+        };
+        let primaries = match self.primaries {
+            Some(6) => Primaries::Bt2020,
+            _ => Primaries::Bt709,
+        };
+        Some(OutputColor {
+            transfer,
+            primaries,
+            reference_nits: self.reference_nits?,
+            min_nits: self.min_nits.unwrap_or(0.0),
+            max_nits: self.target_max_nits.or(self.max_nits).unwrap_or(0.0),
+        })
+    }
+}
+
 #[derive(Debug, Default)]
 struct CaptureState {
     shm: Option<wl_shm::WlShm>,
@@ -307,6 +517,16 @@ struct CaptureState {
     manager_version: u32,
     dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
     dmabuf_version: u32,
+    /// The colour-management global, bound so this client counts as
+    /// colour-management aware.  A compositor that hands HDR over through a
+    /// capture only does so for such a client.  Hyprland 0.56 binds nothing to
+    /// it — its capture path maps the frame to sRGB whatever the client does
+    /// (see `decode_10bit_shm`) — but holding the manager costs nothing and is
+    /// what a compositor that does signal HDR capture keys on.
+    color_manager: Option<wp_color_manager_v1::WpColorManagerV1>,
+    /// Whether an HDR capture is wanted this run, filled from the target's
+    /// output colour (see [`WlrCapture::output_color`]).
+    color_query: Option<ColorQuery>,
     outputs: HashMap<u32, wl_output::WlOutput>,
     output_names: HashMap<u32, String>,
     pending: Option<PendingCapture>,
@@ -385,6 +605,51 @@ impl WlrCapture {
     }
 
     fn capture(&mut self, name: &str, region: Option<Rect>, cursor: bool) -> Result<Frame> {
+        let (buffer, y_invert) = self.capture_buffer(name, region, cursor)?;
+        let convert_started = Instant::now();
+        // A 10-bit buffer on an output the compositor describes as HDR *is* the
+        // output's own HDR pixels: the format is the contract, and the pixels
+        // are never inspected to decide (see the note in `model::hdr`).  An HDR
+        // buffer is tone-mapped down, so the SDR scene, and the annotation
+        // overlay drawn from it, show the content as light rather than HDR read
+        // as sRGB.
+        let frame = if is_10bit_shm(buffer.format) {
+            match self.hdr_output_color(name)? {
+                Some(color) => {
+                    let words = buffer.words(y_invert)?;
+                    trace_rgb10(name, buffer.width, buffer.height, buffer.format, &words);
+                    HdrFrame::from_rgb10(
+                        &words,
+                        Size::new(buffer.width, buffer.height),
+                        color.transfer,
+                        color.primaries,
+                        false,
+                        color.reference_nits,
+                    )?
+                    .tone_map_to_srgb(ToneMap::Reinhard)?
+                }
+                None => buffer.into_frame(y_invert)?,
+            }
+        } else {
+            buffer.into_frame(y_invert)?
+        };
+        if std::env::var_os("VSHOT_RECORD_DEBUG").is_some() {
+            eprintln!(
+                "vshot:   capture: pixel-convert {:.1}ms",
+                convert_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        Ok(frame)
+    }
+
+    /// Runs one `zwlr_screencopy` request and returns the raw buffer the
+    /// compositor filled, before it is converted to any pixel layout.
+    fn capture_buffer(
+        &mut self,
+        name: &str,
+        region: Option<Rect>,
+        cursor: bool,
+    ) -> Result<(CaptureBuffer, bool)> {
         if self.state.pending.is_some() {
             return Err(VshotError::WaylandProtocol(
                 "a capture is already in progress".into(),
@@ -441,15 +706,10 @@ impl WlrCapture {
         let buffer = pending.buffer.ok_or_else(|| {
             VshotError::WaylandProtocol("screencopy completed without a buffer".into())
         })?;
-        let convert_started = Instant::now();
-        let frame = buffer.into_frame(pending.y_invert);
         if std::env::var_os("VSHOT_RECORD_DEBUG").is_some() {
-            eprintln!(
-                "vshot:   capture: compositor+shm-copy {wait_ms:.1}ms pixel-convert {:.1}ms",
-                convert_started.elapsed().as_secs_f64() * 1000.0
-            );
+            eprintln!("vshot:   capture: compositor+shm-copy {wait_ms:.1}ms");
         }
-        frame
+        Ok((buffer, pending.y_invert))
     }
 
     /// Captures one output straight into a dma-buf: the compositor renders
@@ -479,6 +739,198 @@ impl WlrCapture {
         cursor: bool,
     ) -> Result<DmabufFrame> {
         self.capture_dmabuf(name, Some(region), cursor)
+    }
+
+    /// Captures one output as HDR content, when the session can hand it over.
+    ///
+    /// Two routes carry HDR pixels.  The first is the buffer-over-`wl_shm`
+    /// route: when the compositor keeps HDR in the screencopy buffer — a
+    /// compositor patched so that `screencopy_hdr` fills the output's 10-bit
+    /// format with the pixels it is showing — those pixels arrive over shm, and
+    /// a 10-bit buffer on an HDR-described output is read as that output's own
+    /// encoding.  It needs no dma-buf, so it is the route that works on a driver
+    /// (NVIDIA, here) that cannot hand a 10-bit dma-buf over at all.  The second
+    /// is the `linux-dmabuf` route, for a compositor that advertises the
+    /// high-bit-depth format there instead, decoded as HDR10 (BT.2020 primaries,
+    /// PQ transfer).
+    ///
+    /// `Ok(None)` means this output offers no HDR by either route — a compositor
+    /// that maps the capture to sRGB, or an output the compositor does not call
+    /// HDR — and the ordinary SDR path stands alone.
+    pub fn capture_output_hdr(&mut self, name: &str, cursor: bool) -> Result<Option<HdrFrame>> {
+        let debug = std::env::var_os("VSHOT_HDR_DEBUG").is_some();
+
+        // The shm route: a 10-bit buffer on an output the compositor describes
+        // as HDR is that output's own HDR pixels — the format is the contract,
+        // the pixels are never inspected (see the note in `model::hdr`).  An
+        // 8-bit offer means the compositor mapped the capture to sRGB, and the
+        // caller keeps its own SDR frame.
+        let color = self.hdr_output_color(name)?;
+        if let Some(color) = color {
+            let (buffer, y_invert) = self.capture_buffer(name, None, cursor)?;
+            let format = buffer.format;
+            if is_10bit_shm(format) {
+                let words = buffer.words(y_invert)?;
+                trace_rgb10(name, buffer.width, buffer.height, format, &words);
+                let hdr = HdrFrame::from_rgb10(
+                    &words,
+                    Size::new(buffer.width, buffer.height),
+                    color.transfer,
+                    color.primaries,
+                    false,
+                    color.reference_nits,
+                )?;
+                if debug {
+                    eprintln!(
+                        "vshot: hdr shm {name}: peak={} is_hdr={}",
+                        hdr.peak(),
+                        hdr.is_hdr()
+                    );
+                }
+                return Ok(Some(hdr));
+            }
+        }
+
+        let probe = self.probe_dmabuf_offer_region(name, None);
+        if std::env::var_os("VSHOT_HDR_DEBUG").is_some() {
+            eprintln!("vshot: hdr probe {name}: {probe:?}");
+        }
+        let (fourcc, width, height, y_invert) = match probe {
+            Ok(offer) => offer,
+            Err(VshotError::MissingCapability(_)) | Err(VshotError::UnsupportedOutput(_)) => {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
+        if y_invert || !is_hdr_fourcc(fourcc) {
+            if std::env::var_os("VSHOT_HDR_DEBUG").is_some() {
+                eprintln!(
+                    "vshot: hdr skip {name}: fourcc=0x{fourcc:08x} y_invert={y_invert} hdr={}",
+                    is_hdr_fourcc(fourcc)
+                );
+            }
+            return Ok(None);
+        }
+        // A pool built earlier for a different shape or format cannot serve
+        // this capture; HDR outputs are walked one after another here, so the
+        // pool has to follow each output's own offer.
+        if self.state.pool.as_ref().is_some_and(|pool| {
+            pool.fourcc != fourcc || pool.width != width || pool.height != height
+        }) {
+            self.state.pool = None;
+        }
+        self.build_dmabuf_pool(width, height, fourcc)?;
+        let frame = self.capture_output_dmabuf(name, cursor)?;
+        let words = frame.read_rgb10()?;
+        let hdr = HdrFrame::from_rgb10(
+            &words,
+            Size::new(frame.width, frame.height),
+            Transfer::Pq,
+            Primaries::Bt2020,
+            // The `A…` forms carry alpha in the top two bits; the `X…` forms
+            // pad them, and a screenshot is opaque either way.
+            matches!(
+                frame.fourcc,
+                DRM_FORMAT_ARGB2101010 | DRM_FORMAT_ABGR2101010
+            ),
+            // This route decodes plain HDR10 and may run for an output the
+            // compositor does not describe, so it falls back to the HDR10
+            // reference white (BT.2408) when there is no description.
+            color.map_or(REFERENCE_WHITE_NITS, |color| color.reference_nits),
+        )?;
+        if std::env::var_os("VSHOT_HDR_DEBUG").is_some() {
+            eprintln!(
+                "vshot: hdr decoded {name}: {}x{} fourcc=0x{:08x} peak={} is_hdr={}",
+                frame.width,
+                frame.height,
+                frame.fourcc,
+                hdr.peak(),
+                hdr.is_hdr()
+            );
+        }
+        Ok(Some(hdr))
+    }
+
+    /// The colour description of an output, but only when the compositor calls
+    /// it HDR — a PQ or HLG transfer.  `None` means the output is SDR, or the
+    /// compositor does not describe it, so a 10-bit buffer of its pixels is not
+    /// HDR content and must not be read as if it were.
+    fn hdr_output_color(&mut self, name: &str) -> Result<Option<OutputColor>> {
+        Ok(self.output_color(name)?.filter(OutputColor::is_hdr))
+    }
+
+    /// The colour properties the compositor describes for one output, over
+    /// `wp_color_manager_v1`.
+    ///
+    /// This is the Wayland reading of the display facts Starward reads on
+    /// Windows: the reference luminance is the SDR white level — the level above
+    /// which a capture really is HDR — and whether the output is in HDR is its
+    /// transfer function, not the capture buffer's depth.  `None` means the
+    /// compositor does not describe its outputs, or did not answer in time, and
+    /// leaves the capture side to its own defaults.
+    pub fn output_color(&mut self, name: &str) -> Result<Option<OutputColor>> {
+        let Some(manager) = self.state.color_manager.clone() else {
+            return Ok(None);
+        };
+        let output = self.output_by_name(name)?;
+        let qh = self.event_queue.handle();
+        let cm_output = manager.get_output(&output, &qh, ());
+        let description = cm_output.get_image_description(&qh, ());
+        self.state.color_query = Some(ColorQuery {
+            _output: Some(cm_output),
+            description: Some(description),
+            ..ColorQuery::default()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let answered = self.dispatch_while(deadline, |state| {
+            state
+                .color_query
+                .as_ref()
+                .is_some_and(|query| query.ready || query.failed)
+        })?;
+        let ready = answered
+            && self
+                .state
+                .color_query
+                .as_ref()
+                .is_some_and(|query| query.ready);
+        if !ready {
+            self.state.color_query = None;
+            return Ok(None);
+        }
+
+        // The description is ready; ask it for its information and collect it.
+        let info = {
+            let query = self.state.color_query.as_mut().expect("checked above");
+            let description = query.description.clone().expect("a ready description");
+            let info = description.get_information(&qh, ());
+            query.info = Some(info.clone());
+            info
+        };
+        let _ = info;
+        let collected = self.dispatch_while(deadline, |state| {
+            state
+                .color_query
+                .as_ref()
+                .is_some_and(|query| query.done || query.failed)
+        })?;
+        let query = self.state.color_query.take().unwrap_or_default();
+        if !collected || query.failed {
+            return Ok(None);
+        }
+        Ok(query.into_output_color())
+    }
+
+    /// The `wl_output` for one output name, as the registry bound it.
+    fn output_by_name(&self, name: &str) -> Result<wl_output::WlOutput> {
+        self.state
+            .output_names
+            .iter()
+            .find(|(_, output_name)| output_name.as_str() == name)
+            .and_then(|(global_id, _)| self.state.outputs.get(global_id))
+            .cloned()
+            .ok_or_else(|| VshotError::IncompleteTopology(format!("unknown output `{name}`")))
     }
 
     /// One dma-buf capture, of the whole output or of one rectangle inside it.
@@ -611,6 +1063,14 @@ impl WlrCapture {
         let mut slots = Vec::with_capacity(DMABUF_POOL_SLOTS);
         for _ in 0..DMABUF_POOL_SLOTS {
             let gbm = GbmBuffer::create(width, height, fourcc)?;
+            if std::env::var_os("VSHOT_HDR_DEBUG").is_some() {
+                eprintln!(
+                    "vshot: hdr pool {width}x{height} fourcc=0x{fourcc:08x} modifier=0x{:x} stride={} offset={}",
+                    gbm.modifier(),
+                    gbm.stride(),
+                    gbm.offset()
+                );
+            }
             let modifier = gbm.modifier();
             let params = dmabuf.create_params(&qh, ());
             let borrowed = unsafe { BorrowedFd::borrow_raw(gbm.fd()) };
@@ -685,22 +1145,37 @@ impl WlrCapture {
     }
 
     fn dispatch_until(&mut self, deadline: Instant) -> Result<()> {
+        let complete = self.dispatch_while(deadline, |state| {
+            state
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.complete)
+        })?;
+        if !complete {
+            self.state.pending.take();
+            return Err(VshotError::CaptureTimeout);
+        }
+        Ok(())
+    }
+
+    /// Dispatches until `done` holds or `deadline` passes, returning whether it
+    /// held.  A timeout is not an error here: a query that never gets its answer
+    /// simply has none (see [`WlrCapture::output_color`]), so `false` is told
+    /// apart from a protocol failure rather than turned into one.
+    fn dispatch_while<F>(&mut self, deadline: Instant, done: F) -> Result<bool>
+    where
+        F: Fn(&CaptureState) -> bool,
+    {
         loop {
             self.event_queue
                 .dispatch_pending(&mut self.state)
                 .map_err(|error| VshotError::WaylandProtocol(error.to_string()))?;
-            if self
-                .state
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.complete)
-            {
-                return Ok(());
+            if done(&self.state) {
+                return Ok(true);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                self.state.pending.take();
-                return Err(VshotError::CaptureTimeout);
+                return Ok(false);
             }
             self.event_queue
                 .flush()
@@ -734,8 +1209,7 @@ impl WlrCapture {
             };
             if ready == 0 {
                 drop(read_guard);
-                self.state.pending.take();
-                return Err(VshotError::CaptureTimeout);
+                return Ok(false);
             }
             read_guard
                 .read()
@@ -754,6 +1228,18 @@ fn region_arguments(region: Rect) -> Result<(i32, i32, i32, i32)> {
         VshotError::WaylandProtocol("the capture region is too tall to ask for".into())
     })?;
     Ok((region.origin.x, region.origin.y, width, height))
+}
+
+/// The numeric code of a `WEnum` argument, whether or not this build names it.
+/// The protocol's named values are stable, so the numbers are what the colour
+/// mapping keys on (ST 2084 PQ is 11, HLG 13, BT.2020 primaries 6).
+macro_rules! named {
+    ($value:expr) => {
+        match $value {
+            WEnum::Unknown(code) => code,
+            WEnum::Value(value) => value as u32,
+        }
+    };
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for CaptureState {
@@ -786,6 +1272,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for CaptureState {
                     let bind_version = version.min(3);
                     state.dmabuf_version = bind_version;
                     state.dmabuf = Some(registry.bind(name, bind_version, qh, ()));
+                }
+                "wp_color_manager_v1" if state.color_manager.is_none() => {
+                    // Bound for its side effect on a compositor that keys HDR
+                    // capture on it, not for its events (see
+                    // `CaptureState::color_manager`).
+                    state.color_manager = Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 "wl_output" => {
                     let output = registry.bind::<wl_output::WlOutput, _, _>(
@@ -862,6 +1354,91 @@ impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for CaptureState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+    }
+}
+
+impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for CaptureState {
+    fn event(
+        _: &mut Self,
+        _: &wp_color_manager_v1::WpColorManagerV1,
+        _: wp_color_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wp_color_management_output_v1::WpColorManagementOutputV1, ()> for CaptureState {
+    fn event(
+        _: &mut Self,
+        _: &wp_color_management_output_v1::WpColorManagementOutputV1,
+        _: wp_color_management_output_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wp_image_description_v1::WpImageDescriptionV1, ()> for CaptureState {
+    fn event(
+        state: &mut Self,
+        _: &wp_image_description_v1::WpImageDescriptionV1,
+        event: wp_image_description_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(query) = state.color_query.as_mut() else {
+            return;
+        };
+        match event {
+            wp_image_description_v1::Event::Ready { .. }
+            | wp_image_description_v1::Event::Ready2 { .. } => query.ready = true,
+            wp_image_description_v1::Event::Failed { .. } => query.failed = true,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wp_image_description_info_v1::WpImageDescriptionInfoV1, ()> for CaptureState {
+    fn event(
+        state: &mut Self,
+        _: &wp_image_description_info_v1::WpImageDescriptionInfoV1,
+        event: wp_image_description_info_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(query) = state.color_query.as_mut() else {
+            return;
+        };
+        match event {
+            wp_image_description_info_v1::Event::TfNamed { tf } => {
+                query.transfer = Some(named!(tf))
+            }
+            wp_image_description_info_v1::Event::PrimariesNamed { primaries } => {
+                query.primaries = Some(named!(primaries));
+            }
+            wp_image_description_info_v1::Event::Luminances {
+                min_lum,
+                max_lum,
+                reference_lum,
+            } => {
+                query.min_nits = Some(min_lum as f32 / 10_000.0);
+                query.max_nits = Some(max_lum as f32);
+                query.reference_nits = Some(reference_lum as f32);
+            }
+            wp_image_description_info_v1::Event::TargetLuminance { max_lum, .. } => {
+                query.target_max_nits = Some(max_lum as f32);
+            }
+            wp_image_description_info_v1::Event::TargetMaxCll { max_cll } => {
+                query.max_cll = Some(max_cll);
+            }
+            wp_image_description_info_v1::Event::Done => query.done = true,
+            _ => {}
+        }
     }
 }
 
@@ -1119,5 +1696,83 @@ mod tests {
             frame.pixel(crate::geometry::Point::new(0, 0)),
             Some([1, 2, 3, 77])
         );
+    }
+
+    /// A 10-bit capture is a 10-bit sRGB image, not HDR: the `…rgb…` packing
+    /// puts red in bits 20..30, and a full-scale red comes out as a full red.
+    #[test]
+    fn reads_a_10bit_xrgb_buffer_as_srgb_bytes() {
+        let word: u32 = 1023 << 20;
+        let map = word.to_le_bytes().to_vec();
+        let frame = convert_shm_pixels(&map, 1, 1, 4, wl_shm::Format::Xrgb2101010, false).unwrap();
+        assert_eq!(
+            frame.pixel(crate::geometry::Point::new(0, 0)),
+            Some([255, 0, 0, 255])
+        );
+    }
+
+    /// The `…bgr…` packing stores the red and blue fields the other way round,
+    /// so the same word is a red pixel under XBGR2101010 only if the swap is
+    /// applied.
+    #[test]
+    fn reads_a_10bit_xbgr_buffer_swapping_red_and_blue() {
+        let word: u32 = 1023; // red in the low field of a `…bgr…` word
+        let map = word.to_le_bytes().to_vec();
+        let frame = convert_shm_pixels(&map, 1, 1, 4, wl_shm::Format::Xbgr2101010, false).unwrap();
+        assert_eq!(
+            frame.pixel(crate::geometry::Point::new(0, 0)),
+            Some([255, 0, 0, 255])
+        );
+    }
+
+    #[test]
+    fn a_ten_bit_code_rounds_to_the_nearest_byte() {
+        assert_eq!(ten_to_eight(0), 0);
+        assert_eq!(ten_to_eight(1023), 255);
+        assert_eq!(ten_to_eight(512), 128);
+    }
+
+    /// A PQ / BT.2020 output description maps to the HDR reading, and an sRGB
+    /// one does not — the colour codes the protocol names are what the mapping
+    /// keys on.
+    #[test]
+    fn an_output_description_maps_its_transfer_and_primaries() {
+        let hdr = ColorQuery {
+            transfer: Some(11),
+            primaries: Some(6),
+            reference_nits: Some(203.0),
+            max_nits: Some(417.0),
+            ..ColorQuery::default()
+        }
+        .into_output_color()
+        .unwrap();
+        assert!(hdr.is_hdr());
+        assert_eq!(hdr.transfer, Transfer::Pq);
+        assert_eq!(hdr.primaries, Primaries::Bt2020);
+        assert_eq!(hdr.reference_nits, 203.0);
+        assert_eq!(hdr.max_nits, 417.0);
+
+        let sdr = ColorQuery {
+            transfer: Some(9),
+            primaries: Some(1),
+            reference_nits: Some(80.0),
+            ..ColorQuery::default()
+        }
+        .into_output_color()
+        .unwrap();
+        assert!(!sdr.is_hdr());
+        assert_eq!(sdr.transfer, Transfer::Srgb);
+        assert_eq!(sdr.primaries, Primaries::Bt709);
+    }
+
+    /// A description that never stated its reference white cannot be read.
+    #[test]
+    fn an_output_description_without_luminances_is_not_read() {
+        let query = ColorQuery {
+            transfer: Some(11),
+            primaries: Some(6),
+            ..ColorQuery::default()
+        };
+        assert!(query.into_output_color().is_none());
     }
 }

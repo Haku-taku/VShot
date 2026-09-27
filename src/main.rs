@@ -34,6 +34,7 @@ use cli::{Action, CaptureTarget};
 use edit::{pipeline_for_annotations, EditPipeline};
 use error::{Result, VshotError};
 use geometry::Rect;
+use model::hdr::ToneMap;
 use model::{Frame, HdrFrame, ImageDocument, OutputSnapshot, SceneSnapshot};
 use wayland::topology::OutputInfo;
 use wayland::WaylandSession;
@@ -251,11 +252,23 @@ fn run() -> Result<()> {
     // taking the scene apart for it would be waste — and on an output the scene
     // cannot represent (rotated or flipped) it would be a failure, in the one
     // place that does not need a scene at all.
+    // The HDR half of the capture, filled below from the same instant the SDR
+    // scene was taken: `Some` only when the selection's own output offered a
+    // 10-bit buffer.  A capture that has one is written as the SDR/HDR pair.
+    let mut hdr_frame: Option<HdrFrame> = None;
     let (frame, density) = if let Some(window) = native_window {
         window
     } else {
         let output_infos = topology?;
         let scene = capture_scene(&mut capture, &output_infos, request.cursor)?;
+        // One HDR readback per output that offers it, taken now so the SDR and
+        // HDR halves describe the same instant.  Targets that reconstruct a
+        // window or compose every output never keep an HDR half.
+        let hdr_outputs = if target_wants_hdr(&request.target) {
+            capture_hdr_outputs(&mut capture, &scene, request.cursor)
+        } else {
+            Vec::new()
+        };
 
         if !matches!(
             request.target,
@@ -269,6 +282,7 @@ fn run() -> Result<()> {
         match &request.target {
             CaptureTarget::RegionFixed(geometry) => {
                 let (frame, density) = crop_native(&scene, *geometry)?;
+                hdr_frame = hdr_for_region(&hdr_outputs, &scene, *geometry);
                 wayland.show_frozen(false)?;
                 (frame, density)
             }
@@ -307,6 +321,7 @@ fn run() -> Result<()> {
                     );
                 }
                 let (frame, density) = crop_native(&scene, geometry)?;
+                hdr_frame = hdr_for_region(&hdr_outputs, &scene, geometry);
                 // The helper drew its text bitmaps at the scene's scale, which
                 // is only the crop's density when the selection fell on the
                 // highest-density output.
@@ -324,6 +339,9 @@ fn run() -> Result<()> {
                 let density = scene
                     .output(output_id)
                     .map_or(scene.scale(), |output| output.scale);
+                hdr_frame = scene
+                    .output(output_id)
+                    .and_then(|output| hdr_for_name(&hdr_outputs, &output.name));
                 (selection::crop_output(&scene, output_id)?, density)
             }
             CaptureTarget::Monitor(name) => {
@@ -332,6 +350,7 @@ fn run() -> Result<()> {
                 let density = scene
                     .output_by_name(name)
                     .map_or(scene.scale(), |output| output.scale);
+                hdr_frame = hdr_for_name(&hdr_outputs, name);
                 (frame, density)
             }
             CaptureTarget::All => {
@@ -348,6 +367,7 @@ fn run() -> Result<()> {
                 if let Some(geometry) = metadata_window.and_then(|window| window.geometry) {
                     wayland.show_frozen(false)?;
                     let geometry = selection::validate_selection(&scene, geometry)?;
+                    hdr_frame = hdr_for_region(&hdr_outputs, &scene, geometry);
                     // The window's own pixels at its own output's density — cropping
                     // the composed scene would hand back a nearest-upscale of a
                     // window that sits on a lower-density monitor.
@@ -378,6 +398,7 @@ fn run() -> Result<()> {
                         }
                     };
                     let geometry = selection::validate_selection(&scene, geometry)?;
+                    hdr_frame = hdr_for_region(&hdr_outputs, &scene, geometry);
                     crop_native(&scene, geometry)?
                 }
             }
@@ -466,7 +487,7 @@ fn run() -> Result<()> {
         }
     };
 
-    finish_capture(edits, frame, None, density, &request, &mut wayland)
+    finish_capture(edits, frame, hdr_frame, density, &request, &mut wayland)
 }
 
 /// Reports a finished scrolling capture: what it stitched, and -- when not one
@@ -749,26 +770,136 @@ fn write_ocr_text(text: &str, destination: cli::OcrDestination) -> Result<()> {
 fn finish_capture(
     edits: EditPipeline,
     frame: Frame,
-    // The HDR half of the capture, when the source carried HDR content.  The
-    // capture backends do not hand one over yet — decoding a 10-bit HDR buffer
-    // is what would fill this — so every caller passes `None` and the ordinary
-    // single-PNG path runs unchanged.  When a backend can produce one, it
-    // enters here and `write_frame_with_hdr` writes both images.
+    // The HDR half of the capture, when the selection's output offered a 10-bit
+    // buffer.  It is the same crop as `frame`, so the pipeline runs over both:
+    // the SDR one for the PNG, and the HDR one for the `.hdr` written beside it.
     hdr: Option<HdrFrame>,
     density: u32,
     request: &cli::Request,
     wayland: &mut WaylandSession,
 ) -> Result<()> {
-    let document = edits.apply(ImageDocument::new(frame))?;
+    let (sdr, hdr_out) = sdr_and_hdr(&edits, frame, hdr)?;
     let result = output::write_frame_with_hdr(
-        document.frame(),
-        hdr.as_ref(),
+        &sdr,
+        hdr_out.as_ref(),
         &request.destination,
         density,
         request.compression,
     );
     let cleanup = wayland.destroy_overlays();
     result.and(cleanup)
+}
+
+/// The two images of one capture: the SDR PNG and, when the content is really
+/// HDR, the HDR frame written beside it.
+///
+/// Annotations render in HDR mode over the HDR frame — mosaics pixelate in
+/// linear light and every other mark composites in linear light — and the SDR
+/// half is vshot's own tone map of that same content rather than the
+/// compositor's separate 8-bit picture, so both files describe one set of marks
+/// over one set of light.  A 10-bit buffer that carries no light beyond SDR
+/// white is not HDR content at all: it keeps the ordinary path and no `.hdr` is
+/// written beside the PNG.
+fn sdr_and_hdr(
+    edits: &EditPipeline,
+    frame: Frame,
+    hdr: Option<HdrFrame>,
+) -> Result<(Frame, Option<HdrFrame>)> {
+    let hdr = match hdr {
+        Some(hdr) => {
+            let annotated = edits.apply_to_hdr(hdr)?;
+            annotated.is_hdr().then_some(annotated)
+        }
+        None => None,
+    };
+    match hdr {
+        Some(hdr) => Ok((hdr.tone_map_to_srgb(ToneMap::Reinhard)?, Some(hdr))),
+        None => Ok((edits.apply(ImageDocument::new(frame))?.into_frame(), None)),
+    }
+}
+
+/// Whether a target can keep an HDR half.  Only the routes that end in one
+/// output's own pixels can: a composed desktop or a reconstructed window has no
+/// single 10-bit buffer behind it.
+fn target_wants_hdr(target: &CaptureTarget) -> bool {
+    matches!(
+        target,
+        CaptureTarget::RegionFixed(_)
+            | CaptureTarget::RegionInteractive
+            | CaptureTarget::Monitor(_)
+            | CaptureTarget::ActiveWindow { .. }
+    )
+}
+
+/// Captures the HDR view of every output that offers one, keyed by output name.
+/// Best effort: an output with no 10-bit buffer, or a backend that cannot hand
+/// HDR pixels over at all, is simply absent, and the SDR path stands alone.
+fn capture_hdr_outputs(
+    capture: &mut Capturer,
+    scene: &SceneSnapshot,
+    cursor: bool,
+) -> Vec<(String, HdrFrame)> {
+    let debug = std::env::var_os("VSHOT_HDR_DEBUG").is_some();
+    let mut outputs = Vec::new();
+    for output in scene.outputs() {
+        // Only an output the compositor itself describes as HDR can carry an
+        // HDR half.  This is the Wayland reading of Starward's Windows rule —
+        // ask the display, do not guess from the capture buffer — and it keeps
+        // a 10-bit SDR output (which some compositors offer) from producing a
+        // bogus `.hdr`.
+        let color = capture.output_color(&output.name).ok().flatten();
+        if debug {
+            eprintln!("vshot: hdr: output {} colour {color:?}", output.name);
+        }
+        if color.is_some_and(|color| !color.is_hdr()) {
+            continue;
+        }
+        match capture.capture_output_hdr(&output.name, cursor) {
+            Ok(Some(hdr)) => outputs.push((output.name.clone(), hdr)),
+            Ok(None) => {
+                if debug {
+                    eprintln!("vshot: hdr: {} offered no HDR buffer", output.name);
+                }
+            }
+            Err(error) => {
+                if debug {
+                    eprintln!("vshot: hdr: {} failed: {error}", output.name);
+                }
+            }
+        }
+    }
+    outputs
+}
+
+/// The HDR half of one rectangle, cropped from the output that wholly contains
+/// it, or `None` when no such output offered HDR.
+fn hdr_for_region(
+    hdr_outputs: &[(String, HdrFrame)],
+    scene: &SceneSnapshot,
+    geometry: Rect,
+) -> Option<HdrFrame> {
+    let output = scene.outputs().iter().find(|output| {
+        output
+            .geometry
+            .clamp_to(geometry)
+            .is_some_and(|clamped| clamped == geometry)
+    })?;
+    let scale = i32::try_from(output.scale).ok()?;
+    let local = Rect::new(
+        (geometry.left() - output.geometry.left()).checked_mul(scale)?,
+        (geometry.top() - output.geometry.top()).checked_mul(scale)?,
+        geometry.size.width.checked_mul(output.scale)?,
+        geometry.size.height.checked_mul(output.scale)?,
+    );
+    hdr_for_name(hdr_outputs, &output.name)?.crop(local).ok()
+}
+
+/// The HDR half of a whole output, or `None` when it offered none.
+fn hdr_for_name(hdr_outputs: &[(String, HdrFrame)], name: &str) -> Option<HdrFrame> {
+    hdr_outputs
+        .iter()
+        .find(|(candidate, _)| candidate == name)
+        .map(|(_, hdr)| hdr.clone())
 }
 
 /// niri's own capture of the focused window: niri names it, then draws it
@@ -1186,5 +1317,170 @@ mod tests {
             document.frame().pixel(Point::new(1, 0)),
             Some([5, 0, 0, 255])
         );
+    }
+
+    /// An HDR half painted one flat luminance, small enough to keep the tests
+    /// cheap: a crop is told apart by the value it carries and nothing else.
+    fn hdr_half(width: u32, height: u32, value: f32) -> HdrFrame {
+        HdrFrame::new(
+            Size::new(width, height),
+            vec![[value, value, value, 1.0]; (width * height) as usize],
+        )
+        .unwrap()
+    }
+
+    /// A two-screen scene — a 2x screen on the right, a 1x one on the left —
+    /// each with its own HDR half, the shape `hdr_for_region` has to choose
+    /// between.  Kept tiny: the rule only looks at geometry and scale, and a
+    /// realistic 4K pair would cost hundreds of megabytes per test.
+    fn hdr_scene() -> (SceneSnapshot, Vec<(String, HdrFrame)>) {
+        let dense = OutputSnapshot::new(
+            1,
+            "DP-2",
+            Rect::new(64, 0, 16, 16),
+            2,
+            Frame::solid(Size::new(32, 32), [255, 0, 0, 255]).unwrap(),
+        )
+        .unwrap();
+        let plain = OutputSnapshot::new(
+            2,
+            "DP-3",
+            Rect::new(0, 0, 16, 16),
+            1,
+            Frame::solid(Size::new(16, 16), [0, 255, 0, 255]).unwrap(),
+        )
+        .unwrap();
+        let scene = SceneSnapshot::from_outputs(vec![dense, plain]).unwrap();
+        let hdr = vec![
+            ("DP-2".to_owned(), hdr_half(32, 32, 4.0)),
+            ("DP-3".to_owned(), hdr_half(16, 16, 2.0)),
+        ];
+        (scene, hdr)
+    }
+
+    #[test]
+    fn the_hdr_half_of_a_region_comes_from_the_output_that_contains_it() {
+        // A region is an HDR half only when one output wholly contains it: the
+        // 1x screen's five-by-four selection stays five by four, while the 2x
+        // screen's doubles into its own native pixels, exactly as the SDR crop
+        // does.
+        let (scene, hdr) = hdr_scene();
+        let plain = hdr_for_region(&hdr, &scene, Rect::new(2, 3, 5, 4)).unwrap();
+        assert_eq!(plain.size(), Size::new(5, 4));
+        assert_eq!(plain.pixel(0, 0), Some([2.0, 2.0, 2.0, 1.0]));
+
+        let dense = hdr_for_region(&hdr, &scene, Rect::new(66, 3, 5, 4)).unwrap();
+        assert_eq!(dense.size(), Size::new(10, 8));
+        assert_eq!(dense.pixel(0, 0), Some([4.0, 4.0, 4.0, 1.0]));
+    }
+
+    #[test]
+    fn a_region_across_the_seam_has_no_single_hdr_output() {
+        // Straddling the boundary between the two screens, there is no one
+        // 10-bit buffer to read: the SDR scene is the only picture of it.
+        let (scene, hdr) = hdr_scene();
+        assert!(hdr_for_region(&hdr, &scene, Rect::new(63, 3, 5, 4)).is_none());
+    }
+
+    #[test]
+    fn a_screen_that_offered_no_hdr_leaves_its_region_without_one() {
+        let (scene, _) = hdr_scene();
+        // Only the dense screen produced an HDR half this time.
+        let hdr = vec![("DP-2".to_owned(), hdr_half(32, 32, 4.0))];
+        assert!(hdr_for_region(&hdr, &scene, Rect::new(2, 3, 5, 4)).is_none());
+        // The one that did still answers for its own screen.
+        assert!(hdr_for_region(&hdr, &scene, Rect::new(66, 3, 5, 4)).is_some());
+    }
+
+    #[test]
+    fn hdr_for_name_finds_only_a_named_output() {
+        let hdr = vec![("DP-2".to_owned(), hdr_half(4, 4, 4.0))];
+        assert_eq!(hdr_for_name(&hdr, "DP-2").unwrap().size(), Size::new(4, 4));
+        assert!(hdr_for_name(&hdr, "eDP-1").is_none());
+    }
+
+    #[test]
+    fn an_hdr_capture_tone_maps_its_own_sdr_half() {
+        // When the content is truly HDR, the SDR PNG is vshot's own tone map of
+        // it, not a second capture, so the pair describes the same light; the
+        // HDR half is handed over unchanged for the `.hdr` file.
+        let hdr = HdrFrame::new(
+            Size::new(2, 1),
+            vec![[4.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]],
+        )
+        .unwrap();
+        let (sdr, kept) = sdr_and_hdr(&EditPipeline::new(), plain_frame(), Some(hdr)).unwrap();
+        // The peak lands on SDR white; the mid channel is rolled off well below
+        // it, and red stays the dominant channel — a real tone map, not the
+        // second capture.
+        let pixel = sdr.pixel(Point::new(0, 0)).unwrap();
+        assert_eq!(pixel[0], 255);
+        assert_eq!(pixel[1], pixel[2]);
+        assert!((128..=150).contains(&pixel[1]), "green = {}", pixel[1]);
+        let kept = kept.expect("the HDR half is kept");
+        assert_eq!(kept.pixel(0, 0), Some([4.0, 1.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn a_ten_bit_buffer_without_hdr_light_is_not_a_pair() {
+        // A 10-bit buffer whose brightest pixel is only SDR white carries no
+        // HDR content, so the ordinary frame is written alone: no phantom
+        // `.hdr` appears beside a screenshot that never held any highlight.
+        let flat = HdrFrame::new(Size::new(2, 1), vec![[1.0, 1.0, 1.0, 1.0]; 2]).unwrap();
+        let (sdr, kept) = sdr_and_hdr(&EditPipeline::new(), plain_frame(), Some(flat)).unwrap();
+        assert_eq!(sdr.pixel(Point::new(0, 0)), Some([0, 255, 0, 255]));
+        assert!(kept.is_none());
+    }
+
+    #[test]
+    fn a_capture_without_hdr_uses_the_compositors_frame_alone() {
+        let (sdr, kept) = sdr_and_hdr(&EditPipeline::new(), plain_frame(), None).unwrap();
+        assert_eq!(sdr.pixel(Point::new(0, 0)), Some([0, 255, 0, 255]));
+        assert!(kept.is_none());
+    }
+
+    /// A frame the tests can recognise by value, standing in for the compositor's
+    /// own 8-bit capture.
+    fn plain_frame() -> Frame {
+        Frame::solid(Size::new(2, 1), [0, 255, 0, 255]).unwrap()
+    }
+
+    #[test]
+    fn only_targets_ending_in_one_output_keep_an_hdr_half() {
+        // The HDR half must be one output's own 10-bit buffer, so a composed
+        // desktop, a reconstructed window and a scrolling stitch — none of
+        // which has a single such buffer behind it — keep none.
+        let window = CaptureTarget::ActiveWindow {
+            pixel_detect: false,
+            no_blend: false,
+        };
+        let keepers = [
+            CaptureTarget::RegionFixed(Rect::new(0, 0, 4, 4)),
+            CaptureTarget::RegionInteractive,
+            CaptureTarget::Monitor("DP-1".into()),
+            window,
+        ];
+        for target in &keepers {
+            assert!(
+                target_wants_hdr(target),
+                "{target:?} should keep an HDR half"
+            );
+        }
+
+        let refusers = [
+            CaptureTarget::All,
+            CaptureTarget::WindowPick {
+                pixel_detect: false,
+                no_blend: false,
+            },
+            CaptureTarget::LongShot {
+                region: None,
+                options: crate::longshot::LongShotOptions::default(),
+                inject: crate::inject::Prefer::Auto,
+            },
+        ];
+        for target in &refusers {
+            assert!(!target_wants_hdr(target), "{target:?} should not");
+        }
     }
 }

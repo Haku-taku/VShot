@@ -5,7 +5,7 @@
 
 use crate::error::{Result, VshotError};
 use crate::geometry::{Point, Rect};
-use crate::model::{Frame, ImageDocument};
+use crate::model::{Frame, HdrFrame, ImageDocument};
 
 /// Line style of a stroked annotation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -676,6 +676,92 @@ impl EditPipeline {
                 Ok(document)
             })
     }
+
+    /// Applies the same operations to an HDR frame, rendering the annotations
+    /// in HDR mode.
+    ///
+    /// The frame must already be cropped the same way the SDR frame was — an
+    /// annotation pipeline's coordinates are crop-relative, so there is no crop
+    /// for it to apply.  Mosaics are pixelated in linear light directly on the
+    /// HDR frame; every other mark is rasterized into a transparent layer and
+    /// composited **in linear light**, so a mark's brightness is not crushed by
+    /// the SDR curve and a bright HDR backdrop shows through its edges.
+    pub fn apply_to_hdr(&self, frame: HdrFrame) -> Result<HdrFrame> {
+        let mut frame = frame;
+        for operation in &self.operations {
+            match operation {
+                EditOperation::Crop(rect) => frame = frame.crop(*rect)?,
+                EditOperation::Mosaic { rect, block_size } => frame.mosaic(*rect, *block_size)?,
+                EditOperation::MosaicEllipse { rect, block_size } => {
+                    frame.mosaic_ellipse(*rect, *block_size)?
+                }
+                EditOperation::MosaicBrush { points, radius } => {
+                    frame.mosaic_brush(points, *radius)?
+                }
+                paint => {
+                    let mut layer = ImageDocument::new(Frame::solid(frame.size(), [0, 0, 0, 0])?);
+                    match paint {
+                        EditOperation::RectangleStroke {
+                            rect,
+                            color,
+                            width,
+                            dash,
+                        } => layer.stroke_rectangle(*rect, *color, *width, *dash)?,
+                        EditOperation::CircleStroke {
+                            center,
+                            radius,
+                            color,
+                            width,
+                        } => layer.stroke_circle(*center, *radius, *color, *width)?,
+                        EditOperation::EllipseStroke {
+                            rect,
+                            color,
+                            width,
+                            dash,
+                        } => layer.stroke_ellipse(*rect, *color, *width, *dash)?,
+                        EditOperation::Arrow {
+                            start,
+                            end,
+                            color,
+                            width,
+                            dash,
+                            head,
+                            arrow_style,
+                        } => layer.draw_arrow_with_style(
+                            *start,
+                            *end,
+                            *color,
+                            *width,
+                            *dash,
+                            *head,
+                            *arrow_style,
+                        )?,
+                        EditOperation::Freehand {
+                            points,
+                            color,
+                            width,
+                            dash,
+                        } => layer.draw_freehand(points, *color, *width, *dash)?,
+                        EditOperation::Text {
+                            origin,
+                            text,
+                            color,
+                            scale,
+                        } => layer.draw_text(*origin, text, *color, *scale)?,
+                        EditOperation::Blit { origin, bitmap } => {
+                            layer.draw_bitmap(*origin, bitmap)?
+                        }
+                        EditOperation::BlitScaled { rect, bitmap } => {
+                            layer.draw_bitmap_scaled(*rect, bitmap)?
+                        }
+                        _ => unreachable!("the sampling operations are handled above"),
+                    }
+                    frame.composite_srgb_layer(layer.frame())?;
+                }
+            }
+        }
+        Ok(frame)
+    }
 }
 
 pub fn crop_operation(frame: &Frame, rect: Rect) -> Result<ImageDocument> {
@@ -961,6 +1047,41 @@ mod tests {
         let frame = Frame::solid(Size::new(4, 4), [1, 2, 3, 255]).unwrap();
         let document = crop_operation(&frame, Rect::new(1, 1, 2, 2)).unwrap();
         assert_eq!(document.frame().size(), Size::new(2, 2));
+    }
+
+    #[test]
+    fn hdr_annotations_are_composited_in_linear_light() {
+        // A grey HDR frame with a red box stroke: the mark lands on the border,
+        // the untouched middle keeps its HDR value, and the mark's colour is
+        // decoded to linear (pure red) rather than left as the sRGB byte.
+        let hdr = HdrFrame::new(Size::new(8, 8), vec![[0.5, 0.5, 0.5, 1.0]; 64]).unwrap();
+        let pipeline = EditPipeline::new().rectangle_stroke(
+            Rect::new(0, 0, 8, 8),
+            [255, 0, 0, 255],
+            1,
+            LineDash::Solid,
+        );
+        let out = pipeline.apply_to_hdr(hdr).unwrap();
+        let border = out.pixel(0, 0).unwrap();
+        assert!((border[0] - 1.0).abs() < 1e-3, "border red = {}", border[0]);
+        assert!(border[1].abs() < 1e-3, "border green = {}", border[1]);
+        let middle = out.pixel(4, 4).unwrap();
+        assert!((middle[0] - 0.5).abs() < 1e-3, "middle = {}", middle[0]);
+    }
+
+    #[test]
+    fn an_hdr_mosaic_pixelates_the_linear_values() {
+        // Two columns, dark then bright: the mosaic averages in light, so both
+        // sides become the linear mean rather than an sRGB-weighted one.
+        let hdr = HdrFrame::new(
+            Size::new(2, 1),
+            vec![[0.0, 0.0, 0.0, 1.0], [4.0, 0.0, 0.0, 1.0]],
+        )
+        .unwrap();
+        let pipeline = EditPipeline::new().mosaic(Rect::new(0, 0, 2, 1), 2);
+        let out = pipeline.apply_to_hdr(hdr).unwrap();
+        assert!((out.pixel(0, 0).unwrap()[0] - 2.0).abs() < 1e-4);
+        assert!((out.pixel(1, 0).unwrap()[0] - 2.0).abs() < 1e-4);
     }
 
     #[test]
