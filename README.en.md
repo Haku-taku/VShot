@@ -653,7 +653,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --release --locked
 ```
 
-The Qt helper has no test framework, only **offscreen checks that need no compositor** (not built by default; add `-DVSHOT_BUILD_CHECKS=ON`), covering config reads and writes with the settings window, the text size conversion, clipboard color parsing and color card rendering, a pin's self-declared density and outline, text card padding, the color card's right-click menu, the export format of a pasted image, and the annotation overlay's five tools with undo, clear and the toolbar's placement:
+The Qt helper has no test framework, only **offscreen checks that need no compositor** (not built by default; add `-DVSHOT_BUILD_CHECKS=ON`), covering config reads and writes with the settings window, the text size conversion, clipboard color parsing and color card rendering, a pin's self-declared density and outline, text card padding, the color card's right-click menu, the export format of a pasted image, the annotation overlay's five tools with undo, clear and the toolbar's placement, and where the toolbar lands:
 
 ```sh
 cmake -S . -B build-qt -DVSHOT_BUILD_CHECKS=ON && cmake --build build-qt
@@ -667,6 +667,7 @@ QT_QPA_PLATFORM=offscreen build-qt/vshot-text-card-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-menu-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-paste-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-annotate-check
+QT_QPA_PLATFORM=offscreen build-qt/vshot-toolbar-check
 ```
 
 There are also 5 integration tests that are **not run** by default (`#[ignore]`), needing a real environment: KWin's D-Bus capture and backend selection (see the comments in `src/capture/kwin.rs`; a headless KWin suffices — virtual output named `Virtual-0`, 1024x768, no pointer capability — so it only covers the D-Bus capture layer), the active output probe (needs any real session), `/dev/uinput` scroll injection (needs write access), and **the built-in OCR engine reading drawn text** (needs those 30 MB of models on disk, which `cargo test` has nowhere to fetch them from). To run them:

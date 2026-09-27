@@ -1764,6 +1764,7 @@ public:
         auto *toolSurface = new ToolCardFrame(this);
         toolSurface->setObjectName(QStringLiteral("toolbarCommandSurface"));
         toolSurface->setCursor(Qt::ArrowCursor);
+        commandSurface_ = toolSurface;
         auto *toolLayout = new QHBoxLayout(toolSurface);
         toolLayout->setContentsMargins(2, 2, 2, 2);
         toolLayout->setSpacing(2);
@@ -2298,7 +2299,34 @@ public:
         auto *box = qobject_cast<QBoxLayout *>(layout());
         if (box != nullptr) {
             box->setDirection(above ? QBoxLayout::BottomToTop : QBoxLayout::TopToBottom);
+            // Settle the row order now: the controller reads the command bar's
+            // size right after the flip, and may only realize the geometry on
+            // the next event-loop pass otherwise.
+            box->activate();
         }
+    }
+
+    bool styleRowAbove() const { return styleRowAbove_; }
+
+    // Height of the command bar itself (the tool row, without the style row).
+    // The controller pins this row to the selection, so it needs the size on
+    // its own rather than the whole panel's.
+    int commandBarHeight() const
+    {
+        return commandSurface_ != nullptr ? commandSurface_->height() : 0;
+    }
+
+    // Distance from the panel's top edge to its first row.  Constant, but read
+    // off the live layout so a theme change to the padding stays correct.
+    int panelTopPadding() const { return layout()->contentsMargins().top(); }
+
+    // Height the style row adds to the panel while it is shown, and 0 while it
+    // is hidden.  The controller uses it to decide whether the row still fits
+    // beyond the command bar or has to double back over the selection.
+    int styleRowExtra() const
+    {
+        const QMargins margins = layout()->contentsMargins();
+        return std::max(0, height() - commandBarHeight() - margins.top() - margins.bottom());
     }
 
 protected:
@@ -2740,6 +2768,7 @@ private:
     }
 
     OverlayController *controller_;
+    QWidget *commandSurface_ = nullptr;
     QWidget *styleRow_ = nullptr;
     QFrame *styleDivider_ = nullptr;
     QVector<QAbstractButton *> toolButtons_;
@@ -3779,43 +3808,59 @@ void OverlayController::updateToolbarGeometry()
         }
     }
     CaptureOverlay *owner = overlays_.at(toolbarOutput_);
-    // Keep the panel attached to the selection: centered above it, flipping
-    // below when there is no room, always clamped to the owning output.
+    // Keep the command bar attached to the selection: it settles centred above
+    // the selection, or below when the panel does not fit above, always clamped
+    // to the owning output.  The style row takes whichever side of the command
+    // bar still has room; when neither side does -- a capture that nearly fills
+    // the display -- it doubles back over the selection instead, so showing or
+    // hiding it never nudges the buttons.
     const OutputSession &output = owner->output();
     const QRectF localSelection = localRect(output, *selection_, owner->size());
     const QRect anchorSelection = localSelection.toRect();
-    if (toolbarAnchorValid_ && toolbarAnchorSelection_ == anchorSelection) {
-        // The selection has not moved: hold the edge next to the selection so
-        // a style-row toggle grows the panel away from it without moving the
-        // command bar.
-        int y = toolbarAnchor_.y();
-        if (!toolbarAnchorBelow_) {
-            y += toolbarAnchorHeight_ - toolbar_->height();
-        }
-        const int x = std::clamp(toolbarAnchor_.x(), 0,
-                                 std::max(0, owner->width() - toolbar_->width()));
-        y = std::clamp(y, 0, std::max(0, owner->height() - toolbar_->height()));
-        toolbar_->move(x, y);
-        return;
-    }
     const int width = toolbar_->width();
     const int height = toolbar_->height();
-    const int x = std::clamp(static_cast<int>(std::round(localSelection.center().x() - width / 2.0)),
-                             4, std::max(4, owner->width() - width - 4));
-    int y = static_cast<int>(std::round(localSelection.top())) - height - 8;
-    bool below = false;
-    if (y < 4) {
-        y = static_cast<int>(std::round(localSelection.bottom())) + 8;
-        below = true;
+    const int barHeight = toolbar_->commandBarHeight();
+    const int topPadding = toolbar_->panelTopPadding();
+    const int styleExtra = toolbar_->styleRowExtra();
+    constexpr int kEdgeMargin = 4;
+    constexpr int kSelectionGap = 8;
+    const int selectionTop = static_cast<int>(std::round(localSelection.top()));
+    const int selectionBottom = static_cast<int>(std::round(localSelection.bottom()));
+    // While the selection stays put, keep the side it was placed on so a style
+    // toggle cannot throw the command bar to the other side of the selection.
+    const bool selectionSettled =
+        toolbarAnchorValid_ && toolbarAnchorSelection_ == anchorSelection;
+    const bool below = selectionSettled
+        ? toolbarAnchorBelow_
+        : selectionTop - kSelectionGap - height < kEdgeMargin;
+    // The style row prefers the far side of the command bar; when it does not
+    // fit there, it expands the other way, over the selection.
+    bool styleAbove = !below;
+    if (styleAbove) {
+        styleAbove = selectionTop - kSelectionGap - barHeight - topPadding - styleExtra >=
+            kEdgeMargin;
+    } else {
+        const bool fitsBelow =
+            selectionBottom + kSelectionGap - topPadding + height <= owner->height() - kEdgeMargin;
+        styleAbove = !fitsBelow;
     }
-    y = std::clamp(y, 4, std::max(4, owner->height() - height - 4));
-    // The style sub-panel pops away from the selection: on top of the command
-    // bar when the panel floats above the selection, underneath when the
-    // panel had to flip below it.
-    toolbar_->setStyleRowAbove(!below);
+    toolbar_->setStyleRowAbove(styleAbove);
+    // Anchor the command bar's edge nearest the selection, not the panel edge:
+    // the style row may sit on either side of it, so only this edge is fixed.
+    const int barTop =
+        below ? selectionBottom + kSelectionGap : selectionTop - kSelectionGap - barHeight;
+    int y = barTop - (styleAbove ? topPadding + styleExtra : topPadding);
+    int x = 0;
+    if (selectionSettled) {
+        x = std::clamp(toolbarAnchor_.x(), 0, std::max(0, owner->width() - width));
+    } else {
+        x = std::clamp(static_cast<int>(std::round(localSelection.center().x() - width / 2.0)),
+                       kEdgeMargin, std::max(kEdgeMargin, owner->width() - width - kEdgeMargin));
+    }
+    y = std::clamp(y, kEdgeMargin,
+                   std::max(kEdgeMargin, owner->height() - height - kEdgeMargin));
     toolbarAnchor_ = QPoint(x, y);
     toolbarAnchorSelection_ = anchorSelection;
-    toolbarAnchorHeight_ = height;
     toolbarAnchorBelow_ = below;
     toolbarAnchorValid_ = true;
     toolbar_->setGeometry(x, y, width, height);

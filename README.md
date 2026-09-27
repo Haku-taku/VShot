@@ -653,7 +653,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --release --locked
 ```
 
-Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**（默认不构建，加 `-DVSHOT_BUILD_CHECKS=ON`），覆盖配置读写与设置窗口、字号换算、剪贴板颜色解析与色卡渲染、pin 的图片自述密度与描边、文字卡片留白、色卡右键菜单、贴图的导出格式、标注浮层的五个工具与撤销/清除/工具栏位置：
+Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**（默认不构建，加 `-DVSHOT_BUILD_CHECKS=ON`），覆盖配置读写与设置窗口、字号换算、剪贴板颜色解析与色卡渲染、pin 的图片自述密度与描边、文字卡片留白、色卡右键菜单、贴图的导出格式、标注浮层的五个工具与撤销/清除/工具栏位置、以及工具栏的落位：
 
 ```sh
 cmake -S . -B build-qt -DVSHOT_BUILD_CHECKS=ON && cmake --build build-qt
@@ -667,6 +667,7 @@ QT_QPA_PLATFORM=offscreen build-qt/vshot-text-card-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-menu-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-paste-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-annotate-check
+QT_QPA_PLATFORM=offscreen build-qt/vshot-toolbar-check
 ```
 
 另有 5 个默认**不执行**（`#[ignore]`）的集成测试，需要真实环境：KWin 的 D-Bus 采集与后端选择（见 `src/capture/kwin.rs` 的注释，起无头 KWin 即可：虚拟输出名 `Virtual-0`、1024x768、无 pointer capability，只覆盖到 D-Bus 采集这一层）、活跃输出探针（需要任一真实会话）、`/dev/uinput` 滚动注入（需要写权限）、以及**内置 OCR 引擎读一张画出来的文字**（需要那 30 MB 模型在盘上，`cargo test` 没地方去下）。跑法：
