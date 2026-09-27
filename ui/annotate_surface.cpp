@@ -15,6 +15,7 @@
 #include <QHBoxLayout>
 #include <QImage>
 #include <QKeyEvent>
+#include <QLabel>
 #include <QLineEdit>
 #include <QLineF>
 #include <QMouseEvent>
@@ -22,8 +23,10 @@
 #include <QPainterPath>
 #include <QPair>
 #include <QScreen>
+#include <QSignalBlocker>
 #include <QSize>
 #include <QSizePolicy>
+#include <QSlider>
 #include <QTransform>
 #include <QWindow>
 
@@ -492,6 +495,8 @@ public:
             addSwatch(layout, color);
         }
 
+        addAlpha(layout);
+
         addDivider(layout);
         for (const int width : kWidths) {
             addWidth(layout, width);
@@ -524,11 +529,23 @@ public:
         for (const auto &entry : toolButtons_) {
             entry.first->setActive(surface_->tool() == entry.second);
         }
+        // RGB only: a swatch carries no alpha, so a translucent version of a
+        // palette colour is that colour and its ring must stay lit.
         for (const auto &entry : swatchButtons_) {
-            entry.first->setActive(surface_->color() == entry.second);
+            entry.first->setActive(surface_->color().rgb() == entry.second.rgb());
         }
         for (const auto &entry : widthButtons_) {
             entry.first->setActive(surface_->penWidth() == entry.second);
+        }
+        if (alphaSlider_ != nullptr) {
+            // The colour can also be set from outside the toolbar; the slider
+            // follows it without echoing back as an edit.
+            const QSignalBlocker blocker(alphaSlider_);
+            alphaSlider_->setValue(surface_->color().alpha());
+        }
+        if (alphaValue_ != nullptr) {
+            alphaValue_->setText(QStringLiteral("%1%").arg(
+                qRound(surface_->color().alpha() * 100.0 / 255.0)));
         }
         if (undo_ != nullptr) {
             undo_->setEnabled(surface_->canUndo());
@@ -701,9 +718,55 @@ private:
     {
         auto *button =
             new ToolbarButton(this, ToolbarButton::Kind::Swatch, QString(), color, 0);
-        button->setOnClick([this, color] { surface_->setColor(color); });
+        // A swatch has no alpha of its own: it changes the RGB and keeps the
+        // opacity the user already chose.
+        button->setOnClick([this, color] {
+            QColor chosen = color;
+            chosen.setAlpha(surface_->color().alpha());
+            surface_->setColor(chosen);
+        });
         layout->addWidget(button);
         swatchButtons_.append(qMakePair(button, color));
+    }
+
+    // The opacity control, drawn beside the colours because opacity is a
+    // property of the colour being drawn with.  The range is the storage range
+    // (0-255); the value on screen is a percentage, which is what a user thinks
+    // in.  There is no "Alpha" caption: the panel is one row on a fixed-height
+    // bar, so the tooltip and the accessible name carry the word instead.
+    void addAlpha(QHBoxLayout *layout)
+    {
+        alphaSlider_ = new QSlider(Qt::Horizontal, this);
+        alphaSlider_->setRange(0, 255);
+        alphaSlider_->setValue(surface_->color().alpha());
+        alphaSlider_->setFixedWidth(36);
+        alphaSlider_->setFocusPolicy(Qt::NoFocus);
+        alphaSlider_->setCursor(Qt::PointingHandCursor);
+        alphaSlider_->setToolTip(uiTr("Annotation opacity"));
+        alphaSlider_->setAccessibleName(uiTr("Annotation opacity"));
+        // The panel is self-painted and carries no global stylesheet, so the
+        // slider is styled here in the panel's own colours.
+        alphaSlider_->setStyleSheet(QStringLiteral(
+            "QSlider { min-height: 20px; background: transparent; } "
+            "QSlider::groove:horizontal { height: 4px; background: #4a515c; "
+            "border-radius: 2px; } "
+            "QSlider::sub-page:horizontal { background: #dde1ff; border-radius: 2px; } "
+            "QSlider::add-page:horizontal { background: #4a515c; border-radius: 2px; } "
+            "QSlider::handle:horizontal { width: 12px; margin: -5px 0; "
+            "background: #dde1ff; border: 0; border-radius: 6px; } "
+            "QSlider::handle:horizontal:hover { background: #e9ecff; }"));
+        connect(alphaSlider_, &QSlider::valueChanged, this, [this](int value) {
+            QColor color = surface_->color();
+            color.setAlpha(value);
+            surface_->setColor(color);
+        });
+        layout->addWidget(alphaSlider_);
+        alphaValue_ = new QLabel(this);
+        alphaValue_->setObjectName(QStringLiteral("alphaValue"));
+        alphaValue_->setStyleSheet(QStringLiteral("color: #e6e1e5; font-size: 10px;"));
+        alphaValue_->setFixedWidth(26);
+        alphaValue_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        layout->addWidget(alphaValue_);
     }
 
     void addWidth(QHBoxLayout *layout, int width)
@@ -743,6 +806,8 @@ private:
     QVector<QPair<ToolbarButton *, int>> widthButtons_;
     ToolbarButton *undo_ = nullptr;
     ToolbarButton *redo_ = nullptr;
+    QSlider *alphaSlider_ = nullptr;
+    QLabel *alphaValue_ = nullptr;
     bool dragging_ = false;
     QPoint dragOffset_;
 };

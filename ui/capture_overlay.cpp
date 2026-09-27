@@ -967,8 +967,20 @@ QIcon swatchIcon(const QColor &color, bool selected, qreal devicePixelRatio)
     QPainter painter(&pixmap);
     painter.setRenderHint(QPainter::Antialiasing, true);
     painter.setPen(Qt::NoPen);
+    const QPainterPath chip = superellipsePath(QRectF(0.5, 0.5, 19.0, 19.0), 7.0, 5.0);
+    // A translucent chip shows a checkerboard through it, the way the settings
+    // window's color button does, so "this swatch carries alpha" is visible at a
+    // glance rather than reading as a slightly darker opaque colour.
+    if (color.alpha() < 255) {
+        painter.save();
+        painter.setClipPath(chip);
+        painter.fillRect(QRectF(0.0, 0.0, 20.0, 20.0), QColor(0x6f, 0x76, 0x80));
+        painter.fillRect(QRectF(0.0, 0.0, 10.0, 10.0), QColor(0x9a, 0xa3, 0xae));
+        painter.fillRect(QRectF(10.0, 10.0, 10.0, 10.0), QColor(0x9a, 0xa3, 0xae));
+        painter.restore();
+    }
     painter.setBrush(color);
-    painter.drawPath(superellipsePath(QRectF(0.5, 0.5, 19.0, 19.0), 7.0, 5.0));
+    painter.drawPath(chip);
     painter.setBrush(Qt::NoBrush);
     painter.setPen(selected ? QPen(QColor(233, 236, 255), 2.0)
                             : QPen(QColor(86, 93, 104), 1.0));
@@ -1244,6 +1256,28 @@ public:
         layout->addWidget(satVal_);
         huePane_ = new HuePane([this](qreal value) { hue_ = value; satVal_->setHue(value); syncPreview(); }, this);
         layout->addWidget(huePane_);
+        // Opacity, as a 0-255 slider under the hue strip.  Its value rides on
+        // the picker's result, so a colour chosen here can be translucent.
+        auto *alphaRow = new QHBoxLayout;
+        alphaRow->setSpacing(6);
+        auto *alphaLabel = new QLabel(uiTr("Alpha"), this);
+        alphaLabel->setObjectName(QStringLiteral("alphaLabel"));
+        alphaRow->addWidget(alphaLabel);
+        alphaSlider_ = new QSlider(Qt::Horizontal, this);
+        alphaSlider_->setObjectName(QStringLiteral("alphaSlider"));
+        alphaSlider_->setRange(0, 255);
+        alphaSlider_->setValue(255);
+        alphaSlider_->setFocusPolicy(Qt::NoFocus);
+        alphaSlider_->setCursor(Qt::PointingHandCursor);
+        alphaSlider_->setToolTip(uiTr("Opacity (0-255)"));
+        connect(alphaSlider_, &QSlider::valueChanged, this, [this](int) { syncPreview(); });
+        alphaRow->addWidget(alphaSlider_, 1);
+        alphaValue_ = new QLabel(this);
+        alphaValue_->setObjectName(QStringLiteral("alphaValue"));
+        alphaValue_->setFixedWidth(34);
+        alphaValue_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        alphaRow->addWidget(alphaValue_);
+        layout->addLayout(alphaRow);
         auto *row = new QHBoxLayout;
         row->setSpacing(4);
         preview_ = new QLabel(this);
@@ -1252,9 +1286,9 @@ public:
         row->addWidget(preview_);
         hexEdit_ = new QLineEdit(this);
         hexEdit_->setObjectName(QStringLiteral("colorHexEdit"));
-        hexEdit_->setFixedWidth(56);
-        hexEdit_->setMaxLength(7);
-        hexEdit_->setToolTip(uiTr("Hex color (#rrggbb)"));
+        hexEdit_->setFixedWidth(72);
+        hexEdit_->setMaxLength(9);
+        hexEdit_->setToolTip(uiTr("Hex color (#rrggbb or #rrggbbaa)"));
         connect(hexEdit_, &QLineEdit::editingFinished, this, [this] { applyHex(); });
         row->addWidget(hexEdit_);
         row->addStretch(1);
@@ -1281,6 +1315,16 @@ public:
             "border-radius: 7px; padding: 0 5px; min-height: 22px; "
             "selection-color: #00145c; selection-background-color: #dde1ff; } "
             "QLineEdit:focus { border-color: #c7d7f5; } "
+            "QLabel#alphaLabel { color: #c3c9d1; font-size: 11px; } "
+            "QLabel#alphaValue { color: #e6e1e5; font-size: 11px; } "
+            "QSlider { min-height: 20px; background: transparent; } "
+            "QSlider::groove:horizontal { height: 4px; background: #4a515c; "
+            "border-radius: 2px; } "
+            "QSlider::sub-page:horizontal { background: #dde1ff; border-radius: 2px; } "
+            "QSlider::add-page:horizontal { background: #4a515c; border-radius: 2px; } "
+            "QSlider::handle:horizontal { width: 14px; margin: -5px 0; "
+            "background: #dde1ff; border: 0; border-radius: 7px; } "
+            "QSlider::handle:horizontal:hover { background: #e9ecff; } "
             "QPushButton { color: #e6e1e5; background: #333a45; "
             "border: 1px solid transparent; border-radius: 7px; padding: 0 8px; "
             "min-height: 22px; font-size: 12px; } "
@@ -1309,7 +1353,9 @@ public:
         if (hue < 0.0) {
             hue += 1.0;
         }
-        return QColor::fromHsvF(hue, std::clamp(sat_, 0.0, 1.0), std::clamp(val_, 0.0, 1.0));
+        const qreal alpha = alphaSlider_ != nullptr ? alphaSlider_->value() / 255.0 : 1.0;
+        return QColor::fromHsvF(hue, std::clamp(sat_, 0.0, 1.0), std::clamp(val_, 0.0, 1.0),
+                                alpha);
     }
 
 protected:
@@ -1379,6 +1425,12 @@ private:
         }
         sat_ = std::clamp(sat, 0.0f, 1.0f);
         val_ = std::clamp(val, 0.0f, 1.0f);
+        if (alphaSlider_ != nullptr) {
+            // Blocked so loading a colour does not echo back as a user edit;
+            // the preview is refreshed below either way.
+            const QSignalBlocker blocker(alphaSlider_);
+            alphaSlider_->setValue(color.alpha());
+        }
         satVal_->setHue(hue_);
         satVal_->setSatVal(sat_, val_);
         huePane_->setHue(hue_);
@@ -1387,11 +1439,11 @@ private:
 
     void applyHex()
     {
-        QString text = hexEdit_->text().trimmed();
-        if (!text.startsWith(QLatin1Char('#'))) {
-            text.prepend(QLatin1Char('#'));
-        }
-        const QColor parsed(text);
+        // Parsed through the config spelling rather than `QColor(QString)`:
+        // Qt reads an eight-digit literal as `#aarrggbb`, so `#ff880080` --
+        // which this field and the config file both call semi-transparent
+        // orange -- would come out the wrong way round.
+        const QColor parsed = parseColorText(hexEdit_->text());
         if (parsed.isValid()) {
             setHsvFrom(parsed);
         } else {
@@ -1404,8 +1456,14 @@ private:
         const QColor color = pickedColor();
         preview_->setPixmap(swatchIcon(color, false, devicePixelRatioF())
                                 .pixmap(QSize(20, 20), devicePixelRatioF()));
+        if (alphaValue_ != nullptr) {
+            alphaValue_->setText(
+                QStringLiteral("%1%").arg(qRound(color.alpha() * 100.0 / 255.0)));
+        }
         const QSignalBlocker blocker(hexEdit_);
-        hexEdit_->setText(color.name().toUpper());
+        // The same spelling the protocol carries and the field accepts:
+        // `#rrggbb` while opaque, `#rrggbbaa` once alpha is lifted off full.
+        hexEdit_->setText(colorText(color).toUpper());
     }
 
     std::function<void(const QColor &)> apply_;
@@ -1413,6 +1471,8 @@ private:
     HuePane *huePane_ = nullptr;
     QLabel *preview_ = nullptr;
     QLineEdit *hexEdit_ = nullptr;
+    QSlider *alphaSlider_ = nullptr;
+    QLabel *alphaValue_ = nullptr;
     QWidget *opener_ = nullptr;
     qreal hue_ = 0.0;
     qreal sat_ = 1.0;
@@ -2079,8 +2139,13 @@ public:
             swatchButtons_.push_back(swatch);
             colorGroup_->layout()->addWidget(swatch);
             const QColor swatchColor = color;
+            // A swatch carries no alpha of its own: clicking one changes the
+            // RGB and leaves the user's opacity where they set it, so picking a
+            // translucent pen and then a colour does not silently make it opaque.
             connect(swatch, &QPushButton::clicked, [controller = controller_, swatchColor] {
-                controller->setCurrentColor(swatchColor);
+                QColor chosen = swatchColor;
+                chosen.setAlpha(controller->currentColor_.alpha());
+                controller->setCurrentColor(chosen);
             });
         }
 
@@ -2410,11 +2475,16 @@ public:
         const std::uint32_t strength =
             selected != nullptr ? selected->strength : controller_->mosaicStrength_;
         lastColor_ = color;
-        const bool customColor = !swatchColors_.contains(color);
+        // A swatch is "selected" when its RGB matches, whatever the current
+        // alpha: the swatches carry no alpha, so a translucent version of a
+        // palette colour is still that colour and must keep its ring.
+        const bool customColor =
+            std::none_of(swatchColors_.cbegin(), swatchColors_.cend(),
+                         [&color](const QColor &swatch) { return swatch.rgb() == color.rgb(); });
         pickerButton_->setIcon(colorPickerIcon(customColor, ratio));
         for (int index = 0; index < swatchButtons_.size(); ++index) {
-            swatchButtons_.at(index)->setIcon(
-                swatchIcon(swatchColors_.at(index), swatchColors_.at(index) == color, ratio));
+            swatchButtons_.at(index)->setIcon(swatchIcon(
+                swatchColors_.at(index), swatchColors_.at(index).rgb() == color.rgb(), ratio));
         }
         syncToggleGroup(dashButtons_, dashValues_, dash);
         fontButton_->setText(font.isEmpty() ? QApplication::font().family() : font);
@@ -5786,7 +5856,7 @@ QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
         } else if (annotation.kind == Annotation::Kind::Shape) {
             value.insert(QStringLiteral("kind"), QStringLiteral("shape"));
             value.insert(QStringLiteral("tool"), annotation.tool);
-            value.insert(QStringLiteral("color"), annotation.color.name(QColor::HexRgb));
+            value.insert(QStringLiteral("color"), colorText(annotation.color));
             value.insert(QStringLiteral("width"), static_cast<qint64>(annotation.width));
             value.insert(QStringLiteral("dash"), annotation.dash);
             if (annotation.tool == QStringLiteral("mosaic")) {
@@ -5803,7 +5873,7 @@ QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
         } else if (annotation.kind == Annotation::Kind::Stroke) {
             value.insert(QStringLiteral("kind"), QStringLiteral("stroke"));
             value.insert(QStringLiteral("tool"), annotation.tool);
-            value.insert(QStringLiteral("color"), annotation.color.name(QColor::HexRgb));
+            value.insert(QStringLiteral("color"), colorText(annotation.color));
             value.insert(QStringLiteral("width"), static_cast<qint64>(annotation.width));
             value.insert(QStringLiteral("dash"), annotation.dash);
             if (annotation.tool == QStringLiteral("arrow")) {
@@ -5835,7 +5905,7 @@ QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
             // only ever reaches the Rust fallback font.
             value.insert(QStringLiteral("scale"), static_cast<qint64>(textPixelsToScale(
                                                      static_cast<int>(annotation.textPixels))));
-            value.insert(QStringLiteral("color"), annotation.color.name(QColor::HexRgb));
+            value.insert(QStringLiteral("color"), colorText(annotation.color));
             if (!annotation.font.isEmpty()) {
                 value.insert(QStringLiteral("font"), annotation.font);
             }

@@ -28,6 +28,9 @@
 #include <QApplication>
 #include <QColor>
 #include <QImage>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLineEdit>
 #include <QPointF>
 #include <QRegion>
@@ -295,6 +298,99 @@ void checkCachedPixelsLandOnTheMark()
     expect(hasStrokePixels(target), "the rasterized stroke paints where it was drawn");
     paintOnce(overlay, &target);
     expect(hasStrokePixels(target), "the cached stroke blits to the same place");
+}
+
+// Opens an overlay on `screen` in edit state and draws one pen stroke with the
+// given colour, so both the mark's own colour and the document's spelling of it
+// can be read back.  Returns false when the stroke did not land.
+bool drawStrokeWithColor(vshot::OverlayController &controller, vshot::CaptureOverlay **overlay,
+                         QScreen *screen, const QColor &color)
+{
+    QString error;
+    *overlay = controller.addOverlay(0, screen, &error);
+    if (*overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return false;
+    }
+    (*overlay)->show();
+    controller.beginPresetEdit();
+    controller.chooseTool(vshot::Tool::Pen);
+    controller.setWidth(6);
+    controller.setCurrentColor(color);
+    drag(controller, *overlay, QPointF(60, 120), QPointF(340, 120));
+    expect(controller.annotations().size() == 1, "the pen stroke lands as one annotation");
+    return controller.annotations().size() == 1;
+}
+
+// The colour the picker hands the editor has to survive into the committed mark
+// and out through the result document.  Every place that writes an annotation's
+// colour into that document goes through `colorText`, and the document is the
+// only thing the renderer ever sees -- so a colour that lost its alpha between
+// the picker and the JSON is invisible on screen and only shows up as a solid
+// mark in the output PNG.  The exact string is pinned because the Rust reader
+// reads `#rrggbbaa` with the alpha last: a channel dropped, swapped or put in
+// the wrong place changes which colour comes out.
+void checkTranslucentColorSerializesWithAlpha()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    vshot::CaptureOverlay *overlay = nullptr;
+    // A colour with no two channels equal and an alpha that is neither 0 nor
+    // 255, so no single dropped or reordered channel can hide in the string.
+    if (!drawStrokeWithColor(controller, &overlay, screen, QColor(17, 34, 204, 128))) {
+        return;
+    }
+    const vshot::Annotation &mark = controller.annotations().at(0);
+    expect(mark.color.alpha() == 128,
+           "the committed stroke keeps the alpha the current colour carried",
+           QStringLiteral("alpha=%1").arg(mark.color.alpha()));
+
+    const QJsonDocument document = controller.resultDocument();
+    const QJsonArray annotations =
+        document.object().value(QStringLiteral("annotations")).toArray();
+    expect(annotations.size() == 1, "the document carries the stroke");
+    if (annotations.isEmpty()) {
+        return;
+    }
+    const QString color = annotations.at(0).toObject().value(QStringLiteral("color")).toString();
+    expect(color == QStringLiteral("#1122cc80"),
+           "a translucent colour serializes as #rrggbbaa, alpha in the last two digits",
+           QStringLiteral("got %1").arg(color));
+}
+
+// The other half of the same contract: an opaque colour keeps the six-digit
+// spelling, so adding support for alpha did not turn every colour in the
+// document into eight digits.
+void checkOpaqueColorSerializesWithoutAlpha()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    vshot::CaptureOverlay *overlay = nullptr;
+    if (!drawStrokeWithColor(controller, &overlay, screen, QColor(17, 34, 204, 255))) {
+        return;
+    }
+    expect(controller.annotations().at(0).color.alpha() == 255,
+           "an opaque stroke stays fully opaque");
+
+    const QJsonDocument document = controller.resultDocument();
+    const QJsonArray annotations =
+        document.object().value(QStringLiteral("annotations")).toArray();
+    if (annotations.isEmpty()) {
+        expect(false, "the document carries the stroke");
+        return;
+    }
+    const QString color = annotations.at(0).toObject().value(QStringLiteral("color")).toString();
+    expect(color == QStringLiteral("#1122cc"),
+           "an opaque colour serializes as #rrggbb, not eight digits",
+           QStringLiteral("got %1").arg(color));
 }
 
 // A serpentine of many moves, so the live raster is baked in many steps.
@@ -902,6 +998,8 @@ int main(int argc, char *argv[])
     checkRepaintsReuseTheRaster();
     checkEachMarkCachesOnItsOwn();
     checkCachedPixelsLandOnTheMark();
+    checkTranslucentColorSerializesWithAlpha();
+    checkOpaqueColorSerializesWithoutAlpha();
     checkPureMoveReusesTheRaster();
     checkEachOutputKeepsItsOwnRaster();
     checkEdgeOfCanvasKeepsTheRaster();
