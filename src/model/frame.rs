@@ -404,6 +404,46 @@ impl Frame {
         Ok(())
     }
 
+    /// Draws a sine wave along the straight segment `start..end`.
+    ///
+    /// `width` is the device stroke width. `amplitude` (peak deviation from the
+    /// centre line) and `wavelength` (one full period along the line) are in
+    /// device pixels too, but the caller derives them from the *logical* stroke
+    /// width — `amplitude = max(width * 2, 4)`, `wavelength = max(width * 6, 18)`
+    /// — and then scales them up. That order matters: the `max` floors apply to
+    /// the logical width, and the Qt preview computes them the same way, so a
+    /// high-density capture has to keep the same wave shape.
+    ///
+    /// The wave is sampled every device pixel along the line (see
+    /// [`wave_polyline`]) and rasterized through the shared coverage path, so a
+    /// translucent wave keeps a single alpha through its dense turnarounds. A
+    /// zero-length segment degenerates to a single dot, mirroring the pen.
+    pub(crate) fn draw_wave(
+        &mut self,
+        start: Point,
+        end: Point,
+        color: [u8; 4],
+        width: u32,
+        amplitude: u32,
+        wavelength: u32,
+    ) -> Result<()> {
+        validate_stroke_width(width)?;
+        let frame = self.size;
+        let points = wave_polyline(start, end, amplitude, wavelength);
+        let pad = i64::from(width.div_ceil(2)) + 1;
+        let bounds = polyline_bounds(&points, pad);
+        stroke_with_coverage(self, color, bounds, |ink| {
+            if points.len() == 1 {
+                rasterize_capsule(ink, frame, start, start, width);
+                return;
+            }
+            for segment in points.windows(2) {
+                rasterize_capsule(ink, frame, segment[0], segment[1], width);
+            }
+        });
+        Ok(())
+    }
+
     pub(crate) fn draw_text(
         &mut self,
         origin: Point,
@@ -1199,6 +1239,59 @@ fn polyline_bounds(points: &[Point], pad: i64) -> (i64, i64, i64, i64) {
         max_y = max_y.max(i64::from(point.y));
     }
     (min_x - pad, min_y - pad, max_x + pad + 1, max_y + pad + 1)
+}
+
+/// Samples the sine wave along the device-space segment `start..end` as a
+/// polyline, one sample per device pixel of arc length.
+///
+/// `amplitude` is the peak deviation from the centre line and `wavelength` one
+/// full period along the line, both in device pixels. Going by arc length means
+/// the sample count `n = max(2, ceil(length / 1) + 1)` — at least the two
+/// endpoints, and roughly one sample per pixel in between, so a dense wave is
+/// still smooth. The phase starts at the origin: sample `i` sits at distance
+/// `u = (i / (n - 1)) * length` along the line and `amplitude * sin(2π u /
+/// wavelength)` off it, so `i = 0` lands exactly on the centre line, and
+/// `i = n - 1` does too only when the length is a whole number of wavelengths.
+///
+/// A zero-length segment returns the single `start` point; the caller turns
+/// that into a dot.
+fn wave_polyline(start: Point, end: Point, amplitude: u32, wavelength: u32) -> Vec<Point> {
+    let dx = f64::from(end.x) - f64::from(start.x);
+    let dy = f64::from(end.y) - f64::from(start.y);
+    let length = dx.hypot(dy);
+    if length == 0.0 {
+        return vec![start];
+    }
+    // One sample per pixel, plus both endpoints. The cap only ever bites on a
+    // segment far longer than any frame, where the loss of fidelity is moot.
+    const STEP: f64 = 1.0;
+    const MAX_SAMPLES: usize = 1 << 20;
+    let samples = ((length / STEP).ceil() as u64).saturating_add(1);
+    let n = usize::try_from(samples)
+        .unwrap_or(MAX_SAMPLES)
+        .clamp(2, MAX_SAMPLES);
+    let dir_x = dx / length;
+    let dir_y = dy / length;
+    // The 90-degree rotation of `dir`: the direction the wave deviates in.
+    let normal_x = -dir_y;
+    let normal_y = dir_x;
+    // Whole cycles only, so the wave finishes on `end` rather than wherever
+    // the requested wavelength happened to leave its phase.  Both ends then
+    // sit on the line the user dragged, which is what makes it read as a wave
+    // drawn from A to B instead of one smeared off to one side.
+    let cycles = (length / f64::from(wavelength.max(1))).round().max(1.0);
+    let radians_per_pixel = std::f64::consts::TAU / (length / cycles);
+    let mut points = Vec::with_capacity(n);
+    let last = (n - 1) as f64;
+    for i in 0..n {
+        let u = (i as f64 / last) * length;
+        let offset = f64::from(amplitude) * (radians_per_pixel * u).sin();
+        points.push(point_from_f64(
+            f64::from(start.x) + dir_x * u + normal_x * offset,
+            f64::from(start.y) + dir_y * u + normal_y * offset,
+        ));
+    }
+    points
 }
 
 /// Narrows a computed coordinate to `i64`, saturating instead of wrapping so a
@@ -2213,6 +2306,150 @@ mod tests {
         };
         assert!(frame
             .draw_bitmap_scaled(Rect::new(0, 0, 8, 8), &broken)
+            .is_err());
+    }
+
+    // A wave at scale 1 with the smallest sizes: amplitude 6 and wavelength 18.
+    // The line is 54px long, exactly three whole periods, so the far endpoint
+    // comes back onto the centre line (`sin` of a whole number of periods is 0).
+    const WAVE_START: Point = Point::new(4, 16);
+    const WAVE_END: Point = Point::new(58, 16);
+
+    #[test]
+    fn wave_endpoints_sit_on_the_centre_line() {
+        let mut frame = Frame::solid(Size::new(64, 32), [0, 0, 0, 0]).unwrap();
+        frame
+            .draw_wave(WAVE_START, WAVE_END, [255, 0, 0, 255], 1, 6, 18)
+            .unwrap();
+        // The wave is rounded to whole cycles, so both endpoints are covered
+        // on the centre line y = 16.
+        assert_eq!(frame.pixel(WAVE_START), Some([255, 0, 0, 255]), "start");
+        assert_eq!(frame.pixel(WAVE_END), Some([255, 0, 0, 255]), "end");
+    }
+
+    #[test]
+    fn a_wave_ends_on_its_end_point_even_at_a_partial_period() {
+        let mut frame = Frame::solid(Size::new(64, 32), [0, 0, 0, 0]).unwrap();
+        // 50 pixels is not a whole multiple of the 18-pixel wavelength, so a
+        // free-running phase would leave the wave off the centre line here.
+        let end = Point::new(54, 16);
+        frame
+            .draw_wave(Point::new(4, 16), end, [255, 0, 0, 255], 1, 6, 18)
+            .unwrap();
+        assert_eq!(
+            frame.pixel(Point::new(4, 16)),
+            Some([255, 0, 0, 255]),
+            "start"
+        );
+        assert_eq!(frame.pixel(end), Some([255, 0, 0, 255]), "end");
+    }
+
+    #[test]
+    fn wave_crests_reach_the_amplitude_and_do_not_overshoot() {
+        let mut frame = Frame::solid(Size::new(64, 32), [0, 0, 0, 0]).unwrap();
+        // Width 1 keeps the covered band within half a pixel of the centre
+        // line, so the extreme covered row is the rounded crest itself.
+        frame
+            .draw_wave(WAVE_START, WAVE_END, [255, 0, 0, 255], 1, 6, 18)
+            .unwrap();
+        let mut above = 0i64;
+        let mut below = 0i64;
+        for y in 0..32 {
+            for x in 0..64 {
+                if frame.pixel(Point::new(x, y)) == Some([255, 0, 0, 255]) {
+                    let up = i64::from(y) - 16;
+                    above = above.max(up);
+                    below = below.max(-up);
+                }
+            }
+        }
+        // The nearest sample to the quarter-period crest is 0.985 of it, which
+        // rounds to a full amplitude; nothing reaches further than that.
+        assert_eq!(above, 6, "crest reaches the amplitude");
+        assert_eq!(below, 6, "trough reaches the amplitude");
+    }
+
+    #[test]
+    fn wave_sampling_density_follows_the_line_length() {
+        // n = max(2, ceil(length) + 1): one sample per device pixel plus both
+        // endpoints, so a ten-times longer line gets ten times the samples.
+        let short = wave_polyline(Point::new(0, 0), Point::new(9, 0), 4, 18);
+        let long = wave_polyline(Point::new(0, 0), Point::new(99, 0), 4, 18);
+        assert_eq!(short.len(), 10);
+        assert_eq!(long.len(), 100);
+        assert!(
+            long.len() > short.len() * 5,
+            "{} vs {}",
+            long.len(),
+            short.len()
+        );
+    }
+
+    #[test]
+    fn translucent_wave_keeps_one_alpha_through_its_crests() {
+        let mut frame = Frame::solid(Size::new(64, 32), [0, 0, 0, 0]).unwrap();
+        frame
+            .draw_wave(WAVE_START, WAVE_END, [255, 0, 0, 128], 3, 6, 18)
+            .unwrap();
+        // A 3px pen at 128 alpha. The crest at x = 8 stands farthest off the
+        // line (y = 16 + 6 * sin(80°) = 21.9); the centre line is crossed at
+        // x = 22 (u = 18, one whole period). Dense sampling makes the wave
+        // overlap itself at every turnaround, so without the coverage mask the
+        // crest would composite twice and come out darker than the crossing.
+        let crossing = frame.pixel(Point::new(22, 16)).unwrap();
+        let crest = frame.pixel(Point::new(8, 22)).unwrap();
+        assert_eq!(crossing[3], 128, "one 128-alpha coat stays 128");
+        assert_eq!(
+            crest[3], crossing[3],
+            "a crest must not blend a second time"
+        );
+    }
+
+    #[test]
+    fn zero_length_wave_draws_a_dot_and_never_panics() {
+        let mut frame = Frame::solid(Size::new(16, 16), [0, 0, 0, 0]).unwrap();
+        // A click without a drag degenerates to a single dot on the point,
+        // matching how the pen renders a zero-length path.
+        frame
+            .draw_wave(
+                Point::new(8, 8),
+                Point::new(8, 8),
+                [0, 255, 0, 255],
+                3,
+                6,
+                18,
+            )
+            .unwrap();
+        assert_eq!(frame.pixel(Point::new(8, 8)), Some([0, 255, 0, 255]));
+
+        // A zero wavelength would divide by zero if it were not floored.
+        frame
+            .draw_wave(
+                Point::new(0, 0),
+                Point::new(10, 0),
+                [0, 255, 0, 255],
+                1,
+                6,
+                0,
+            )
+            .unwrap();
+
+        // Off-canvas and zero-width calls stay inside the frame and reject a
+        // zero stroke width rather than panicking.
+        let before = frame.clone();
+        frame
+            .draw_wave(
+                Point::new(-50, -50),
+                Point::new(-40, -40),
+                [0, 255, 0, 255],
+                1,
+                6,
+                18,
+            )
+            .unwrap();
+        assert_eq!(frame, before);
+        assert!(frame
+            .draw_wave(Point::new(0, 0), Point::new(4, 0), [1, 2, 3, 255], 0, 6, 18)
             .is_err());
     }
 }

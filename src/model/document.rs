@@ -97,6 +97,19 @@ impl ImageDocument {
         self.frame.draw_freehand(points, color, width, dash)
     }
 
+    pub(crate) fn draw_wave(
+        &mut self,
+        start: Point,
+        end: Point,
+        color: [u8; 4],
+        width: u32,
+        amplitude: u32,
+        wavelength: u32,
+    ) -> Result<()> {
+        self.frame
+            .draw_wave(start, end, color, width, amplitude, wavelength)
+    }
+
     pub(crate) fn draw_text(
         &mut self,
         origin: Point,

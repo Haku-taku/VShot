@@ -265,6 +265,17 @@ pub enum EditOperation {
         width: u32,
         dash: LineDash,
     },
+    /// A sine wave along the device-space segment `start..end`. `width`,
+    /// `amplitude` and `wavelength` are all device pixels; the caller derives
+    /// the latter two from the logical stroke width (see `wave_amplitude`).
+    Wave {
+        start: Point,
+        end: Point,
+        color: [u8; 4],
+        width: u32,
+        amplitude: u32,
+        wavelength: u32,
+    },
     Text {
         origin: Point,
         text: String,
@@ -412,6 +423,26 @@ impl EditPipeline {
         self
     }
 
+    pub(crate) fn wave(
+        mut self,
+        start: Point,
+        end: Point,
+        color: [u8; 4],
+        width: u32,
+        amplitude: u32,
+        wavelength: u32,
+    ) -> Self {
+        self.operations.push(EditOperation::Wave {
+            start,
+            end,
+            color,
+            width,
+            amplitude,
+            wavelength,
+        });
+        self
+    }
+
     pub(crate) fn text(
         mut self,
         origin: Point,
@@ -508,6 +539,16 @@ impl EditPipeline {
                         width,
                         dash,
                     } => document.draw_freehand(points, *color, *width, *dash)?,
+                    EditOperation::Wave {
+                        start,
+                        end,
+                        color,
+                        width,
+                        amplitude,
+                        wavelength,
+                    } => {
+                        document.draw_wave(*start, *end, *color, *width, *amplitude, *wavelength)?
+                    }
                     EditOperation::Text {
                         origin,
                         text,
@@ -561,7 +602,8 @@ pub fn pipeline_for_annotations(
     let mut pipeline = EditPipeline::new();
     for annotation in annotations {
         let color = annotation.color();
-        let width = device_width(annotation.width(), scale)?;
+        let logical_width = annotation.width();
+        let width = device_width(logical_width, scale)?;
         let dash = annotation.dash();
         let head = annotation.head();
         let arrow_style = annotation.arrow_style();
@@ -606,6 +648,21 @@ pub fn pipeline_for_annotations(
                             dash,
                             head,
                             arrow_style,
+                        );
+                    }
+                    crate::wayland::input::EditorTool::Wave if points.len() >= 2 => {
+                        // The floors of the amplitude/wavelength formulas apply
+                        // to the logical width, then the density scales them,
+                        // matching the Qt preview exactly.
+                        pipeline = pipeline.wave(
+                            points[0],
+                            *points.last().ok_or_else(|| {
+                                VshotError::Selection("wave has no endpoint".into())
+                            })?,
+                            color,
+                            width,
+                            wave_amplitude(logical_width, scale),
+                            wave_wavelength(logical_width, scale),
                         );
                     }
                     crate::wayland::input::EditorTool::Pen
@@ -653,6 +710,27 @@ pub fn pipeline_for_annotations(
         }
     }
     Ok(pipeline)
+}
+
+/// Peak deviation of a wave stroke from its centre line, in device pixels.
+///
+/// The floor of `max(width * 2, 4)` is applied to the *logical* width and the
+/// result is then scaled, which is exactly what the Qt preview does; scaling
+/// first and flooring afterwards would flatten the wave at high densities.
+fn wave_amplitude(logical_width: u32, scale: u32) -> u32 {
+    logical_width
+        .saturating_mul(2)
+        .max(4)
+        .saturating_mul(scale.max(1))
+}
+
+/// One full period of a wave stroke along its line, in device pixels. Like
+/// [`wave_amplitude`], `max(width * 6, 18)` is applied in logical pixels first.
+fn wave_wavelength(logical_width: u32, scale: u32) -> u32 {
+    logical_width
+        .saturating_mul(6)
+        .max(18)
+        .saturating_mul(scale.max(1))
 }
 
 /// Converts an annotation stroke width from logical pixels to device pixels.
@@ -831,5 +909,46 @@ mod tests {
         );
         assert_eq!(document.pixel(Point::new(3, 6)), Some([0, 0, 0, 255]));
         assert_eq!(document.pixel(Point::new(12, 6)), Some([0, 0, 0, 255]));
+    }
+
+    #[test]
+    fn a_wave_annotation_becomes_a_wave_operation() {
+        // A logical width of 1 gives `amplitude = max(2, 4) = 4` and
+        // `wavelength = max(6, 18) = 18`, both then scaled by 2; the endpoints
+        // shift into the selection's device pixels and the width doubles.
+        let pipeline = pipeline_for_annotations(
+            vec![crate::wayland::input::Annotation::stroke(
+                crate::wayland::input::EditorTool::Wave,
+                vec![Point::new(2, 3), Point::new(8, 3)],
+            )],
+            Rect::new(0, 0, 20, 20),
+            2,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            pipeline.operations(),
+            [EditOperation::Wave {
+                start: Point::new(4, 6),
+                end: Point::new(16, 6),
+                color: crate::wayland::input::DEFAULT_ANNOTATION_COLOR,
+                width: 2,
+                amplitude: 8,
+                wavelength: 36,
+            }]
+        );
+    }
+
+    #[test]
+    fn wave_amplitude_and_wavelength_floor_in_logical_pixels() {
+        // The floors bind before scaling: a logical width of 1 is amplified to
+        // 4 / 18, not to 1 / 6, and only then multiplied by the density.
+        assert_eq!(wave_amplitude(1, 1), 4);
+        assert_eq!(wave_wavelength(1, 1), 18);
+        assert_eq!(wave_amplitude(1, 3), 12);
+        assert_eq!(wave_wavelength(1, 3), 54);
+        // Above the floor the wave just follows the width.
+        assert_eq!(wave_amplitude(3, 2), 12);
+        assert_eq!(wave_wavelength(3, 2), 36);
     }
 }

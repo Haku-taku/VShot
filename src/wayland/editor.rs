@@ -30,6 +30,9 @@ pub enum EditorTool {
     Draw,
     /// A straight line between the gesture endpoints.
     Line,
+    /// A sine wave drawn along the straight line between the gesture
+    /// endpoints. The wire carries exactly two points, the start and the end.
+    Wave,
     /// A straight line with an arrow head supplied by the renderer.
     Arrow,
     /// A rectangle shape.

@@ -1206,6 +1206,7 @@ fn parse_stroke_tool(name: &str) -> Result<EditorTool> {
         "pen" => Ok(EditorTool::Pen),
         "draw" => Ok(EditorTool::Draw),
         "line" => Ok(EditorTool::Line),
+        "wave" => Ok(EditorTool::Wave),
         "mosaic" => Ok(EditorTool::Mosaic),
         "blur" => Ok(EditorTool::Blur),
         _ => Err(VshotError::Selection(format!(
