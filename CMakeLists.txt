@@ -394,4 +394,25 @@ if(VSHOT_BUILD_CHECKS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(vshot-annotate-check PRIVATE -Wall -Wextra -Wpedantic)
     endif()
+
+    # The text-layer check: the recognized text of a capture and the selection
+    # rules that turn a drag into a range of it. It parses what `vshot ocr
+    # --json` prints, so the wire format has one end here and one end in
+    # `src/ocr.rs` and a rename on either side has to fail rather than quietly
+    # place every character at the origin. Needs Qt Core and nothing else: no
+    # widgets, no platform plugin, no compositor.
+    add_executable(vshot-text-layer-check
+        ui/text_layer_check.cpp
+        ui/text_layer.cpp
+        ui/text_layer.hpp
+        ui/session_protocol.hpp
+    )
+    target_link_libraries(vshot-text-layer-check PRIVATE
+        Qt6::Core
+        Qt6::Gui
+    )
+    target_compile_features(vshot-text-layer-check PRIVATE cxx_std_17)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(vshot-text-layer-check PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
 endif()
