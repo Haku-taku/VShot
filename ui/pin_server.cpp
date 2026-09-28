@@ -14,6 +14,7 @@
 #include <QDateTime>
 #include <QDebug>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
@@ -30,14 +31,19 @@
 #include <QScreen>
 #include <QSocketNotifier>
 #include <QTemporaryDir>
+#include <QThread>
 #include <QTimer>
 #include <QUrl>
+#include <QtEndian>
 
 #include <algorithm>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -394,6 +400,18 @@ struct Pin {
     // here rather than re-derived when the menu opens: the card was rendered
     // from these rows, so the menu copies exactly what the card printed.
     QVector<ColorRow> colorRows;
+    // This capture's HDR half, as PQ codes in a file this daemon owns, or empty
+    // for a pin that has none.  The pixels above are the tone map of it, so the
+    // pin's size and every hit test are unchanged; this file is what the surface
+    // helper shows instead, and it is drawn only while the helper has the pin's
+    // output.  A pin whose pixels are replaced from an SDR editor loses it.
+    QString hdrPath;
+    // The light the HDR half's `1.0` stands for, from its own header.  The
+    // surface helper draws the pin's rim in the terms that surface is described
+    // in, so it has to be told what one whole white is worth there; this is the
+    // only place that number is known, because the daemon never decodes the
+    // HDR half itself.
+    double hdrWhite = 203.0;
 
     QSize displaySize() const
     {
@@ -618,6 +636,304 @@ PinDensity resolveDensity(const QJsonObject &request, QScreen *target, const QIm
     }
     return {inferDensity(image, target), "the image size and the target output"};
 }
+
+// Whether `path` is a PQ image the surface helper will be able to read: the
+// magic, and a length that matches what its own header says.  This is the one
+// thing the daemon can check about an HDR half it never decodes, and it has to
+// check something: the helper leaves a pin's rect transparent, so a half it
+// cannot read would leave that rect painted by neither side and the pin would
+// read as a hole in the screen.
+bool isPqImage(const QString &path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return false;
+    }
+    const QByteArray header = file.read(20);
+    if (header.size() != 20 || !header.startsWith(QByteArrayLiteral("VSHTPQ01"))) {
+        return false;
+    }
+    const auto *bytes = reinterpret_cast<const uchar *>(header.constData());
+    const quint32 width = qFromLittleEndian<quint32>(bytes + 8);
+    const quint32 height = qFromLittleEndian<quint32>(bytes + 12);
+    if (width == 0 || height == 0) {
+        return false;
+    }
+    const qint64 expected = 20 + static_cast<qint64>(width) * height * 4;
+    return file.size() == expected;
+}
+
+// What the HDR half's own white is worth, in cd/m², as its header states it.
+// VShot's own default stands in when the file cannot say, which is what a
+// capture on an output with no stated reference is written with.
+double pqWhiteNits(const QString &path)
+{
+    constexpr double fallback = 203.0;
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return fallback;
+    }
+    const QByteArray header = file.read(20);
+    if (header.size() != 20 || !header.startsWith(QByteArrayLiteral("VSHTPQ01"))) {
+        return fallback;
+    }
+    const auto *bytes = reinterpret_cast<const uchar *>(header.constData());
+    float nits = 0.0f;
+    std::memcpy(&nits, bytes + 16, sizeof nits);
+    return std::isfinite(nits) && nits > 0.0f ? static_cast<double>(nits) : fallback;
+}
+
+// Where the HDR surface helper may live: next to this executable (installed
+// layouts) or under the crate's own `target/` one and two levels up (the
+// in-tree `build-qt/` + `cargo build` development layouts).  `VSHOT_HDR_HELPER`
+// overrides the search the way `VSHOT_QT_HELPER` does on the other side.
+QString hdrHelperProgram()
+{
+    const QByteArray override = qgetenv("VSHOT_HDR_HELPER");
+    if (!override.isEmpty()) {
+        const QString path = QString::fromLocal8Bit(override);
+        return QFileInfo(path).isExecutable() ? path : QString();
+    }
+    const QString directory = QCoreApplication::applicationDirPath();
+    const QStringList candidates = {
+        directory + QStringLiteral("/vshot"),
+        directory + QStringLiteral("/../target/release/vshot"),
+        directory + QStringLiteral("/../target/debug/vshot"),
+        directory + QStringLiteral("/../../target/release/vshot"),
+        directory + QStringLiteral("/../../target/debug/vshot"),
+    };
+    for (const QString &candidate : candidates) {
+        const QFileInfo info(candidate);
+        if (info.isExecutable()) {
+            return info.absoluteFilePath();
+        }
+    }
+    return QString();
+}
+
+// The HDR half of the pin stack: a helper process that shows pinned HDR images
+// on layer surfaces of its own.
+//
+// A pin surface is a Qt window, and Qt builds a window's colour description from
+// a `QColorSpace` -- named BT.2020, with no luminances.  The compositor leaves a
+// surface's pixels alone only when its description is the output's own, and that
+// description carries the output's luminances, so a Qt window holding PQ codes
+// is converted and tone-mapped down to SDR.  The helper is a plain Wayland
+// client of our own: it can put the output's own description on a surface, whose
+// ten-bit buffer is then a passthrough, so the pixels reach the panel as the
+// light they stand for.  It draws the images; the Qt surfaces keep the rim, the
+// badges and the menus, and leave the images transparent for it to show through.
+//
+// The helper's surfaces sit on the same layer as ours, and the compositor stacks
+// a layer in map order with no restack request, so they have to be up first: the
+// process is started as the daemon starts, and `ensureMapped` -- called before
+// the first surface of ours is mapped -- waits for it to say it is on screen.
+// Nothing else waits on it: a helper that never comes up simply leaves every pin
+// an ordinary SDR one.
+class PinHdr
+{
+public:
+    PinHdr()
+    {
+        program_ = hdrHelperProgram();
+        if (program_.isEmpty() || !directory_.isValid()) {
+            return;
+        }
+        socketPath_ = directory_.filePath(QStringLiteral("hdr.sock"));
+        process_.setProgram(program_);
+        process_.setArguments({QStringLiteral("--pin-hdr-server"), socketPath_});
+        process_.setStandardInputFile(QProcess::nullDevice());
+        process_.setProcessChannelMode(QProcess::ForwardedErrorChannel);
+        // Started here so it has the whole first command's round trip to get on
+        // screen; waited for in `ensureMapped`, which runs before the first
+        // surface of ours is mapped.
+        process_.start();
+    }
+
+    ~PinHdr()
+    {
+        if (process_.state() == QProcess::NotRunning) {
+            return;
+        }
+        // Closing the connection is what tells the helper to unmap and exit; a
+        // signal would leave its layer surfaces behind on some compositors.
+        if (socket_.state() == QLocalSocket::ConnectedState) {
+            socket_.write("{\"cmd\":\"quit\"}\n");
+            socket_.flush();
+        }
+        socket_.disconnectFromServer();
+        if (!process_.waitForFinished(750)) {
+            process_.terminate();
+            if (!process_.waitForFinished(750)) {
+                process_.kill();
+                process_.waitForFinished(750);
+            }
+        }
+    }
+
+    // Makes sure the helper is on screen and has answered with the outputs it
+    // could put an HDR surface on.  Called once, before the first Qt surface of
+    // ours is mapped; afterwards the answer is a flag.
+    void ensureMapped()
+    {
+        if (attempted_) {
+            return;
+        }
+        attempted_ = true;
+        if (program_.isEmpty() || process_.state() != QProcess::Running) {
+            return;
+        }
+        // The helper binds its socket before it accepts anything, so the file
+        // appearing is the signal that connecting will work; a helper that dies
+        // first (a compositor with no layer shell, say) is not waited for.
+        QElapsedTimer timer;
+        timer.start();
+        while (!QFile::exists(socketPath_)) {
+            if (process_.state() == QProcess::NotRunning || timer.elapsed() > kSocketWaitMs) {
+                stop();
+                return;
+            }
+            QThread::msleep(5);
+        }
+        socket_.connectToServer(socketPath_);
+        if (!socket_.waitForConnected(kConnectWaitMs)) {
+            stop();
+            return;
+        }
+        waitForMapped();
+        if (!mapped_) {
+            // Nothing will arrive late to land above the surfaces this daemon is
+            // about to map.
+            stop();
+            return;
+        }
+        // The helper answers every command with one line.  Nothing reads them,
+        // so they have to be drained or its writes would block once the socket's
+        // buffer filled.
+        QObject::connect(&socket_, &QLocalSocket::readyRead, &socket_,
+                         [this] { socket_.readAll(); });
+    }
+
+    bool mapped() const { return mapped_; }
+
+    // Whether the helper's surface on `name` carries that output's own colour
+    // description.  Only there can a ten-bit buffer be read as HDR.
+    bool isHdrOutput(const QString &name) const { return outputs_.contains(name); }
+
+    // Copies one PQ image into the helper's directory and answers the copy's
+    // path: the CLI's file is gone the moment it is answered, and the helper
+    // reads the pixels by path, so the copy is what lives as long as the pin.
+    QString takeImage(const QString &source)
+    {
+        if (!mapped_ || !directory_.isValid() || !isPqImage(source)) {
+            return QString();
+        }
+        const QString destination =
+            directory_.filePath(QStringLiteral("pin-%1.pq").arg(++sequence_));
+        if (!QFile::copy(source, destination)) {
+            return QString();
+        }
+        return destination;
+    }
+
+    // Hands the helper the whole stack of HDR pins, in the daemon's own paint
+    // order, together with the look they are drawn with.  Every other pin is the
+    // Qt surface's to draw and is left out.
+    void sync(const QJsonArray &pins, const QJsonObject &style)
+    {
+        if (!mapped_ || socket_.state() != QLocalSocket::ConnectedState) {
+            return;
+        }
+        // The same stack and the same look again — a pin coming to the front, an
+        // SDR pin moving — is nothing for the helper to do.  Its picture is
+        // derived from these two alone, so asking for it twice would have it
+        // recompose the whole output for an image identical to the one already
+        // on it.
+        if (sent_ && pins == sent_.value() && style == sentStyle_) {
+            return;
+        }
+        sent_ = pins;
+        sentStyle_ = style;
+        QJsonObject command;
+        command.insert(QStringLiteral("cmd"), QStringLiteral("pins"));
+        command.insert(QStringLiteral("style"), style);
+        command.insert(QStringLiteral("pins"), pins);
+        QByteArray line = QJsonDocument(command).toJson(QJsonDocument::Compact);
+        line.append('\n');
+        socket_.write(line);
+        socket_.flush();
+    }
+
+private:
+    // Waits for the helper's `mapped` line and remembers the outputs it named.
+    void waitForMapped()
+    {
+        QByteArray buffer;
+        QElapsedTimer timer;
+        timer.start();
+        while (socket_.state() == QLocalSocket::ConnectedState) {
+            if (socket_.bytesAvailable() == 0) {
+                if (timer.hasExpired(kMappedWaitMs)) {
+                    return;
+                }
+                if (!socket_.waitForReadyRead(250)) {
+                    continue;
+                }
+            }
+            buffer.append(socket_.readAll());
+            int newline = -1;
+            while ((newline = buffer.indexOf('\n')) >= 0) {
+                const QByteArray line = buffer.left(newline);
+                buffer.remove(0, newline + 1);
+                const QJsonDocument document = QJsonDocument::fromJson(line);
+                if (!document.isObject()) {
+                    continue;
+                }
+                const QJsonObject object = document.object();
+                if (object.value(QStringLiteral("event")).toString()
+                    != QStringLiteral("mapped")) {
+                    continue;
+                }
+                const QJsonArray outputs = object.value(QStringLiteral("outputs")).toArray();
+                for (const QJsonValue &value : outputs) {
+                    outputs_.append(value.toString());
+                }
+                mapped_ = true;
+                return;
+            }
+        }
+    }
+
+    // Gives up on a helper that never answered.
+    void stop()
+    {
+        socket_.disconnectFromServer();
+        if (process_.state() != QProcess::NotRunning) {
+            process_.terminate();
+            if (!process_.waitForFinished(250)) {
+                process_.kill();
+            }
+        }
+    }
+
+    static constexpr int kSocketWaitMs = 2000;
+    static constexpr int kConnectWaitMs = 1000;
+    static constexpr int kMappedWaitMs = 2000;
+
+    QString program_;
+    QString socketPath_;
+    QTemporaryDir directory_;
+    QProcess process_;
+    QLocalSocket socket_;
+    QStringList outputs_;
+    // The pin stack the helper was last handed, so an unchanged one is not
+    // handed over again, and the look that went with it.
+    std::optional<QJsonArray> sent_;
+    QJsonObject sentStyle_;
+    bool attempted_ = false;
+    bool mapped_ = false;
+    quint64 sequence_ = 0;
+};
 
 // Owns every pinned surface and dispatches daemon commands. It inherits
 // QObject only to reuse the functor-based connect() lifetime; it declares no
@@ -946,6 +1262,10 @@ wl-clipboard package"));
         pin->label = label;
         pin->sourcePath = sourcePath;
         pin->colorRows = colorRows;
+        // The HDR half, when the request carries one: a private file the CLI
+        // wrote, which is gone by the time this reply lands.  Taken below, once
+        // the helper is known to be up, since the copy lives in its directory.
+        const QString hdrSource = request.value(QStringLiteral("hdr")).toString();
         const PinDensity density = resolveDensity(request, screen, image, sourcePath, sourceBytes);
         pin->density = density.value;
         // Why a pin came out the size it did is the first question when one
@@ -1018,6 +1338,12 @@ wl-clipboard package"));
         // The look is taken from the file as it is now: the daemon may have been
         // up since before the user changed it.
         reloadStyle();
+        // `ensureSurfaces` has made the helper known, so its directory exists and
+        // the HDR half can be taken; without a helper the pin is an SDR one.
+        if (!hdrSource.isEmpty()) {
+            pin->hdrPath = hdr_.takeImage(hdrSource);
+            pin->hdrWhite = pqWhiteNits(pin->hdrPath);
+        }
         // Appended, so it is painted last: a new pin lands in front of the pins
         // that were already there.
         pins_.push_back(pin);
@@ -1047,6 +1373,7 @@ wl-clipboard package"));
             return error(QStringLiteral("pin %1 no longer exists").arg(id));
         }
         const QString path = request.value(QStringLiteral("path")).toString();
+        const QString hdr = request.value(QStringLiteral("hdr")).toString();
         if (!path.isEmpty()) {
             const QImage image(path);
             if (image.isNull()) {
@@ -1060,6 +1387,24 @@ wl-clipboard package"));
                 pin->scale = std::clamp(static_cast<double>(display.width()) / image.width(),
                                         kMinScale, kMaxScale);
             }
+            // The pixels were replaced, so whatever HDR half the pin had is no
+            // longer theirs -- unless this same request brings its replacement
+            // along, which is what an HDR pin's edit does.
+            if (hdr.isEmpty() && !pin->hdrPath.isEmpty()) {
+                QFile::remove(pin->hdrPath);
+                pin->hdrPath.clear();
+            }
+        }
+        if (!hdr.isEmpty()) {
+            // An unreadable half clears the pin's own, so a pin whose pixels
+            // changed is never left showing a stale HDR image: it falls back to
+            // the SDR picture it was given.
+            const QString taken = hdr_.takeImage(hdr);
+            if (!pin->hdrPath.isEmpty()) {
+                QFile::remove(pin->hdrPath);
+            }
+            pin->hdrPath = taken;
+            pin->hdrWhite = pqWhiteNits(taken);
         }
         pin->origin = clampOrigin(*pin, QPoint(x, y));
         syncAll();
@@ -1132,6 +1477,13 @@ wl-clipboard package"));
         output.insert(QStringLiteral("pixel_height"),
                       static_cast<qint64>(pin->image.height()));
         output.insert(QStringLiteral("path"), imagePath);
+        // An HDR pin carries a second file, and the editor has to put its marks
+        // on that half too or the pin would drop back to SDR the moment it is
+        // annotated.  The path stays valid for the whole edit: the file lives in
+        // the helper's directory, which the daemon owns.
+        if (!pin->hdrPath.isEmpty()) {
+            output.insert(QStringLiteral("hdr"), pin->hdrPath);
+        }
 
         QJsonObject bounds;
         bounds.insert(QStringLiteral("x"), static_cast<qint64>(globalRect.x()));
@@ -1409,6 +1761,9 @@ wl-clipboard package"));
                 surface->setStyle(style_);
             }
         }
+        // The helper draws the HDR half of a pin, rim included, so a new look is
+        // something it has to be told about as well.
+        syncHdr();
     }
 
     // Creates the stack's surface on one output.
@@ -1423,6 +1778,17 @@ wl-clipboard package"));
         // hit-tests the whole stack, so the daemon looks the pin up by id.
         surface->setPickCallback([this](quint64 id) {
             bringToFront(byId_.value(id, nullptr));
+        });
+        // The surface is the only place that knows whether it still holds the
+        // keyboard and which pin the pointer last picked, which together decide
+        // whose rim is the live one.  An HDR pin's rim is drawn by the helper, so
+        // that answer has to travel.
+        surface->setActiveCallback([this](quint64 id) {
+            if (id == hdrActiveId_) {
+                return;
+            }
+            hdrActiveId_ = id;
+            syncHdr();
         });
         surface->setDragCallback([this](quint64 id, QPoint topLeft) {
             Pin *pin = byId_.value(id, nullptr);
@@ -1489,6 +1855,11 @@ wl-clipboard package"));
         if (!surfaces_.isEmpty()) {
             return;
         }
+        // The helper's surfaces and ours share a layer, and the compositor
+        // stacks a layer in map order with no restack request: the helper has to
+        // be on the screen before the first surface of ours, whatever kind of
+        // pin this is.  A helper that does not come up leaves every pin SDR.
+        hdr_.ensureMapped();
         for (QScreen *screen : QGuiApplication::screens()) {
             addSurface(screen);
         }
@@ -1558,12 +1929,19 @@ wl-clipboard package"));
         if (byId_.value(pin->id, nullptr) == pin) {
             byId_.remove(pin->id);
         }
+        // The HDR half is a file of ours; the pin going away takes it.
+        if (!pin->hdrPath.isEmpty()) {
+            QFile::remove(pin->hdrPath);
+        }
         delete pin;
         if (pins_.isEmpty()) {
             // Nothing is left to paint, so the surfaces go as well: they are the
             // daemon's own layer surfaces and have no reason to outlive the last
             // pin.
             destroySurfaces();
+            // ... and the helper is told to clear, so no HDR image survives the
+            // pin it belonged to.
+            syncHdr();
             armIdleQuit();
             return;
         }
@@ -1586,9 +1964,71 @@ wl-clipboard package"));
                 if (surface->isPinnedVisible() != allVisible_) {
                     surface->setPinnedVisible(allVisible_);
                 }
+                // Only an output the helper described can show an HDR pin; on
+                // any other the surface paints the image itself.
+                const QScreen *screen = surface->screen();
+                surface->setHdrPixels(screen != nullptr
+                                      && hdr_.isHdrOutput(screen->name()));
                 surface->setPins(items);
             }
         }
+        syncHdr();
+    }
+
+    // Hands the helper the HDR pins alone: it draws those images, in the same
+    // paint order, along with their shadows and rims, and the Qt surfaces leave
+    // their rects transparent.
+    void syncHdr()
+    {
+        if (!hdr_.mapped()) {
+            return;
+        }
+        QJsonObject style;
+        style.insert(QStringLiteral("radius"), static_cast<qint64>(style_.radius));
+        if (style_.shadow.enabled && style_.shadow.size > 0 && style_.shadow.opacity > 0) {
+            QJsonObject shadow;
+            shadow.insert(QStringLiteral("size"), style_.shadow.size);
+            shadow.insert(QStringLiteral("offset"), style_.shadow.offset);
+            shadow.insert(QStringLiteral("opacity"), style_.shadow.opacity);
+            style.insert(QStringLiteral("shadow"), shadow);
+        } else {
+            style.insert(QStringLiteral("shadow"), QJsonValue::Null);
+        }
+        if (style_.borderWidth > 0) {
+            QJsonObject border;
+            border.insert(QStringLiteral("width"), static_cast<qint64>(style_.borderWidth));
+            border.insert(QStringLiteral("color"), rgbArray(style_.borderColor));
+            border.insert(QStringLiteral("active"), rgbArray(style_.activeBorderColor));
+            style.insert(QStringLiteral("border"), border);
+        } else {
+            style.insert(QStringLiteral("border"), QJsonValue::Null);
+        }
+        QJsonArray array;
+        for (const Pin *pin : pins_) {
+            if (pin->hdrPath.isEmpty()) {
+                continue;
+            }
+            QJsonObject entry;
+            entry.insert(QStringLiteral("id"), static_cast<qint64>(pin->id));
+            entry.insert(QStringLiteral("path"), pin->hdrPath);
+            entry.insert(QStringLiteral("x"), pin->origin.x());
+            entry.insert(QStringLiteral("y"), pin->origin.y());
+            entry.insert(QStringLiteral("scale"), pin->scale);
+            entry.insert(QStringLiteral("visible"), allVisible_);
+            // Which pin's rim shows as the live one, and what one whole white is
+            // worth on the output the HDR half came from: the helper draws the
+            // rim itself, in the terms its own surface is described in.
+            entry.insert(QStringLiteral("active"), pin->id == hdrActiveId_);
+            entry.insert(QStringLiteral("white"), pin->hdrWhite);
+            array.append(entry);
+        }
+        hdr_.sync(array, style);
+    }
+
+    // One colour as the three channels the helper reads, 0-255.
+    static QJsonArray rgbArray(const QColor &color)
+    {
+        return QJsonArray{color.red(), color.green(), color.blue()};
     }
 
     // How one pinned image looks on an output. A pin may span several outputs,
@@ -1603,6 +2043,10 @@ wl-clipboard package"));
         item.scale = pin.scale;
         item.origin = pin.origin;
         item.colorRows = pin.colorRows;
+        // Whether the surface leaves the image to the helper is its own to
+        // decide -- it depends on this output -- but whether there *is* an HDR
+        // half is the pin's.
+        item.hdr = !pin.hdrPath.isEmpty();
         return item;
     }
 
@@ -1634,6 +2078,7 @@ wl-clipboard package"));
                 surface->setPinnedVisible(visible);
             }
         }
+        syncHdr();
     }
 
     QLocalServer *server_;
@@ -1654,6 +2099,12 @@ wl-clipboard package"));
     // output, or the first pin after the daemon has been idle) starts from the
     // same style as the ones already up.
     PinSurface::Style style_;
+    // The pin whose rim the helper should draw as the live one, 0 for none.
+    quint64 hdrActiveId_ = 0;
+    // The HDR half of the stack: the helper process that draws pinned HDR
+    // images on surfaces of its own.  Started with the daemon, so it is always
+    // under the Qt surfaces this daemon maps.
+    PinHdr hdr_;
     quint64 nextId_ = 1;
     Pin *editingPin_ = nullptr;
     bool allVisible_ = true;

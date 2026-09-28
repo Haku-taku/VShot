@@ -59,6 +59,11 @@ public:
         double scale = 1.0;
         // Global logical top-left of the image.
         QPoint origin;
+        // Whether this pin's pixels are drawn by the HDR surface helper rather
+        // than by this surface.  The image is still held -- it is what the size,
+        // the mask and every edit are worked out from -- but it is not painted,
+        // so the helper's HDR image shows through.
+        bool hdr = false;
         // The formats a pinned color card shows, empty for every other pin.
         // A right-click on the card turns them into a copy menu, and the menu
         // hands back the very string the card prints for that format.
@@ -97,6 +102,12 @@ public:
     // LayerShellQt is unavailable.
     bool showLayerSurface();
 
+    // Whether this output can show HDR pixels: true when the surface helper has
+    // the output's own colour description on its copy of it.  An item marked
+    // `hdr` is only left unpainted when this is on -- on any other output the
+    // item's own image is the only copy there is.
+    void setHdrPixels(bool on);
+
     // Replaces the whole stack, back to front: the last entry is painted last,
     // i.e. it is the frontmost. Entries keep their scaled copy across calls
     // when their pixels and on-screen size are unchanged, so dragging a pin
@@ -120,6 +131,14 @@ public:
     void setPickCallback(std::function<void(quint64)> callback)
     {
         picked_ = std::move(callback);
+    }
+    // Fires with the pin whose rim should show as the live one, or 0 when none
+    // should.  Only the surface knows both halves of that -- whether it still
+    // holds the keyboard and which pin the pointer last picked -- and the HDR
+    // half of a pin is drawn by another process, so it has to be told.
+    void setActiveCallback(std::function<void(quint64)> callback)
+    {
+        activeReported_ = std::move(callback);
     }
     void setDragCallback(std::function<void(quint64, QPoint)> callback)
     {
@@ -251,6 +270,18 @@ private:
     void applyMask();
     // Moves which pin is picked, repainting the strokes that change colour.
     void movePickTo(quint64 id);
+    // Tells the daemon which pin's rim is the live one, when that changed.
+    void reportActive();
+    // Moves the HDR marker to the pin the pointer is over, repainting the one
+    // it leaves and the one it lands on.
+    void moveHoverTo(quint64 id);
+    // Follows the pointer inside this surface: the marker is about the pin
+    // under it, so this is asked for whenever the pointer moves while no drag
+    // or menu owns the surface.
+    void trackHover(const QPoint &local);
+    // Paints the `HDR` tag a pinned HDR image carries while the pointer is over
+    // it, and remembers where, so taking it down repaints only its own box.
+    void paintHdrMarker(QPainter &painter, const QRect &target, bool shownAsHdr);
     // Hands the keyboard back to the compositor: interactivity goes to None
     // and a commit makes the change reach the compositor at once. Needed
     // because the compositors in the field never tell a layer surface that a
@@ -295,6 +326,7 @@ private:
     Style style_;
     QScreen *screen_;
     std::function<void(quint64)> picked_;
+    std::function<void(quint64)> activeReported_;
     std::function<void(quint64, QPoint)> dragMoved_;
     std::function<void(quint64, double)> zoomRequested_;
     std::function<void(quint64)> closeRequested_;
@@ -306,6 +338,9 @@ private:
     // The pin the user last clicked on this output: the one the zoom badge and
     // the Space edit shortcut belong to, and the only one drawn as focused.
     quint64 pickedId_ = 0;
+    // The pin this surface last told the daemon was the live one, so an
+    // unchanged answer is not reported again.
+    quint64 activeId_ = 0;
     // The pin being dragged, 0 while no left button is down.
     quint64 draggingId_ = 0;
     QPoint pressGlobal_;
@@ -316,6 +351,13 @@ private:
     // Where the badge was painted last, so clearing it does not repaint the
     // whole output.
     QRect badgeRect_;
+    // The pin the pointer is over, when that pin is an HDR capture: the marker
+    // this surface paints belongs to it alone.  0 while the pointer is over an
+    // SDR pin, over no pin, or off this output altogether.
+    quint64 hoverId_ = 0;
+    // Where that marker was painted last, so clearing it repaints its own box
+    // rather than the whole pin it was on.
+    QRect hoverMarker_;
     // The open right-click menu: the pin it belongs to (0 while closed), the
     // copy rows it offers, where it is painted, and the row the pointer is
     // over. Row indices run over `menuRows_` first and then the action rows,
@@ -333,6 +375,9 @@ private:
     bool hasFocus_ = false;
     bool visible_ = true;
     bool surfaceReady_ = false;
+    // Whether the surface helper shows this output's HDR pins; see
+    // `setHdrPixels`.
+    bool hdrPixels_ = false;
     // This surface's layer-shell window, kept for the keyboard hand-back; null
     // until showLayerSurface() succeeded.
     LayerShellQt::Window *layer_ = nullptr;

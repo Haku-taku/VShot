@@ -30,12 +30,39 @@ pub(crate) struct PoolUserData;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BufferToken {
     Parent(u64),
+    /// One of a pinned HDR image's picture buffers, named by its slot.  A pin is
+    /// drawn on a half-float dma-buf, not on shared memory, so its buffers carry
+    /// their own token kind rather than reusing the frozen backdrop's.
+    Pin(u64),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BufferUserData {
     pub(crate) output_id: u32,
     pub(crate) token: BufferToken,
+}
+
+/// One picture buffer of a pinned HDR image: the `wl_buffer` the compositor
+/// takes, and whether it has given it back.
+///
+/// The pixels are *not* here.  They live in a half-float dma-buf the helper
+/// allocated and draws into through EGL, so this side only ever names it: the
+/// buffer is built from the descriptor facts the helper read back out of its own
+/// allocation, and the drawing happens on the other side of the connection.
+pub(crate) struct PinSlot {
+    pub(crate) buffer: wl_buffer::WlBuffer,
+    pub(crate) token: BufferToken,
+    pub(crate) available: bool,
+}
+
+impl std::fmt::Debug for PinSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PinSlot")
+            .field("token", &self.token)
+            .field("available", &self.available)
+            .finish_non_exhaustive()
+    }
 }
 
 pub(crate) fn release_buffer_if_current(
@@ -1400,6 +1427,10 @@ pub(crate) struct OverlaySurface {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) slots: Vec<ShmSlot>,
+    /// A pinned HDR image's picture buffers, when this surface is the pin
+    /// helper's rather than the frozen scene's.  They are dma-bufs the helper
+    /// draws into, so there is nothing here to render into them.
+    pub(crate) pin_slots: Vec<PinSlot>,
     pub(crate) pending_parent_redraw: bool,
     /// The colour-management objects an HDR backdrop hangs on its surface,
     /// held so they outlive it.
@@ -1441,6 +1472,44 @@ impl std::fmt::Debug for OverlaySurface {
 impl OverlaySurface {
     pub(crate) fn attach_available(&mut self) -> Option<usize> {
         self.slots.iter().position(|slot| slot.available)
+    }
+
+    /// Attaches one of the pin's picture buffers and commits only `region` of
+    /// it.  `false` when that slot has nothing, or is still with the compositor.
+    ///
+    /// The pixels are already in the buffer — the helper drew them and copied
+    /// the region across — so this is the attach, the damage and the commit, and
+    /// nothing else.
+    pub(crate) fn present_pin_slot(&mut self, slot: usize, region: Rect) -> bool {
+        if region.is_empty() {
+            return false;
+        }
+        let Some(pin) = self.pin_slots.get_mut(slot) else {
+            return false;
+        };
+        if !pin.available {
+            return false;
+        }
+        pin.available = false;
+        self.surface.attach(Some(&pin.buffer), 0, 0);
+        // `damage_buffer` rather than `damage`: the region is already in buffer
+        // pixels, and `damage` would be scaled by the output's scale on top.
+        self.surface.damage_buffer(
+            region.origin.x,
+            region.origin.y,
+            region.size.width as i32,
+            region.size.height as i32,
+        );
+        self.surface.commit();
+        true
+    }
+
+    /// Marks one picture buffer as free again after the compositor returned it.
+    pub(crate) fn release_pin_slot(&mut self, token: BufferToken) -> bool {
+        let Some(pin) = self.pin_slots.iter_mut().find(|slot| slot.token == token) else {
+            return false;
+        };
+        release_buffer_if_current(pin.token, token, &mut pin.available)
     }
 
     pub(crate) fn commit_slot(&mut self, slot: usize) {

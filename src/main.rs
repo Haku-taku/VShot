@@ -17,6 +17,8 @@ mod ocr;
 mod output;
 mod parallel;
 mod pin;
+mod pin_hdr;
+mod pin_hdr_fp16;
 mod qt_overlay;
 mod record;
 mod selection;
@@ -24,6 +26,7 @@ mod stitch;
 mod wayland;
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -37,6 +40,7 @@ use error::{Result, VshotError};
 use geometry::Rect;
 use model::hdr::{Primaries, Transfer, REFERENCE_WHITE_NITS};
 use model::{Frame, HdrFrame, ImageDocument, OutputColor, OutputSnapshot, SceneSnapshot};
+use output::HdrHalf;
 use wayland::topology::OutputInfo;
 use wayland::{BackdropFrame, WaylandSession};
 
@@ -67,6 +71,20 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
+    // An internal mode, the way the Qt helper has `--pin-server`: the pin daemon
+    // spawns this process to show pinned HDR images on layer surfaces of their
+    // own.  It is read before the CLI parser, so it is not a subcommand and
+    // never appears in the command tree.
+    let mut arguments = std::env::args_os().skip(1);
+    if let Some(flag) = arguments.next() {
+        if flag == "--pin-hdr-server" {
+            let socket = arguments.next().ok_or_else(|| VshotError::HdrPin {
+                path: PathBuf::from("--pin-hdr-server"),
+                reason: "no socket path was given".into(),
+            })?;
+            return pin_hdr::run(Path::new(&socket));
+        }
+    }
     let cli = cli::parse();
     let action = cli.parse_action()?;
     let request = match action {
@@ -261,7 +279,7 @@ fn run() -> Result<()> {
     // The HDR half of the capture, filled below from the same instant the SDR
     // scene was taken: `Some` only when the selection's own output offered a
     // 10-bit buffer.  A capture that has one is written as the SDR/HDR pair.
-    let mut hdr_frame: Option<HdrFrame> = None;
+    let mut hdr_frame: Option<HdrHalf> = None;
     // Where on the desktop the capture came from, in global logical pixels, for
     // the destinations that put the image back on the screen: a pin lands back
     // exactly there.  `None` for a target with no place of its own (a composed
@@ -826,7 +844,7 @@ fn finish_capture(
     // The HDR half of the capture, when the selection's output offered a 10-bit
     // buffer.  It is the same crop as `frame`, so the pipeline runs over both:
     // the SDR one for the PNG, and the HDR one for the `.hdr` written beside it.
-    hdr: Option<HdrFrame>,
+    hdr: Option<HdrHalf>,
     density: u32,
     // Where on the desktop the capture came from, in global logical pixels, for
     // a destination that puts the image back on the screen: the pin daemon
@@ -874,17 +892,23 @@ fn finish_capture(
 fn sdr_and_hdr(
     edits: &EditPipeline,
     frame: Frame,
-    hdr: Option<HdrFrame>,
-) -> Result<(Frame, Option<HdrFrame>)> {
+    hdr: Option<HdrHalf>,
+) -> Result<(Frame, Option<HdrHalf>)> {
     let hdr = match hdr {
-        Some(hdr) => {
-            let annotated = edits.apply_to_hdr(hdr)?;
-            annotated.is_hdr().then_some(annotated)
+        Some(HdrHalf {
+            frame,
+            reference_nits,
+        }) => {
+            let annotated = edits.apply_to_hdr(frame)?;
+            annotated.is_hdr().then_some(HdrHalf {
+                frame: annotated,
+                reference_nits,
+            })
         }
         None => None,
     };
     match hdr {
-        Some(hdr) => Ok((hdr.tone_map_to_srgb()?, Some(hdr))),
+        Some(half) => Ok((half.frame.tone_map_to_srgb()?, Some(half))),
         None => Ok((edits.apply(ImageDocument::new(frame))?.into_frame(), None)),
     }
 }
@@ -979,7 +1003,7 @@ fn hdr_for_region(
     hdr_outputs: &[HdrOutput],
     scene: &SceneSnapshot,
     geometry: Rect,
-) -> Option<HdrFrame> {
+) -> Option<HdrHalf> {
     let output = scene.outputs().iter().find(|output| {
         output
             .geometry
@@ -993,15 +1017,22 @@ fn hdr_for_region(
         geometry.size.width.checked_mul(output.scale)?,
         geometry.size.height.checked_mul(output.scale)?,
     );
-    hdr_for_name(hdr_outputs, &output.name)?.crop(local).ok()
+    let half = hdr_for_name(hdr_outputs, &output.name)?;
+    Some(HdrHalf {
+        frame: half.frame.crop(local).ok()?,
+        reference_nits: half.reference_nits,
+    })
 }
 
 /// The HDR half of a whole output, or `None` when it offered none.
-fn hdr_for_name(hdr_outputs: &[HdrOutput], name: &str) -> Option<HdrFrame> {
+fn hdr_for_name(hdr_outputs: &[HdrOutput], name: &str) -> Option<HdrHalf> {
     hdr_outputs
         .iter()
         .find(|output| output.name == name)
-        .map(|output| output.frame.clone())
+        .map(|output| HdrHalf {
+            frame: output.frame.clone(),
+            reference_nits: output.reference_nits,
+        })
 }
 
 /// Puts the frozen HDR half of each output on a backdrop surface below the Qt
@@ -1536,12 +1567,12 @@ mod tests {
         // does.
         let (scene, hdr) = hdr_scene();
         let plain = hdr_for_region(&hdr, &scene, Rect::new(2, 3, 5, 4)).unwrap();
-        assert_eq!(plain.size(), Size::new(5, 4));
-        assert_eq!(plain.pixel(0, 0), Some([2.0, 2.0, 2.0, 1.0]));
+        assert_eq!(plain.frame.size(), Size::new(5, 4));
+        assert_eq!(plain.frame.pixel(0, 0), Some([2.0, 2.0, 2.0, 1.0]));
 
         let dense = hdr_for_region(&hdr, &scene, Rect::new(66, 3, 5, 4)).unwrap();
-        assert_eq!(dense.size(), Size::new(10, 8));
-        assert_eq!(dense.pixel(0, 0), Some([4.0, 4.0, 4.0, 1.0]));
+        assert_eq!(dense.frame.size(), Size::new(10, 8));
+        assert_eq!(dense.frame.pixel(0, 0), Some([4.0, 4.0, 4.0, 1.0]));
     }
 
     #[test]
@@ -1565,7 +1596,10 @@ mod tests {
     #[test]
     fn hdr_for_name_finds_only_a_named_output() {
         let hdr = vec![hdr_output_half("DP-2", 4, 4, 4.0)];
-        assert_eq!(hdr_for_name(&hdr, "DP-2").unwrap().size(), Size::new(4, 4));
+        assert_eq!(
+            hdr_for_name(&hdr, "DP-2").unwrap().frame.size(),
+            Size::new(4, 4)
+        );
         assert!(hdr_for_name(&hdr, "eDP-1").is_none());
     }
 
@@ -1579,7 +1613,15 @@ mod tests {
             vec![[4.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]],
         )
         .unwrap();
-        let (sdr, kept) = sdr_and_hdr(&EditPipeline::new(), plain_frame(), Some(hdr)).unwrap();
+        let (sdr, kept) = sdr_and_hdr(
+            &EditPipeline::new(),
+            plain_frame(),
+            Some(HdrHalf {
+                frame: hdr,
+                reference_nits: REFERENCE_WHITE_NITS,
+            }),
+        )
+        .unwrap();
         // The peak lands on SDR white; the mid channel is rolled off well below
         // it, and red stays the dominant channel — a real tone map, not the
         // second capture.
@@ -1588,7 +1630,7 @@ mod tests {
         assert_eq!(pixel[1], pixel[2]);
         assert!((128..=150).contains(&pixel[1]), "green = {}", pixel[1]);
         let kept = kept.expect("the HDR half is kept");
-        assert_eq!(kept.pixel(0, 0), Some([4.0, 1.0, 1.0, 1.0]));
+        assert_eq!(kept.frame.pixel(0, 0), Some([4.0, 1.0, 1.0, 1.0]));
     }
 
     #[test]
@@ -1597,7 +1639,15 @@ mod tests {
         // HDR content, so the ordinary frame is written alone: no phantom
         // `.hdr` appears beside a screenshot that never held any highlight.
         let flat = HdrFrame::new(Size::new(2, 1), vec![[1.0, 1.0, 1.0, 1.0]; 2]).unwrap();
-        let (sdr, kept) = sdr_and_hdr(&EditPipeline::new(), plain_frame(), Some(flat)).unwrap();
+        let (sdr, kept) = sdr_and_hdr(
+            &EditPipeline::new(),
+            plain_frame(),
+            Some(HdrHalf {
+                frame: flat,
+                reference_nits: REFERENCE_WHITE_NITS,
+            }),
+        )
+        .unwrap();
         assert_eq!(sdr.pixel(Point::new(0, 0)), Some([0, 255, 0, 255]));
         assert!(kept.is_none());
     }

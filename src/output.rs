@@ -13,6 +13,17 @@ use crate::error::{Result, VshotError};
 use crate::geometry::Point;
 use crate::model::{Frame, HdrFrame, PngCompression};
 
+/// One capture's HDR half, with the light its `1.0` stands for: the output's own
+/// SDR white.  Kept together because both consumers need both — the `.hdr` file
+/// takes the frame alone, while a pinned surface takes it re-encoded at that
+/// white, which is what turns the frame back into the absolute codes the panel
+/// shows.
+#[derive(Clone, Debug)]
+pub struct HdrHalf {
+    pub frame: HdrFrame,
+    pub reference_nits: f32,
+}
+
 /// Writes a captured frame to `destination`. `density` is the frame's device
 /// pixels per logical pixel (the scale of the output it came from); every PNG
 /// written to a file, stdout or the clipboard carries it as its physical
@@ -27,12 +38,12 @@ use crate::model::{Frame, HdrFrame, PngCompression};
 /// the same path with its extension replaced by `.hdr` (Radiance RGBE), so
 /// `shot.png` and `shot.hdr` name the same capture — the first is the
 /// accurately tone-mapped SDR view, the second the HDR content itself.  Only a
-/// file destination can carry the pair — stdout, the clipboard and the pin
-/// daemon all take one image — so the HDR half is written for a file and the
-/// SDR half alone goes anywhere else.
+/// file destination names that second path: stdout and the clipboard carry one
+/// image, and the pin daemon carries the HDR half out of band, as the PQ codes
+/// a surface of its own reads (see the `Pin` arm below).
 pub fn write_frame_with_hdr(
     frame: &Frame,
-    hdr: Option<&HdrFrame>,
+    hdr: Option<&HdrHalf>,
     destination: &Destination,
     density: u32,
     compression: PngCompression,
@@ -59,7 +70,21 @@ pub fn write_frame_with_hdr(
         // The daemon is told the density outright, so the bytes it loads need
         // no declaration of their own, and they only have to survive the trip
         // through the temp file: the default (fastest useful) level is right.
-        Destination::Pin => crate::pin::pin_png(&frame.to_png()?, density, pin_origin),
+        //
+        // An HDR pinch travels in two files: the tone-mapped PNG, which the
+        // daemon loads as it always did -- for the pin's size, its fallback and
+        // whatever edits it holds -- and the PQ codes, which the daemon hands
+        // to a surface of its own so the image reaches the panel as the light
+        // it stands for rather than as the tone map of it.
+        Destination::Pin => {
+            let pq = hdr.map(|half| crate::pin::PqPin {
+                words: half.frame.to_rgb10_pq(half.reference_nits),
+                width: half.frame.size().width,
+                height: half.frame.size().height,
+                reference_nits: half.reference_nits,
+            });
+            crate::pin::pin_png(&frame.to_png()?, density, pin_origin, pq.as_ref())
+        }
     }
 }
 
@@ -68,7 +93,7 @@ pub fn write_frame_with_hdr(
 fn write_capture_files(
     path: &Path,
     frame: &Frame,
-    hdr: Option<&HdrFrame>,
+    hdr: Option<&HdrHalf>,
     density: u32,
     compression: PngCompression,
 ) -> Result<()> {
@@ -83,7 +108,7 @@ fn write_capture_files(
     };
     write_file(&png_path, &frame.encode_png(Some(density), compression)?)?;
     if let Some(hdr) = hdr {
-        write_file(&hdr_path, &hdr.encode_radiance())?;
+        write_file(&hdr_path, &hdr.frame.encode_radiance())?;
     }
     Ok(())
 }
@@ -249,7 +274,10 @@ mod tests {
     #[test]
     fn an_hdr_capture_writes_both_files_with_the_same_stem() {
         let frame = Frame::solid(Size::new(2, 2), [10, 20, 30, 255]).unwrap();
-        let hdr = HdrFrame::new(Size::new(2, 2), vec![[4.0, 2.0, 1.0, 1.0]; 4]).unwrap();
+        let hdr = HdrHalf {
+            frame: HdrFrame::new(Size::new(2, 2), vec![[4.0, 2.0, 1.0, 1.0]; 4]).unwrap(),
+            reference_nits: 203.0,
+        };
         let mut path = std::env::temp_dir();
         path.push(format!(
             "vshot-hdr-output-test-{}-{}.png",
@@ -278,7 +306,10 @@ mod tests {
         // A destination that already ends in `.hdr` names the HDR half; the PNG
         // goes beside it rather than to the same path, so neither file is lost.
         let frame = Frame::solid(Size::new(2, 2), [10, 20, 30, 255]).unwrap();
-        let hdr = HdrFrame::new(Size::new(2, 2), vec![[4.0, 2.0, 1.0, 1.0]; 4]).unwrap();
+        let hdr = HdrHalf {
+            frame: HdrFrame::new(Size::new(2, 2), vec![[4.0, 2.0, 1.0, 1.0]; 4]).unwrap(),
+            reference_nits: 203.0,
+        };
         let mut path = std::env::temp_dir();
         path.push(format!(
             "vshot-hdr-destination-test-{}-{}.hdr",

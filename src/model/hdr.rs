@@ -197,6 +197,15 @@ fn pq_eotf(code: f32) -> f32 {
 
 /// The PQ inverse EOTF (OETF): linear luminance normalised to 10 000 cd/m²
 /// back to a 0..1 code.
+///
+/// Kept next to [`pq_eotf`] because they are two halves of one curve, and
+/// `pub(crate)` because the pin surface encodes a rim colour with it: a colour
+/// from the config is sRGB, and the PQ code of its own light is what a surface
+/// described as this output wants.
+pub(crate) fn pq_encode(luminance: f32) -> f32 {
+    pq_oetf(luminance)
+}
+
 fn pq_oetf(luminance: f32) -> f32 {
     const M1: f32 = 2610.0 / 16384.0;
     const M2: f32 = 2523.0 / 4096.0 * 128.0;

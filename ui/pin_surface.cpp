@@ -100,6 +100,24 @@ QRect expandOutline(const QRect &rect, int bleed)
 // from is shared with the file dialog's frame, which casts one too.
 
 
+// The label both the transient badge and the HDR marker wear: a short tag in a
+// translucent box, large enough to read over any image and no larger.  The font
+// is a constant rather than the pin's: a tag says what the pin *is*, and it has
+// to stay legible on a pin zoomed down to a thumbnail.
+constexpr int kLabelPixelSize = 16;
+constexpr qreal kLabelRadius = 6.0;
+const QColor kLabelBox(0, 0, 0, 160);
+
+// The HDR tag's two inks.  A pinned HDR capture and the SDR half the daemon
+// keeps beside it are the same picture to the eye -- what differs is light no
+// photograph of a screen reproduces -- so the tag is the only thing that says
+// which of the two this output is showing: white while the pixels are the
+// helper's HDR ones, muted grey while this surface is showing the SDR copy
+// itself.  Either way the pin *is* an HDR capture, which is why the tag is up
+// at all.
+const QColor kHdrTagShown(255, 255, 255);
+const QColor kHdrTagFallback(192, 192, 192);
+
 /// The corner radius a pin can actually carry: never past half the shorter side
 /// of the painted image, where a corner would stop being a corner and start
 /// being a lozenge.  The same rule the dialog's rim follows, against the
@@ -109,6 +127,15 @@ int paintRadius(std::uint32_t radius, const QSize &size)
 {
     const int most = std::max(0, std::min(size.width(), size.height()) / 2);
     return std::min(static_cast<int>(radius), most);
+}
+
+// The box a label needs: the text's own bounds grown by the same padding on
+// every side, so every tag of the same font comes out the same height whatever
+// it says.
+QRect labelBox(const QFontMetrics &metrics, const QString &text)
+{
+    const int pad = metrics.height() / 3;
+    return metrics.boundingRect(text).adjusted(-pad, -pad / 2, pad, pad / 2);
 }
 
 // Wayland has no "no input here" request: an unset input region means the
@@ -220,6 +247,20 @@ QRect PinSurface::localRect(const Item &item) const
     return QRect(item.origin - origin, paintedSize(item.image, item.scale));
 }
 
+void PinSurface::setHdrPixels(bool on)
+{
+    if (hdrPixels_ == on) {
+        return;
+    }
+    hdrPixels_ = on;
+    // Every item marked `hdr` is painted by the other side when this turns on,
+    // and by this surface when it turns off, so the whole output has to be
+    // repainted either way.
+    if (surfaceReady_) {
+        update();
+    }
+}
+
 const PinSurface::Entry *PinSurface::entryFor(quint64 id) const
 {
     for (const Entry &entry : entries_) {
@@ -268,9 +309,12 @@ void PinSurface::setPins(const QVector<Item> &pins)
                 dirty |= dirtyRect(was);
             }
             // The pixels can be replaced without the rect moving at all (pin
-            // edit writes an annotated image back in place), so the rect alone
-            // does not say whether there is anything to repaint.
-            if (before.item.image.cacheKey() != item.image.cacheKey() || was != after) {
+            // edit writes an annotated image back in place), and a pin can also
+            // change hands between this surface and the HDR helper without
+            // moving or changing its pixels, so the rect alone does not say
+            // whether there is anything to repaint.
+            if (before.item.image.cacheKey() != item.image.cacheKey()
+                || before.item.hdr != item.hdr || was != after) {
                 dirty |= dirtyRect(after);
             }
         } else {
@@ -300,6 +344,9 @@ void PinSurface::setPins(const QVector<Item> &pins)
     // A pin that is gone can be neither picked, dragged nor announced.
     if (!ids.contains(pickedId_)) {
         pickedId_ = 0;
+    }
+    if (!ids.contains(hoverId_)) {
+        hoverId_ = 0;
     }
     if (!ids.contains(draggingId_)) {
         draggingId_ = 0;
@@ -468,6 +515,7 @@ void PinSurface::movePickTo(quint64 id)
     }
     const QRect was = pickedOutline();
     pickedId_ = id;
+    reportActive();
     const QRect now = pickedOutline();
     if (focusTrace()) {
         traceFocus(QStringLiteral("picked %1 (pointer)").arg(id));
@@ -478,6 +526,92 @@ void PinSurface::movePickTo(quint64 id)
     if (!now.isNull() && now != was) {
         update(now);
     }
+}
+
+// Tells the daemon which pin's rim is the live one.  The black edge is a pin
+// this surface holds the keyboard for and the pointer is over; the HDR half of
+// that pin is drawn by another process, so the answer has to travel.
+void PinSurface::reportActive()
+{
+    const quint64 active = hasFocus_ ? pickedId_ : 0;
+    if (active == activeId_) {
+        return;
+    }
+    activeId_ = active;
+    if (activeReported_) {
+        activeReported_(active);
+    }
+}
+
+void PinSurface::trackHover(const QPoint &local)
+{
+    // Only an HDR pin carries the marker: over any other pin the pointer is
+    // simply over a pin, and the surface has nothing to say about it.
+    const quint64 under = pinAt(local);
+    const Entry *entry = entryFor(under);
+    moveHoverTo(entry != nullptr && entry->item.hdr ? under : 0);
+}
+
+void PinSurface::moveHoverTo(quint64 id)
+{
+    if (id == hoverId_) {
+        return;
+    }
+    const QRect was = hoverMarker_;
+    hoverId_ = id;
+    // Arriving repaints the pin the tag lands on, which is what puts it up --
+    // it is anchored to that pin's own corner, so its box is not known until it
+    // is painted.  Leaving repaints the box it was last painted in, because the
+    // pin it was on may be gone by now.
+    if (!was.isNull()) {
+        update(was.adjusted(-1, -1, 1, 1));
+    }
+    if (const Entry *entry = entryFor(id)) {
+        update(localRect(entry->item));
+    }
+}
+
+void PinSurface::paintHdrMarker(QPainter &painter, const QRect &target, bool shownAsHdr)
+{
+    QFont font = painter.font();
+    font.setPixelSize(kLabelPixelSize);
+    font.setBold(true);
+    const QFontMetrics metrics(font);
+    const QString text = QStringLiteral("HDR");
+    const int pad = metrics.height() / 3;
+    QRect box = labelBox(metrics, text);
+    // Anchored inside the part of the pin this output actually shows: a pin
+    // hanging off the edge of the screen keeps its tag in the frame instead of
+    // pushing it out with the corner it is anchored to.
+    const QRect visible = target.intersected(rect());
+    if (visible.isEmpty()) {
+        return;
+    }
+    box.moveTopLeft(visible.topLeft() + QPoint(pad, pad));
+    box = box.intersected(rect().adjusted(0, 0, -1, -1));
+    if (box.width() <= 0 || box.height() <= 0) {
+        return;
+    }
+    const QColor ink = shownAsHdr ? kHdrTagShown : kHdrTagFallback;
+    painter.save();
+    painter.setFont(font);
+    // Smoothing on, unlike the rim: the tag is the one thing here with corners
+    // of its own, and a rounded box drawn without it reads as a staircase.
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(kLabelBox);
+    painter.drawRoundedRect(box, kLabelRadius, kLabelRadius);
+    // The stroke is what makes it a label rather than a smudge on a dark image:
+    // the box alone is only a translucency, and a translucent tag over a dark
+    // picture reads as part of the picture.
+    painter.setBrush(Qt::NoBrush);
+    painter.setPen(QPen(ink, 1));
+    painter.drawRoundedRect(QRectF(box).adjusted(0.5, 0.5, -0.5, -0.5), kLabelRadius,
+                            kLabelRadius);
+    painter.setPen(ink);
+    painter.drawText(box, Qt::AlignCenter, text);
+    painter.restore();
+    hoverMarker_ = box;
 }
 
 void PinSurface::offerKeyboardBack()
@@ -525,7 +659,9 @@ void PinSurface::enterEvent(QEnterEvent *event)
     // A menu and a drag own the surface while they are open: the pointer moving
     // inside them must not change what they act on.
     if (menuId_ == 0 && draggingId_ == 0) {
-        movePickTo(pinAt(event->position().toPoint()));
+        const QPoint local = event->position().toPoint();
+        movePickTo(pinAt(local));
+        trackHover(local);
     }
     QWidget::enterEvent(event);
 }
@@ -537,12 +673,15 @@ void PinSurface::leaveEvent(QEvent *event)
     }
     if (menuId_ == 0 && draggingId_ == 0) {
         // The pointer left every pin on this output, so no pin is the one a key
-        // press would act on any more. Riding on the pointer rather than on the
-        // keyboard is deliberate: a compositor is not obliged to tell a layer
-        // surface that it has stopped being focused, and the ones in the field
-        // that stay quiet left the edge black long after the user had clicked a
-        // window -- while the pointer had already gone. This one always comes.
+        // press would act on any more -- and the HDR marker, which is about the
+        // pin under the pointer, has nothing left to be about.  Riding on the
+        // pointer rather than on the keyboard is deliberate: a compositor is
+        // not obliged to tell a layer surface that it has stopped being
+        // focused, and the ones in the field that stay quiet left the edge
+        // black long after the user had clicked a window -- while the pointer
+        // had already gone. This one always comes.
         movePickTo(0);
+        moveHoverTo(0);
         // The same signal is also the only reliable moment to hand the
         // keyboard back. Waiting for the compositor to move it on the click
         // into a window does not work: the click focuses the window's own
@@ -612,6 +751,17 @@ void PinSurface::paintEvent(QPaintEvent *event)
         // The corners, clamped to what this pin's size can carry: a radius past
         // half the shorter side turns the image into a lozenge.
         const int radius = paintRadius(style_.radius, target.size());
+        // An HDR pin's picture, its shadow and its rim are all drawn by the
+        // surface helper, on a surface of its own below this one: only a surface
+        // carrying the output's *own* colour description is passed through
+        // untouched, and that is a surface this Qt window can never be.  The
+        // three have to travel together — one surface, one commit — or the
+        // picture would trail its own edge the moment the pin was dragged.  What
+        // is left here is the chrome: the badges, the menus and the `HDR` tag.
+        const bool hdr = entry.item.hdr && hdrPixels_;
+        if (hdr) {
+            continue;
+        }
         // The shadow goes down first and only under this pin -- the pins behind
         // it have already been painted, and a shadow drawn over them would read
         // as a smudge rather than as depth.  A shadow of no size, or one turned
@@ -667,8 +817,16 @@ void PinSurface::paintEvent(QPaintEvent *event)
         }
         painter.restore();
     }
-    // Above every pin: the menu belongs to one of them but must never end up
-    // under another.
+    // Above every pin, because each of these belongs to one pin but must never
+    // end up under another.  For the marker that is the whole reason it is not
+    // painted with the pin it belongs to: the pin under the pointer can have a
+    // pin in front of it covering the corner the tag is anchored to.
+    hoverMarker_ = QRect();
+    if (hoverId_ != 0) {
+        if (const Entry *entry = entryFor(hoverId_)) {
+            paintHdrMarker(painter, localRect(entry->item), entry->item.hdr && hdrPixels_);
+        }
+    }
     if (menuId_ != 0) {
         paintMenu(painter);
     }
@@ -684,14 +842,13 @@ void PinSurface::paintEvent(QPaintEvent *event)
     // on this output. The font size is fixed: the badge reports what just
     // happened to the pin, it must not grow with the image itself.
     QFont font = painter.font();
-    font.setPixelSize(16);
+    font.setPixelSize(kLabelPixelSize);
     font.setBold(true);
     painter.setFont(font);
     const QFontMetrics metrics(font);
     const QString text = badgeText_;
-    const QRect textRect = metrics.boundingRect(text);
     const int pad = metrics.height() / 3;
-    QRect badgeBox = textRect.adjusted(-pad, -pad / 2, pad, pad / 2);
+    QRect badgeBox = labelBox(metrics, text);
     const QRect corner = localRect(badge->item).intersected(rect());
     badgeBox.moveBottomRight(corner.bottomRight() - QPoint(pad, pad));
     // A pin may hang partially off-screen; keep the badge readable.
@@ -700,8 +857,8 @@ void PinSurface::paintEvent(QPaintEvent *event)
         return;
     }
     painter.setPen(Qt::NoPen);
-    painter.setBrush(QColor(0, 0, 0, 160));
-    painter.drawRoundedRect(badgeBox, 6, 6);
+    painter.setBrush(kLabelBox);
+    painter.drawRoundedRect(badgeBox, kLabelRadius, kLabelRadius);
     painter.setPen(Qt::white);
     painter.drawText(badgeBox, Qt::AlignCenter, text);
     badgeRect_ = badgeBox;
@@ -1101,6 +1258,10 @@ void PinSurface::mouseMoveEvent(QMouseEvent *event)
         event->accept();
         return;
     }
+    // The pointer inside the surface and over a pin: this is the only place the
+    // marker can follow it from one pin to the next, because the input region
+    // is the whole stack and crossing it produces no enter or leave.
+    trackHover(event->position().toPoint());
     QWidget::mouseMoveEvent(event);
 }
 
@@ -1198,6 +1359,7 @@ void PinSurface::keyPressEvent(QKeyEvent *event)
 void PinSurface::focusInEvent(QFocusEvent *event)
 {
     hasFocus_ = true;
+    reportActive();
     if (focusTrace()) {
         traceFocus(QStringLiteral("keyboard in"));
     }
@@ -1213,6 +1375,7 @@ void PinSurface::focusInEvent(QFocusEvent *event)
 void PinSurface::focusOutEvent(QFocusEvent *event)
 {
     hasFocus_ = false;
+    reportActive();
     if (focusTrace()) {
         traceFocus(QStringLiteral("keyboard out"));
     }

@@ -6,12 +6,13 @@ pub mod input;
 pub mod topology;
 
 use std::collections::{HashMap, HashSet};
+use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm,
-    wl_shm_pool, wl_surface,
+    wl_buffer, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region, wl_registry, wl_seat,
+    wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
 use wayland_protocols::wp::color_management::v1::client::{
@@ -21,6 +22,7 @@ use wayland_protocols::wp::color_management::v1::client::{
 use wayland_protocols::wp::cursor_shape::v1::client::{
     wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
 };
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
 use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
@@ -30,7 +32,7 @@ use crate::model::{HdrFrame, SceneSnapshot};
 
 use self::freeze_overlay::{
     release_buffer_if_current, BufferToken, BufferUserData, LayerSurfaceUserData, OverlayColor,
-    OverlaySurface, PoolUserData, ShmSlot, SurfaceUserData,
+    OverlaySurface, PinSlot, PoolUserData, ShmSlot, SurfaceUserData,
 };
 use self::input::{
     global_point, EditorState, ResizeHandle, SelectionEvent, SelectionResult, SelectionTracker,
@@ -67,6 +69,29 @@ struct HdrBackdrop {
     words: Arc<Vec<u32>>,
 }
 
+/// One output's picture buffer, as the helper allocated and drew it: the
+/// descriptor facts a `wl_buffer` needs, and the size the compositor should read
+/// from it.  The descriptor stays the helper's; this side only borrows it for
+/// the length of the `add` request.
+#[derive(Clone, Copy, Debug)]
+pub struct PinBufferSpec {
+    pub fd: std::os::fd::RawFd,
+    pub offset: u32,
+    pub stride: u32,
+    pub modifier: u64,
+    pub format: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// One output's own image description, asked for and ready, waiting for the
+/// commit that puts it on a surface.
+#[derive(Debug)]
+struct PendingColor {
+    output: wp_color_management_output_v1::WpColorManagementOutputV1,
+    description: wp_image_description_v1::WpImageDescriptionV1,
+}
+
 #[derive(Debug, Default)]
 struct WaylandState {
     topology: TopologyState,
@@ -77,10 +102,18 @@ struct WaylandState {
     /// on the top layer, below the Qt helper's overlay layer, hands the pointer
     /// nothing, and carries the output's own colour description.
     hdr_backdrop: HashMap<u32, HdrBackdrop>,
+    /// Output ids whose overlays are the pin daemon's HDR image surfaces rather
+    /// than a frozen frame.  They carry no scene: every buffer starts as
+    /// transparent ten-bit words, and [`WaylandSession::show_pin_image`] puts an
+    /// image into one of them later.
+    pin_surfaces: HashSet<u32>,
     /// Output ids whose image description came back `ready`, and those whose
     /// query failed, between `get_image_description` and the flood of events.
     cm_ready: HashSet<u32>,
     cm_failed: HashSet<u32>,
+    /// Descriptions that came back ready and are waiting for
+    /// [`WaylandSession::apply_surface_color`] to commit them.
+    pending_color: HashMap<u32, PendingColor>,
     ready_outputs: HashSet<u32>,
     pointer_output: Option<u32>,
     pointer_grab_output: Option<u32>,
@@ -171,7 +204,11 @@ impl WaylandState {
         self.keyboard_focus_output = None;
         self.overlays.clear();
         self.hdr_backdrop.clear();
+        self.pin_surfaces.clear();
         self.ready_outputs.clear();
+        self.cm_ready.clear();
+        self.cm_failed.clear();
+        self.pending_color.clear();
     }
 
     fn origins(&self) -> HashMap<u32, Point> {
@@ -325,6 +362,12 @@ impl WaylandState {
                             redraw = overlay.pending_parent_redraw;
                         }
                     }
+                }
+                // A picture buffer coming back is what lets the helper's next
+                // compose go out; nothing is queued here, because the helper
+                // offers its waiting picture again on the very next wake-up.
+                BufferToken::Pin(_) => {
+                    overlay.release_pin_slot(data.token);
                 }
             }
         }
@@ -488,6 +531,7 @@ impl WaylandSession {
                     width: info.geometry.size.width,
                     height: info.geometry.size.height,
                     slots: Vec::new(),
+                    pin_slots: Vec::new(),
                     pending_parent_redraw: false,
                     color: None,
                 },
@@ -640,6 +684,7 @@ impl WaylandSession {
                     width: info.geometry.size.width,
                     height: info.geometry.size.height,
                     slots: Vec::new(),
+                    pin_slots: Vec::new(),
                     pending_parent_redraw: false,
                     color: None,
                 },
@@ -675,14 +720,43 @@ impl WaylandSession {
     /// the answer: its surface reads as sRGB, which would show a PQ buffer far
     /// darker than the screen, so the caller paints the SDR frame there instead.
     fn attach_backdrop_color(&mut self) -> Result<HashSet<u32>> {
-        let mut colored = HashSet::new();
-        let Some(manager) = self.state.topology.color_manager.clone() else {
-            return Ok(colored);
-        };
+        let ids = self
+            .state
+            .hdr_backdrop
+            .keys()
+            .copied()
+            .collect::<Vec<u32>>();
+        self.request_surface_color(&ids)?;
+        self.apply_surface_color()
+    }
+
+    /// Asks each of `ids`' outputs for the description it publishes, keeps the
+    /// ones that came back `ready`, and answers their ids.
+    ///
+    /// Nothing is set on a surface here: a description is applied on a commit,
+    /// and the commit that attaches a surface's first buffer is the one that
+    /// maps it — so the caller decides when the description goes on.  Splitting
+    /// the ask from the set is what lets a pin surface have its description in
+    /// place before its first picture is drawn.
+    fn request_surface_color(&mut self, ids: &[u32]) -> Result<HashSet<u32>> {
+        let mut ready = HashSet::new();
+        if self.state.topology.color_manager.is_none() {
+            return Ok(ready);
+        }
+        // The sets are per call: a stale entry from an earlier overlay would
+        // make the wait below return before this call's events had arrived.
+        self.state.cm_ready.clear();
+        self.state.cm_failed.clear();
+        self.state.pending_color.clear();
+        let manager = self
+            .state
+            .topology
+            .color_manager
+            .clone()
+            .expect("checked above");
         let qh = self.event_queue.handle();
         let mut pending = Vec::new();
-        let ids = self.state.hdr_backdrop.keys().copied().collect::<Vec<_>>();
-        for global_id in ids {
+        for global_id in ids.iter().copied() {
             let Some(output) = self.state.topology.output_proxies.get(&global_id).cloned() else {
                 continue;
             };
@@ -691,7 +765,7 @@ impl WaylandSession {
             pending.push((global_id, color_output, description));
         }
         if pending.is_empty() {
-            return Ok(colored);
+            return Ok(ready);
         }
         let expected = pending.len();
         self.dispatch_until(
@@ -710,19 +784,41 @@ impl WaylandSession {
                 }
                 continue;
             }
+            self.state.pending_color.insert(
+                global_id,
+                PendingColor {
+                    output: color_output,
+                    description,
+                },
+            );
+            ready.insert(global_id);
+        }
+        Ok(ready)
+    }
+
+    /// Sets the descriptions [`WaylandSession::request_surface_color`] kept on
+    /// their surfaces and commits, and answers the ids that got one.
+    fn apply_surface_color(&mut self) -> Result<HashSet<u32>> {
+        let mut colored = HashSet::new();
+        let Some(manager) = self.state.topology.color_manager.clone() else {
+            return Ok(colored);
+        };
+        let qh = self.event_queue.handle();
+        let pending = std::mem::take(&mut self.state.pending_color);
+        for (global_id, color) in pending {
             let Some(overlay) = self.state.overlays.get_mut(&global_id) else {
                 continue;
             };
             let color_surface = manager.get_surface(&overlay.surface, &qh, ());
             color_surface
-                .set_image_description(&description, wp_color_manager_v1::RenderIntent::Perceptual);
+                .set_image_description(&color.description, wp_color_manager_v1::RenderIntent::Perceptual);
             // The description is double-buffered, so the commit that already
             // attached the buffer has to be followed by another one for it to
             // take effect.
             overlay.surface.commit();
             overlay.color = Some(OverlayColor {
-                _output: color_output,
-                _description: description,
+                _output: color.output,
+                _description: color.description,
                 _surface: color_surface,
             });
             colored.insert(global_id);
@@ -735,6 +831,374 @@ impl WaylandSession {
             .flush()
             .map_err(|error| VshotError::WaylandProtocol(error.to_string()))?;
         Ok(colored)
+    }
+
+    /// Creates one layer surface per output for pinned HDR images: an empty
+    /// input region, and the output's own image description -- so the pixels
+    /// drawn into it are shown as the light they stand for, with no conversion
+    /// and no tone map in between.
+    ///
+    /// This is the backdrop without a frozen frame: nothing is captured, and the
+    /// surfaces carry no buffer at all until
+    /// [`WaylandSession::install_pin_buffers`] hands them the half-float dma-bufs
+    /// the caller draws into.  It answers the names of the outputs whose image
+    /// description came back `ready`; on any other output a half-float buffer
+    /// would be read as sRGB, so the caller keeps its SDR picture there and
+    /// installs no buffers.
+    ///
+    /// `layer` is the caller's to choose.  A pin belongs on `Overlay`, where the
+    /// Qt pin surfaces are, and the compositor stacks the surfaces of one layer
+    /// in the order they were mapped — so whoever maps these has to map them
+    /// *before* the chrome that draws the badges and the menus.
+    pub fn show_pin_surfaces(
+        &mut self,
+        layer: zwlr_layer_shell_v1::Layer,
+        namespace: &str,
+    ) -> Result<Vec<String>> {
+        let Some(compositor) = self.state.topology.compositor.clone() else {
+            return Err(VshotError::MissingCapability("wl_compositor".into()));
+        };
+        // No colour management means no output can be told what its pixels are,
+        // so a half-float buffer here would be read as sRGB and look far darker
+        // than the screen; there is nothing this helper could usefully show, and
+        // no surface worth mapping.  The caller keeps its SDR picture.
+        if self.state.topology.color_manager.is_none() {
+            return Ok(Vec::new());
+        }
+        // A pinned HDR image is a half-float dma-buf, and both halves of that
+        // have to be on offer: the protocol that names the buffer, and a layout
+        // for the format the compose side allocates.
+        if self.state.topology.dmabuf.is_none() {
+            return Err(VshotError::MissingCapability("zwp_linux_dmabuf_v1".into()));
+        }
+        if self
+            .state
+            .topology
+            .dmabuf_modifier_order(crate::pin_hdr_fp16::FORMAT_ABGR16161616F)
+            .is_none()
+        {
+            return Err(VshotError::MissingCapability(
+                "a dma-buf modifier for ABGR16161616F".into(),
+            ));
+        }
+        let Some(layer_shell) = self.state.topology.layer_shell.clone() else {
+            return Err(VshotError::MissingCapability("zwlr_layer_shell_v1".into()));
+        };
+        let infos = self.state.topology.output_infos()?;
+        if !self.state.overlays.is_empty() {
+            self.clear_overlays();
+        }
+        self.state.ready_outputs.clear();
+        // No scene here, and none wanted: these surfaces are told which output
+        // they are for, and their buffers arrive through `install_pin_buffers`.
+        self.state.pin_surfaces.clear();
+        let qh = self.event_queue.handle();
+        for info in &infos {
+            let output = self
+                .state
+                .topology
+                .output_proxies
+                .get(&info.global_id)
+                .cloned()
+                .ok_or(VshotError::TopologyChanged)?;
+            let surface = compositor.create_surface(
+                &qh,
+                SurfaceUserData {
+                    output_id: info.global_id,
+                },
+            );
+            surface.set_buffer_scale(i32::try_from(info.scale).map_err(|_| {
+                VshotError::UnsupportedOutput(format!("output {} scale is too large", info.name))
+            })?);
+            let layer_surface = layer_shell.get_layer_surface(
+                &surface,
+                Some(&output),
+                layer,
+                namespace.to_string(),
+                &qh,
+                LayerSurfaceUserData {
+                    output_id: info.global_id,
+                },
+            );
+            layer_surface.set_size(0, 0);
+            layer_surface.set_anchor(zwlr_layer_surface_v1::Anchor::all());
+            layer_surface.set_exclusive_zone(-1);
+            layer_surface
+                .set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
+            // A picture takes no input, and this one sits above every window:
+            // an empty input region is what keeps a click outside the pin
+            // going to what is under it instead of to us.
+            let region = compositor.create_region(&qh, ());
+            surface.set_input_region(Some(&region));
+            region.destroy();
+            // No buffer yet: the compositor answers the first commit with the
+            // configure that says how big the surface is, and a buffer before
+            // that is a protocol error.
+            surface.commit();
+
+            self.state.pin_surfaces.insert(info.global_id);
+            self.state.overlays.insert(
+                info.global_id,
+                OverlaySurface {
+                    output_id: info.global_id,
+                    surface,
+                    _layer_surface: layer_surface,
+                    configured: false,
+                    closed: false,
+                    width: info.geometry.size.width,
+                    height: info.geometry.size.height,
+                    slots: Vec::new(),
+                    pin_slots: Vec::new(),
+                    pending_parent_redraw: false,
+                    color: None,
+                },
+            );
+        }
+        self.dispatch_until(
+            Instant::now() + Duration::from_secs(10),
+            VshotError::OverlayTimeout,
+            |state| state.ready_outputs.len() == state.overlays.len(),
+        )?;
+        let ids = infos
+            .iter()
+            .map(|info| info.global_id)
+            .collect::<Vec<u32>>();
+        // The description is asked for and kept now, but *set* only after the
+        // caller has installed buffers: the compositor applies a surface's
+        // description on a commit, and the commit that attaches the first buffer
+        // is the one that maps the surface.
+        let colored = self.request_surface_color(&ids)?;
+        if let Some(error) = self.state.error.take() {
+            return Err(error);
+        }
+        if self.state.topology.topology_changed {
+            return Err(VshotError::TopologyChanged);
+        }
+        Ok(infos
+            .iter()
+            .filter(|info| colored.contains(&info.global_id))
+            .map(|info| info.name.clone())
+            .collect())
+    }
+
+    /// The layouts one format's picture buffer may be allocated in, most
+    /// preferred first, or `None` when the compositor will not take the format.
+    pub fn dmabuf_modifier_order(&self, fourcc: u32) -> Option<Vec<u64>> {
+        self.state.topology.dmabuf_modifier_order(fourcc)
+    }
+
+    /// Builds one `wl_buffer` per entry of `specs` on `name`'s pin surface, and
+    /// maps the surface with the first of them.
+    ///
+    /// The pixels are the caller's: it allocated the dma-bufs, and it has
+    /// already drawn into the first one, because the commit here is what puts
+    /// that buffer in front of the compositor.  Only the first buffer is
+    /// committed; the others are held until [`WaylandSession::present_pin_buffer`]
+    /// names them.
+    ///
+    /// `create_immed` can fail on the compositor's side without saying so, so
+    /// this waits for the round trip that would carry the `failed` event and
+    /// reports the refusal rather than leaving an unusable buffer behind.
+    pub fn install_pin_buffers(&mut self, name: &str, specs: &[PinBufferSpec]) -> Result<()> {
+        let Some(global_id) = self.output_id_of(name) else {
+            return Err(VshotError::TopologyChanged);
+        };
+        let Some(dmabuf) = self.state.topology.dmabuf.clone() else {
+            return Err(VshotError::MissingCapability("zwp_linux_dmabuf_v1".into()));
+        };
+        let qh = self.event_queue.handle();
+        let mut slots = Vec::with_capacity(specs.len());
+        for (index, spec) in specs.iter().enumerate() {
+            let params = dmabuf.create_params(&qh, ());
+            let borrowed = unsafe { BorrowedFd::borrow_raw(spec.fd) };
+            params.add(
+                borrowed,
+                0,
+                spec.offset,
+                spec.stride,
+                (spec.modifier >> 32) as u32,
+                (spec.modifier & 0xffff_ffff) as u32,
+            );
+            let buffer = params.create_immed(
+                i32::try_from(spec.width).unwrap_or(0),
+                i32::try_from(spec.height).unwrap_or(0),
+                spec.format,
+                zwp_linux_buffer_params_v1::Flags::empty(),
+                &qh,
+                BufferUserData {
+                    output_id: global_id,
+                    token: BufferToken::Pin(index as u64),
+                },
+            );
+            params.destroy();
+            slots.push(PinSlot {
+                buffer,
+                token: BufferToken::Pin(index as u64),
+                available: true,
+            });
+        }
+        self.event_queue
+            .flush()
+            .map_err(|error| VshotError::WaylandProtocol(error.to_string()))?;
+        self.event_queue
+            .roundtrip(&mut self.state)
+            .map_err(|error| VshotError::WaylandProtocol(error.to_string()))?;
+        if let Some(error) = self.state.error.take() {
+            return Err(error);
+        }
+        let Some(overlay) = self.state.overlays.get_mut(&global_id) else {
+            return Err(VshotError::TopologyChanged);
+        };
+        overlay.pin_slots = slots;
+        // The first buffer is committed now: it is what maps the surface, and the
+        // caller has already drawn into it.  Its whole extent is damaged because
+        // the compositor has never seen this surface before.
+        let (width, height) = specs
+            .first()
+            .map(|spec| (spec.width.max(1), spec.height.max(1)))
+            .unwrap_or((1, 1));
+        if !overlay.present_pin_slot(0, Rect::new(0, 0, width, height)) {
+            return Err(VshotError::PinSurface(
+                "the pin surface would not take its first buffer".into(),
+            ));
+        }
+        self.event_queue
+            .flush()
+            .map_err(|error| VshotError::WaylandProtocol(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Gives the pin surfaces their output's own colour description, now that
+    /// they have buffers.  Answers the names that were given one.
+    pub fn apply_pin_color(&mut self) -> Result<Vec<String>> {
+        let colored = self.apply_surface_color()?;
+        Ok(self
+            .state
+            .pin_surfaces
+            .iter()
+            .filter(|id| colored.contains(id))
+            .filter_map(|id| self.state.topology.outputs.get(id)?.name.clone())
+            .collect())
+    }
+
+    /// Commits one picture buffer of `name`'s pin surface having changed only
+    /// `damage` of it, in device pixels.  `false` means that slot was still with
+    /// the compositor; the caller keeps what it wanted to show and offers it
+    /// again after the next pump.
+    pub fn present_pin_buffer(&mut self, name: &str, slot: usize, damage: Rect) -> Result<bool> {
+        let Some(global_id) = self.output_id_of(name) else {
+            return Ok(false);
+        };
+        let Some(overlay) = self.state.overlays.get_mut(&global_id) else {
+            return Ok(false);
+        };
+        if !overlay.present_pin_slot(slot, damage) {
+            return Ok(false);
+        }
+        self.event_queue
+            .flush()
+            .map_err(|error| VshotError::WaylandProtocol(error.to_string()))?;
+        Ok(true)
+    }
+
+    /// Whether one of `name`'s picture buffers is free to be drawn into again.
+    pub fn pin_slot_available(&self, name: &str, slot: usize) -> bool {
+        let Some(global_id) = self.output_id_of(name) else {
+            return false;
+        };
+        self.state
+            .overlays
+            .get(&global_id)
+            .and_then(|overlay| overlay.pin_slots.get(slot))
+            .is_some_and(|pin| pin.available)
+    }
+
+    /// The global id of the output called `name`.
+    fn output_id_of(&self, name: &str) -> Option<u32> {
+        self.state
+            .topology
+            .outputs
+            .iter()
+            .find(|(_, data)| data.name.as_deref() == Some(name))
+            .map(|(global_id, _)| *global_id)
+    }
+
+    /// Pumps the connection for up to `timeout`: buffer releases, configure
+    /// events, anything the compositor has to say.  A timeout is not an error.
+    pub fn pump(&mut self, timeout: Duration) -> Result<()> {
+        self.pump_watching(None, Some(timeout))
+    }
+
+    /// Pumps the connection until it or `extra` has something to say.
+    ///
+    /// A client that waits on its own socket as well as the compositor — the
+    /// pin helper, whose next command and whose next buffer release are two
+    /// different descriptors — otherwise has to wake on a timer and poll one of
+    /// the two, which is a delay on every update and a spin on top.  Waiting on
+    /// both at once costs nothing and wakes the moment either happens.
+    ///
+    /// `None` for `timeout` waits as long as it takes.
+    pub fn pump_watching(
+        &mut self,
+        extra: Option<BorrowedFd<'_>>,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
+        self.event_queue
+            .dispatch_pending(&mut self.state)
+            .map_err(|error| VshotError::WaylandProtocol(error.to_string()))?;
+        if self.state.take_interaction_redraw() {
+            // Nothing here draws an editor, but the state machine may still ask.
+        }
+        if let Some(error) = self.state.error.take() {
+            return Err(error);
+        }
+        if timeout.is_some_and(|timeout| timeout.is_zero()) {
+            return Ok(());
+        }
+        let Some(read_guard) = self.event_queue.prepare_read() else {
+            return Ok(());
+        };
+        let fd = read_guard.connection_fd();
+        let mut poll_fds = Vec::with_capacity(2);
+        poll_fds.push(rustix::event::PollFd::new(
+            &fd,
+            rustix::event::PollFlags::IN | rustix::event::PollFlags::ERR,
+        ));
+        if let Some(extra) = &extra {
+            poll_fds.push(rustix::event::PollFd::new(
+                extra,
+                rustix::event::PollFlags::IN
+                    | rustix::event::PollFlags::ERR
+                    | rustix::event::PollFlags::HUP,
+            ));
+        }
+        let timeout_spec = match timeout {
+            Some(timeout) => Some(rustix::event::Timespec::try_from(timeout).map_err(|_| {
+                VshotError::WaylandProtocol("Wayland timeout is out of range".into())
+            })?),
+            None => None,
+        };
+        let ready = rustix::event::poll(&mut poll_fds, timeout_spec.as_ref()).map_err(|error| {
+            VshotError::WaylandProtocol(format!("failed to poll Wayland connection: {error}"))
+        })?;
+        let connection_ready = ready > 0
+            && poll_fds[0]
+                .revents()
+                .intersects(rustix::event::PollFlags::IN | rustix::event::PollFlags::ERR);
+        if !connection_ready {
+            drop(read_guard);
+            return Ok(());
+        }
+        read_guard
+            .read()
+            .map_err(|error| VshotError::WaylandProtocol(error.to_string()))?;
+        self.event_queue
+            .dispatch_pending(&mut self.state)
+            .map_err(|error| VshotError::WaylandProtocol(error.to_string()))?;
+        if let Some(error) = self.state.error.take() {
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// The output the pointer is on: the one thing here that needs a pointer,
@@ -969,6 +1433,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                     state.topology.color_manager =
                         Some(registry.bind(name, version.min(1), qh, ()));
                 }
+                "zwp_linux_dmabuf_v1" if state.topology.dmabuf.is_none() => {
+                    // Version 3 is where `modifier` arrives, and it is the last
+                    // version that advertises the formats as a flat table this
+                    // client does not have to chase through `feedback` objects.
+                    state.topology.dmabuf = Some(registry.bind(name, version.min(3), qh, ()));
+                }
                 "zxdg_output_manager_v1" if state.topology.xdg_output_manager.is_none() => {
                     state.topology.xdg_output_manager =
                         Some(registry.bind(name, version.min(3), qh, ()));
@@ -996,6 +1466,58 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                 _ => {}
             },
             wl_registry::Event::GlobalRemove { .. } => state.topology.topology_changed = true,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, ()> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+        event: zwp_linux_buffer_params_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // `create_immed` answers nothing, so a refused buffer is only ever
+        // reported here.  It is recorded as the session's error and named by
+        // whichever call was waiting for the round trip.
+        if let zwp_linux_buffer_params_v1::Event::Failed = event {
+            state.fail(VshotError::PinSurface(
+                "the compositor refused a pinned picture buffer".into(),
+            ));
+        }
+    }
+}
+
+impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+        event: zwp_linux_dmabuf_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // The flat format/modifier table: what a picture buffer may be made of.
+        // A format with no modifier event yet is still worth keeping, because a
+        // compositor that supports version 1 or 2 offers implicit modifiers only.
+        match event {
+            zwp_linux_dmabuf_v1::Event::Format { format } => {
+                state.topology.dmabuf_formats.entry(format).or_default();
+            }
+            zwp_linux_dmabuf_v1::Event::Modifier {
+                format,
+                modifier_hi,
+                modifier_lo,
+            } => {
+                let modifier = (u64::from(modifier_hi) << 32) | u64::from(modifier_lo);
+                let list = state.topology.dmabuf_formats.entry(format).or_default();
+                if !list.contains(&modifier) {
+                    list.push(modifier);
+                }
+            }
             _ => {}
         }
     }
@@ -1458,6 +1980,20 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
     }
 }
 
+impl Dispatch<wl_region::WlRegion, ()> for WaylandState {
+    fn event(
+        _: &mut Self,
+        _: &wl_region::WlRegion,
+        _: wl_region::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // A region has no events; this exists so an empty input region can be
+        // made for a surface that must take no input.
+    }
+}
+
 impl Dispatch<wl_surface::WlSurface, SurfaceUserData> for WaylandState {
     fn event(
         _: &mut Self,
@@ -1486,6 +2022,23 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, LayerSurfaceUserData> f
                 height,
             } => {
                 layer_surface.ack_configure(serial);
+                // A pinned-image surface carries no scene, and no buffer here:
+                // the half-float dma-bufs it draws into arrive through
+                // `install_pin_buffers`, and the caller allocates them on a
+                // render node this side has nothing to do with.  The configure
+                // only says the surface is ready for one.
+                if state.pin_surfaces.contains(&data.output_id) {
+                    let Some(overlay) = state.overlays.get_mut(&data.output_id) else {
+                        state.fail(VshotError::TopologyChanged);
+                        return;
+                    };
+                    overlay.configured = true;
+                    overlay.width = width;
+                    overlay.height = height;
+                    overlay.pending_parent_redraw = false;
+                    state.ready_outputs.insert(data.output_id);
+                    return;
+                }
                 let Some(scene) = state.scene.clone() else {
                     state.fail(VshotError::WaylandProtocol(
                         "layer surface configured before scene installation".into(),
