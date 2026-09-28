@@ -75,16 +75,19 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("Copied"), QString::fromUtf8("已复制")},
         {QStringLiteral("Copy failed"), QString::fromUtf8("复制失败")},
         {QStringLiteral("Save as…"), QString::fromUtf8("另存为…")},
+        {QStringLiteral("Recognize text…"), QString::fromUtf8("取字…")},
         {QStringLiteral("Save pinned image"), QString::fromUtf8("保存浮层图片")},
         {QStringLiteral("PNG image (*.png)"), QString::fromUtf8("PNG 图片 (*.png)")},
         {QStringLiteral("Saved %1"), QString::fromUtf8("已保存 %1")},
         {QStringLiteral("Could not save the image"), QString::fromUtf8("图片保存失败")},
 
-        // Pasting an image into the annotation editor.
+        // Pasting an image into the annotation editor, and reading the text
+        // off a capture.
         {QStringLiteral("Image"), QString::fromUtf8("图片")},
         {QStringLiteral("Text+"), QString::fromUtf8("取字")},
-        {QStringLiteral("Copy the text in the selection to the clipboard"),
-         QString::fromUtf8("把选区里的文字复制到剪贴板")},
+        {QStringLiteral("Select the text in the selection and copy what you select"),
+         QString::fromUtf8("选中选区里的文字，复制选中的部分")},
+        {QStringLiteral("No text is selected."), QString::fromUtf8("没有选中文字。")},
         {QStringLiteral("Failed"), QString::fromUtf8("失败")},
         {QStringLiteral("Reading text needs a selection to read from."),
          QString::fromUtf8("要先有选区才能取字。")},

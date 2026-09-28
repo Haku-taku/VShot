@@ -18,7 +18,7 @@ A Wayland screenshot tool written in Rust, with a Qt interactive UI and a reside
 - **Replay** — encode continuously but keep only the last N seconds in memory; a key writes that stretch to an MP4 (a stream copy, no re-encode)
 - **Pin overlay** — pin images or clipboard content to the screen: drag, wheel to zoom, double-click to close, one-key show/hide, Space to annotate
 - **Clipboard pinning** — colors, images, copied image files, plain text (rendered as a card as HTML / markdown / code / plain text)
-- **OCR** — frame a region and get its text back (Chinese, English and Japanese), through `vshot ocr` or the editor toolbar's *Text+* button, with a desktop notification when it finishes
+- **OCR** — frame a region and get its text back (Chinese, English and Japanese), through `vshot ocr` or the editor toolbar's *Text+* button, which selects the recognized text in place rather than copying all of it; a desktop notification when it finishes
 - **Output targets** — file (with strftime paths), stdout, clipboard, or an on-screen pin; exactly one
 - **Bilingual UI** — the interface and `--help` follow the system language
 
@@ -98,6 +98,7 @@ vshot annotate quit                         # quit the daemon, drawing and all
 vshot settings                              # Settings: a window for the editor style and the command-line defaults
 
 vshot ocr                                   # OCR: frame a region, text to stdout
+vshot ocr --json                            # OCR: frame a region, the text and each character's position as JSON
 vshot ocr --clipboard                       # the same, onto the clipboard
 vshot ocr --input shot.png                  # read an existing image file
 
@@ -143,7 +144,7 @@ When `vshot region` gets no `--geometry`, the frozen frame fills each output and
 - The toolbar's first row holds the tools Select, Rect, Ellipse, Arrow, Draw, Text, Mosaic plus Undo, Redo, OK, Cancel; style sub-panels appear according to the current tool and follow the selection
 - Style entries: a color palette (with a custom picker: HSV gradient plus hex input), line style Solid/Dash/Dot, arrow head Open V/Filled, thickness 1-64, arrow size 1-8, font size 7-448 (the number *is* the pixel height), mosaic shape Rect/Ellip/Brush, mosaic strength 1-3, and a system font list (each entry previewed in its own glyphs). Arrow draws a straight arrow from press to release; Draw is freehand; the mosaic strength controls both the pixel block size and the brush radius
 - The **Select** tool picks any annotation: click to select, drag to move (text too), shapes/lines/mosaics resize by their handles, Delete/Backspace removes it; style changes apply to the selected annotation immediately; **Ctrl+Z / Ctrl+Y** (or Ctrl+Shift+Z) undo/redo. Annotations come back to Rust in global logical coordinates and the final PNG is redrawn by the built-in software renderer, matching the preview
-- **Pasting and reading text**: the toolbar's *Image* button picks an image from disk, or **Ctrl+V** pastes whatever image the clipboard holds — it lands centred at its own size, shrunk to fit when it is larger than the selection, and comes up selected so it can be dragged and resized by its handles; the *Text+* button recognizes the text in the selection and puts it on the clipboard (see [OCR](#ocr); `cli.ocr.notify` turns it off)
+- **Pasting and reading text**: the toolbar's *Image* button picks an image from disk, or **Ctrl+V** pastes whatever image the clipboard holds — it lands centred at its own size, shrunk to fit when it is larger than the selection, and comes up selected so it can be dragged and resized by its handles; the *Text+* button recognizes the text in the selection and selects it in place rather than copying all of it (see [OCR](#ocr); `cli.ocr.notify` turns it off)
 
 The UI language follows the system by default (`QLocale::system()`) and can be overridden with `VSHOT_LANG`: a value starting with `zh` selects Chinese, any other non-empty value selects English. The language is fixed when the helper starts, so switching needs a rerun. The Rust CLI's `--help` uses the same rule, so `VSHOT_LANG=zh vshot --help` is Chinese.
 
@@ -152,6 +153,7 @@ The UI language follows the system by default (`QLocale::system()`) and can be o
 
 ```sh
 vshot ocr                    # frame a region, text to stdout
+vshot ocr --json             # the same, but each line and each character's position as JSON
 vshot ocr --clipboard        # the same, onto the clipboard
 vshot ocr --geometry '0,0 800x200'
 vshot ocr --input shot.png   # read an existing image file
@@ -160,6 +162,12 @@ vshot ocr --input shot.png   # read an existing image file
 A finished recognition raises a **desktop notification** by default: the text it read (cut at 160 characters), or why it failed — when `vshot ocr` is started from a keybinding, nothing else says it is done. The notification is handed to whatever owns `org.freedesktop.Notifications` on the session bus, and **a session with no notification daemon still works**: it just misses the note. The switch is on the settings window's *Text recognition* page, or the `cli.ocr.notify` key.
 
 What lands on the clipboard is the recognized text itself, **with no trailing newline added**; one is added only for stdout, so the shell prompt does not end up on the last line of the output.
+
+**`--json`** prints no plain text; it writes the recognized lines, and where each character sat, as JSON on stdout, so a program can place the text rather than read it. It conflicts with `--clipboard` and **suppresses the desktop notification** — a caller that asked for JSON is a program, not a person.
+
+The editor's *Text+* button recognizes the selection's text too, but does not put the whole thing on the clipboard: the recognized text becomes a **selectable layer drawn where the characters actually were** — drag across the text to select a range, double-click takes the word under the pointer, triple-click widens that to the whole line, **Ctrl+A** takes everything, **Enter** or **Ctrl+C** copies only what is selected and leaves the mode, and **Esc** leaves the mode and returns to ordinary editing (it does **not** cancel the capture; a second **Esc** does). While the mode is up the tools are not offered, because the layer describes the capture's own selection and a tool change would invalidate it.
+
+An **external** engine (the GPU escape hatch) reports text and no character positions, so there is nothing to select: its whole text is copied as before and a line goes to stderr saying so.
 
 Recognition uses **PaddleOCR's PP-OCR models** (the official models converted to ONNX) on ONNX Runtime, **on the CPU**, in this process. The models are the `PP-OCRv6_small` tier, about 30 MB:
 
@@ -338,7 +346,7 @@ The defaults come from the config file's `cli.replay` section (see [`cli` — co
 - **Drag** to move (across monitors; the copy on the other screen follows); **wheel** zooms around the image center (0.1x–8x), with the factor briefly shown at the image's bottom-right; **double-click** closes that image; **left click** raises the image to the front, so a clicked one is always above the rest when they overlap. Whichever image the pointer rests on gets a solid black outline, the others light gray (2 logical pixels thick, not covering the image itself)
 - **Its look is configurable**: corner radius, the shadow, border width and the two border colours live in the config file (square corners with a shadow by default) — see [`pin` — how a pinned image looks](#pin--how-a-pinned-image-looks)
 - With the pointer over a pin and that screen holding the keyboard, press **Space** to enter the same annotation editor `vshot region` uses
-- Right-clicking **any** pin opens a menu: a color card lists its formats first, and clicking one copies that value back to the clipboard (↑/↓ to move, Enter to copy, Esc to close; a badge flashes at the bottom-right once copied). The last row, **Save as…**, is there for every pin: it opens a save dialog and writes the image out as a PNG, then reports the result in the same badge
+- Right-clicking **any** pin opens a menu: a color card lists its formats first, and clicking one copies that value back to the clipboard (↑/↓ to move, Enter to copy, Esc to close; a badge flashes at the bottom-right once copied). The last two rows are there for every pin: **Save as…** opens a save dialog and writes the image out as a PNG, then reports the result in the same badge; **Recognize text…** opens the pin editor already in the text-selection mode above (see [OCR](#ocr)), so the text of a pinned image can be read the same way
 
 A new pin lands on the **active output**: the screen the pointer is on first, then the output holding keyboard focus when the pointer cannot be read, then the primary output. What you can pin:
 
@@ -653,7 +661,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --release --locked
 ```
 
-The Qt helper has no test framework, only **offscreen checks that need no compositor** (not built by default; add `-DVSHOT_BUILD_CHECKS=ON`), covering config reads and writes with the settings window, the text size conversion, clipboard color parsing and color card rendering, a pin's self-declared density and outline, text card padding, the color card's right-click menu, the export format of a pasted image, the annotation overlay's five tools with undo, clear and the toolbar's placement, where the toolbar lands, the annotation render cache being hit, and the resolution that cache is built at on a high-DPI screen:
+The Qt helper has no test framework, only **offscreen checks that need no compositor** (not built by default; add `-DVSHOT_BUILD_CHECKS=ON`), covering config reads and writes with the settings window, the text size conversion, clipboard color parsing and color card rendering, a pin's self-declared density and outline, text card padding, the color card's right-click menu, the export format of a pasted image, the annotation overlay's five tools with undo, clear and the toolbar's placement, where the toolbar lands, the annotation render cache being hit, the resolution that cache is built at on a high-DPI screen, and the text layer — which parses the JSON `vshot ocr --json` prints (so the wire format has one end in `src/ocr.rs` and one on the Qt side) and, building no widget, needs no `QT_QPA_PLATFORM`:
 
 ```sh
 cmake -S . -B build-qt -DVSHOT_BUILD_CHECKS=ON && cmake --build build-qt
@@ -670,6 +678,7 @@ QT_QPA_PLATFORM=offscreen build-qt/vshot-annotate-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-toolbar-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-annotation-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-dpr-check
+build-qt/vshot-text-layer-check
 ```
 
 There are also 5 integration tests that are **not run** by default (`#[ignore]`), needing a real environment: KWin's D-Bus capture and backend selection (see the comments in `src/capture/kwin.rs`; a headless KWin suffices — virtual output named `Virtual-0`, 1024x768, no pointer capability — so it only covers the D-Bus capture layer), the active output probe (needs any real session), `/dev/uinput` scroll injection (needs write access), and **the built-in OCR engine reading drawn text** (needs those 30 MB of models on disk, which `cargo test` has nowhere to fetch them from). To run them:

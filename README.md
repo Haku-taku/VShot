@@ -18,7 +18,7 @@ Rust 写的 Wayland 截图工具，带 Qt 交互界面与常驻 pin 浮层。捕
 - **回录**——一直在编码但只留最近 N 秒在内存里，按键就把刚才那段拷成 MP4（流拷贝，不重编）
 - **pin 浮层**——把图片或剪贴板内容钉在屏幕上：拖动、滚轮缩放、双击关闭、一键显隐、Space 进标注编辑
 - **剪贴板贴图**——颜色、图片、复制的图片文件、纯文本（按 HTML / markdown / 代码 / 普通文本渲染成卡片）
-- **OCR 取字**——框选一块区域把文字读出来（中英日），走 `vshot ocr`，编辑器工具栏里也有「取字」按钮，识别完弹一条桌面通知
+- **OCR 取字**——框选一块区域把文字读出来（中英日），走 `vshot ocr`，编辑器工具栏里也有「取字」按钮——它把识别到的文字就地选出来，而不是整段复制走；识别完弹一条桌面通知
 - **输出目标**——文件（支持 strftime 路径）、stdout、剪贴板、屏幕 pin，四选一
 - **中英双语**——界面与 `--help` 都跟随系统语言
 
@@ -98,6 +98,7 @@ vshot annotate quit                         # 退出 daemon（连标注一起）
 vshot settings                              # 设置：开窗口改编辑器样式与命令行默认值（写进 config.json）
 
 vshot ocr                                   # OCR：框选，文字到 stdout
+vshot ocr --json                            # OCR：框选，文字与每个字的位置输出成 JSON
 vshot ocr --clipboard                       # 同上，进剪贴板
 vshot ocr --input shot.png                  # 读一个已有的图片文件
 
@@ -143,7 +144,7 @@ vshot all --output 'shots/capture-%Y%m%d-%H%M%S.final.png'
 - 工具栏第一行为 Select、Rect、Ellipse、Arrow、Draw、Text、Mosaic 与 Undo、Redo、OK、Cancel；样式子面板按当前工具显隐，跟随选区移动
 - 样式项：颜色色板（含自定义取色器：HSV 渐变 + 十六进制输入）、线型 Solid/Dash/Dot、箭头头型 Open V/Filled、粗细 1-64、箭头大小 1-8、字号 7-448（直接就是像素高）、马赛克形状 Rect/Ellip/Brush、马赛克程度 1-3、系统字体列表（每项按自身字形预览）。Arrow 是按下点到释放点的直线箭头；Draw 是自由绘制；Mosaic 的马赛克程度控制像素块大小与涂抹半径
 - **Select** 工具可点选任意标注：单击选中，拖动移动（文本同样），形状/线条/马赛克可拖把手缩放，Delete/Backspace 删除；样式修改即时应用到选中标注；**Ctrl+Z / Ctrl+Y**（或 Ctrl+Shift+Z）撤销/重做。标注以全局逻辑坐标传回 Rust，最终 PNG 由内置软件渲染重绘，与预览一致
-- **贴图 / 取字**：工具栏的「图片」按钮从磁盘挑一张，或 **Ctrl+V** 直接把剪贴板里的图贴进来——原尺寸落在选区正中，比选区大时等比缩小塞进去，贴完自动切到 Select 并选中它；「取字」按钮把选区里的文字读出来放进剪贴板（见[「OCR 取字」](#ocr-取字)，`cli.ocr.notify` 可关）
+- **贴图 / 取字**：工具栏的「图片」按钮从磁盘挑一张，或 **Ctrl+V** 直接把剪贴板里的图贴进来——原尺寸落在选区正中，比选区大时等比缩小塞进去，贴完自动切到 Select 并选中它；「取字」按钮把选区里的文字识别成一层可就地选取的文字层，而不是整段复制走（见[「OCR 取字」](#ocr-取字)，`cli.ocr.notify` 可关）
 
 界面语言默认跟随系统（`QLocale::system()`），可用 `VSHOT_LANG` 覆盖：以 `zh` 开头选中文，其它非空值选英文。语言在 helper 启动时确定，切换需重新运行。Rust CLI 的 `--help` 走同一套判定，`VSHOT_LANG=zh vshot --help` 即中文。
 
@@ -152,6 +153,7 @@ vshot all --output 'shots/capture-%Y%m%d-%H%M%S.final.png'
 
 ```sh
 vshot ocr                    # 框一块区域，文字到 stdout
+vshot ocr --json             # 同上，但把每行文字和每个字的位置输出成 JSON
 vshot ocr --clipboard        # 同上，进剪贴板
 vshot ocr --geometry '0,0 800x200'
 vshot ocr --input shot.png   # 读一个已有的图片文件
@@ -160,6 +162,12 @@ vshot ocr --input shot.png   # 读一个已有的图片文件
 识别完默认会弹一条**桌面通知**：成功给出识别到的文字（长了截断到 160 字），失败给出原因——`vshot ocr` 被快捷键拉起时，没有别的东西告诉你它跑完了。通知交给会话总线上 `org.freedesktop.Notifications` 的服务去画，**没有通知服务也照样能用**，只是少这条提示；开关在设置窗口的「文本识别」页，也可以手改 `cli.ocr.notify`。
 
 剪贴板里放的是识别出的文字本身，**不会多出一个结尾换行**；只有输出到 stdout 时才补一个，免得终端的提示符挤在最后一行文字上。
+
+**`--json`** 不打印纯文本，而是把识别到的每一行连同每个字的位置写成 JSON 输出到 stdout，让程序自己摆放这些文字而不是读它们。它与 `--clipboard` 互斥，并且**不弹桌面通知**——要 JSON 的调用方是程序，不是人。
+
+编辑器里「取字」也识别选区里的文字，但不把整段丢进剪贴板：识别到的文字会变成**一层可就地选取的文字层**，画在字符原本所在的位置——在文字上拖拽选出范围，双击取指针下的词，三击扩到整行，**Ctrl+A** 全取，**Enter** 或 **Ctrl+C** 只把选中的那部分复制走并退出该模式，**Esc** 退出该模式回到普通编辑（它**不取消**这次截图，再按一次 **Esc** 才是取消）。该模式期间不提供工具栏，因为这一层描述的就是这次截图自己的选区，换工具会让它失效。
+
+**外接引擎**（GPU 那条路）只报文字、不报每个字的位置，没有东西可选：它的整段文字照旧复制走，并往 stderr 写一句说明。
 
 识别用 **PaddleOCR 的 PP-OCR 模型**（官方模型转成的 ONNX 版本），跑在本进程的 ONNX Runtime 上，**用 CPU**。模型是 `PP-OCRv6_small` 这一档，约 30 MB：
 
@@ -338,7 +346,7 @@ bind = SUPER ALT, R, exec, vshot replay stop
 - **拖拽**移动（可跨显示器，跨屏时另一块屏上的副本同步跟随）；**滚轮**以图片中心缩放（0.1x–8x），倍率短暂显示在图片右下角；**双击**关闭该图；**左键点击**把该图提到最前，重叠时被点到的一定压在其余之上。鼠标停在哪张图上，哪张图的描边就是纯黑，其余是浅灰（2 逻辑像素粗，不遮挡图像本身）
 - **外观可配**：圆角、阴影、边框宽度与两种状态的边框颜色都在配置文件里（默认直角 + 阴影），见[「`pin`——pin 浮层外观」](#pinpin-浮层外观)
 - 指针在某张 pin 上且该屏持有键盘时按 **Space** 进入与 `vshot region` 相同的标注编辑器
-- 右键点击**任意** pin 弹出菜单：色卡在前几行列出它的各种格式，点哪一项就把那个值抄回剪贴板（↑/↓ 选行、回车抄走、Esc 关闭；复制成功后右下角闪一个徽标）；最后一行 `另存为…` 对所有 pin 都在，选了就弹出保存对话框把这张图写成 PNG，存完在右下角报结果
+- 右键点击**任意** pin 弹出菜单：色卡在前几行列出它的各种格式，点哪一项就把那个值抄回剪贴板（↑/↓ 选行、回车抄走、Esc 关闭；复制成功后右下角闪一个徽标）；最后两行对所有 pin 都在：`另存为…` 弹出保存对话框把这张图写成 PNG，存完在右下角报结果；`取字…` 打开 pin 编辑器并直接进入取字模式（见[「OCR 取字」](#ocr-取字)），钉住的图也能这样读字
 
 新 pin 落在**激活的输出**上：指针所在的那块屏优先，指针读不到时退回键盘焦点所在的输出，都没有则回退主输出。pin 的对象：
 
@@ -653,7 +661,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --release --locked
 ```
 
-Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**（默认不构建，加 `-DVSHOT_BUILD_CHECKS=ON`），覆盖配置读写与设置窗口、字号换算、剪贴板颜色解析与色卡渲染、pin 的图片自述密度与描边、文字卡片留白、色卡右键菜单、贴图的导出格式、标注浮层的五个工具与撤销/清除/工具栏位置、工具栏的落位、标注渲染缓存的命中、以及高 DPI 屏上的缓存分辨率：
+Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**（默认不构建，加 `-DVSHOT_BUILD_CHECKS=ON`），覆盖配置读写与设置窗口、字号换算、剪贴板颜色解析与色卡渲染、pin 的图片自述密度与描边、文字卡片留白、色卡右键菜单、贴图的导出格式、标注浮层的五个工具与撤销/清除/工具栏位置、工具栏的落位、标注渲染缓存的命中、高 DPI 屏上的缓存分辨率，以及文字层——它解析 `vshot ocr --json` 打印的 JSON（这套线格式一头在 `src/ocr.rs`、一头在 Qt 侧），并且不建控件，因此不需要 `QT_QPA_PLATFORM`：
 
 ```sh
 cmake -S . -B build-qt -DVSHOT_BUILD_CHECKS=ON && cmake --build build-qt
@@ -670,6 +678,7 @@ QT_QPA_PLATFORM=offscreen build-qt/vshot-annotate-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-toolbar-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-annotation-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-dpr-check
+build-qt/vshot-text-layer-check
 ```
 
 另有 5 个默认**不执行**（`#[ignore]`）的集成测试，需要真实环境：KWin 的 D-Bus 采集与后端选择（见 `src/capture/kwin.rs` 的注释，起无头 KWin 即可：虚拟输出名 `Virtual-0`、1024x768、无 pointer capability，只覆盖到 D-Bus 采集这一层）、活跃输出探针（需要任一真实会话）、`/dev/uinput` 滚动注入（需要写权限）、以及**内置 OCR 引擎读一张画出来的文字**（需要那 30 MB 模型在盘上，`cargo test` 没地方去下）。跑法：
