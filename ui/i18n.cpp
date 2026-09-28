@@ -85,6 +85,7 @@ const QHash<QString, QString> &chineseTable()
         // off a capture.
         {QStringLiteral("Image"), QString::fromUtf8("图片")},
         {QStringLiteral("Text+"), QString::fromUtf8("取字")},
+        {QStringLiteral("OCR…"), QString::fromUtf8("识别中")},
         {QStringLiteral("Select the text in the selection and copy what you select"),
          QString::fromUtf8("选中选区里的文字，复制选中的部分")},
         {QStringLiteral("No text is selected."), QString::fromUtf8("没有选中文字。")},

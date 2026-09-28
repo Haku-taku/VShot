@@ -15,6 +15,7 @@
 #include <QCoreApplication>
 #include <QDataStream>
 #include <QDir>
+#include <QEventLoop>
 #include <QFile>
 #include <QFont>
 #include <QFontDatabase>
@@ -2551,7 +2552,7 @@ public:
                                    uiTr("Select the text in the selection and copy what you "
                                         "select"),
                                    QStringLiteral("ocrButton"),
-                                   {uiTr("Copied"), uiTr("Failed")});
+                                   {uiTr("OCR…"), uiTr("Copied"), uiTr("Failed")});
         textButton_ = text;
         connect(text, &QToolButton::clicked, [controller = controller_] {
             controller->beginTextSelection(nullptr);
@@ -2561,12 +2562,30 @@ public:
         // key, which the controller sees and this toolbar does not, so the
         // controller reports through this callback rather than the handler
         // above.  The width was settled for every label it can show when it was
-        // built, so the word is not elided now.
-        controller_->setTextResultCallback([this](bool ok, const QString &) {
+        // built, so the word is not elided now.  `Busy` and `Idle` are the two
+        // reports that do not expire: the first is replaced by the outcome that
+        // follows it, the second is the button's own label coming back.
+        controller_->setTextResultCallback([this](TextOutcome outcome, const QString &) {
             if (textButton_ == nullptr) {
                 return;
             }
-            textButton_->setText(ok ? uiTr("Copied") : uiTr("Failed"));
+            switch (outcome) {
+            case TextOutcome::Busy:
+                // Short on purpose: the button is sized once, for every label
+                // it can ever show, and a long word here would widen it past
+                // every other button in the row for good.
+                textButton_->setText(uiTr("OCR…"));
+                return;
+            case TextOutcome::Idle:
+                textButton_->setText(uiTr("Text+"));
+                return;
+            case TextOutcome::Copied:
+                textButton_->setText(uiTr("Copied"));
+                break;
+            case TextOutcome::Failed:
+                textButton_->setText(uiTr("Failed"));
+                break;
+            }
             QTimer::singleShot(1200, textButton_, [this] {
                 if (controller_->isFinished() || controller_->isCancelled()) {
                     return;
@@ -5941,7 +5960,7 @@ bool OverlayController::beginTextSelection(QString *error)
             *error = message;
         }
         if (textResultCallback_) {
-            textResultCallback_(false, message);
+            textResultCallback_(TextOutcome::Failed, message);
         }
         return false;
     };
@@ -6008,6 +6027,16 @@ bool OverlayController::beginTextSelection(QString *error)
         }
     }
 
+    // The engine takes a moment -- a model load on the first run -- and the
+    // wait below runs on the GUI thread, so the button says what it is waiting
+    // for, and the label is given its paint before the wait begins.  Input is
+    // held back for that paint: a click landing mid-recognition would reach a
+    // mode that is not up yet.
+    if (textResultCallback_) {
+        textResultCallback_(TextOutcome::Busy, QString());
+    }
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+
     QProcess process;
     process.setProgram(program);
     // `--json` carries the position of every character, which is what the text
@@ -6039,7 +6068,10 @@ bool OverlayController::beginTextSelection(QString *error)
         return fail(error != nullptr ? *error : QString());
     }
     if (textResultCallback_) {
-        textResultCallback_(true, QString());
+        // The mode being up means nothing has been copied yet -- the button
+        // waits for the gesture that picks a range.  The no-positions fallback
+        // is the other way to get here, and that one did copy.
+        textResultCallback_(textMode() ? TextOutcome::Idle : TextOutcome::Copied, QString());
     }
     return true;
 }
@@ -6106,9 +6138,13 @@ bool OverlayController::enterTextSelection(const QByteArray &document, QString *
     if (layer->hasGeometry()) {
         textLayer_ = std::move(layer);
         textMode_ = true;
-        textAnchor_ = -1;
-        textFocus_ = -1;
         textDragging_ = false;
+        // The whole layer starts selected.  The user asked for the text and
+        // usually wants all of it, so the copy is one key or one more click
+        // away; a drag narrows the range from there.  A layer whose lines
+        // carry no characters at all is left with nothing selected, which is
+        // the one case where the mode still starts empty.
+        selectTextRange(0, textLayer_->count() - 1);
         // A label being typed would take the keys the mode now needs.
         if (textEdit_ != nullptr) {
             finishText(false);
@@ -6163,7 +6199,8 @@ QString OverlayController::selectedText() const
     return textLayer_->rangeText(textAnchor_, textFocus_);
 }
 
-void OverlayController::setTextResultCallback(std::function<void(bool, const QString &)> callback)
+void OverlayController::setTextResultCallback(
+    std::function<void(TextOutcome, const QString &)> callback)
 {
     textResultCallback_ = std::move(callback);
 }
@@ -6242,19 +6279,19 @@ void OverlayController::copyTextSelection()
         // Nothing is selected, so there is nothing to copy and the mode stays
         // up for the user to try again.
         if (textResultCallback_) {
-            textResultCallback_(false, uiTr("No text is selected."));
+            textResultCallback_(TextOutcome::Failed, uiTr("No text is selected."));
         }
         return;
     }
     if (!writeClipboard(text)) {
         // The selection is not lost: the copy can be tried again.
         if (textResultCallback_) {
-            textResultCallback_(false, uiTr("Cannot copy the text to the clipboard."));
+            textResultCallback_(TextOutcome::Failed, uiTr("Cannot copy the text to the clipboard."));
         }
         return;
     }
     if (textResultCallback_) {
-        textResultCallback_(true, QString());
+        textResultCallback_(TextOutcome::Copied, QString());
     }
     leaveTextMode();
 }

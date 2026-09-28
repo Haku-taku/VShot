@@ -199,6 +199,21 @@ enum class Tool {
 
 class CaptureOverlay;
 
+/// What the toolbar's text button has to say: the recognition is running, the
+/// text mode is up and waiting for a gesture, the copy landed, or the last
+/// attempt failed.  One callback carries all of them so the button never has to
+/// guess which of its own clicks it is answering.
+enum class TextOutcome {
+    /// The recognition run is in flight; the button stays on this label until
+    /// the outcome that follows replaces it.
+    Busy,
+    /// Nothing to report: the mode is up and the button goes back to its own
+    /// label, waiting for the copy the user is about to ask for.
+    Idle,
+    Copied,
+    Failed,
+};
+
 class OverlayController final {
 public:
     explicit OverlayController(Session session);
@@ -272,7 +287,10 @@ public:
     bool textMode() const { return textMode_; }
     /// The text the current range would copy, empty when nothing is selected.
     QString selectedText() const;
-    void setTextResultCallback(std::function<void(bool, const QString &)> callback);
+    /// Told what the text button should show.  Called with `Busy` before the
+    /// recognition run starts -- the wait for the engine is long enough that
+    /// the button has to say so -- and once more with the outcome.
+    void setTextResultCallback(std::function<void(TextOutcome, const QString &)> callback);
     /// Replaces the clipboard write the text paths use.  It exists so a check
     /// can verify what would be copied without a clipboard; the default writes
     /// through `wl-copy`.
@@ -356,10 +374,11 @@ private:
     /// succession -- Qt's third press, reported as another double click -- can
     /// widen the word it took to the whole line.
     QElapsedTimer textClickClock_;
-    /// Told when the text mode starts or a copy finishes, so the toolbar can say
-    /// so on the button the user pressed.  The copy can be triggered by a key,
-    /// which the controller sees and the toolbar does not.
-    std::function<void(bool ok, const QString &error)> textResultCallback_;
+    /// Told when the recognition starts, when the text mode starts, and when a
+    /// copy finishes, so the toolbar can say so on the button the user pressed.
+    /// The copy can be triggered by a key, which the controller sees and the
+    /// toolbar does not.
+    std::function<void(TextOutcome outcome, const QString &error)> textResultCallback_;
     /// Writes the text the mode copies.  The default is `wl-copy`; a check
     /// replaces it so the copy can be verified without a clipboard.
     std::function<bool(const QString &)> clipboardWriter_;

@@ -501,7 +501,8 @@ void checkTextButton()
     // on the font this machine resolves -- so this is a guard rather than a
     // reproduction of the clipping a wider font produces.  What it pins is that
     // the width was settled against the labels, not assumed from one of them.
-    for (const QString &label : {text->text(), vshot::uiTr(QStringLiteral("Copied")),
+    for (const QString &label : {text->text(), vshot::uiTr(QStringLiteral("OCR…")),
+                                 vshot::uiTr(QStringLiteral("Copied")),
                                  vshot::uiTr(QStringLiteral("Failed"))}) {
         QToolButton reference(surface);
         reference.setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
@@ -616,8 +617,10 @@ void checkTextSelection()
     expect(controller.enterTextSelection(document, &error),
            "the document enters the text mode", error);
     expect(controller.textMode(), "the text mode is on");
-    expect(controller.selectedText().isEmpty(), "nothing is selected to begin with",
-           controller.selectedText());
+    // The mode opens with the whole layer selected, so the copy the button
+    // promises is one key -- or one more click -- away.
+    expect(controller.selectedText() == QStringLiteral("AB C\nDE"),
+           "the whole layer is selected as the mode opens", controller.selectedText());
 
     // A press on a character starts the range there, the drag to another one
     // widens it, and the release fixes it: the three steps a mouse makes.
