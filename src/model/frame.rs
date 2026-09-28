@@ -5,7 +5,7 @@
 
 use image::{DynamicImage, ImageFormat};
 
-use crate::edit::{covered_span, ArrowStyle, LineDash, TextBitmap};
+use crate::edit::{covered_span, ArrowStyle, BezierFill, LineDash, TextBitmap};
 use crate::error::{Result, VshotError};
 use crate::geometry::{Point, Rect, Size};
 
@@ -452,13 +452,21 @@ impl Frame {
     /// Casteljau subdivision (see [`bezier_polyline`]) and stroked through the
     /// shared coverage path, so a translucent path keeps one alpha through its
     /// joins. When `closed`, a straight segment joins the last anchor back to
-    /// the first, and the enclosed area is filled before the stroke — matching
-    /// the Qt side's `fillPath`-then-`strokePath` order — with half the
-    /// stroke's alpha.
+    /// the first, matching the Qt side's `closeSubpath`.
+    ///
+    /// `fill` picks which parts get painted. Under [`BezierFill::Both`] the
+    /// historical behaviour stands: a closed path has its enclosed area filled
+    /// before the stroke — matching the Qt side's `fillPath`-then-`strokePath`
+    /// order — with half the stroke's alpha, and an open path is stroked alone.
+    /// [`BezierFill::Stroke`] never fills, even a closed path, and
+    /// [`BezierFill::Fill`] paints a closed path's interior without its
+    /// outline. No mode fills an open path: that would close it implicitly, so
+    /// a shape the user never closed would appear whole.
     pub(crate) fn draw_bezier(
         &mut self,
         points: &[Point],
         closed: bool,
+        fill: BezierFill,
         color: [u8; 4],
         width: u32,
         dash: LineDash,
@@ -473,15 +481,21 @@ impl Frame {
             // closeSubpath: a straight segment back to the first anchor.
             polyline.push(start);
         }
-        let pad = i64::from(width.div_ceil(2)) + 1;
-        let bounds = polyline_bounds(&polyline, pad);
-        if closed && polyline.len() >= 3 {
+        if fill.fills(closed) && polyline.len() >= 3 {
             // "Translucent fill, solid stroke": the fill keeps the stroke's
             // colour at half its alpha, floored, exactly as Qt computes it.
-            let mut fill = color;
-            fill[3] = color[3] / 2;
-            self.fill_polygon(&polyline, fill);
+            // Only a closed path gets here, so `fill_polygon`'s implicit
+            // closure of the outline is never what the user sees.
+            let mut fill_color = color;
+            fill_color[3] = color[3] / 2;
+            self.fill_polygon(&polyline, fill_color);
         }
+        if !fill.strokes(closed) {
+            // `Fill` on a closed path: the outline itself is left unpainted.
+            return Ok(());
+        }
+        let pad = i64::from(width.div_ceil(2)) + 1;
+        let bounds = polyline_bounds(&polyline, pad);
         if polyline.len() == 1 {
             stroke_with_coverage(self, color, bounds, |ink| {
                 rasterize_capsule(ink, frame, polyline[0], polyline[0], width);
@@ -2710,7 +2724,14 @@ mod tests {
         // is not.
         let mut frame = Frame::solid(Size::new(24, 12), [0, 0, 0, 0]).unwrap();
         frame
-            .draw_bezier(&TRIANGLE[0..4], false, [255, 0, 0, 255], 1, LineDash::Solid)
+            .draw_bezier(
+                &TRIANGLE[0..4],
+                false,
+                BezierFill::Both,
+                [255, 0, 0, 255],
+                1,
+                LineDash::Solid,
+            )
             .unwrap();
         assert_eq!(frame.pixel(Point::new(12, 4)), Some([255, 0, 0, 255]));
         assert_eq!(frame.pixel(Point::new(12, 6)), Some([0, 0, 0, 0]));
@@ -2720,7 +2741,14 @@ mod tests {
     fn a_closed_bezier_fills_at_half_alpha_then_strokes_opaque() {
         let mut frame = Frame::solid(Size::new(24, 24), [0, 0, 0, 0]).unwrap();
         frame
-            .draw_bezier(&TRIANGLE, true, [255, 0, 0, 255], 1, LineDash::Solid)
+            .draw_bezier(
+                &TRIANGLE,
+                true,
+                BezierFill::Both,
+                [255, 0, 0, 255],
+                1,
+                LineDash::Solid,
+            )
             .unwrap();
         // The interior centroid (12, 9) is covered by the fill only: half of
         // the opaque stroke's alpha, floored.
@@ -2733,10 +2761,81 @@ mod tests {
 
         // The same path left open only strokes: its interior stays clear.
         let mut open = Frame::solid(Size::new(24, 24), [0, 0, 0, 0]).unwrap();
-        open.draw_bezier(&TRIANGLE, false, [255, 0, 0, 255], 1, LineDash::Solid)
-            .unwrap();
+        open.draw_bezier(
+            &TRIANGLE,
+            false,
+            BezierFill::Both,
+            [255, 0, 0, 255],
+            1,
+            LineDash::Solid,
+        )
+        .unwrap();
         assert_eq!(open.pixel(Point::new(12, 9)), Some([0, 0, 0, 0]));
         assert_eq!(open.pixel(Point::new(12, 4)), Some([255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn a_stroke_only_bezier_leaves_even_a_closed_path_hollow() {
+        let mut frame = Frame::solid(Size::new(24, 24), [0, 0, 0, 0]).unwrap();
+        frame
+            .draw_bezier(
+                &TRIANGLE,
+                true,
+                BezierFill::Stroke,
+                [255, 0, 0, 255],
+                1,
+                LineDash::Solid,
+            )
+            .unwrap();
+        // The interior stays clear even though the pen closed the path.
+        assert_eq!(frame.pixel(Point::new(12, 9)), Some([0, 0, 0, 0]));
+        // The outline is still stroked, including the segment that closes the
+        // path: (12, 20) back to (4, 4) passes through (8, 12).
+        assert_eq!(frame.pixel(Point::new(12, 4)), Some([255, 0, 0, 255]));
+        assert_eq!(frame.pixel(Point::new(8, 12)), Some([255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn a_fill_only_bezier_strokes_an_open_path_instead_of_closing_it() {
+        let mut frame = Frame::solid(Size::new(24, 24), [0, 0, 0, 0]).unwrap();
+        frame
+            .draw_bezier(
+                &TRIANGLE,
+                false,
+                BezierFill::Fill,
+                [255, 0, 0, 255],
+                1,
+                LineDash::Solid,
+            )
+            .unwrap();
+        // An open path has no interior to fill, and filling one would close the
+        // outline implicitly -- showing the user a shape they never closed. The
+        // outline is stroked instead, at the pen's own alpha rather than the
+        // half-alpha coat a fill would leave.
+        assert_eq!(frame.pixel(Point::new(12, 9)), Some([0, 0, 0, 0]));
+        assert_eq!(frame.pixel(Point::new(12, 4)), Some([255, 0, 0, 255]));
+        // Outside the outline, too, nothing is painted: the implicit closure
+        // would have covered the triangle's interior.
+        assert_eq!(frame.pixel(Point::new(0, 0)), Some([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn a_both_bezier_does_not_fill_an_open_path() {
+        let mut frame = Frame::solid(Size::new(24, 24), [0, 0, 0, 0]).unwrap();
+        frame
+            .draw_bezier(
+                &TRIANGLE,
+                false,
+                BezierFill::Both,
+                [255, 0, 0, 255],
+                1,
+                LineDash::Solid,
+            )
+            .unwrap();
+        // Open paths are stroked alone under the default mode; only a path the
+        // pen actually closed gets its interior painted.
+        assert_eq!(frame.pixel(Point::new(12, 9)), Some([0, 0, 0, 0]));
+        assert_eq!(frame.pixel(Point::new(12, 4)), Some([255, 0, 0, 255]));
     }
 
     #[test]
@@ -2777,7 +2876,14 @@ mod tests {
         ];
         let mut frame = Frame::solid(Size::new(24, 24), [0, 0, 0, 0]).unwrap();
         frame
-            .draw_bezier(&corner, false, [255, 0, 0, 128], 3, LineDash::Solid)
+            .draw_bezier(
+                &corner,
+                false,
+                BezierFill::Both,
+                [255, 0, 0, 128],
+                3,
+                LineDash::Solid,
+            )
             .unwrap();
         let midpoint = frame.pixel(Point::new(12, 4)).unwrap();
         let joint = frame.pixel(Point::new(20, 4)).unwrap();

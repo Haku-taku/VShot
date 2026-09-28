@@ -440,6 +440,61 @@ const QHash<QString, QString> &chineseTable()
          QString::fromUtf8("键盘会作用到的那张 pin；自动即黑色")},
         {QStringLiteral("Use the built-in colour instead of one of its own"),
          QString::fromUtf8("用内置颜色，不用自己的颜色")},
+        // The numbered badge.  These strings were already wrapped in uiTr() but
+        // had no entry here, so the whole number tool read as English on a
+        // Chinese session.
+        {QStringLiteral("Number"), QString::fromUtf8("序号")},
+        {QStringLiteral("Number style"), QString::fromUtf8("序号样式")},
+        // "Disc" rather than "Solid": the line-style row's own "Solid" is
+        // already in this table, and one key cannot carry two translations.
+        {QStringLiteral("Disc"), QString::fromUtf8("实心")},
+        {QStringLiteral("Ring"), QString::fromUtf8("圆环")},
+        {QStringLiteral("Square"), QString::fromUtf8("方框")},
+        {QStringLiteral("Plain"), QString::fromUtf8("纯数字")},
+        {QStringLiteral("Filled circle"), QString::fromUtf8("实心圆")},
+        {QStringLiteral("Number: %1 (click to place a number)"),
+         QString::fromUtf8("序号：%1（点击放置）")},
+        {QStringLiteral("Number: %1 (click again to change the style)"),
+         QString::fromUtf8("序号：%1（再次点击换样式）")},
+        {QStringLiteral("Click to place a number; each click counts up from one"),
+         QString::fromUtf8("单击放置序号，每次点击依次加一")},
+        // The badge's own size, and the colour's opacity.
+        {QStringLiteral("Size %1"), QString::fromUtf8("大小 %1")},
+        {QStringLiteral("Alpha"), QString::fromUtf8("不透明度")},
+        {QStringLiteral("Alpha %1"), QString::fromUtf8("不透明度 %1")},
+        {QStringLiteral("Color opacity (0-255)"),
+         QString::fromUtf8("颜色不透明度（0-255）")},
+        // The wave's shape.
+        {QStringLiteral("Amplitude"), QString::fromUtf8("幅度")},
+        {QStringLiteral("Amplitude %1"), QString::fromUtf8("幅度 %1")},
+        {QStringLiteral("Wave height (1-64 logical pixels)"),
+         QString::fromUtf8("波高（1-64 逻辑像素）")},
+        {QStringLiteral("Wavelength"), QString::fromUtf8("波长")},
+        {QStringLiteral("Wavelength %1"), QString::fromUtf8("波长 %1")},
+        {QStringLiteral("Wave period (6-256 logical pixels)"),
+         QString::fromUtf8("波长，即一个周期多长（6-256 逻辑像素）")},
+        {QStringLiteral("Drag between two points, then shape the wave with Amplitude "
+                        "and Wavelength"),
+         QString::fromUtf8("在两点之间拖出波浪线，再用「幅度」「波长」调整形状")},
+        // How a pen path is painted.
+        {QStringLiteral("Pen fill mode"), QString::fromUtf8("钢笔填充方式")},
+        // "Outline" rather than "Stroke": the settings window's line-style card
+        // already owns that word, and one key cannot carry two translations.
+        {QStringLiteral("Outline"), QString::fromUtf8("描边")},
+        {QStringLiteral("Fill"), QString::fromUtf8("填充")},
+        {QStringLiteral("Both"), QString::fromUtf8("填充+描边")},
+        {QStringLiteral("Click to drop an anchor, drag from it to bend the curve, click the "
+                        "first anchor to close, double click to finish"),
+         QString::fromUtf8("单击落锚点，按住拖动弯出弧度，点回第一个锚点闭合，双击结束开放路径")},
+        {QStringLiteral("Draw a wavy line between two points; the Amplitude and "
+                        "Wavelength sliders shape it"),
+         QString::fromUtf8("在两点之间画波浪线，用「幅度」「波长」滑块调整形状")},
+        {QStringLiteral("Draw a curved path: click to drop an anchor, drag from it to "
+                        "bend the curve, click the first anchor to close the path, "
+                        "double-click to finish it open; Stroke/Fill/Both decides how "
+                        "it is painted"),
+         QString::fromUtf8("画曲线：单击落锚点，按住拖动弯出弧度，点回第一个锚点可闭合，"
+                           "双击结束开放路径；用「描边/填充/填充+描边」决定怎么画")},
     };
     return table;
 }

@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 use crate::capture::WindowCandidate;
-use crate::edit::{ArrowStyle, LineDash, ShapeMask, TextBitmap, DEFAULT_MOSAIC_STRENGTH};
+use crate::edit::{
+    ArrowStyle, BezierFill, LineDash, ShapeMask, TextBitmap, DEFAULT_MOSAIC_STRENGTH,
+};
 use crate::error::{Result, VshotError};
 use crate::geometry::{Point, Rect};
 use crate::model::SceneSnapshot;
@@ -422,6 +424,15 @@ struct QtAnnotation {
     // Pen-tool strokes only: whether the path closes back onto its first
     // anchor. Missing means an open path.
     closed: Option<bool>,
+    // Pen-tool strokes only: which parts of the path get painted, one of
+    // "stroke" / "fill" / "both". Missing or unknown means "both", the
+    // historical fill-and-stroke behaviour.
+    fill: Option<String>,
+    // Wave strokes only: the peak deviation from the centre line and the length
+    // of one full period, both in logical pixels. Zero or missing means the
+    // renderer derives them from the stroke width.
+    amplitude: Option<u32>,
+    wavelength: Option<u32>,
     // Font family used by the helper to rasterize the text label; empty or
     // missing means the helper's application default font.
     font: Option<String>,
@@ -1050,6 +1061,9 @@ fn parse_annotation(annotation: QtAnnotation) -> Result<Annotation> {
                 arrow_style: parse_arrow_style(annotation.arrow_style.as_deref())?,
                 strength: parse_strength(annotation.strength)?,
                 closed: annotation.closed.unwrap_or(false),
+                amplitude: parse_wave_size(annotation.amplitude),
+                wavelength: parse_wave_size(annotation.wavelength),
+                fill: parse_fill(annotation.fill.as_deref()),
             })
         }
         "text" => {
@@ -1227,6 +1241,21 @@ fn parse_mask(value: Option<&str>) -> Result<ShapeMask> {
     })
 }
 
+/// Clamps an explicit wave amplitude or wavelength, in logical pixels.
+///
+/// Zero is not clamped up to one: it is the helper's way of saying "derive it
+/// from the stroke width", and the renderer's derivation floors the value well
+/// above one anyway.
+fn parse_wave_size(value: Option<u32>) -> u32 {
+    value.unwrap_or(0).min(4096)
+}
+
+/// Parses the optional pen fill mode; a missing or unknown value means the
+/// historical fill-and-stroke behaviour.
+fn parse_fill(value: Option<&str>) -> BezierFill {
+    value.and_then(BezierFill::parse).unwrap_or_default()
+}
+
 fn parse_point(point: WirePoint, label: &str) -> Result<Point> {
     Ok(Point::new(
         i32::try_from(point.x)
@@ -1354,6 +1383,41 @@ mod tests {
             ),
             Err(VshotError::Selection(_))
         ));
+    }
+
+    #[test]
+    fn parses_wave_sizes_and_pen_fill_from_wire() {
+        let wave = |extra: &str| {
+            let json = format!(
+                r#"{{"kind":"stroke","tool":"wave","points":[{{"x":0,"y":0}},{{"x":9,"y":0}}]{extra}}}"#
+            );
+            parse_annotation(serde_json::from_str(&json).unwrap()).unwrap()
+        };
+        // Explicit sizes travel as logical pixels.
+        let sized = wave(r#","amplitude":12,"wavelength":48"#);
+        assert_eq!(sized.amplitude(), 12);
+        assert_eq!(sized.wavelength(), 48);
+        // A missing key and an explicit zero both mean "derive it from the
+        // stroke width"; an absurd value is clamped rather than passed on.
+        let derived = wave("");
+        assert_eq!(derived.amplitude(), 0);
+        assert_eq!(derived.wavelength(), 0);
+        assert_eq!(wave(r#","amplitude":0,"wavelength":0"#).amplitude(), 0);
+        assert_eq!(wave(r#","amplitude":99999"#).amplitude(), 4096);
+
+        let pen = |extra: &str| {
+            let json = format!(
+                r#"{{"kind":"stroke","tool":"bezier","points":[{{"x":0,"y":0}},{{"x":1,"y":1}}]{extra}}}"#
+            );
+            parse_annotation(serde_json::from_str(&json).unwrap()).unwrap()
+        };
+        assert_eq!(pen(r#","fill":"stroke""#).fill(), BezierFill::Stroke);
+        assert_eq!(pen(r#","fill":"fill""#).fill(), BezierFill::Fill);
+        assert_eq!(pen(r#","fill":"both""#).fill(), BezierFill::Both);
+        // A missing key and an unknown spelling both fall back to the
+        // historical fill-and-stroke behaviour.
+        assert_eq!(pen("").fill(), BezierFill::Both);
+        assert_eq!(pen(r#","fill":"hollow""#).fill(), BezierFill::Both);
     }
 
     #[test]

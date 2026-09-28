@@ -227,23 +227,21 @@ constexpr double kTau = 6.283185307179586476925286766559;
 //
 // A zero-length segment returns the single `start` point, which the callers
 // turn into a dot.
-QVector<QPointF> wavePolyline(const QPointF &start, const QPointF &end, int widthLogical,
-                              double scale)
+QVector<QPointF> wavePolyline(const QPointF &start, const QPointF &end, double amplitude,
+                              double wavelength, double scale)
 {
     const QPointF delta = end - start;
     const double length = std::hypot(delta.x(), delta.y());
     if (length <= 0.0) {
         return {start};
     }
-    const double amplitude = std::max(widthLogical * 2, 4);
-    const double wavelength = std::max(widthLogical * 6, 18);
     // One sample per device pixel, plus both endpoints.
     const double step = 1.0 / std::max(1.0, scale);
     const int n = std::max(2, static_cast<int>(std::ceil(length / step)) + 1);
     const QPointF dir(delta.x() / length, delta.y() / length);
     // The 90-degree rotation of `dir`: the direction the wave deviates in.
     const QPointF normal(-dir.y(), dir.x());
-    const double cycles = std::max(1.0, std::round(length / wavelength));
+    const double cycles = std::max(1.0, std::round(length / std::max(1.0, wavelength)));
     const double radiansPerPixel = kTau / (length / cycles);
     QVector<QPointF> points;
     points.reserve(n);
@@ -254,6 +252,26 @@ QVector<QPointF> wavePolyline(const QPointF &start, const QPointF &end, int widt
         points.append(start + dir * u + normal * offset);
     }
     return points;
+}
+
+// A wave's crest offset and period for one mark, in logical pixels: the
+// annotation's own numbers when it carries them, and the width-derived defaults
+// when it does not -- a wave the user never tuned keeps exactly the look it had
+// before those numbers could be set.  The preview, the committed raster and the
+// padding all ask here, so a wave cannot be drawn as one shape and saved as
+// another.
+double effectiveWaveAmplitude(const Annotation &annotation)
+{
+    return annotation.amplitude > 0
+        ? static_cast<double>(annotation.amplitude)
+        : std::max(static_cast<double>(annotation.width) * 2.0, 4.0);
+}
+
+double effectiveWaveWavelength(const Annotation &annotation)
+{
+    return annotation.wavelength > 0
+        ? static_cast<double>(annotation.wavelength)
+        : std::max(static_cast<double>(annotation.width) * 6.0, 18.0);
 }
 
 // The pen tool's geometry.  The model stores one handle per anchor, interleaved
@@ -334,36 +352,44 @@ QPainterPath bezierPath(const QVector<Point> &points, bool closed)
 
 // The pen path's ink, in whatever coordinate space the caller has converted its
 // points into.  The preview and the committed mark both draw through here, so a
-// closed path cannot end up filled in one place and only stroked in another.
-void paintBezierInk(QPainter *painter, const QVector<QPointF> &at, bool closed, const QColor &color,
-                    int width)
+// path cannot end up filled in one place and only stroked in another.
+//
+// `fill` is "stroke", "fill" or "both", and none of them fills a path the user
+// left open: an open path is stroked in "fill" and in "both" alike, so the two
+// modes differ only in whether a closed shape keeps its outline.  Filling an
+// open path would close it behind the user's back -- the shape would be whole
+// the moment it appeared, as if the pen had drawn something nobody closed.
+void paintBezierInk(QPainter *painter, const QVector<QPointF> &at, bool closed, const QString &fill,
+                    const QColor &color, int width)
 {
     if (at.isEmpty()) {
         return;
     }
     if (at.size() < 4) {
         // A click that was never dragged past its own anchor is a dot, the same
-        // ink the freehand pen gives one.
+        // ink the freehand pen gives one.  It is always stroked: a fill on its
+        // own would leave the click invisible.
         painter->setPen(QPen(color, width, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
         painter->setBrush(Qt::NoBrush);
         painter->drawPoint(at.constFirst());
         return;
     }
+    const bool wantFill = closed && fill != QStringLiteral("stroke");
+    const bool wantStroke = !wantFill || fill == QStringLiteral("both");
     const QPainterPath path = bezierPathAt(at, closed);
-    if (!closed) {
-        painter->setPen(QPen(color, width, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
-        painter->setBrush(Qt::NoBrush);
-        painter->drawPath(path);
-        return;
+    if (wantFill) {
+        // Fill first and stroke second, the order the Rust renderer bakes in.
+        // The fill is the stroke's own colour at half its alpha, floored: that
+        // is what "a translucent fill under a solid outline" means for a colour
+        // the user picked an opacity for.
+        QColor fillInk = color;
+        fillInk.setAlpha(color.alpha() / 2);
+        painter->fillPath(path, fillInk);
     }
-    // Fill first and stroke second, the order the Rust renderer bakes in.  The
-    // fill is the stroke's own colour at half its alpha, floored: that is what
-    // "a translucent fill under a solid outline" means for a colour the user
-    // picked an opacity for.
-    QColor fill = color;
-    fill.setAlpha(color.alpha() / 2);
-    painter->fillPath(path, fill);
-    painter->strokePath(path, QPen(color, width, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    if (wantStroke) {
+        painter->setBrush(Qt::NoBrush);
+        painter->strokePath(path, QPen(color, width, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    }
 }
 
 // The same path sampled into a polyline, about one sample per two logical
@@ -519,18 +545,19 @@ QSize textMetrics(const Annotation &annotation)
     return QSize(width, std::max(1, static_cast<int>(lines.size()) * metrics.lineSpacing()));
 }
 
-// A numbered badge is sized from the stroke width rather than from a control of
-// its own, so the width slider covers it too: six pen widths across, floored at
-// 18 logical pixels so the thinnest pen still draws something legible and capped
-// at 96 so the thickest one does not paint a billboard.  The standalone annotate
-// surface spells the same two numbers out for itself: the two files share no
-// code on purpose, and this is the price of that.
+// A numbered badge's diameter is a value of its own, set by the number tool's
+// size control: floored at 18 logical pixels so the count stays legible, and
+// capped at 96 so it does not paint a billboard.  It used to be six pen widths
+// across, which tied a badge's size to the width slider and left no way to size
+// one without restyling every stroke.  The standalone annotate surface spells
+// the same two numbers out for itself: the two files share no code on purpose,
+// and this is the price of that.
 constexpr int kNumberMinDiameter = 18;
 constexpr int kNumberMaxDiameter = 96;
 
-int numberDiameter(int width)
+int numberDiameter(std::uint32_t size)
 {
-    return std::clamp(width * 6, kNumberMinDiameter, kNumberMaxDiameter);
+    return std::clamp(static_cast<int>(size), kNumberMinDiameter, kNumberMaxDiameter);
 }
 
 // The glyphs are a touch over half the badge, bold, so that a two-digit count
@@ -569,7 +596,7 @@ constexpr qreal kNumberHaloWidth = 2.0;
 // draw through here, so the four styles cannot drift apart between them -- and
 // the bitmap the Rust side composites is exactly what the user saw.
 void paintNumberBadge(QPainter &painter, const QRectF &box, const QString &text, NumberStyle style,
-                      const QColor &color, int width)
+                      const QColor &color)
 {
     const int diameter = std::max(1, static_cast<int>(std::lround(box.width())));
     painter.setFont(numberFont(diameter));
@@ -583,8 +610,10 @@ void paintNumberBadge(QPainter &painter, const QRectF &box, const QString &text,
         painter.drawText(box, Qt::AlignCenter, text);
         break;
     case NumberStyle::Ring: {
-        const qreal pen = std::clamp(static_cast<qreal>(std::max(1, width)), 1.0,
-                                     std::max(1.0, box.width() / 4.0));
+        // The ring's line comes from the badge's own diameter now that the width
+        // slider no longer describes a badge: an eighth of it, floored at two
+        // pixels so a small badge still shows a ring, and never past a quarter.
+        const qreal pen = std::clamp(box.width() / 8.0, 2.0, std::max(1.0, box.width() / 4.0));
         const qreal inset = pen / 2.0;
         painter.setBrush(Qt::NoBrush);
         painter.setPen(QPen(color, pen, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
@@ -686,15 +715,15 @@ Point numberCenter(const Annotation &annotation)
                  annotation.rect.y + static_cast<std::int32_t>(annotation.rect.height / 2)};
 }
 
-// Lays a badge's box out around `center` for the width it currently carries.
+// Lays a badge's box out around `center` for the diameter it currently carries.
 //
 // The box is not decoration: the hit test, the drag clamp, the raster cache and
 // the bitmap the renderer is handed are all sized from it, so it is re-derived
-// wherever the width it comes from changes -- at placement, and when the width
-// control restyles the badge under the selection.
+// wherever the diameter changes -- at placement, and when the size control
+// restyles the badge under the selection.
 void layoutNumberBox(Annotation &annotation, Point center)
 {
-    const int diameter = numberDiameter(static_cast<int>(annotation.width));
+    const int diameter = numberDiameter(annotation.numberSize);
     const Point origin{center.x - diameter / 2, center.y - diameter / 2};
     annotation.origin = origin;
     annotation.rect = LogicalRect{origin.x, origin.y, static_cast<std::uint32_t>(diameter),
@@ -866,7 +895,7 @@ QIcon toolbarIcon(Tool tool, const QColor &color = QColor(230, 225, 229),
         // A miniature of the badge itself, drawn with the same painter as the
         // mark so the button and the click agree on the look.
         paintNumberBadge(painter, QRectF(4.0, 4.0, 16.0, 16.0), QStringLiteral("1"),
-                         NumberStyle::FilledCircle, color, 2);
+                         NumberStyle::FilledCircle, color);
         break;
     case Tool::Mosaic:
         painter.setPen(Qt::NoPen);
@@ -2743,7 +2772,8 @@ public:
             // translucent pen and then a colour does not silently make it opaque.
             connect(swatch, &QPushButton::clicked, [controller = controller_, swatchColor] {
                 QColor chosen = swatchColor;
-                chosen.setAlpha(controller->currentColor_.alpha());
+                chosen.setAlpha(
+                    controller->toolStyle(controller->styleTargetTool()).color.alpha());
                 controller->setCurrentColor(chosen);
             });
         }
@@ -2819,7 +2849,8 @@ public:
         widthSlider_->setSingleStep(1);
         widthSlider_->setPageStep(4);
         widthSlider_->setFixedWidth(110);
-        widthSlider_->setValue(static_cast<int>(controller_->currentWidth_));
+        widthSlider_->setValue(
+            static_cast<int>(controller_->toolStyle(controller_->styleTargetTool()).width));
         widthSlider_->setToolTip(uiTr("Stroke width (1-64 logical pixels)"));
         widthGroup_->layout()->addWidget(widthLabel_);
         widthGroup_->layout()->addWidget(widthSlider_);
@@ -2876,8 +2907,12 @@ public:
         // is the style target.
         numberGroup_ = addGroup(optionLayout, true);
         numberGroup_->setObjectName(QStringLiteral("numberGroup"));
+        // "Disc", not "Solid" or "Fill": the line-style row already owns
+        // "Solid" and the pen's fill mode owns "Fill", so either word would
+        // collide in the translation table and one row would show the other's
+        // text.
         addStyleButtons(numberGroup_,
-                        {uiTr("Fill"), uiTr("Ring"), uiTr("Square"), uiTr("Plain")},
+                        {uiTr("Disc"), uiTr("Ring"), uiTr("Square"), uiTr("Plain")},
                         uiTr("Number style"),
                         {numberStyleValue(NumberStyle::FilledCircle),
                          numberStyleValue(NumberStyle::Ring),
@@ -2905,17 +2940,103 @@ public:
         strengthGroup_->layout()->addWidget(strengthLabel_);
         strengthGroup_->layout()->addWidget(strengthSlider_);
 
+        // The colour's opacity, on the bar rather than behind the picker button:
+        // it is a number, so it belongs with the others.
+        alphaGroup_ = addGroup(numericLayout);
+        alphaGroup_->setObjectName(QStringLiteral("alphaGroup"));
+        alphaGroup_->setProperty("toolbarGroupKind", "numeric");
+        alphaLabel_ = new QLabel(uiTr("Alpha"), alphaGroup_);
+        alphaLabel_->setFixedWidth(
+            QFontMetrics(alphaLabel_->font()).horizontalAdvance(uiTr("Alpha %1").arg(255)));
+        alphaSlider_ = new QSlider(Qt::Horizontal, alphaGroup_);
+        alphaSlider_->setObjectName(QStringLiteral("colorAlphaSlider"));
+        alphaSlider_->setRange(0, 255);
+        alphaSlider_->setSingleStep(1);
+        alphaSlider_->setPageStep(16);
+        alphaSlider_->setFixedWidth(72);
+        alphaSlider_->setValue(
+            controller_->toolStyle(controller_->styleTargetTool()).color.alpha());
+        alphaSlider_->setToolTip(uiTr("Color opacity (0-255)"));
+        alphaGroup_->layout()->addWidget(alphaLabel_);
+        alphaGroup_->layout()->addWidget(alphaSlider_);
+
+        // The wave's own shape: how far a crest leaves the line its two points
+        // describe, and how long one full period is, both in logical pixels.
+        amplitudeGroup_ = addGroup(numericLayout);
+        amplitudeGroup_->setObjectName(QStringLiteral("amplitudeGroup"));
+        amplitudeGroup_->setProperty("toolbarGroupKind", "numeric");
+        amplitudeLabel_ = new QLabel(uiTr("Amplitude"), amplitudeGroup_);
+        amplitudeLabel_->setFixedWidth(QFontMetrics(amplitudeLabel_->font())
+                                           .horizontalAdvance(uiTr("Amplitude %1").arg(64)));
+        amplitudeSlider_ = new QSlider(Qt::Horizontal, amplitudeGroup_);
+        amplitudeSlider_->setObjectName(QStringLiteral("waveAmplitudeSlider"));
+        amplitudeSlider_->setRange(1, 64);
+        amplitudeSlider_->setSingleStep(1);
+        amplitudeSlider_->setFixedWidth(80);
+        amplitudeSlider_->setValue(
+            static_cast<int>(controller_->toolStyle(QStringLiteral("wave")).amplitude));
+        amplitudeSlider_->setToolTip(uiTr("Wave height (1-64 logical pixels)"));
+        amplitudeGroup_->layout()->addWidget(amplitudeLabel_);
+        amplitudeGroup_->layout()->addWidget(amplitudeSlider_);
+
+        wavelengthGroup_ = addGroup(numericLayout);
+        wavelengthGroup_->setObjectName(QStringLiteral("wavelengthGroup"));
+        wavelengthGroup_->setProperty("toolbarGroupKind", "numeric");
+        wavelengthLabel_ = new QLabel(uiTr("Wavelength"), wavelengthGroup_);
+        wavelengthLabel_->setFixedWidth(QFontMetrics(wavelengthLabel_->font())
+                                            .horizontalAdvance(uiTr("Wavelength %1").arg(256)));
+        wavelengthSlider_ = new QSlider(Qt::Horizontal, wavelengthGroup_);
+        wavelengthSlider_->setObjectName(QStringLiteral("waveWavelengthSlider"));
+        wavelengthSlider_->setRange(6, 256);
+        wavelengthSlider_->setSingleStep(1);
+        wavelengthSlider_->setFixedWidth(80);
+        wavelengthSlider_->setValue(
+            static_cast<int>(controller_->toolStyle(QStringLiteral("wave")).wavelength));
+        wavelengthSlider_->setToolTip(uiTr("Wave period (6-256 logical pixels)"));
+        wavelengthGroup_->layout()->addWidget(wavelengthLabel_);
+        wavelengthGroup_->layout()->addWidget(wavelengthSlider_);
+
+        // How the pen path is painted.  "Outline", not "Stroke": the settings
+        // window already owns that word for its line-style card, and a shared
+        // key would give one of the two the other's translation.
+        fillGroup_ = addGroup(optionLayout, true);
+        fillGroup_->setObjectName(QStringLiteral("fillGroup"));
+        addStyleButtons(fillGroup_, {uiTr("Outline"), uiTr("Fill"), uiTr("Both")},
+                        uiTr("Pen fill mode"),
+                        {QStringLiteral("stroke"), QStringLiteral("fill"),
+                         QStringLiteral("both")},
+                        &fillButtons_, &fillValues_,
+                        [controller = controller_](QString value) {
+                            controller->setFill(value);
+                        });
+
         styleLayout->addWidget(optionsRow_);
         styleLayout->addWidget(numericRow_);
         rootLayout->addWidget(styleRow_);
+        // One line for the tools whose gesture is not obvious from a single
+        // drag.  It is hidden for every other tool, so the panel stays as short
+        // as it was.
+        usageHint_ = new QLabel(this);
+        usageHint_->setObjectName(QStringLiteral("usageHint"));
+        usageHint_->setVisible(false);
+        rootLayout->addWidget(usageHint_);
 
         connect(widthSlider_, &QSlider::sliderPressed, this,
                 [controller = controller_] { controller->beginStyleAdjustment(); });
         connect(widthSlider_, &QSlider::sliderReleased, this,
                 [controller = controller_] { controller->endStyleAdjustment(); });
+        // The one slider serves two numbers: the stroke width of the tools that
+        // draw with it, and -- while the number tool or a placed badge is the
+        // style target -- the badge's diameter.  Which one it means follows from
+        // the target, the same answer `syncState` takes the label and the range
+        // from, so the two can never disagree about what the value is.
         connect(widthSlider_, &QSlider::valueChanged, this,
                 [controller = controller_](int value) {
-                    controller->setWidth(static_cast<std::uint32_t>(value));
+                    if (controller->styleTargetTool() == QStringLiteral("number")) {
+                        controller->setNumberSize(static_cast<std::uint32_t>(value));
+                    } else {
+                        controller->setWidth(static_cast<std::uint32_t>(value));
+                    }
                 });
         connect(arrowSlider_, &QSlider::sliderPressed, this,
                 [controller = controller_] { controller->beginStyleAdjustment(); });
@@ -2932,6 +3053,34 @@ public:
         connect(strengthSlider_, &QSlider::valueChanged, this,
                 [controller = controller_](int value) {
                     controller->setMosaicStrength(static_cast<std::uint32_t>(value));
+                });
+        connect(alphaSlider_, &QSlider::sliderPressed, this,
+                [controller = controller_] { controller->beginStyleAdjustment(); });
+        connect(alphaSlider_, &QSlider::sliderReleased, this,
+                [controller = controller_] { controller->endStyleAdjustment(); });
+        // The slider carries opacity alone; the colour it belongs to is whatever
+        // the style target already has, so dragging it never moves the hue.
+        connect(alphaSlider_, &QSlider::valueChanged, this,
+                [controller = controller_](int value) {
+                    QColor color = controller->toolStyle(controller->styleTargetTool()).color;
+                    color.setAlpha(value);
+                    controller->setCurrentColor(color);
+                });
+        connect(amplitudeSlider_, &QSlider::sliderPressed, this,
+                [controller = controller_] { controller->beginStyleAdjustment(); });
+        connect(amplitudeSlider_, &QSlider::sliderReleased, this,
+                [controller = controller_] { controller->endStyleAdjustment(); });
+        connect(amplitudeSlider_, &QSlider::valueChanged, this,
+                [controller = controller_](int value) {
+                    controller->setWaveAmplitude(static_cast<std::uint32_t>(value));
+                });
+        connect(wavelengthSlider_, &QSlider::sliderPressed, this,
+                [controller = controller_] { controller->beginStyleAdjustment(); });
+        connect(wavelengthSlider_, &QSlider::sliderReleased, this,
+                [controller = controller_] { controller->endStyleAdjustment(); });
+        connect(wavelengthSlider_, &QSlider::valueChanged, this,
+                [controller = controller_](int value) {
+                    controller->setWaveWavelength(static_cast<std::uint32_t>(value));
                 });
         connect(textSpin_, qOverload<int>(&QSpinBox::valueChanged), this,
                 [controller = controller_](int value) {
@@ -3022,6 +3171,11 @@ public:
         const bool showMosaic = mosaic;
         const bool showStrength = mosaic;
         const bool showNumberStyle = number;
+        // The wave draws with the colour like every other stroke, but its shape
+        // is the wave's own business.
+        const bool showWaveShape = target == QStringLiteral("wave");
+        // How a pen path is painted, offered only for the pen.
+        const bool showFill = target == QStringLiteral("bezier");
         colorGroup_->setVisible(showColor);
         fontGroup_->setVisible(showFont);
         dashGroup_->setVisible(showDash);
@@ -3032,6 +3186,18 @@ public:
         mosaicGroup_->setVisible(showMosaic);
         strengthGroup_->setVisible(showStrength);
         numberGroup_->setVisible(showNumberStyle);
+        alphaGroup_->setVisible(showColor);
+        fillGroup_->setVisible(showFill);
+        amplitudeGroup_->setVisible(showWaveShape);
+        wavelengthGroup_->setVisible(showWaveShape);
+        // The width slider carries the badge's diameter while the number tool or
+        // a placed badge is the target, and the range follows: a badge is
+        // measured in tens of pixels, a stroke outline in single ones.
+        {
+            const QSignalBlocker rangeBlocker(widthSlider_);
+            widthSlider_->setRange(number ? kNumberMinDiameter : 1,
+                                   number ? kNumberMaxDiameter : 64);
+        }
         for (int index = 0; index < mosaicButtons_.size(); ++index) {
             const bool brush = mosaicValues_.at(index) == QStringLiteral("brush");
             mosaicButtons_.at(index)->setEnabled(
@@ -3051,9 +3217,11 @@ public:
             {colorGroup_, showColor, true},          {fontGroup_, showFont, true},
             {dashGroup_, showDash, true},
             {arrowStyleGroup_, showArrowHead, true}, {mosaicGroup_, showMosaic, true},
-            {numberGroup_, showNumberStyle, true},
-            {widthGroup_, showWidth, false},         {arrowGroup_, showArrowSize, false},
-            {textGroup_, showTextSize, false},       {strengthGroup_, showStrength, false},
+            {numberGroup_, showNumberStyle, true},   {fillGroup_, showFill, true},
+            {alphaGroup_, showColor, false},         {widthGroup_, showWidth, false},
+            {arrowGroup_, showArrowSize, false},     {textGroup_, showTextSize, false},
+            {strengthGroup_, showStrength, false},   {amplitudeGroup_, showWaveShape, false},
+            {wavelengthGroup_, showWaveShape, false},
         };
         QVector<QWidget *> visibleGroups;
         int visibleWidth = 0;
@@ -3073,9 +3241,10 @@ public:
             optionLayout->contentsMargins().left() + optionLayout->contentsMargins().right() +
             4; // styleRow_ side margins
         const bool singleRow = groupCount > 0 && mergedWidth <= kStyleRowMaxWidth;
-        const bool anyOptionsGroup =
-            showColor || showFont || showDash || showArrowHead || showMosaic || showNumberStyle;
-        const bool anyNumericGroup = showWidth || showArrowSize || showTextSize || showStrength;
+        const bool anyOptionsGroup = showColor || showFont || showDash || showArrowHead ||
+            showMosaic || showNumberStyle || showFill;
+        const bool anyNumericGroup = showWidth || showArrowSize || showTextSize ||
+            showStrength || showColor || showWaveShape;
         for (const StyleGroup &entry : orderedGroups) {
             QWidget *homeRow = (singleRow || entry.optionsRow) ? optionsRow_ : numericRow_;
             if (entry.widget->parentWidget() == homeRow) {
@@ -3108,9 +3277,13 @@ public:
         numericRow_->updateGeometry();
         styleRow_->updateGeometry();
 
-        const QColor color = selected != nullptr ? selected->color : controller_->currentColor_;
+        // The style the row shows while nothing is selected: the tool the row is
+        // pointed at owns its colour and its numbers, so switching tools shows
+        // that tool's values rather than one shared set.
+        const ToolStyle &pendingStyle = controller_->toolStyle(controller_->styleTargetTool());
+        const QColor color = selected != nullptr ? selected->color : pendingStyle.color;
         const QString dash = selected != nullptr ? selected->dash : controller_->currentDash_;
-        const std::uint32_t width = selected != nullptr ? selected->width : controller_->currentWidth_;
+        const std::uint32_t width = selected != nullptr ? selected->width : pendingStyle.width;
         const std::uint32_t size = selected != nullptr ? selected->size : controller_->arrowSize_;
         const QString arrowStyle = selected != nullptr ? selected->arrowStyle
                                                         : controller_->currentArrowStyle_;
@@ -3151,19 +3324,60 @@ public:
                         .arg(numberStyleName(numberStyle)));
             }
         }
+        const std::uint32_t numberSize = selected != nullptr && isNumberAnnotation(*selected)
+            ? selected->numberSize
+            : controller_->toolStyle(QStringLiteral("number")).numberSize;
+        const bool waveSelected = selected != nullptr && selected->tool == QStringLiteral("wave");
+        // A wave that was never tuned carries zeroes; the slider shows the shape
+        // that is actually on screen, which is the derived one.
+        const std::uint32_t amplitude = waveSelected
+            ? static_cast<std::uint32_t>(std::lround(effectiveWaveAmplitude(*selected)))
+            : pendingStyle.amplitude;
+        const std::uint32_t wavelength = waveSelected
+            ? static_cast<std::uint32_t>(std::lround(effectiveWaveWavelength(*selected)))
+            : pendingStyle.wavelength;
+        const QString fill = selected != nullptr && selected->tool == QStringLiteral("bezier")
+            ? selected->fill
+            : controller_->currentFill_;
         {
             const QSignalBlocker widthBlocker(widthSlider_);
             const QSignalBlocker arrowBlocker(arrowSlider_);
             const QSignalBlocker textBlocker(textSpin_);
             const QSignalBlocker strengthBlocker(strengthSlider_);
-            widthSlider_->setValue(static_cast<int>(std::clamp(width, 1u, 64u)));
+            const QSignalBlocker alphaBlocker(alphaSlider_);
+            const QSignalBlocker amplitudeBlocker(amplitudeSlider_);
+            const QSignalBlocker wavelengthBlocker(wavelengthSlider_);
+            widthSlider_->setValue(number ? static_cast<int>(numberSize)
+                                          : static_cast<int>(std::clamp(width, 1u, 64u)));
             arrowSlider_->setValue(static_cast<int>(std::clamp(size, 1u, 8u)));
             textSpin_->setValue(clampTextPixels(static_cast<int>(textSize)));
             strengthSlider_->setValue(static_cast<int>(std::clamp(strength, 1u, 3u)));
+            alphaSlider_->setValue(color.alpha());
+            amplitudeSlider_->setValue(static_cast<int>(std::clamp(amplitude, 1u, 64u)));
+            wavelengthSlider_->setValue(static_cast<int>(std::clamp(wavelength, 6u, 256u)));
         }
-        widthLabel_->setText(uiTr("Width %1").arg(widthSlider_->value()));
+        syncToggleGroup(fillButtons_, fillValues_, fill);
+        // The width slider carries the badge's diameter while a badge is the
+        // target, and its label has to say so.
+        widthLabel_->setText(number ? uiTr("Size %1").arg(widthSlider_->value())
+                                    : uiTr("Width %1").arg(widthSlider_->value()));
         arrowLabel_->setText(uiTr("Arrow %1").arg(arrowSlider_->value()));
         strengthLabel_->setText(uiTr("Mosaic %1").arg(strengthSlider_->value()));
+        alphaLabel_->setText(uiTr("Alpha %1").arg(alphaSlider_->value()));
+        amplitudeLabel_->setText(uiTr("Amplitude %1").arg(amplitudeSlider_->value()));
+        wavelengthLabel_->setText(uiTr("Wavelength %1").arg(wavelengthSlider_->value()));
+        // The pen and the wave each need a sentence: neither gesture reads off
+        // its button, and a user said so.
+        const QString usage =
+            target == QStringLiteral("bezier")
+            ? uiTr("Click to drop an anchor, drag from it to bend the curve, click the "
+                   "first anchor to close, double click to finish")
+            : (target == QStringLiteral("wave")
+                   ? uiTr("Drag between two points, then shape the wave with Amplitude "
+                          "and Wavelength")
+                   : QString());
+        usageHint_->setText(usage);
+        usageHint_->setVisible(!usage.isEmpty());
         // While a label is being typed the size box must not take the keyboard:
         // clicking it would blur the editor the user is typing in.  A spin box
         // defaults to WheelFocus, so it is the one control on this bar whose
@@ -3580,11 +3794,13 @@ private:
         case Tool::Line:
             return uiTr("Draw a straight line");
         case Tool::Wave:
-            return uiTr("Draw a wavy line");
+            return uiTr("Draw a wavy line between two points; the Amplitude and "
+                        "Wavelength sliders shape it");
         case Tool::Bezier:
-            return uiTr("Draw a curved path: click to add an anchor, drag to bend the "
-                        "curve, click the first anchor to close and fill it, "
-                        "double-click to finish it open");
+            return uiTr("Draw a curved path: click to drop an anchor, drag from it to "
+                        "bend the curve, click the first anchor to close the path, "
+                        "double-click to finish it open; Stroke/Fill/Both decides how "
+                        "it is painted");
         case Tool::Pen:
             return uiTr("Draw a freehand line");
         case Tool::Text:
@@ -3693,6 +3909,9 @@ private:
     QWidget *mosaicGroup_ = nullptr;
     QWidget *strengthGroup_ = nullptr;
     QWidget *numberGroup_ = nullptr;
+    QWidget *alphaGroup_ = nullptr;
+    QWidget *amplitudeGroup_ = nullptr;
+    QWidget *wavelengthGroup_ = nullptr;
     QWidget *optionsRow_ = nullptr;
     QWidget *numericRow_ = nullptr;
     QVector<QPushButton *> dashButtons_;
@@ -3711,6 +3930,22 @@ private:
     QLabel *textLabel_ = nullptr;
     QSlider *strengthSlider_ = nullptr;
     QLabel *strengthLabel_ = nullptr;
+    // The colour's opacity, on the bar rather than only inside the picker: the
+    // user asked for it where the colours are, not one popup deeper.
+    QSlider *alphaSlider_ = nullptr;
+    QLabel *alphaLabel_ = nullptr;
+    // The wave's own shape, shown only while the wave is the style target.
+    QSlider *amplitudeSlider_ = nullptr;
+    QLabel *amplitudeLabel_ = nullptr;
+    QSlider *wavelengthSlider_ = nullptr;
+    QLabel *wavelengthLabel_ = nullptr;
+    // How the pen path is painted, shown only while the pen is the target.
+    QWidget *fillGroup_ = nullptr;
+    QVector<QPushButton *> fillButtons_;
+    QVector<QString> fillValues_;
+    // One line telling the user how the pointer-heavy tools work, shown only
+    // while one of them is armed.
+    QLabel *usageHint_ = nullptr;
     QPushButton *undo_ = nullptr;
     QPushButton *redo_ = nullptr;
     bool dragging_ = false;
@@ -3780,15 +4015,32 @@ OverlayController::OverlayController(Session session)
     selectOnly_ = session_.mode == QStringLiteral("region-only");
     // The style the user last left the editor in.
     const EditorPreferences preferences = loadEditorPreferences();
-    currentColor_ = preferences.color;
     currentFont_ = preferences.font;
-    currentWidth_ = preferences.width;
     textSize_ = preferences.textSize;
     currentDash_ = preferences.dash;
     arrowSize_ = preferences.arrowSize;
     currentArrowStyle_ = preferences.arrowStyle;
     mosaicShape_ = preferences.mosaicShape;
     mosaicStrength_ = preferences.mosaicStrength;
+    // Every tool starts from the same remembered style and keeps its own copy
+    // from there: a width moved on the rectangle must not follow the user to the
+    // pen.  The badge diameter and the wave's shape have no entry of their own in
+    // the config file -- there is one remembered style, not one per tool -- so
+    // they start from the editor's defaults, with the wave derived from the
+    // remembered width so a wide default still draws a proportionate wave.
+    const Tool everyTool[] = {
+        Tool::Select,  Tool::Rectangle, Tool::Ellipse, Tool::Arrow, Tool::Line,
+        Tool::Wave,    Tool::Bezier,    Tool::Pen,     Tool::Text,  Tool::Number,
+        Tool::Mosaic,
+    };
+    for (const Tool entry : everyTool) {
+        ToolStyle style;
+        style.color = preferences.color;
+        style.width = preferences.width;
+        style.amplitude = std::max(2u * preferences.width, 4u);
+        style.wavelength = std::max(6u * preferences.width, 18u);
+        toolStyles_.insert(toolName(entry), style);
+    }
     // The remembered tool is restored only where a tool is already meaningful:
     // a session that starts in editing state -- one that arrives with its
     // selection made (`beginPresetEdit`, the window picker's follow-up) and the
@@ -4360,9 +4612,10 @@ void OverlayController::finishDrawing(Point point)
     }
     Annotation annotation;
     annotation.tool = toolName(drawingTool);
+    const ToolStyle &style = toolStyle(annotation.tool);
     annotation.textPixels = textSize_;
-    annotation.color = currentColor_;
-    annotation.width = currentWidth_;
+    annotation.color = style.color;
+    annotation.width = style.width;
     annotation.dash = currentDash_;
     annotation.size = arrowSize_;
     annotation.arrowStyle = currentArrowStyle_;
@@ -4441,8 +4694,10 @@ void OverlayController::finishBezier(bool closed)
     // A single anchor has no segment to close, so a path that was somehow closed
     // before it had two of them stays open rather than being filled as a point.
     annotation.closed = closed && bezierAnchors(points) >= 2;
-    annotation.color = currentColor_;
-    annotation.width = currentWidth_;
+    const ToolStyle &style = toolStyle(annotation.tool);
+    annotation.color = style.color;
+    annotation.width = style.width;
+    annotation.fill = currentFill_;
     annotation.dash = currentDash_;
     annotation.points = points;
     QVector<Annotation> next = annotations_;
@@ -4522,8 +4777,9 @@ void OverlayController::placeNumber(Point point)
     }
     annotation.number = highest + 1;
     annotation.numberStyle = numberStyle_;
-    annotation.color = currentColor_;
-    annotation.width = currentWidth_;
+    const ToolStyle &style = toolStyle(annotation.tool);
+    annotation.color = style.color;
+    annotation.numberSize = style.numberSize;
     // The badge hangs from the point the click landed on, and its box is
     // recorded on the annotation: the hit test, the drag clamp, the raster cache
     // and the paint all read it from there, which is what makes a badge
@@ -4590,7 +4846,9 @@ void OverlayController::startTextEditor(CaptureOverlay *overlay, int index, Poin
     // While re-editing, the editor mirrors the annotation's own style so the
     // user must not re-pick it after moving a label around.
     textEditPixels_ = cancelledText_.has_value() ? cancelledText_->textPixels : textSize_;
-    const QColor editColor = cancelledText_.has_value() ? cancelledText_->color : currentColor_;
+    const QColor editColor = cancelledText_.has_value()
+        ? cancelledText_->color
+        : toolStyle(QStringLiteral("text")).color;
     textEditFont_ = cancelledText_.has_value() ? cancelledText_->font : currentFont_;
     textOutput_ = overlay->outputIndex();
     textOrigin_ = origin;
@@ -4655,7 +4913,7 @@ void OverlayController::finishText(bool accept)
             annotation.font = textEditFont_;
         } else {
             annotation.textPixels = textSize_;
-            annotation.color = currentColor_;
+            annotation.color = toolStyle(QStringLiteral("text")).color;
             annotation.font = currentFont_;
         }
         QVector<Annotation> next = annotations_;
@@ -4933,6 +5191,19 @@ double liveStrokeMargin(bool brush, int widthLogical, int scale, std::uint32_t s
     return deviceRadius / scale + 2.0;
 }
 
+/// How far a wave's pixels reach from the line its two points describe.
+///
+/// A crest leaves that line by the amplitude and the stroke adds half its width
+/// on top, plus a pixel for the antialiased edge.  The live preview's damage
+/// rectangle and a committed wave's padding are both computed from this one
+/// number: they used to be spelled out separately, and the drag path was
+/// missing the amplitude term altogether, which left the previous frame's
+/// crests on screen after the wave moved.
+double waveReach(double amplitude, double width)
+{
+    return amplitude + width / 2.0 + 4.0;
+}
+
 // Room for the size pill the editor pins to the selection's top-left corner: it
 // is centred on that corner, so it reaches half its width to either side and a
 // line below.  Slack rather than the measured width, because the step has to
@@ -5007,11 +5278,15 @@ LogicalRect OverlayController::drawingTouch(int pointsBefore) const
         }
     }
     const bool brush = tool_ == Tool::Mosaic;
-    const int margin = static_cast<int>(std::ceil(liveStrokeMargin(
-                           brush, std::max(1, static_cast<int>(currentWidth_)), scale,
-                           mosaicStrength_))) +
-        kSelectionChrome;
-    return growBy(touched, margin);
+    const ToolStyle &style = toolStyle(toolName(tool_));
+    // A wave is the one two-point tool whose pixels leave the box its endpoints
+    // describe, so it is measured by its own reach rather than by the half-width
+    // margin every other straight tool fits inside.
+    const double reach = tool_ == Tool::Wave
+        ? waveReach(style.amplitude, style.width)
+        : liveStrokeMargin(brush, std::max(1, static_cast<int>(style.width)), scale,
+                           mosaicStrength_);
+    return growBy(touched, static_cast<int>(std::ceil(reach)) + kSelectionChrome);
 }
 
 LogicalRect OverlayController::bezierTouch() const
@@ -5037,6 +5312,12 @@ LogicalRect OverlayController::bezierTouch() const
     const LogicalRect band{std::min(anchor.x, cursor.x), std::min(anchor.y, cursor.y),
                            static_cast<std::uint32_t>(std::abs(cursor.x - anchor.x) + 1),
                            static_cast<std::uint32_t>(std::abs(cursor.y - anchor.y) + 1)};
+    // The anchor and handle guides reach past the curve itself: a handle is
+    // pulled out from its anchor, often well outside the box the sampled path
+    // occupies, and the chrome around it would otherwise be left on screen.
+    for (const Point &point : gesture_->points) {
+        bounds = uniteLogical(bounds, LogicalRect{point.x, point.y, 1u, 1u});
+    }
     return growBy(uniteLogical(bounds, band),
                   annotationReach(previewAnnotation()) + kSelectionChrome);
 }
@@ -5049,8 +5330,10 @@ Annotation OverlayController::previewAnnotation() const
     Annotation preview;
     preview.kind = Annotation::Kind::Stroke;
     preview.tool = QStringLiteral("bezier");
-    preview.color = currentColor_;
-    preview.width = currentWidth_;
+    const ToolStyle &style = toolStyle(preview.tool);
+    preview.color = style.color;
+    preview.width = style.width;
+    preview.fill = currentFill_;
     preview.dash = currentDash_;
     preview.points = gesture_->points;
     return preview;
@@ -5058,7 +5341,10 @@ Annotation OverlayController::previewAnnotation() const
 
 bool OverlayController::drawsGrowingStroke() const
 {
-    return (tool_ == Tool::Pen && currentColor_.alpha() == 255) ||
+    // Only an opaque pen stroke can be baked a segment at a time: a translucent
+    // one has to be composited as a whole, and the mosaic brush stamps blocks
+    // the committed mark rebuilds from the source.
+    return (tool_ == Tool::Pen && toolStyle(QStringLiteral("pen")).color.alpha() == 255) ||
            (tool_ == Tool::Mosaic && mosaicShape_ == QStringLiteral("brush"));
 }
 
@@ -5193,7 +5479,8 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
         // rather than on a release: the click is the whole closing gesture, and
         // waiting for the button to come up would leave the filled shape
         // hanging on a press the user already made.
-        const double reach = std::max(8.0, static_cast<double>(currentWidth_) * 2.0);
+        const double reach =
+            std::max(8.0, static_cast<double>(toolStyle(QStringLiteral("bezier")).width) * 2.0);
         if (gesture_->type == Gesture::Type::Bezier &&
             bezierAnchors(gesture_->points) >= 2 &&
             std::hypot(static_cast<double>(gesture_->points.constFirst().x - point.x),
@@ -5758,7 +6045,7 @@ void OverlayController::setCurrentColor(const QColor &color)
     if (finished_ || cancelled_ || !color.isValid()) {
         return;
     }
-    currentColor_ = color;
+    toolStyle(styleTargetTool()).color = color;
     applyStyleToSelected([&color](Annotation &annotation) { annotation.color = color; });
     updateAll();
 }
@@ -5793,21 +6080,87 @@ void OverlayController::setWidth(std::uint32_t width)
     if (finished_ || cancelled_) {
         return;
     }
-    currentWidth_ = std::clamp(width, 1u, 64u);
-    applyStyleToSelected([this](Annotation &annotation) {
-        // A numbered badge is a text annotation, but its size *is* derived from
-        // the stroke width, so the width control has to reach it; a label's is
-        // its own size box and must not be overwritten here.
+    const QString target = styleTargetTool();
+    const std::uint32_t clamped = std::clamp(width, 1u, 64u);
+    toolStyle(target).width = clamped;
+    // A numbered badge is a text annotation by wire, but its diameter is a value
+    // of its own and this control never reaches it: the badges already on the
+    // canvas keep the size they were placed with.  A label's size is its own box
+    // for the same reason.
+    if (target == QStringLiteral("number")) {
+        updateAll();
+        return;
+    }
+    applyStyleToSelected([&clamped](Annotation &annotation) {
         if (annotation.kind != Annotation::Kind::Text) {
-            annotation.width = currentWidth_;
-            return;
+            annotation.width = clamped;
         }
+    });
+    updateAll();
+}
+
+void OverlayController::setNumberSize(std::uint32_t size)
+{
+    if (finished_ || cancelled_) {
+        return;
+    }
+    const std::uint32_t clamped =
+        std::clamp(size, static_cast<std::uint32_t>(kNumberMinDiameter),
+                   static_cast<std::uint32_t>(kNumberMaxDiameter));
+    toolStyle(QStringLiteral("number")).numberSize = clamped;
+    applyStyleToSelected([&clamped](Annotation &annotation) {
         if (isNumberAnnotation(annotation)) {
             const Point center = numberCenter(annotation);
-            annotation.width = currentWidth_;
-            // The box travels with the width, or the badge would keep the size
-            // it was placed at while the slider moved.
+            annotation.numberSize = clamped;
+            // The box travels with the diameter, or a placed badge would keep
+            // the size it was placed at while the slider moved.
             layoutNumberBox(annotation, center);
+        }
+    });
+    updateAll();
+}
+
+void OverlayController::setWaveAmplitude(std::uint32_t amplitude)
+{
+    if (finished_ || cancelled_) {
+        return;
+    }
+    const std::uint32_t clamped = std::clamp(amplitude, 1u, 64u);
+    toolStyle(QStringLiteral("wave")).amplitude = clamped;
+    applyStyleToSelected([&clamped](Annotation &annotation) {
+        if (annotation.tool == QStringLiteral("wave")) {
+            annotation.amplitude = clamped;
+        }
+    });
+    updateAll();
+}
+
+void OverlayController::setWaveWavelength(std::uint32_t wavelength)
+{
+    if (finished_ || cancelled_) {
+        return;
+    }
+    const std::uint32_t clamped = std::clamp(wavelength, 6u, 256u);
+    toolStyle(QStringLiteral("wave")).wavelength = clamped;
+    applyStyleToSelected([&clamped](Annotation &annotation) {
+        if (annotation.tool == QStringLiteral("wave")) {
+            annotation.wavelength = clamped;
+        }
+    });
+    updateAll();
+}
+
+void OverlayController::setFill(const QString &fill)
+{
+    if (finished_ || cancelled_) {
+        return;
+    }
+    currentFill_ = fill == QStringLiteral("stroke") || fill == QStringLiteral("fill")
+        ? fill
+        : QStringLiteral("both");
+    applyStyleToSelected([this](Annotation &annotation) {
+        if (annotation.tool == QStringLiteral("bezier")) {
+            annotation.fill = currentFill_;
         }
     });
     updateAll();
@@ -5875,9 +6228,9 @@ void OverlayController::setTextSize(std::uint32_t size)
         textEdit_->setFixedHeight(height);
     }
     applyStyleToSelected([this](Annotation &annotation) {
-        // A badge's pixel size *is* its diameter, kept in step by the width
-        // control; letting the label size box write over it would decouple the
-        // bitmap's density from the scale the protocol derives.
+        // A badge's diameter has a size control of its own; letting the label
+        // size box write over it would decouple the bitmap's density from the
+        // scale the protocol derives.
         if (annotation.kind == Annotation::Kind::Text && !isNumberAnnotation(annotation)) {
             annotation.textPixels = textSize_;
         }
@@ -6516,6 +6869,23 @@ QString OverlayController::styleTargetTool() const
     return toolName(tool_);
 }
 
+ToolStyle &OverlayController::toolStyle(const QString &tool)
+{
+    // `QHash::operator[]` default-constructs, which is the right value for a
+    // name the loop in the constructor somehow missed.
+    return toolStyles_[tool];
+}
+
+const ToolStyle &OverlayController::toolStyle(const QString &tool) const
+{
+    // A const read must never insert -- a painter path asks for its style on
+    // every frame -- so a name with no entry falls back to the built-in style
+    // instead of allocating one.
+    static const ToolStyle fallback;
+    const QHash<QString, ToolStyle>::const_iterator found = toolStyles_.constFind(tool);
+    return found == toolStyles_.constEnd() ? fallback : found.value();
+}
+
 void OverlayController::applyStyleToSelected(
     const std::function<void(Annotation &)> &mutate)
 {
@@ -6613,7 +6983,8 @@ int OverlayController::annotationHitAt(Point point) const
             const Point &last = annotation.points.constLast();
             const QVector<QPointF> wave =
                 wavePolyline(QPointF(first.x, first.y), QPointF(last.x, last.y),
-                             static_cast<int>(annotation.width), 1.0);
+                             effectiveWaveAmplitude(annotation),
+                             effectiveWaveWavelength(annotation), 1.0);
             for (int segment = 1; segment < wave.size(); ++segment) {
                 const auto toPoint = [](const QPointF &value) {
                     return Point{static_cast<std::int32_t>(std::lround(value.x())),
@@ -7220,12 +7591,22 @@ QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
                 value.insert(QStringLiteral("strength"),
                              static_cast<qint64>(annotation.strength));
             }
+            if (annotation.tool == QStringLiteral("wave")) {
+                // The wave's own crest offset and period, in logical pixels.  A
+                // wave the user never tuned carries zeroes, which tells the
+                // renderer to derive both from the width exactly as the editor
+                // does -- so an untouched wave keeps the shape it always had.
+                value.insert(QStringLiteral("amplitude"),
+                             static_cast<qint64>(annotation.amplitude));
+                value.insert(QStringLiteral("wavelength"),
+                             static_cast<qint64>(annotation.wavelength));
+            }
             if (annotation.tool == QStringLiteral("bezier")) {
-                // The pen path's closure, and the one field that makes the two
-                // ends of the protocol agree: the renderer fills a closed path
-                // before it strokes it.  Only a bezier carries it, the same way
-                // only an arrow carries `size`.
+                // The pen path's closure and how it is painted: the two fields
+                // that make the ends of the protocol agree.  Only a bezier
+                // carries them, the same way only an arrow carries `size`.
                 value.insert(QStringLiteral("closed"), annotation.closed);
+                value.insert(QStringLiteral("fill"), annotation.fill);
             }
             QJsonArray points;
             for (const Point &point : annotation.points) {
@@ -7295,8 +7676,7 @@ QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
                             paintNumberBadge(bitmapPainter,
                                              QRectF(0, 0, logical.width(), logical.height()),
                                              QString::number(annotation.number),
-                                             annotation.numberStyle, annotation.color,
-                                             static_cast<int>(annotation.width));
+                                             annotation.numberStyle, annotation.color);
                         } else {
                             QFont font = textFont(
                                 annotation.font,
@@ -7419,7 +7799,13 @@ public:
             cache.image.fill(Qt::transparent);
             QPainter raster(&cache.image);
             raster.setRenderHint(QPainter::Antialiasing, true);
-            raster.scale(ratio, ratio);
+            // No `scale(ratio, ratio)` here: the cache carries the ratio as its
+            // device-pixel ratio, and QPainter applies that transform itself
+            // when it paints into the image, so the painter already works in
+            // logical coordinates.  Scaling once more multiplied it by a second
+            // ratio -- on a 2x screen every committed mark came out twice the
+            // size, with the part past its own clip cut away, while the live
+            // preview stayed right because it never goes through a raster.
             raster.translate(-clip.topLeft());
             draw(&raster, annotation, output, size);
             cache.key = key;
@@ -7585,9 +7971,15 @@ protected:
         QByteArray data;
         QDataStream stream(&data, QIODevice::WriteOnly);
         writeContext(stream, output, size);
+        // Every number the ink depends on belongs here, not just the ones a
+        // stroke has always carried: a wave drawn with a new amplitude or
+        // wavelength, or a pen path whose fill mode changed, redraws only when
+        // its key moves -- and a key without them kept the pixels the old
+        // numbers produced.
         stream << annotation.tool << annotation.dash << annotation.width
                << static_cast<quint32>(annotation.color.rgba()) << annotation.size
-               << annotation.arrowStyle << annotation.strength << annotation.closed;
+               << annotation.arrowStyle << annotation.strength << annotation.closed
+               << annotation.amplitude << annotation.wavelength << annotation.fill;
         if (annotation.tool == QStringLiteral("mosaic")) {
             // The freehand mosaic brush averages the source image under the
             // path, so every point's absolute position has to stay in the key.
@@ -7632,7 +8024,7 @@ protected:
             for (const Point &point : annotation.points) {
                 at.append(localPoint(output, point, size));
             }
-            paintBezierInk(painter, at, annotation.closed, annotation.color,
+            paintBezierInk(painter, at, annotation.closed, annotation.fill, annotation.color,
                            static_cast<int>(annotation.width));
             return;
         }
@@ -7643,10 +8035,16 @@ protected:
             // A wave is the sine sample of the segment between its two points,
             // not the segment itself: sample it here the same way the live
             // preview and the Rust renderer do, and draw it solid.
+            // The crest offset and the period are logical pixels like every
+            // other number here, and the painter is the logical one: the `scale`
+            // argument only says how finely to sample, one point per device
+            // pixel.  Multiplying them by the scale as well drew a high-density
+            // screen's wave twice as large as the padding allowed, so its crests
+            // were cut off by their own raster clip.
             const QVector<QPointF> wave = wavePolyline(
                 localPoint(output, annotation.points.constFirst(), size),
                 localPoint(output, annotation.points.constLast(), size),
-                static_cast<int>(annotation.width), scale);
+                effectiveWaveAmplitude(annotation), effectiveWaveWavelength(annotation), scale);
             polygon = QPolygonF(wave.begin(), wave.end());
             pen = wavePen(annotation);
         } else {
@@ -7706,14 +8104,15 @@ protected:
             return head + static_cast<int>(annotation.width) + 4;
         }
         if (annotation.tool == QStringLiteral("wave")) {
-            // The wave's crests reach `amplitude` off the line its two points
+            // The wave's crests reach its amplitude off the line its two points
             // describe -- the box `annotationLogicalBounds` reports -- so the
             // room has to cover that plus the pen's own half width and a pixel
-            // for the antialiased edge.  The controller sizes the region a drag
-            // invalidates from this, so a crest left outside it would stay on
-            // screen after the wave moved.
-            const int amplitude = std::max(static_cast<int>(annotation.width) * 2, 4);
-            return amplitude + static_cast<int>(annotation.width) / 2 + 4;
+            // for the antialiased edge.  `waveReach` is the very number the live
+            // drag sizes its damage rectangle with, so the two cannot drift
+            // apart and leave a crest outside the region a step invalidates.
+            return static_cast<int>(
+                std::ceil(waveReach(effectiveWaveAmplitude(annotation),
+                                    static_cast<double>(annotation.width))));
         }
         return AnnotationRaster::padding(annotation);
     }
@@ -7803,7 +8202,7 @@ protected:
         // rather than centred on a point again.
         paintNumberBadge(*painter, localRect(output, rect, size),
                          QString::number(annotation.number), annotation.numberStyle,
-                         annotation.color, static_cast<int>(annotation.width));
+                         annotation.color);
     }
 };
 
@@ -7994,14 +8393,25 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
         const int count = textLayer_->count();
         const int low = textAnchor_ >= 0 ? std::min(textAnchor_, textFocus_) : -1;
         const int high = textAnchor_ >= 0 ? std::max(textAnchor_, textFocus_) : -1;
-        // The fills first, so the outlines below stay visible on top of them.
-        // Adjacent unit boxes tile exactly, so the fills join into one bar the
-        // way a text selection does.
+        // One bar per line of the selection, spanning what is actually selected.
+        // Drawing each character's own box shows a row of little rectangles
+        // wherever the recognizer left a gap between glyphs, while a text
+        // selection reads as one run.  Units come in reading order and carry
+        // their line, so a run is a span of indices grouped by that number.
         if (low >= 0) {
             painter->setPen(Qt::NoPen);
             painter->setBrush(kTextSelectionFill);
-            for (int index = low; index <= high; ++index) {
-                painter->drawRect(localRect(output, textLayer_->unit(index).rect, overlay->size()));
+            int runStart = low;
+            while (runStart <= high) {
+                const int line = textLayer_->unit(runStart).line;
+                QRectF bar = localRect(output, textLayer_->unit(runStart).rect, overlay->size());
+                ++runStart;
+                while (runStart <= high && textLayer_->unit(runStart).line == line) {
+                    bar = bar.united(
+                        localRect(output, textLayer_->unit(runStart).rect, overlay->size()));
+                    ++runStart;
+                }
+                painter->drawRect(bar);
             }
         }
         // One outline per line, around the union of its units: the user can see
@@ -8082,7 +8492,7 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
                 // the mark the user ends up with.
                 paintNumberBadge(*painter, localRect(output, bounds, overlay->size()),
                                  QString::number(annotation.number), annotation.numberStyle,
-                                 annotation.color, static_cast<int>(annotation.width));
+                                 annotation.color);
                 return;
             }
             QFont font = annotationFont(annotation);
@@ -8111,7 +8521,7 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
             for (const Point &point : annotation.points) {
                 at.append(localPoint(output, point, overlay->size()));
             }
-            paintBezierInk(painter, at, annotation.closed, annotation.color,
+            paintBezierInk(painter, at, annotation.closed, annotation.fill, annotation.color,
                            static_cast<int>(annotation.width));
             return;
         }
@@ -8121,11 +8531,13 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
             // A wave is the sine sample of the segment between its two points,
             // not the segment itself: sample it here exactly as the committed
             // mark's rasterizer does -- solid, and from the same two points --
-            // so letting go changes nothing on screen.
+            // so letting go changes nothing on screen.  The crest offset and
+            // period stay logical, as they are in the rasterizer: `scale` only
+            // sets the sampling density.
             const QVector<QPointF> wave = wavePolyline(
                 localPoint(output, annotation.points.constFirst(), overlay->size()),
                 localPoint(output, annotation.points.constLast(), overlay->size()),
-                static_cast<int>(annotation.width), scale);
+                effectiveWaveAmplitude(annotation), effectiveWaveWavelength(annotation), scale);
             polygon = QPolygonF(wave.begin(), wave.end());
             pen = wavePen(annotation);
         } else {
@@ -8189,11 +8601,41 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
         const QPointF from = localPoint(output, anchor, overlay->size());
         const QPointF to = localPoint(output, gesture_->current, overlay->size());
         if (QLineF(from, to).length() > 0.0) {
-            painter->setPen(QPen(currentColor_, static_cast<double>(currentWidth_), Qt::SolidLine,
-                                 Qt::RoundCap, Qt::RoundJoin));
+            const ToolStyle &bandStyle = toolStyle(QStringLiteral("bezier"));
+            painter->setPen(QPen(bandStyle.color, static_cast<double>(bandStyle.width),
+                                 Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
             painter->setBrush(Qt::NoBrush);
             painter->drawLine(from, to);
         }
+        // The anchors and the handles, drawn the way the selection's own handles
+        // are.  A curve on its own says nothing about where an anchor sits or
+        // which way its handle points, so there is no way to aim the next click:
+        // the anchor is a square, its handle a dot on the line it pulls along.
+        // White with a dark outline so the guides never read as the user's own
+        // ink.
+        for (int index = 0; index + 1 < gesture_->points.size(); index += 2) {
+            const QPointF anchorAt =
+                localPoint(output, gesture_->points.at(index), overlay->size());
+            const QPointF handleAt =
+                localPoint(output, gesture_->points.at(index + 1), overlay->size());
+            if (QLineF(anchorAt, handleAt).length() <= 0.0) {
+                continue;
+            }
+            painter->setBrush(Qt::NoBrush);
+            painter->setPen(QPen(QColor(255, 255, 255, 190), 1.0, Qt::SolidLine));
+            painter->drawLine(anchorAt, handleAt);
+            painter->setBrush(Qt::white);
+            painter->setPen(QPen(Qt::black, 1.0));
+            painter->drawEllipse(handleAt, 3.0, 3.0);
+        }
+        painter->setBrush(Qt::white);
+        painter->setPen(QPen(Qt::black, 1.0));
+        for (int index = 0; index < gesture_->points.size(); index += 2) {
+            const QPointF anchorAt =
+                localPoint(output, gesture_->points.at(index), overlay->size());
+            painter->drawRect(QRectF(anchorAt.x() - 4.0, anchorAt.y() - 4.0, 8.0, 8.0));
+        }
+        painter->setBrush(Qt::NoBrush);
     }
     if (gesture_->type == Gesture::Type::Drawing && !gesture_->points.isEmpty()) {
         // Rectangle, ellipse, the area mosaic and the arrow all depend on two
@@ -8208,8 +8650,10 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
         } else {
             Annotation preview;
             preview.tool = toolName(tool_);
-            preview.color = currentColor_;
-            preview.width = currentWidth_;
+            const ToolStyle &previewStyle = toolStyle(preview.tool);
+            preview.color = previewStyle.color;
+            preview.width = previewStyle.width;
+            preview.fill = currentFill_;
             preview.dash = currentDash_;
             preview.size = arrowSize_;
             preview.arrowStyle = currentArrowStyle_;
@@ -8333,7 +8777,7 @@ void OverlayController::paintLiveStroke(QPainter *painter, const OutputSession &
         return;
     }
     const bool brush = tool_ == Tool::Mosaic;
-    const int widthLogical = std::max(1, static_cast<int>(currentWidth_));
+    const int widthLogical = std::max(1, static_cast<int>(toolStyle(toolName(tool_)).width));
     const int scale = static_cast<int>(output.scale > 0 ? output.scale : 1);
     const double deviceRadius = brush
         ? std::clamp(brushRadiusForStrength(
@@ -8353,9 +8797,10 @@ void OverlayController::paintLiveStroke(QPainter *painter, const OutputSession &
     {
         QDataStream stream(&key, QIODevice::WriteOnly);
         const LogicalRect &surface = surfaceOf(output);
+        const ToolStyle &liveStyle = toolStyle(toolName(tool_));
         stream << size.width() << size.height() << output.id << output.scale << surface.x
                << surface.y << surface.width << surface.height << toolName(tool_)
-               << static_cast<quint32>(currentColor_.rgba()) << currentWidth_ << currentDash_
+               << static_cast<quint32>(liveStyle.color.rgba()) << liveStyle.width << currentDash_
                << mosaicStrength_ << mosaicShape_ << ratio;
     }
     if (key != gesture_->liveKey) {
@@ -8415,8 +8860,11 @@ void OverlayController::paintLiveStroke(QPainter *painter, const OutputSession &
         resized.setDevicePixelRatio(ratio);
         resized.fill(Qt::transparent);
         {
+            // Both images carry the same device-pixel ratio, so the copy is
+            // drawn in logical coordinates by a painter that already has the
+            // ratio's transform; scaling here would place the old pixels at
+            // twice their offset and leave most of the grown raster empty.
             QPainter copy(&resized);
-            copy.scale(ratio, ratio);
             copy.drawImage(current.topLeft() - grown.topLeft(), gesture_->liveRaster);
         }
         gesture_->liveRaster = resized;
@@ -8426,7 +8874,9 @@ void OverlayController::paintLiveStroke(QPainter *painter, const OutputSession &
     {
         QPainter raster(&gesture_->liveRaster);
         raster.setRenderHint(QPainter::Antialiasing, true);
-        raster.scale(ratio, ratio);
+        // No `scale(ratio, ratio)`, for the same reason as the committed
+        // rasters: `setDevicePixelRatio` is the transform, and a second one
+        // would draw the stroke at twice its size.
         raster.translate(-gesture_->liveOrigin);
         if (brush) {
             for (int i = gesture_->liveBaked; i < count; ++i) {
@@ -8438,8 +8888,9 @@ void OverlayController::paintLiveStroke(QPainter *painter, const OutputSession &
             Annotation style;
             style.kind = Annotation::Kind::Stroke;
             style.tool = toolName(tool_);
-            style.color = currentColor_;
-            style.width = currentWidth_;
+            const ToolStyle &strokeStyle = toolStyle(style.tool);
+            style.color = strokeStyle.color;
+            style.width = strokeStyle.width;
             style.dash = currentDash_;
             const QPen pen = penForAnnotation(style);
             const bool dashed = currentDash_ != QStringLiteral("solid");

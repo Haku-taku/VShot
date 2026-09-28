@@ -9,6 +9,7 @@
 #include <QByteArray>
 #include <QColor>
 #include <QElapsedTimer>
+#include <QHash>
 #include <QImage>
 #include <QJsonDocument>
 #include <QPointF>
@@ -112,6 +113,21 @@ struct Annotation {
     // plainly different marks, which is what the undo comparison needs.
     NumberStyle numberStyle = NumberStyle::FilledCircle;
     int number = 0;
+    // Diameter of a numbered badge, in logical pixels.  The badge's size used to
+    // be derived from the stroke width, so the width slider silently resized a
+    // placed badge; it is a value of its own now, and `width` means nothing to a
+    // badge.
+    std::uint32_t numberSize = 18;
+    // A wave's shape, in logical pixels: how far a crest leaves the line its two
+    // points describe, and how long one full period is.  Zero means "derive it
+    // from the stroke width" -- which is what a wave that was never tuned keeps,
+    // so the default look is unchanged and the wire may leave both out.
+    std::uint32_t amplitude = 0;
+    std::uint32_t wavelength = 0;
+    // How a bezier path is painted: "stroke" outlines it, "fill" fills it, and
+    // "both" does both.  "both" fills only a path that was actually closed, so
+    // it is exactly what the editor did before this field existed.
+    QString fill = QStringLiteral("both");
     // Output scale the label was drawn on; the text bitmap is rasterized at
     // this device ratio.
     std::uint32_t deviceRatio = 1;
@@ -149,6 +165,15 @@ inline bool annotationEquals(const Annotation &first, const Annotation &second)
         // either out and two badges that differ only in their number compare
         // equal, which silently collapses an undo step.
         first.numberStyle != second.numberStyle || first.number != second.number ||
+        // A badge's diameter is the badge: two badges of different sizes are
+        // plainly different marks.
+        first.numberSize != second.numberSize ||
+        // A wave's tuned shape is content too -- dragging the amplitude slider
+        // must be an undoable change, not a repaint the comparison eats.
+        first.amplitude != second.amplitude || first.wavelength != second.wavelength ||
+        // And so is a pen path's paint mode: the same outline filled and merely
+        // stroked are different pictures.
+        first.fill != second.fill ||
         // Likewise for a bezier path's closure: an open curve and the closed
         // one that fills it are different marks, and leaving this out would let
         // an undo step that only closes a path look like no change at all.
@@ -170,6 +195,29 @@ inline bool annotationEquals(const Annotation &first, const Annotation &second)
     }
     return true;
 }
+
+/// The style one tool draws with.
+///
+/// The editor used to keep a single colour and width for every tool, so moving
+/// the rectangle's width slider also moved the pen's.  Each tool owns its
+/// values now: the style row shows and edits the values of the tool it is
+/// pointed at -- the selected annotation's tool while one is selected, and the
+/// armed tool otherwise, which is what `styleTargetTool` answers.
+///
+/// `numberSize`, `amplitude` and `wavelength` mean something to one tool each
+/// and are kept here anyway, so that "the style of a tool" stays one object
+/// rather than a mix of shared and per-tool state.
+struct ToolStyle {
+    QColor color{255, 64, 64, 255};
+    /// Stroke width in logical pixels: a shape's outline, a segment's
+    /// thickness, the mosaic brush's radius base.
+    std::uint32_t width = 2;
+    /// Diameter of a numbered badge, in logical pixels.
+    std::uint32_t numberSize = 18;
+    /// A wave's crest offset and period, in logical pixels.
+    std::uint32_t amplitude = 4;
+    std::uint32_t wavelength = 18;
+};
 
 enum class Tool {
     Select,
@@ -253,6 +301,18 @@ public:
     void setTextSize(std::uint32_t size);
     void setMosaicShape(const QString &shape);
     void setMosaicStrength(std::uint32_t strength);
+    /// Diameter of the next numbered badge, in logical pixels.  A badge's size
+    /// is a value of its own now; the width control no longer reaches it.
+    void setNumberSize(std::uint32_t size);
+    /// The wave's crest offset and period, in logical pixels.
+    void setWaveAmplitude(std::uint32_t amplitude);
+    void setWaveWavelength(std::uint32_t wavelength);
+    /// How the next pen path is painted: "stroke" | "fill" | "both".
+    void setFill(const QString &fill);
+    /// The style of one tool, by its wire name (see `toolName`).  Every tool has
+    /// one from construction, so a read never has to invent a value.
+    ToolStyle &toolStyle(const QString &tool);
+    const ToolStyle &toolStyle(const QString &tool) const;
     // The badge style the next numbered mark is placed with, and any number
     // already selected.
     void setNumberStyle(NumberStyle style);
@@ -426,13 +486,19 @@ private:
     Point pointer_;
     int pointerOutput_ = -1;
     Tool tool_ = Tool::Select;
-    QColor currentColor_{255, 64, 64, 255};
     QString currentFont_;
-    std::uint32_t currentWidth_ = 2;
+    // Per-tool colour and numeric parameters, keyed by `toolName`.  A painter
+    // path reads the tool it is drawing with; the style row reads and writes
+    // the selected annotation's tool, or the armed one.
+    QHash<QString, ToolStyle> toolStyles_;
     // Font height for the next label, in logical pixels -- the same number the
     // size box shows.
     std::uint32_t textSize_ = 14;
     QString currentDash_ = QStringLiteral("solid");
+    // How the next pen path is painted: "stroke" | "fill" | "both".  Like the
+    // dash and the arrow head, this is a choice rather than a number, so it
+    // stays shared instead of travelling per tool.
+    QString currentFill_ = QStringLiteral("both");
     std::uint32_t arrowSize_ = 1;
     QString currentArrowStyle_ = QStringLiteral("open");
     QString mosaicShape_ = QStringLiteral("rect");

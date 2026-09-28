@@ -5,7 +5,9 @@ use super::{
     global_point, SelectionEvent, BTN_LEFT, BTN_RIGHT, KEY_CONFIRM, KEY_DOWN, KEY_ESC, KEY_LEFT,
     KEY_RIGHT, KEY_UP,
 };
-use crate::edit::{ArrowStyle, LineDash, ShapeMask, TextBitmap, DEFAULT_MOSAIC_STRENGTH};
+use crate::edit::{
+    ArrowStyle, BezierFill, LineDash, ShapeMask, TextBitmap, DEFAULT_MOSAIC_STRENGTH,
+};
 use crate::error::{Result, VshotError};
 use crate::geometry::{Point, Rect, Size};
 
@@ -223,6 +225,15 @@ pub enum Annotation {
         /// back onto its first anchor, turning the stroke into a filled shape.
         /// Every other stroke tool leaves this false.
         closed: bool,
+        /// Only meaningful for `EditorTool::Wave`: the peak deviation of the
+        /// crest from the centre line, and the length of one full period, both
+        /// in logical pixels. Zero means "derive them from the stroke width",
+        /// which is what the renderer does when the helper sends nothing.
+        amplitude: u32,
+        wavelength: u32,
+        /// Only meaningful for `EditorTool::Bezier`: which parts of the path
+        /// get painted. Every other stroke tool leaves the default.
+        fill: BezierFill,
     },
     Shape {
         tool: EditorTool,
@@ -270,6 +281,9 @@ impl Annotation {
             arrow_style: ArrowStyle::Open,
             strength: DEFAULT_MOSAIC_STRENGTH,
             closed: false,
+            amplitude: 0,
+            wavelength: 0,
+            fill: BezierFill::Both,
         }
     }
 
@@ -357,6 +371,33 @@ impl Annotation {
         match self {
             Self::Stroke { closed, .. } => *closed,
             Self::Shape { .. } | Self::Text { .. } | Self::Image { .. } => false,
+        }
+    }
+
+    /// Wave amplitude in logical pixels; zero means the renderer derives it
+    /// from the stroke width. Zero for every non-wave annotation.
+    pub const fn amplitude(&self) -> u32 {
+        match self {
+            Self::Stroke { amplitude, .. } => *amplitude,
+            Self::Shape { .. } | Self::Text { .. } | Self::Image { .. } => 0,
+        }
+    }
+
+    /// Wave wavelength in logical pixels; zero means the renderer derives it
+    /// from the stroke width. Zero for every non-wave annotation.
+    pub const fn wavelength(&self) -> u32 {
+        match self {
+            Self::Stroke { wavelength, .. } => *wavelength,
+            Self::Shape { .. } | Self::Text { .. } | Self::Image { .. } => 0,
+        }
+    }
+
+    /// Which parts of a pen path get painted. Shapes, text and images report
+    /// the default, which is the only value they can have.
+    pub const fn fill(&self) -> BezierFill {
+        match self {
+            Self::Stroke { fill, .. } => *fill,
+            Self::Shape { .. } | Self::Text { .. } | Self::Image { .. } => BezierFill::Both,
         }
     }
 

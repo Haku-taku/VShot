@@ -1202,7 +1202,9 @@ void checkNumberSerializesAsATextBitmap()
     controller.beginPresetEdit();
 
     controller.chooseTool(vshot::Tool::Number);
-    controller.setWidth(6);
+    // A badge's diameter is a value of its own now; the width slider no longer
+    // reaches it, and 36 is what the six-pixel width used to produce.
+    controller.setNumberSize(36);
     controller.setCurrentColor(QColor(255, 30, 30));
     const QPointF at(200, 200);
     controller.press(overlay, at, Qt::LeftButton, Qt::NoModifier);
@@ -1405,6 +1407,10 @@ void checkBezierFillsAtHalfAlpha()
     paintOnce(overlay, &background);
     const QColor ink(kPenRed, kPenGreen, kPenBlue);
 
+    // Style the tool before drawing with it: the colour and the width belong to
+    // the tool now, so setting them while another one is armed would style that
+    // one instead.
+    controller.chooseTool(vshot::Tool::Bezier);
     controller.setWidth(6);
     controller.setCurrentColor(QColor(kPenRed, kPenGreen, kPenBlue, kPenAlpha));
     drawPenPath(controller, overlay, true);
@@ -1455,6 +1461,7 @@ void checkBezierFillsAtHalfAlpha()
     if (!openLargeOverlay(open, &openOverlay)) {
         return;
     }
+    open.chooseTool(vshot::Tool::Bezier);
     open.setWidth(6);
     open.setCurrentColor(QColor(kPenRed, kPenGreen, kPenBlue, kPenAlpha));
     drawPenPath(open, openOverlay, false);

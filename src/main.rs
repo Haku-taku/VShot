@@ -948,7 +948,7 @@ fn crop_native(scene: &SceneSnapshot, geometry: Rect) -> Result<(Frame, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::edit::{ArrowStyle, LineDash};
+    use crate::edit::{ArrowStyle, BezierFill, LineDash};
     use crate::geometry::{Point, Rect, Size};
     use crate::model::Frame;
     use crate::wayland::input::{Annotation, EditorTool};
@@ -1150,6 +1150,9 @@ mod tests {
                     arrow_style: ArrowStyle::Open,
                     strength: 2,
                     closed: false,
+                    amplitude: 0,
+                    wavelength: 0,
+                    fill: BezierFill::Both,
                 },
             ],
             Rect::new(0, 0, 10, 10),

@@ -107,6 +107,67 @@ impl ShapeMask {
     }
 }
 
+/// Which parts of a pen-tool path get painted.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BezierFill {
+    /// Stroke only. Even a path the pen closed is left hollow.
+    Stroke,
+    /// Fill instead of stroking: a closed path has its interior painted and its
+    /// outline left off. An open path is stroked like the other two modes —
+    /// there is no interior to fill, and filling one would close it behind the
+    /// user's back.
+    Fill,
+    /// Fill and stroke, but the fill only happens on a path the pen actually
+    /// closed; an open path is stroked alone. This is the historical
+    /// behaviour, and the default.
+    #[default]
+    Both,
+}
+
+impl BezierFill {
+    /// Parses the wire representation emitted by the Qt helper. Unknown and
+    /// missing values both fall back to [`Self::Both`].
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "stroke" => Some(Self::Stroke),
+            "fill" => Some(Self::Fill),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Stroke => "stroke",
+            Self::Fill => "fill",
+            Self::Both => "both",
+        }
+    }
+
+    /// Whether a path in this closure state has its interior painted. No mode
+    /// fills an open path: filling one closes it implicitly, so a shape the
+    /// user never closed would appear whole. `Stroke` never fills at all, which
+    /// is what leaves even a closed path hollow.
+    pub const fn fills(self, closed: bool) -> bool {
+        match self {
+            Self::Stroke => false,
+            Self::Fill | Self::Both => closed,
+        }
+    }
+
+    /// Whether a path in this closure state has its outline painted. `Fill`
+    /// drops the outline of a closed path -- that is all that makes it a fill
+    /// rather than a fill *and* an outline -- and keeps it on an open one,
+    /// where there is no interior to paint and a path with no ink at all would
+    /// simply vanish as the user drew it.
+    pub const fn strokes(self, closed: bool) -> bool {
+        match self {
+            Self::Stroke | Self::Both => true,
+            Self::Fill => !closed,
+        }
+    }
+}
+
 /// Mosaic strength levels 1..3: the device-pixel block size of rectangular
 /// and elliptical pixelation, and the smear radius factor of the freehand
 /// brush.  Level 2 matches the historical fixed 12px block.
@@ -280,10 +341,11 @@ pub enum EditOperation {
     /// anchor `i`, `points[2i + 1]` its out-handle, both in device pixels — so
     /// its length is even. The in-handle is the mirror of the out-handle about
     /// the anchor. `closed` joins the last anchor back to the first with a
-    /// straight segment and fills the enclosed area.
+    /// straight segment; `fill` decides which parts of the path get painted.
     Bezier {
         points: Vec<Point>,
         closed: bool,
+        fill: BezierFill,
         color: [u8; 4],
         width: u32,
         dash: LineDash,
@@ -459,6 +521,7 @@ impl EditPipeline {
         mut self,
         points: Vec<Point>,
         closed: bool,
+        fill: BezierFill,
         color: [u8; 4],
         width: u32,
         dash: LineDash,
@@ -466,6 +529,7 @@ impl EditPipeline {
         self.operations.push(EditOperation::Bezier {
             points,
             closed,
+            fill,
             color,
             width,
             dash,
@@ -582,10 +646,11 @@ impl EditPipeline {
                     EditOperation::Bezier {
                         points,
                         closed,
+                        fill,
                         color,
                         width,
                         dash,
-                    } => document.draw_bezier(points, *closed, *color, *width, *dash)?,
+                    } => document.draw_bezier(points, *closed, *fill, *color, *width, *dash)?,
                     EditOperation::Text {
                         origin,
                         text,
@@ -645,6 +710,12 @@ pub fn pipeline_for_annotations(
         let head = annotation.head();
         let arrow_style = annotation.arrow_style();
         let strength = annotation.strength();
+        // A wave's amplitude and wavelength travel as logical pixels; zero means
+        // "derive them from the stroke width". A pen's fill mode says which
+        // parts of the path get painted.
+        let amplitude = annotation.amplitude();
+        let wavelength = annotation.wavelength();
+        let fill = annotation.fill();
         match annotation {
             Annotation::Shape {
                 tool, rect, mask, ..
@@ -693,9 +764,11 @@ pub fn pipeline_for_annotations(
                         );
                     }
                     crate::wayland::input::EditorTool::Wave if points.len() >= 2 => {
-                        // The floors of the amplitude/wavelength formulas apply
-                        // to the logical width, then the density scales them,
-                        // matching the Qt preview exactly.
+                        // An explicit amplitude or wavelength is a logical-pixel
+                        // value from the helper; zero falls back to the derived
+                        // formula.  Either way the floors of the derivation
+                        // apply to the logical width and the density scales the
+                        // result, matching the Qt preview exactly.
                         pipeline = pipeline.wave(
                             points[0],
                             *points.last().ok_or_else(|| {
@@ -703,8 +776,8 @@ pub fn pipeline_for_annotations(
                             })?,
                             color,
                             width,
-                            wave_amplitude(logical_width, scale),
-                            wave_wavelength(logical_width, scale),
+                            wave_size(amplitude, logical_width, scale, wave_amplitude),
+                            wave_size(wavelength, logical_width, scale, wave_wavelength),
                         );
                     }
                     crate::wayland::input::EditorTool::Bezier => {
@@ -718,7 +791,7 @@ pub fn pipeline_for_annotations(
                                 "bezier stroke must contain an even number of points".into(),
                             ));
                         }
-                        pipeline = pipeline.bezier(points, closed, color, width, dash);
+                        pipeline = pipeline.bezier(points, closed, fill, color, width, dash);
                     }
                     crate::wayland::input::EditorTool::Pen
                     | crate::wayland::input::EditorTool::Draw
@@ -788,6 +861,20 @@ fn wave_wavelength(logical_width: u32, scale: u32) -> u32 {
         .saturating_mul(scale.max(1))
 }
 
+/// Resolves one wave dimension from the helper's logical-pixel value.
+///
+/// `explicit` is what the user typed, clamped by the parser to `1..=4096`; a
+/// zero means the helper sent nothing, so `derive` computes it from the logical
+/// stroke width.  An explicit value is a logical-pixel length like the derived
+/// one, so it goes through the same saturating multiply by the density.
+fn wave_size(explicit: u32, logical_width: u32, scale: u32, derive: fn(u32, u32) -> u32) -> u32 {
+    if explicit == 0 {
+        derive(logical_width, scale)
+    } else {
+        explicit.saturating_mul(scale.max(1))
+    }
+}
+
 /// Converts an annotation stroke width from logical pixels to device pixels.
 fn device_width(logical_width: u32, scale: u32) -> Result<u32> {
     let width = logical_width
@@ -839,6 +926,35 @@ mod tests {
         assert_eq!(ArrowStyle::parse("filled"), Some(ArrowStyle::Filled));
         assert_eq!(ArrowStyle::parse("closed"), None);
         assert_eq!(ArrowStyle::default().name(), "open");
+    }
+
+    #[test]
+    fn bezier_fill_parses_only_supported_wire_values() {
+        assert_eq!(BezierFill::parse("stroke"), Some(BezierFill::Stroke));
+        assert_eq!(BezierFill::parse("fill"), Some(BezierFill::Fill));
+        assert_eq!(BezierFill::parse("both"), Some(BezierFill::Both));
+        assert_eq!(BezierFill::parse("hollow"), None);
+        // "Both" is the historical fill-and-stroke behaviour, so it is what a
+        // helper that sends nothing gets.
+        assert_eq!(BezierFill::default(), BezierFill::Both);
+        assert_eq!(BezierFill::default().name(), "both");
+        // No mode fills an open path: an implicit closure would show the user a
+        // shape they never closed. "fill" and "both" differ only in whether a
+        // closed path keeps its outline.
+        assert!(!BezierFill::Stroke.fills(true));
+        assert!(!BezierFill::Stroke.fills(false));
+        assert!(BezierFill::Fill.fills(true));
+        assert!(!BezierFill::Fill.fills(false));
+        assert!(BezierFill::Both.fills(true));
+        assert!(!BezierFill::Both.fills(false));
+        assert!(BezierFill::Stroke.strokes(true));
+        assert!(BezierFill::Stroke.strokes(false));
+        // The outline "fill" drops is exactly the closed path's: it is still
+        // drawn on an open one, or a path in progress would be invisible.
+        assert!(!BezierFill::Fill.strokes(true));
+        assert!(BezierFill::Fill.strokes(false));
+        assert!(BezierFill::Both.strokes(true));
+        assert!(BezierFill::Both.strokes(false));
     }
     #[test]
     fn initial_crop_operation_is_executable() {
@@ -997,7 +1113,7 @@ mod tests {
     #[test]
     fn a_bezier_annotation_becomes_a_bezier_operation() {
         // The interleaved points shift into the selection's device pixels and
-        // the width doubles; the closed flag rides along.
+        // the width doubles; the closed flag and the fill mode ride along.
         let pipeline = pipeline_for_annotations(
             vec![crate::wayland::input::Annotation::Stroke {
                 tool: crate::wayland::input::EditorTool::Bezier,
@@ -1014,6 +1130,9 @@ mod tests {
                 arrow_style: ArrowStyle::Open,
                 strength: DEFAULT_MOSAIC_STRENGTH,
                 closed: true,
+                amplitude: 0,
+                wavelength: 0,
+                fill: BezierFill::Both,
             }],
             Rect::new(0, 0, 20, 20),
             2,
@@ -1030,6 +1149,7 @@ mod tests {
                     Point::new(20, 6),
                 ],
                 closed: true,
+                fill: BezierFill::Both,
                 color: [10, 20, 30, 200],
                 width: 4,
                 dash: LineDash::Solid,
@@ -1051,6 +1171,9 @@ mod tests {
             arrow_style: ArrowStyle::Open,
             strength: DEFAULT_MOSAIC_STRENGTH,
             closed: false,
+            amplitude: 0,
+            wavelength: 0,
+            fill: BezierFill::Both,
         };
         let result = pipeline_for_annotations(vec![annotation], Rect::new(0, 0, 20, 20), 1, 1);
         assert!(matches!(result, Err(VshotError::Selection(_))));
@@ -1067,5 +1190,69 @@ mod tests {
         // Above the floor the wave just follows the width.
         assert_eq!(wave_amplitude(3, 2), 12);
         assert_eq!(wave_wavelength(3, 2), 36);
+    }
+
+    #[test]
+    fn explicit_wave_sizes_override_the_derived_ones() {
+        // A logical width of 1 would derive 4 / 18 here, but the helper's
+        // explicit values win.  They are logical pixels too, so the density
+        // scales them exactly as it scales the derived ones.
+        let annotation = crate::wayland::input::Annotation::Stroke {
+            tool: crate::wayland::input::EditorTool::Wave,
+            points: vec![Point::new(2, 3), Point::new(8, 3)],
+            color: crate::wayland::input::DEFAULT_ANNOTATION_COLOR,
+            width: 1,
+            dash: LineDash::Solid,
+            head: 1,
+            arrow_style: ArrowStyle::Open,
+            strength: DEFAULT_MOSAIC_STRENGTH,
+            closed: false,
+            amplitude: 7,
+            wavelength: 30,
+            fill: BezierFill::Both,
+        };
+        let pipeline =
+            pipeline_for_annotations(vec![annotation], Rect::new(0, 0, 20, 20), 2, 2).unwrap();
+        assert_eq!(
+            pipeline.operations(),
+            [EditOperation::Wave {
+                start: Point::new(4, 6),
+                end: Point::new(16, 6),
+                color: crate::wayland::input::DEFAULT_ANNOTATION_COLOR,
+                width: 2,
+                amplitude: 14,
+                wavelength: 60,
+            }]
+        );
+
+        // Zero on either one falls back to the derived formula, so the helper
+        // can leave a key out without changing the shape.
+        let derived = crate::wayland::input::Annotation::Stroke {
+            tool: crate::wayland::input::EditorTool::Wave,
+            points: vec![Point::new(2, 3), Point::new(8, 3)],
+            color: crate::wayland::input::DEFAULT_ANNOTATION_COLOR,
+            width: 1,
+            dash: LineDash::Solid,
+            head: 1,
+            arrow_style: ArrowStyle::Open,
+            strength: DEFAULT_MOSAIC_STRENGTH,
+            closed: false,
+            amplitude: 0,
+            wavelength: 30,
+            fill: BezierFill::Both,
+        };
+        let pipeline =
+            pipeline_for_annotations(vec![derived], Rect::new(0, 0, 20, 20), 2, 2).unwrap();
+        assert_eq!(
+            pipeline.operations(),
+            [EditOperation::Wave {
+                start: Point::new(4, 6),
+                end: Point::new(16, 6),
+                color: crate::wayland::input::DEFAULT_ANNOTATION_COLOR,
+                width: 2,
+                amplitude: 8,
+                wavelength: 60,
+            }]
+        );
     }
 }

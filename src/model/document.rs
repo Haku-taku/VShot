@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 
 use super::frame::Frame;
-use crate::edit::{ArrowStyle, LineDash, TextBitmap};
+use crate::edit::{ArrowStyle, BezierFill, LineDash, TextBitmap};
 use crate::error::Result;
 use crate::geometry::{Point, Rect};
 
@@ -114,11 +114,13 @@ impl ImageDocument {
         &mut self,
         points: &[Point],
         closed: bool,
+        fill: BezierFill,
         color: [u8; 4],
         width: u32,
         dash: LineDash,
     ) -> Result<()> {
-        self.frame.draw_bezier(points, closed, color, width, dash)
+        self.frame
+            .draw_bezier(points, closed, fill, color, width, dash)
     }
 
     pub(crate) fn draw_text(
