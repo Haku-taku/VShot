@@ -1033,11 +1033,13 @@ wl-clipboard package"));
         return reply;
     }
 
-    // One Space-triggered edit round: export the pin's pixels, describe the
-    // pin-edit session, and run `vshot pin --apply` in the background. That
-    // process shows the annotation editor, renders the result in Rust, and
-    // sends `move` back to this daemon.
-    void startEdit(Pin *pin)
+    // One edit round: export the pin's pixels, describe the pin-edit session,
+    // and run `vshot pin --apply` in the background. That process shows the
+    // annotation editor, renders the result in Rust, and sends `move` back to
+    // this daemon. `textMode` opens the editor on the pin's recognized text
+    // instead of on its marks; the Space key asks for the ordinary editor, the
+    // menu's `Recognize text…` row for the text one.
+    void startEdit(Pin *pin, bool textMode)
     {
         if (editingPin_ != nullptr) {
             return; // one edit session at a time
@@ -1101,6 +1103,12 @@ wl-clipboard package"));
         QJsonObject session;
         session.insert(QStringLiteral("version"), 1);
         session.insert(QStringLiteral("mode"), QStringLiteral("pin-edit"));
+        // Which part of the editor to open on. Absent for the Space-key edit,
+        // which opens the ordinary annotation editor; only the menu's
+        // `Recognize text…` row asks for the text mode.
+        if (textMode) {
+            session.insert(QStringLiteral("action"), QStringLiteral("text"));
+        }
         session.insert(QStringLiteral("bounds"), bounds);
         session.insert(QStringLiteral("id"), static_cast<qint64>(pin->id));
         // The editor drives the real pin window while editing (moving it with
@@ -1395,7 +1403,7 @@ wl-clipboard package"));
         });
         surface->setEditCallback([this](quint64 id) {
             if (Pin *pin = byId_.value(id, nullptr)) {
-                startEdit(pin);
+                startEdit(pin, false);
             }
         });
         // A menu pick is a clipboard write and nothing else: the surface
@@ -1417,6 +1425,13 @@ wl-clipboard package"));
                 request.insert(QStringLiteral("suggested"), suggestedSaveName(*pin));
             }
             savePin(request);
+        });
+        // `Recognize text…` reuses the Space-key edit path, only asking the
+        // editor to open on the pin's text instead of on its marks.
+        surface->setRecognizeCallback([this](quint64 id) {
+            if (Pin *pin = byId_.value(id, nullptr)) {
+                startEdit(pin, true);
+            }
         });
         if (!surface->showLayerSurface()) {
             delete surface;
@@ -1471,6 +1486,7 @@ wl-clipboard package"));
         surface->setZoomCallback({});
         surface->setCopyCallback({});
         surface->setSaveCallback({});
+        surface->setRecognizeCallback({});
         QObject::disconnect(surface, nullptr, this, nullptr);
         surface->setPinnedVisible(false);
         surface->hide();

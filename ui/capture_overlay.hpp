@@ -296,6 +296,12 @@ public:
     void setPinTarget(std::uint64_t pinId, const QString &socketPath);
     // Enters editing state over the fixed canvas (shows the toolbar).
     void beginPinEdit();
+    // The same editor, opened on the text rather than on the marks: it does
+    // what `beginPinEdit` does and then runs recognition over the whole pin,
+    // entering the text-selection mode where the recognition succeeds. A
+    // failure leaves the editor in the ordinary pin-editing state, reporting
+    // through the same callback the toolbar's `Text+` button uses.
+    void beginPinEditText();
     // Region sessions that arrive with a selection (window picking resolved
     // one) start in editing state with the toolbar up.  Call after the overlay
     // is shown; sessions without a selection are left alone.

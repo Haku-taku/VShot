@@ -101,8 +101,14 @@ int runPinEdit(const QString &sessionPath)
         reportError(QStringLiteral("could not create the pin-edit surface"));
         return 1;
     }
-    // Jump straight into annotation editing with the whole image selected.
-    controller.beginPinEdit();
+    // Jump straight into editing with the whole image selected. A session that
+    // asked for the text mode opens on the recognized text instead of on the
+    // marks; everything else about the editor is the same.
+    if (session.action == QStringLiteral("text")) {
+        controller.beginPinEditText();
+    } else {
+        controller.beginPinEdit();
+    }
 
     QCoreApplication::exec();
     if (!controller.isFinished()) {

@@ -306,6 +306,10 @@ struct QtSession<'a> {
     // Pin-edit only: id of the pinned image inside the daemon.
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<u64>,
+    // Pin-edit only: which part of the editor to open on, absent for the
+    // ordinary annotation editor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<&'a str>,
     // Window-pick only: what the pointer may snap to.
     #[serde(skip_serializing_if = "Option::is_none")]
     candidates: Option<Vec<QtCandidate>>,
@@ -679,6 +683,9 @@ pub(crate) struct PinEditSpec<'a> {
     pub(crate) socket: &'a Path,
     /// Id of this pin inside the daemon, echoed back in session JSON.
     pub(crate) pin_id: u64,
+    /// Which part of the editor to open on, empty for the ordinary annotation
+    /// editor the Space key opens. `"text"` opens it on the recognized text.
+    pub(crate) action: &'a str,
 }
 
 /// Serializes a pin-edit session: one virtual output whose geometry is the
@@ -703,6 +710,7 @@ pub(crate) fn write_pin_edit_session(spec: &PinEditSpec<'_>) -> Result<(TempDir,
         window: Some(spec.window.into()),
         socket: Some(spec.socket.to_string_lossy().into_owned()),
         id: Some(spec.pin_id),
+        action: (!spec.action.is_empty()).then_some(spec.action),
         candidates: None,
         selection: None,
         outputs: vec![QtOutput {
@@ -855,6 +863,7 @@ fn write_session(
         window: None,
         socket: None,
         id: None,
+        action: None,
         candidates: (!candidates.is_empty())
             .then(|| candidates.iter().map(QtCandidate::from).collect()),
         selection,

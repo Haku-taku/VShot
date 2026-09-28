@@ -512,6 +512,13 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| VshotError::Pin("pin-edit session has no daemon socket".into()))?
         .to_owned();
+    // Optional: which part of the editor to open on. Absent for the ordinary
+    // annotation editor the Space key opens; the menu's `Recognize text…` row
+    // asks for `"text"`.
+    let action = session
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
 
     // The editor session and the rendered replacement share one private
     // directory; both are cleaned up when this function returns.
@@ -535,6 +542,7 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
             scale,
             socket: Path::new(&socket_path),
             pin_id: id,
+            action,
         })?;
     let output = crate::qt_overlay::run_session(&editor_session)?;
     let Some((selection, annotations)) = crate::qt_overlay::parse_edit_result(output, window)?

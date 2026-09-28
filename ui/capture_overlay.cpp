@@ -6845,6 +6845,19 @@ void OverlayController::beginPinEdit()
     showToolbar();
 }
 
+void OverlayController::beginPinEditText()
+{
+    // The same editor opened on the text rather than on the marks: the pin
+    // image is the canvas and the whole of it is what recognition reads, so the
+    // characters come back where they were for the pointer to select a range.
+    beginPinEdit();
+    // A recognition that fails reports through `textResultCallback_` -- the
+    // toolbar's `Text+` button is on screen by now and says so -- and the
+    // editor simply stays in the ordinary pin-editing state. There is no
+    // second error path here.
+    beginTextSelection(nullptr);
+}
+
 void OverlayController::beginPresetEdit()
 {
     if (!session_.selection.has_value() || finished_ || cancelled_) {

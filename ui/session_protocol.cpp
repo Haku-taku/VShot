@@ -221,6 +221,17 @@ bool loadSession(const QString &sessionPath, Session *session, QString *error)
         if (!parsed.pinSocket.startsWith(QLatin1Char('/'))) {
             return fail(error, QStringLiteral("pin-edit session `socket` must be an absolute path"));
         }
+        // Optional: which part of the editor to open on. Absent for the
+        // ordinary annotation editor; unknown values are left for the editor to
+        // fall back on, so they do not fail the session here.
+        const QJsonValue actionValue = root.value(QStringLiteral("action"));
+        if (!actionValue.isUndefined() && !actionValue.isNull()) {
+            if (!actionValue.isString()) {
+                return fail(error,
+                            QStringLiteral("pin-edit session `action` must be a string"));
+            }
+            parsed.action = actionValue.toString();
+        }
     }
 
     // Window picking needs something to pick: the candidates come from the

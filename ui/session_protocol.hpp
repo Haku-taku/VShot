@@ -64,6 +64,9 @@ struct Session {
     // socket instead of drawing a second copy of the image.
     std::uint64_t pinId = 0;
     QString pinSocket;
+    // Pin-edit only: which part of the editor to open on, absent for the
+    // ordinary annotation editor. `"text"` opens it in the text-selection mode.
+    QString action;
 };
 
 bool loadSession(const QString &sessionPath, Session *session, QString *error);

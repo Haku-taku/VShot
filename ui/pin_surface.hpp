@@ -154,6 +154,13 @@ public:
     {
         saveRequested_ = std::move(callback);
     }
+    // Invoked when the user picks `Recognize text…` out of a pin's right-click
+    // menu. The editor runs in a helper process the daemon spawns, so nothing
+    // about its outcome comes back through this surface.
+    void setRecognizeCallback(std::function<void(quint64)> callback)
+    {
+        recognizeRequested_ = std::move(callback);
+    }
     // Puts a transient message on a pin's corner from outside the surface. A
     // save runs in a helper process, so its outcome is known long after the
     // menu that started it has closed.
@@ -200,16 +207,17 @@ private:
     // menu's own top-left. Painting and hit-testing both read this, so a row
     // can never be drawn where it cannot be clicked.
     //
-    // The rows are the copy rows a color card offers, followed by one action
-    // row every pin has: `Save as…`. The heading exists only when there are
-    // copy rows to head -- an image pin's menu is that one action row.
+    // The rows are the copy rows a color card offers, followed by the action
+    // rows every pin has: `Save as…` and `Recognize text…`. The heading exists
+    // only when there are copy rows to head -- an image pin's menu is those
+    // action rows alone.
     struct MenuLayout {
         int headingHeight = 0;
         int rowHeight = 0;
         // How many rows copy a format, and how many rows there are in total.
         int copyRows = 0;
         int totalRows = 0;
-        // The y of the first copy row and of the action row.
+        // The y of the first copy row and of the first action row.
         int rowsTop = 0;
         int actionTop = 0;
         qreal labelWidth = 0.0;
@@ -279,7 +287,8 @@ private:
     void paintMenu(QPainter &painter);
     // Copies one row's value through the daemon and reports it in the badge.
     void copyRow(int row);
-    // Runs the row's action: the first row copies, the last saves.
+    // Runs the row's action: the copy rows copy, the action rows save and
+    // recognize.
     void activateRow(int row);
 
     QVector<Entry> entries_;
@@ -292,6 +301,7 @@ private:
     std::function<void(quint64)> editRequested_;
     std::function<bool(quint64, const QString &)> copyRequested_;
     std::function<void(quint64)> saveRequested_;
+    std::function<void(quint64)> recognizeRequested_;
 
     // The pin the user last clicked on this output: the one the zoom badge and
     // the Space edit shortcut belong to, and the only one drawn as focused.
@@ -308,8 +318,9 @@ private:
     QRect badgeRect_;
     // The open right-click menu: the pin it belongs to (0 while closed), the
     // copy rows it offers, where it is painted, and the row the pointer is
-    // over. Row indices run over `menuRows_` first and then the one action
-    // row, which is why `menuHover_` may equal `menuRows_.size()`.
+    // over. Row indices run over `menuRows_` first and then the action rows,
+    // which is why `menuHover_` may reach `menuRows_.size()` plus the action
+    // count.
     quint64 menuId_ = 0;
     QVector<ColorRow> menuRows_;
     QRect menuRect_;
