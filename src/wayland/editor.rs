@@ -33,6 +33,13 @@ pub enum EditorTool {
     /// A sine wave drawn along the straight line between the gesture
     /// endpoints. The wire carries exactly two points, the start and the end.
     Wave,
+    /// A cubic Bezier path drawn like a vector pen. The wire carries the
+    /// anchors and their out-handles interleaved — `points[2i]` is anchor `i`
+    /// and `points[2i + 1]` its out-handle — so the point count is even. The
+    /// in-handle of an anchor is the mirror of its out-handle about the anchor;
+    /// `Annotation::Stroke::closed` says whether the path returns to the first
+    /// anchor to enclose a filled shape.
+    Bezier,
     /// A straight line with an arrow head supplied by the renderer.
     Arrow,
     /// A rectangle shape.
@@ -212,6 +219,10 @@ pub enum Annotation {
         head: u32,
         arrow_style: ArrowStyle,
         strength: u32,
+        /// Only meaningful for `EditorTool::Bezier`: whether the path closes
+        /// back onto its first anchor, turning the stroke into a filled shape.
+        /// Every other stroke tool leaves this false.
+        closed: bool,
     },
     Shape {
         tool: EditorTool,
@@ -258,6 +269,7 @@ impl Annotation {
             head: 1,
             arrow_style: ArrowStyle::Open,
             strength: DEFAULT_MOSAIC_STRENGTH,
+            closed: false,
         }
     }
 
@@ -336,6 +348,15 @@ impl Annotation {
         match self {
             Self::Stroke { strength, .. } | Self::Shape { strength, .. } => *strength,
             Self::Text { .. } | Self::Image { .. } => DEFAULT_MOSAIC_STRENGTH,
+        }
+    }
+
+    /// Whether a stroke closes back onto its first point, enclosing a filled
+    /// shape. Always false for shapes, text and images.
+    pub const fn closed(&self) -> bool {
+        match self {
+            Self::Stroke { closed, .. } => *closed,
+            Self::Shape { .. } | Self::Text { .. } | Self::Image { .. } => false,
         }
     }
 
@@ -1473,6 +1494,10 @@ fn finish_annotation(tool: EditorTool, points: Vec<Point>) -> Result<Option<Anno
             })?;
             Ok(Some(Annotation::shape(tool, rect)))
         }
+        // The pointer gesture here only ever drags out an open path; the pen
+        // tool's closed shapes come from the Qt overlay, which carries the
+        // `closed` flag on the wire.
+        EditorTool::Bezier => Ok(Some(Annotation::stroke(tool, points))),
         _ => Ok(Some(Annotation::stroke(tool, points))),
     }
 }

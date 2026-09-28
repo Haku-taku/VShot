@@ -394,6 +394,9 @@ struct QtAnnotation {
     mask: Option<String>,
     arrow_style: Option<String>,
     strength: Option<u32>,
+    // Pen-tool strokes only: whether the path closes back onto its first
+    // anchor. Missing means an open path.
+    closed: Option<bool>,
     // Font family used by the helper to rasterize the text label; empty or
     // missing means the helper's application default font.
     font: Option<String>,
@@ -1003,6 +1006,7 @@ fn parse_annotation(annotation: QtAnnotation) -> Result<Annotation> {
                 head: parse_head(annotation.size)?,
                 arrow_style: parse_arrow_style(annotation.arrow_style.as_deref())?,
                 strength: parse_strength(annotation.strength)?,
+                closed: annotation.closed.unwrap_or(false),
             })
         }
         "text" => {
@@ -1207,6 +1211,7 @@ fn parse_stroke_tool(name: &str) -> Result<EditorTool> {
         "draw" => Ok(EditorTool::Draw),
         "line" => Ok(EditorTool::Line),
         "wave" => Ok(EditorTool::Wave),
+        "bezier" => Ok(EditorTool::Bezier),
         "mosaic" => Ok(EditorTool::Mosaic),
         "blur" => Ok(EditorTool::Blur),
         _ => Err(VshotError::Selection(format!(
@@ -1374,6 +1379,18 @@ mod tests {
             ),
             Err(VshotError::Selection(_))
         ));
+    }
+
+    #[test]
+    fn parses_a_bezier_stroke_with_its_closed_flag() {
+        let bytes = br##"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"stroke","tool":"bezier","points":[{"x":1,"y":2},{"x":3,"y":4},{"x":5,"y":6},{"x":7,"y":8}],"closed":true,"color":"#11223380"},{"kind":"stroke","tool":"bezier","points":[{"x":0,"y":0},{"x":1,"y":1}]}]}"##.to_vec();
+        let (_, annotations) = parse_result(bytes, Rect::new(0, 0, 100, 100)).unwrap();
+        assert_eq!(annotations[0].tool(), EditorTool::Bezier);
+        assert!(annotations[0].closed());
+        assert_eq!(annotations[0].color(), [0x11, 0x22, 0x33, 0x80]);
+        assert_eq!(annotations[0].points().len(), 4);
+        // A missing flag means an open path.
+        assert!(!annotations[1].closed());
     }
 
     #[test]

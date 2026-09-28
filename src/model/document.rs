@@ -110,6 +110,17 @@ impl ImageDocument {
             .draw_wave(start, end, color, width, amplitude, wavelength)
     }
 
+    pub(crate) fn draw_bezier(
+        &mut self,
+        points: &[Point],
+        closed: bool,
+        color: [u8; 4],
+        width: u32,
+        dash: LineDash,
+    ) -> Result<()> {
+        self.frame.draw_bezier(points, closed, color, width, dash)
+    }
+
     pub(crate) fn draw_text(
         &mut self,
         origin: Point,

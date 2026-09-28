@@ -444,6 +444,124 @@ impl Frame {
         Ok(())
     }
 
+    /// Draws a pen-tool cubic Bezier path.
+    ///
+    /// `points` is interleaved — anchor, out-handle, anchor, out-handle — in
+    /// device pixels; the in-handle of an anchor is the mirror of its
+    /// out-handle about the anchor. The curve is flattened by adaptive de
+    /// Casteljau subdivision (see [`bezier_polyline`]) and stroked through the
+    /// shared coverage path, so a translucent path keeps one alpha through its
+    /// joins. When `closed`, a straight segment joins the last anchor back to
+    /// the first, and the enclosed area is filled before the stroke — matching
+    /// the Qt side's `fillPath`-then-`strokePath` order — with half the
+    /// stroke's alpha.
+    pub(crate) fn draw_bezier(
+        &mut self,
+        points: &[Point],
+        closed: bool,
+        color: [u8; 4],
+        width: u32,
+        dash: LineDash,
+    ) -> Result<()> {
+        validate_stroke_width(width)?;
+        let frame = self.size;
+        let Some(&start) = points.first() else {
+            return Ok(());
+        };
+        let mut polyline = bezier_polyline(points);
+        if closed {
+            // closeSubpath: a straight segment back to the first anchor.
+            polyline.push(start);
+        }
+        let pad = i64::from(width.div_ceil(2)) + 1;
+        let bounds = polyline_bounds(&polyline, pad);
+        if closed && polyline.len() >= 3 {
+            // "Translucent fill, solid stroke": the fill keeps the stroke's
+            // colour at half its alpha, floored, exactly as Qt computes it.
+            let mut fill = color;
+            fill[3] = color[3] / 2;
+            self.fill_polygon(&polyline, fill);
+        }
+        if polyline.len() == 1 {
+            stroke_with_coverage(self, color, bounds, |ink| {
+                rasterize_capsule(ink, frame, polyline[0], polyline[0], width);
+            });
+            return Ok(());
+        }
+        stroke_with_coverage(self, color, bounds, |ink| {
+            if dash == LineDash::Solid {
+                for segment in polyline.windows(2) {
+                    rasterize_capsule(ink, frame, segment[0], segment[1], width);
+                }
+            } else {
+                rasterize_dashed_polyline(ink, frame, &polyline, width, dash);
+            }
+        });
+        Ok(())
+    }
+
+    /// Fills the polygon `points` with `color`, source-over.
+    ///
+    /// The rule is even-odd — the default `QPainterPath` fill rule on the Qt
+    /// side — so a self-intersecting outline fills its odd winding and no pixel
+    /// is ever composited twice. Each pixel row is sampled at its centre
+    /// (`y + 0.5`); the crossings of that horizontal line with every
+    /// non-horizontal edge are sorted and the spans between successive pairs are
+    /// filled. Sampling at pixel centres and treating each edge as half-open in
+    /// `y` counts a shared vertex exactly once. The polygon is closed
+    /// implicitly, even when the last point does not repeat the first.
+    pub(crate) fn fill_polygon(&mut self, points: &[Point], color: [u8; 4]) {
+        if points.len() < 3 || color[3] == 0 {
+            return;
+        }
+        let frame_width = i64::from(self.size.width);
+        let frame_height = i64::from(self.size.height);
+        let mut min_y = i64::from(points[0].y);
+        let mut max_y = min_y;
+        for point in points {
+            min_y = min_y.min(i64::from(point.y));
+            max_y = max_y.max(i64::from(point.y));
+        }
+        let first_row = min_y.max(0);
+        let last_row = max_y.min(frame_height - 1);
+        if first_row > last_row {
+            return;
+        }
+        let mut crossings: Vec<f64> = Vec::new();
+        let edges = points.len();
+        for row in first_row..=last_row {
+            let scan = row as f64 + 0.5;
+            crossings.clear();
+            for index in 0..edges {
+                let a = points[index];
+                let b = points[(index + 1) % edges];
+                let (ay, by) = (f64::from(a.y), f64::from(b.y));
+                let (low, high) = if ay <= by { (ay, by) } else { (by, ay) };
+                // Half-open in y: an edge owns its lower end, not its upper, so
+                // a vertex shared by two edges crosses the scanline once. A
+                // horizontal edge (low == high) is skipped.
+                if scan < low || scan >= high {
+                    continue;
+                }
+                let t = (scan - ay) / (by - ay);
+                crossings.push(f64::from(a.x) + t * (f64::from(b.x) - f64::from(a.x)));
+            }
+            crossings.sort_by(f64::total_cmp);
+            let mut pair = 0;
+            while pair + 1 < crossings.len() {
+                let span_start = crossings[pair];
+                let span_end = crossings[pair + 1];
+                pair += 2;
+                // The pixel centre x + 0.5 must lie in [span_start, span_end).
+                let first_x = ((span_start - 0.5).ceil() as i64).max(0);
+                let last_x = (((span_end - 0.5).ceil() as i64) - 1).min(frame_width - 1);
+                for x in first_x..=last_x {
+                    self.blend_pixel_at(x, row, color);
+                }
+            }
+        }
+    }
+
     pub(crate) fn draw_text(
         &mut self,
         origin: Point,
@@ -1292,6 +1410,122 @@ fn wave_polyline(start: Point, end: Point, amplitude: u32, wavelength: u32) -> V
         ));
     }
     points
+}
+
+/// A point in the Bezier subdivision's own floating-point space.
+///
+/// The control polygon is carried as `f64` through the recursion and rounded to
+/// whole device pixels only when a chord is emitted, so repeated midpoint
+/// subdivision does not accumulate rounding.
+#[derive(Clone, Copy)]
+struct FPoint {
+    x: f64,
+    y: f64,
+}
+
+fn to_f(point: Point) -> FPoint {
+    FPoint {
+        x: f64::from(point.x),
+        y: f64::from(point.y),
+    }
+}
+
+/// The exact midpoint of two control points (de Casteljau's first stage).
+fn midpoint(a: FPoint, b: FPoint) -> FPoint {
+    FPoint {
+        x: (a.x + b.x) * 0.5,
+        y: (a.y + b.y) * 0.5,
+    }
+}
+
+/// Recursion cap for the adaptive subdivision: each level halves the curve, so
+/// 16 levels bound the work for even the most contorted control points without
+/// ever risking a deep call stack.
+const BEZIER_MAX_DEPTH: u32 = 16;
+
+/// Flatness tolerance in device pixels: a cubic is subdivided until both its
+/// control points sit within this distance of the chord.
+const BEZIER_FLATNESS: f64 = 0.25;
+
+/// Whether the cubic `p0..p3` is flat enough to be one chord.
+///
+/// Each control point's perpendicular distance from the chord is the cross
+/// product `(handle - p0) × (p3 - p0)` divided by the chord length; comparing
+/// the cross product against `tolerance * chord` avoids the division. A
+/// degenerate chord (the endpoints coincide) has no direction, so the test
+/// falls back to how far the handles stray from `p0` — a loop then still gets
+/// subdivided instead of collapsing to a dot.
+fn cubic_is_flat(p0: FPoint, p1: FPoint, p2: FPoint, p3: FPoint) -> bool {
+    let dx = p3.x - p0.x;
+    let dy = p3.y - p0.y;
+    let chord = dx.hypot(dy);
+    if chord == 0.0 {
+        let first = (p1.x - p0.x).hypot(p1.y - p0.y);
+        let second = (p2.x - p0.x).hypot(p2.y - p0.y);
+        return first <= BEZIER_FLATNESS && second <= BEZIER_FLATNESS;
+    }
+    let first = ((p1.x - p0.x) * dy - (p1.y - p0.y) * dx).abs();
+    let second = ((p2.x - p0.x) * dy - (p2.y - p0.y) * dx).abs();
+    let limit = BEZIER_FLATNESS * chord;
+    first <= limit && second <= limit
+}
+
+/// Appends the flattened chords of the cubic `p0..p3`, excluding `p0` (the
+/// caller already emitted it) and including `p3`.
+///
+/// Subdivision is de Casteljau at `t = 0.5`, repeated while the curve is not
+/// flat enough and the depth cap has not been reached; the cap turns a
+/// pathological segment into a bounded number of chords rather than an
+/// unbounded recursion.
+fn flatten_cubic(out: &mut Vec<Point>, p0: FPoint, p1: FPoint, p2: FPoint, p3: FPoint, depth: u32) {
+    if depth >= BEZIER_MAX_DEPTH || cubic_is_flat(p0, p1, p2, p3) {
+        out.push(point_from_f64(p3.x, p3.y));
+        return;
+    }
+    let p01 = midpoint(p0, p1);
+    let p12 = midpoint(p1, p2);
+    let p23 = midpoint(p2, p3);
+    let p012 = midpoint(p01, p12);
+    let p123 = midpoint(p12, p23);
+    let p0123 = midpoint(p012, p123);
+    flatten_cubic(out, p0, p01, p012, p0123, depth + 1);
+    flatten_cubic(out, p0123, p123, p23, p3, depth + 1);
+}
+
+/// Flattens the interleaved anchor/out-handle list into a polyline.
+///
+/// Every consecutive pair of anchors is one cubic segment: the first anchor,
+/// its out-handle, the next anchor's in-handle (`2 * anchor - out_handle`) and
+/// the next anchor. A list with fewer than two anchors yields just the anchor
+/// it has, which the caller turns into a dot.
+fn bezier_polyline(points: &[Point]) -> Vec<Point> {
+    let Some(&start) = points.first() else {
+        return Vec::new();
+    };
+    let mut polyline = vec![start];
+    let anchors = points.len() / 2;
+    for index in 0..anchors.saturating_sub(1) {
+        let p0 = points[2 * index];
+        let out = points[2 * index + 1];
+        let next = points[2 * index + 2];
+        let next_out = points[2 * index + 3];
+        // The in-handle mirrors the out-handle through its anchor. Both are
+        // integers, so the mirror is exact; saturating keeps a hand-crafted
+        // extreme handle from overflowing.
+        let in_handle = Point::new(
+            next.x.saturating_mul(2).saturating_sub(next_out.x),
+            next.y.saturating_mul(2).saturating_sub(next_out.y),
+        );
+        flatten_cubic(
+            &mut polyline,
+            to_f(p0),
+            to_f(out),
+            to_f(in_handle),
+            to_f(next),
+            0,
+        );
+    }
+    polyline
 }
 
 /// Narrows a computed coordinate to `i64`, saturating instead of wrapping so a
@@ -2451,5 +2685,126 @@ mod tests {
         assert!(frame
             .draw_wave(Point::new(0, 0), Point::new(4, 0), [1, 2, 3, 255], 0, 6, 18)
             .is_err());
+    }
+
+    // A triangle with straight edges: the out-handle of every anchor sits on
+    // the anchor itself, so each cubic segment degenerates to a line.
+    const TRIANGLE: [Point; 6] = [
+        Point::new(4, 4),
+        Point::new(4, 4),
+        Point::new(20, 4),
+        Point::new(20, 4),
+        Point::new(12, 20),
+        Point::new(12, 20),
+    ];
+
+    #[test]
+    fn a_bezier_whose_handles_sit_on_the_endpoints_flattens_to_one_chord() {
+        // Both control points coincide with an endpoint, so the curve is a
+        // straight line and must collapse to a single chord rather than being
+        // subdivided down to the depth cap.
+        let polyline = bezier_polyline(&TRIANGLE[0..4]);
+        assert_eq!(polyline, vec![Point::new(4, 4), Point::new(20, 4)]);
+
+        // And it strokes that chord: the midpoint is inked, a pixel a row below
+        // is not.
+        let mut frame = Frame::solid(Size::new(24, 12), [0, 0, 0, 0]).unwrap();
+        frame
+            .draw_bezier(&TRIANGLE[0..4], false, [255, 0, 0, 255], 1, LineDash::Solid)
+            .unwrap();
+        assert_eq!(frame.pixel(Point::new(12, 4)), Some([255, 0, 0, 255]));
+        assert_eq!(frame.pixel(Point::new(12, 6)), Some([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn a_closed_bezier_fills_at_half_alpha_then_strokes_opaque() {
+        let mut frame = Frame::solid(Size::new(24, 24), [0, 0, 0, 0]).unwrap();
+        frame
+            .draw_bezier(&TRIANGLE, true, [255, 0, 0, 255], 1, LineDash::Solid)
+            .unwrap();
+        // The interior centroid (12, 9) is covered by the fill only: half of
+        // the opaque stroke's alpha, floored.
+        assert_eq!(frame.pixel(Point::new(12, 9)), Some([255, 0, 0, 127]));
+        // A pixel on the top edge is stroked at full alpha; the fill underneath
+        // is overwritten by the opaque stroke.
+        assert_eq!(frame.pixel(Point::new(12, 4)), Some([255, 0, 0, 255]));
+        // A pixel outside the triangle is untouched.
+        assert_eq!(frame.pixel(Point::new(0, 0)), Some([0, 0, 0, 0]));
+
+        // The same path left open only strokes: its interior stays clear.
+        let mut open = Frame::solid(Size::new(24, 24), [0, 0, 0, 0]).unwrap();
+        open.draw_bezier(&TRIANGLE, false, [255, 0, 0, 255], 1, LineDash::Solid)
+            .unwrap();
+        assert_eq!(open.pixel(Point::new(12, 9)), Some([0, 0, 0, 0]));
+        assert_eq!(open.pixel(Point::new(12, 4)), Some([255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn fill_polygon_covers_a_concave_shape_without_spilling() {
+        // An L: the notch at the bottom right is outside the polygon.
+        let l_shape = [
+            Point::new(2, 2),
+            Point::new(12, 2),
+            Point::new(12, 6),
+            Point::new(6, 6),
+            Point::new(6, 12),
+            Point::new(2, 12),
+        ];
+        let mut frame = Frame::solid(Size::new(16, 16), [0, 0, 0, 0]).unwrap();
+        frame.fill_polygon(&l_shape, [0, 255, 0, 255]);
+        // Inside the arms.
+        assert_eq!(frame.pixel(Point::new(10, 4)), Some([0, 255, 0, 255]));
+        assert_eq!(frame.pixel(Point::new(4, 10)), Some([0, 255, 0, 255]));
+        assert_eq!(frame.pixel(Point::new(4, 4)), Some([0, 255, 0, 255]));
+        // The notch is not filled.
+        assert_eq!(frame.pixel(Point::new(10, 10)), Some([0, 0, 0, 0]));
+        // Nor is anything outside the bounding box's far corner.
+        assert_eq!(frame.pixel(Point::new(0, 0)), Some([0, 0, 0, 0]));
+        assert_eq!(frame.pixel(Point::new(14, 14)), Some([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn translucent_bezier_keeps_one_alpha_through_its_corner() {
+        // An L-shaped curve: a horizontal chord into a vertical one, meeting at
+        // (20, 4). Both capsules cover that corner.
+        let corner = [
+            Point::new(4, 4),
+            Point::new(4, 4),
+            Point::new(20, 4),
+            Point::new(20, 4),
+            Point::new(20, 20),
+            Point::new(20, 20),
+        ];
+        let mut frame = Frame::solid(Size::new(24, 24), [0, 0, 0, 0]).unwrap();
+        frame
+            .draw_bezier(&corner, false, [255, 0, 0, 128], 3, LineDash::Solid)
+            .unwrap();
+        let midpoint = frame.pixel(Point::new(12, 4)).unwrap();
+        let joint = frame.pixel(Point::new(20, 4)).unwrap();
+        assert_eq!(midpoint[3], 128, "one 128-alpha coat stays 128");
+        assert_eq!(
+            joint[3], midpoint[3],
+            "the corner must not blend a second time"
+        );
+    }
+
+    #[test]
+    fn a_bezier_with_extreme_handles_stops_at_the_depth_cap() {
+        // Handles flung far from the anchors force subdivision all the way to
+        // the cap; the point count stays bounded and the recursion never gets
+        // deep enough to overflow the stack.
+        let points = [
+            Point::new(0, 0),
+            Point::new(i32::MAX, i32::MAX),
+            Point::new(100, 0),
+            Point::new(0, i32::MIN),
+        ];
+        let polyline = bezier_polyline(&points);
+        assert!(polyline.len() > 2, "the curve is subdivided");
+        assert!(
+            polyline.len() <= (1usize << BEZIER_MAX_DEPTH) + 1,
+            "flattening is bounded by the depth cap, got {}",
+            polyline.len()
+        );
     }
 }

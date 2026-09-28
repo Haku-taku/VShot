@@ -1076,6 +1076,7 @@ mod tests {
                     head: 1,
                     arrow_style: ArrowStyle::Open,
                     strength: 2,
+                    closed: false,
                 },
             ],
             Rect::new(0, 0, 10, 10),

@@ -276,6 +276,18 @@ pub enum EditOperation {
         amplitude: u32,
         wavelength: u32,
     },
+    /// A pen-tool cubic Bezier path. `points` is interleaved — `points[2i]` is
+    /// anchor `i`, `points[2i + 1]` its out-handle, both in device pixels — so
+    /// its length is even. The in-handle is the mirror of the out-handle about
+    /// the anchor. `closed` joins the last anchor back to the first with a
+    /// straight segment and fills the enclosed area.
+    Bezier {
+        points: Vec<Point>,
+        closed: bool,
+        color: [u8; 4],
+        width: u32,
+        dash: LineDash,
+    },
     Text {
         origin: Point,
         text: String,
@@ -443,6 +455,24 @@ impl EditPipeline {
         self
     }
 
+    pub(crate) fn bezier(
+        mut self,
+        points: Vec<Point>,
+        closed: bool,
+        color: [u8; 4],
+        width: u32,
+        dash: LineDash,
+    ) -> Self {
+        self.operations.push(EditOperation::Bezier {
+            points,
+            closed,
+            color,
+            width,
+            dash,
+        });
+        self
+    }
+
     pub(crate) fn text(
         mut self,
         origin: Point,
@@ -549,6 +579,13 @@ impl EditPipeline {
                     } => {
                         document.draw_wave(*start, *end, *color, *width, *amplitude, *wavelength)?
                     }
+                    EditOperation::Bezier {
+                        points,
+                        closed,
+                        color,
+                        width,
+                        dash,
+                    } => document.draw_bezier(points, *closed, *color, *width, *dash)?,
                     EditOperation::Text {
                         origin,
                         text,
@@ -631,7 +668,12 @@ pub fn pipeline_for_annotations(
                     _ => {}
                 }
             }
-            Annotation::Stroke { tool, points, .. } => {
+            Annotation::Stroke {
+                tool,
+                points,
+                closed,
+                ..
+            } => {
                 let points = points
                     .into_iter()
                     .map(|point| local_point(point, selection, scale))
@@ -664,6 +706,19 @@ pub fn pipeline_for_annotations(
                             wave_amplitude(logical_width, scale),
                             wave_wavelength(logical_width, scale),
                         );
+                    }
+                    crate::wayland::input::EditorTool::Bezier => {
+                        // The wire interleaves an anchor and its out-handle, so
+                        // a well-formed path always has an even number of
+                        // points. An odd count means a truncated pair; erroring
+                        // out is better than silently dropping the last point
+                        // or inventing a handle for it.
+                        if points.len() % 2 != 0 {
+                            return Err(VshotError::Selection(
+                                "bezier stroke must contain an even number of points".into(),
+                            ));
+                        }
+                        pipeline = pipeline.bezier(points, closed, color, width, dash);
                     }
                     crate::wayland::input::EditorTool::Pen
                     | crate::wayland::input::EditorTool::Draw
@@ -937,6 +992,68 @@ mod tests {
                 wavelength: 36,
             }]
         );
+    }
+
+    #[test]
+    fn a_bezier_annotation_becomes_a_bezier_operation() {
+        // The interleaved points shift into the selection's device pixels and
+        // the width doubles; the closed flag rides along.
+        let pipeline = pipeline_for_annotations(
+            vec![crate::wayland::input::Annotation::Stroke {
+                tool: crate::wayland::input::EditorTool::Bezier,
+                points: vec![
+                    Point::new(2, 3),
+                    Point::new(4, 3),
+                    Point::new(8, 3),
+                    Point::new(10, 3),
+                ],
+                color: [10, 20, 30, 200],
+                width: 2,
+                dash: LineDash::Solid,
+                head: 1,
+                arrow_style: ArrowStyle::Open,
+                strength: DEFAULT_MOSAIC_STRENGTH,
+                closed: true,
+            }],
+            Rect::new(0, 0, 20, 20),
+            2,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            pipeline.operations(),
+            [EditOperation::Bezier {
+                points: vec![
+                    Point::new(4, 6),
+                    Point::new(8, 6),
+                    Point::new(16, 6),
+                    Point::new(20, 6),
+                ],
+                closed: true,
+                color: [10, 20, 30, 200],
+                width: 4,
+                dash: LineDash::Solid,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_bezier_with_an_odd_point_count_is_rejected() {
+        // The wire pairs each anchor with its out-handle; an odd count is a
+        // truncated pair and must error rather than be silently repaired.
+        let annotation = crate::wayland::input::Annotation::Stroke {
+            tool: crate::wayland::input::EditorTool::Bezier,
+            points: vec![Point::new(2, 3), Point::new(4, 3), Point::new(8, 3)],
+            color: [255, 64, 64, 255],
+            width: 1,
+            dash: LineDash::Solid,
+            head: 1,
+            arrow_style: ArrowStyle::Open,
+            strength: DEFAULT_MOSAIC_STRENGTH,
+            closed: false,
+        };
+        let result = pipeline_for_annotations(vec![annotation], Rect::new(0, 0, 20, 20), 1, 1);
+        assert!(matches!(result, Err(VshotError::Selection(_))));
     }
 
     #[test]
