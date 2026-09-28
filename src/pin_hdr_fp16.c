@@ -7,9 +7,13 @@
 // The shape of the thing, in one paragraph: one compose texture the size of an
 // output holds the picture as it should look, half-float and PQ-encoded; a
 // command clears the region that changed, draws the pins into it -- shadow,
-// image, rim, in that order -- and copies that region into a dma-buf the
-// compositor takes.  A region is not the whole output: a pin that moved by three
-// pixels costs three pixels of drawing and three pixels of copying.
+// image, rim, in that order -- and copies the whole picture into a dma-buf the
+// compositor takes.  The drawing is regional -- a pin that moved by three pixels
+// costs three pixels of drawing -- but the copy is not: the compositor may
+// re-read a buffer the damage does not cover (it does so when the attached
+// buffer changes, which with two buffers alternated is every other commit), and
+// a slot that had only ever been handed the damaged regions would then show a
+// pin where it used to be.
 //
 // Three details are worth knowing before reading the shaders:
 //

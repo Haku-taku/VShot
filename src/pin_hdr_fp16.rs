@@ -299,8 +299,8 @@ impl Surface {
         };
     }
 
-    /// Copies the region that changed into `slot`, ready to attach.  `false`
-    /// when that slot has no buffer in it.
+    /// Copies a rectangle of the compose texture into `slot`, ready to attach.
+    /// `false` when that slot has no buffer in it.
     pub(crate) fn present(&self, slot: c_int, x: i32, y: i32, width: i32, height: i32) -> bool {
         unsafe { vshot_fp16_present(self.raw, slot, x, y, width, height) == 0 }
     }

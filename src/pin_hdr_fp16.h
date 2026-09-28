@@ -86,8 +86,8 @@ int vshot_fp16_draw_image(vshot_fp16 *ctx, uint64_t image_id, int x, int y, int 
 int vshot_fp16_draw_rim(vshot_fp16 *ctx, int x, int y, int width, int height, int radius,
                         int thickness, float red, float green, float blue);
 
-/// Copies the region that changed into `slot` and leaves it ready to attach.
-/// Answers 0, or -1 when that slot has nothing in it.
+/// Copies a rectangle of the compose texture into `slot` and leaves it ready to
+/// attach.  Answers 0, or -1 when that slot has nothing in it.
 int vshot_fp16_present(vshot_fp16 *ctx, int slot, int x, int y, int width, int height);
 
 #ifdef __cplusplus

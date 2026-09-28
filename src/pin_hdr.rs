@@ -682,7 +682,15 @@ impl PinTarget {
 
     /// Draws the whole picture for this output into `slot`: the region that
     /// changed is cleared, every pin is drawn into it — shadow, picture, rim, in
-    /// that order — and the region is copied into the buffer.
+    /// that order — and the whole picture is copied into the buffer.
+    ///
+    /// The drawing stays regional, but the copy cannot: the compositor re-reads
+    /// the buffer where the damage does not reach whenever the attached buffer
+    /// changes, which with two picture buffers alternated is every other commit.
+    /// A slot that had only ever been handed the damaged regions would then show
+    /// a pin where it used to be.  Qt's own surfaces never meet this -- copying a
+    /// backing store is a whole-surface affair -- which is why only this helper
+    /// ghosted.
     fn render(
         &mut self,
         pins: &[(u64, Pin)],
@@ -721,10 +729,10 @@ impl PinTarget {
         }
         if !self.surface.present(
             slot as i32,
-            damage.origin.x,
-            damage.origin.y,
-            damage.size.width as i32,
-            damage.size.height as i32,
+            0,
+            0,
+            self.width as i32,
+            self.height as i32,
         ) {
             return Err(VshotError::PinSurface(format!(
                 "the picture could not be copied into {}'s buffer",
