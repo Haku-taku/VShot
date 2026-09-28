@@ -266,13 +266,46 @@ fn run() -> Result<()> {
                 (frame, density)
             }
             CaptureTarget::RegionInteractive => {
-                let (geometry, annotations) = qt_overlay::select_and_edit(&scene)?;
-                let geometry = selection::validate_selection(&scene, geometry)?;
+                let outcome = qt_overlay::select_and_edit(&scene)?;
+                let geometry = selection::validate_selection(&scene, outcome.rect)?;
+                // The editor's other answer is a scrolling capture: the region
+                // is scrolled and stitched instead of kept as one frame.  Any
+                // marks drawn are dropped with it, because the picture the
+                // stitch is made of does not exist yet -- the rows come back
+                // from the scroll, not from this scene -- so a mark has nowhere
+                // to land.  This route has no flags of its own, so the options
+                // are the ones the settings window remembers.
+                if outcome.long {
+                    let (options, backend) =
+                        longshot::options_from_defaults(&crate::config::load().long)?;
+                    let desktop = longshot::desktop_bounds(&output_infos)?;
+                    let mut injector = inject::Injector::open(desktop, backend)?;
+                    let result = longshot::run(
+                        &mut capture,
+                        &output_infos,
+                        geometry,
+                        &mut injector,
+                        &options,
+                    )?;
+                    report_long_capture(&result, &injector, geometry);
+                    return finish_capture(
+                        EditPipeline::new(),
+                        result.frame,
+                        result.density,
+                        &request,
+                        &mut wayland,
+                    );
+                }
                 let (frame, density) = crop_native(&scene, geometry)?;
                 // The helper drew its text bitmaps at the scene's scale, which
                 // is only the crop's density when the selection fell on the
                 // highest-density output.
-                edits = pipeline_for_annotations(annotations, geometry, density, scene.scale())?;
+                edits = pipeline_for_annotations(
+                    outcome.annotations,
+                    geometry,
+                    density,
+                    scene.scale(),
+                )?;
                 (frame, density)
             }
             CaptureTarget::Monitor(name) if name == "current" => {
@@ -417,41 +450,51 @@ fn run() -> Result<()> {
                 let mut injector = inject::Injector::open(desktop, *inject)?;
                 let result =
                     longshot::run(&mut capture, &output_infos, region, &mut injector, options)?;
-                eprintln!(
-                    "vshot: stitched {} frames into {}x{} pixels ({}, wheel through {})",
-                    result.frames,
-                    result.frame.size().width,
-                    result.frame.size().height,
-                    longshot::stop_reason(result.stop),
-                    injector.backend_name()
-                );
-                if result.appended == 0 {
-                    // Not one scroll moved anything: the picture is a single frame.
-                    // Say which backend carried the wheel and where it was aimed,
-                    // because the causes look identical otherwise — a region that
-                    // cannot scroll (a panel, a bar, a window with nothing to
-                    // scroll), a pointer that never was over the region (only the
-                    // compositor protocol moves it), and a window that ignores
-                    // synthetic wheel events.
-                    eprintln!(
-                        "vshot: nothing scrolled, so the result is a single frame of {}x{}: the \
-wheel went through {} aimed at the region centre ({}, {}) on {}, and a region that has \
-nothing to scroll, a pointer that is outside it, and a window that ignores synthetic wheel \
-events all look the same from here",
-                        result.frame.size().width,
-                        result.frame.size().height,
-                        injector.backend_name(),
-                        region.origin.x + (region.size.width / 2) as i32,
-                        region.origin.y + (region.size.height / 2) as i32,
-                        result.output,
-                    );
-                }
+                report_long_capture(&result, &injector, region);
                 (result.frame, result.density)
             }
         }
     };
 
     finish_capture(edits, frame, density, &request, &mut wayland)
+}
+
+/// Reports a finished scrolling capture: what it stitched, and -- when not one
+/// scroll moved anything -- why the result is a single frame.
+fn report_long_capture(
+    result: &longshot::LongShotResult,
+    injector: &inject::Injector,
+    region: Rect,
+) {
+    eprintln!(
+        "vshot: stitched {} frames into {}x{} pixels ({}, wheel through {})",
+        result.frames,
+        result.frame.size().width,
+        result.frame.size().height,
+        longshot::stop_reason(result.stop),
+        injector.backend_name()
+    );
+    if result.appended == 0 {
+        // Not one scroll moved anything: the picture is a single frame.
+        // Say which backend carried the wheel and where it was aimed,
+        // because the causes look identical otherwise — a region that
+        // cannot scroll (a panel, a bar, a window with nothing to
+        // scroll), a pointer that never was over the region (only the
+        // compositor protocol moves it), and a window that ignores
+        // synthetic wheel events.
+        eprintln!(
+            "vshot: nothing scrolled, so the result is a single frame of {}x{}: the \
+wheel went through {} aimed at the region centre ({}, {}) on {}, and a region that has \
+nothing to scroll, a pointer that is outside it, and a window that ignores synthetic wheel \
+events all look the same from here",
+            result.frame.size().width,
+            result.frame.size().height,
+            injector.backend_name(),
+            region.origin.x + (region.size.width / 2) as i32,
+            region.origin.y + (region.size.height / 2) as i32,
+            result.output,
+        );
+    }
 }
 
 /// Starts a replay session detached from this terminal, so it outlives the

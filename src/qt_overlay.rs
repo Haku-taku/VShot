@@ -318,6 +318,11 @@ struct QtSession<'a> {
     // drag.
     #[serde(skip_serializing_if = "Option::is_none")]
     selection: Option<WireRect>,
+    // Region editing only: whether the editor offers the scrolling-capture
+    // action.  Window editing reuses the same editor on a frame that has
+    // nothing to scroll, so it leaves this out and the action stays away.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    long_allowed: Option<bool>,
     outputs: Vec<QtOutput<'a>>,
 }
 
@@ -380,6 +385,22 @@ struct QtResult {
     // caller can resolve the click against the windows that exist by then.
     point: Option<WirePoint>,
     annotations: Option<Vec<QtAnnotation>>,
+    // Region editing only: the user pressed the toolbar's scrolling-capture
+    // action, so the selection names a region to scroll and stitch rather
+    // than a still to keep.
+    #[serde(default)]
+    long: bool,
+}
+
+/// What an editing session reported: the region to keep, the marks drawn
+/// on it, and whether the user asked for a scrolling capture instead.
+pub(crate) struct SelectionOutcome {
+    pub(crate) rect: Rect,
+    pub(crate) annotations: Vec<Annotation>,
+    /// True when the toolbar's scrolling-capture action was pressed.  The
+    /// marks are still carried, but the caller drops them: the picture the
+    /// stitch is made of does not exist yet, so a mark has nowhere to land.
+    pub(crate) long: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -411,11 +432,11 @@ struct QtAnnotation {
     bitmap: Option<String>,
 }
 
-pub fn select_and_edit(scene: &SceneSnapshot) -> Result<(Rect, Vec<Annotation>)> {
-    let (_directory, session_path) = write_session(scene, "region", &[], None)?;
+pub fn select_and_edit(scene: &SceneSnapshot) -> Result<SelectionOutcome> {
+    let (_directory, session_path) = write_session(scene, "region", &[], None, true)?;
     let helper = helper_program()?;
     let output = run_helper(&helper, &session_path)?;
-    parse_result(output, scene.bounds())
+    parse_outcome(output, scene.bounds())
 }
 
 /// What a picking session reported: the window the click landed on, as the
@@ -440,7 +461,7 @@ pub fn pick_window(
     candidates: &[WindowCandidate],
     refresh: impl Fn() -> Option<Vec<WindowCandidate>>,
 ) -> Result<PickedWindow> {
-    let (_directory, session_path) = write_session(scene, "window-pick", candidates, None)?;
+    let (_directory, session_path) = write_session(scene, "window-pick", candidates, None, false)?;
     let helper = helper_program()?;
     let output = run_pick_helper(&helper, &session_path, &refresh)?;
     parse_picked_window(output, scene.bounds())
@@ -450,7 +471,8 @@ pub fn pick_window(
 /// the window the user picked is edited on the frame that was captured after
 /// the pick — not on the one the picking itself started from.
 pub fn edit_selection(scene: &SceneSnapshot, selection: Rect) -> Result<(Rect, Vec<Annotation>)> {
-    let (_directory, session_path) = write_session(scene, "region", &[], Some(selection.into()))?;
+    let (_directory, session_path) =
+        write_session(scene, "region", &[], Some(selection.into()), false)?;
     let helper = helper_program()?;
     let output = run_helper(&helper, &session_path)?;
     parse_result(output, scene.bounds())
@@ -460,7 +482,7 @@ pub fn edit_selection(scene: &SceneSnapshot, selection: Rect) -> Result<(Rect, V
 /// what this is for: the frame that gets stitched does not exist yet, so there
 /// is nothing to mark up at selection time.
 pub fn select_region(scene: &SceneSnapshot) -> Result<Rect> {
-    let (_directory, session_path) = write_session(scene, "region-only", &[], None)?;
+    let (_directory, session_path) = write_session(scene, "region-only", &[], None, false)?;
     let helper = helper_program()?;
     let output = run_helper(&helper, &session_path)?;
     let (selection, _annotations) = parse_result(output, scene.bounds())?;
@@ -713,6 +735,7 @@ pub(crate) fn write_pin_edit_session(spec: &PinEditSpec<'_>) -> Result<(TempDir,
         action: (!spec.action.is_empty()).then_some(spec.action),
         candidates: None,
         selection: None,
+        long_allowed: None,
         outputs: vec![QtOutput {
             id: 0,
             name: spec.output_name,
@@ -824,6 +847,7 @@ fn write_session(
     mode: &str,
     candidates: &[WindowCandidate],
     selection: Option<WireRect>,
+    long_allowed: bool,
 ) -> Result<(TempDir, PathBuf)> {
     let directory = tempfile::Builder::new()
         .prefix("vshot-qt-")
@@ -867,6 +891,7 @@ fn write_session(
         candidates: (!candidates.is_empty())
             .then(|| candidates.iter().map(QtCandidate::from).collect()),
         selection,
+        long_allowed: long_allowed.then_some(true),
         outputs,
     };
     let session_path = directory.path().join("session.json");
@@ -913,7 +938,7 @@ fn compact_error(bytes: &[u8]) -> String {
     text
 }
 
-fn parse_result(bytes: Vec<u8>, bounds: Rect) -> Result<(Rect, Vec<Annotation>)> {
+fn parse_outcome(bytes: Vec<u8>, bounds: Rect) -> Result<SelectionOutcome> {
     let result: QtResult = serde_json::from_slice(&bytes).map_err(|error| {
         VshotError::Selection(format!("Qt helper returned invalid result JSON: {error}"))
     })?;
@@ -938,12 +963,21 @@ fn parse_result(bytes: Vec<u8>, bounds: Rect) -> Result<(Rect, Vec<Annotation>)>
                 .into_iter()
                 .map(parse_annotation)
                 .collect::<Result<Vec<_>>>()?;
-            Ok((selection, annotations))
+            Ok(SelectionOutcome {
+                rect: selection,
+                annotations,
+                long: result.long,
+            })
         }
         status => Err(VshotError::Selection(format!(
             "Qt helper returned unknown status `{status}`"
         ))),
     }
+}
+
+fn parse_result(bytes: Vec<u8>, bounds: Rect) -> Result<(Rect, Vec<Annotation>)> {
+    let outcome = parse_outcome(bytes, bounds)?;
+    Ok((outcome.rect, outcome.annotations))
 }
 
 /// A picking session's answer: the window it took and where the click landed.
@@ -1263,6 +1297,30 @@ mod tests {
             Some("A")
         );
         assert_eq!(annotations[2].color(), DEFAULT_TEXT_COLOR);
+    }
+
+    #[test]
+    fn parses_the_scrolling_capture_intent_from_the_result() {
+        // The toolbar's scrolling-capture action ends the session like a
+        // confirmation, so the answer travels in the same document as the
+        // selection and the marks.  `parse_outcome` carries it; `parse_result`,
+        // which predates it, keeps its old shape for the callers that never ask.
+        let bytes = br#"{"status":"ok","selection":{"x":1,"y":2,"width":10,"height":8},"long":true,"annotations":[{"kind":"shape","tool":"rectangle","rect":{"x":0,"y":1,"width":3,"height":4}}]}"#.to_vec();
+        let outcome = parse_outcome(bytes.clone(), Rect::new(0, 0, 100, 100)).unwrap();
+        assert!(outcome.long);
+        assert_eq!(outcome.rect, Rect::new(1, 2, 10, 8));
+        assert_eq!(outcome.annotations.len(), 1);
+        let (selection, annotations) = parse_result(bytes, Rect::new(0, 0, 100, 100)).unwrap();
+        assert_eq!(selection, Rect::new(1, 2, 10, 8));
+        assert_eq!(annotations.len(), 1);
+        // A document without the key -- window editing never sends it -- reads
+        // as an ordinary capture.
+        let plain = br#"{"status":"ok","selection":{"x":0,"y":0,"width":10,"height":8}}"#.to_vec();
+        assert!(
+            !parse_outcome(plain, Rect::new(0, 0, 100, 100))
+                .unwrap()
+                .long
+        );
     }
 
     #[test]

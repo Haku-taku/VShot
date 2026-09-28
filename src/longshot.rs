@@ -107,6 +107,26 @@ impl Default for LongShotOptions {
     }
 }
 
+/// The options a scrolling capture runs with when nothing was passed on a
+/// command line: the remembered defaults win over the built-in ones, the same
+/// way the flags do.  This is the region editor's route -- it has no flags of
+/// its own -- so both the options and the wheel backend come from the settings
+/// window.
+pub fn options_from_defaults(
+    defaults: &crate::config::LongDefaults,
+) -> Result<(LongShotOptions, crate::inject::Prefer)> {
+    let fallback = LongShotOptions::default();
+    let options = LongShotOptions {
+        notches: defaults.notches.unwrap_or(fallback.notches),
+        max_height: defaults.max_height.unwrap_or(fallback.max_height),
+        max_frames: defaults.max_frames.unwrap_or(fallback.max_frames),
+        timeout: Duration::from_secs(defaults.timeout.unwrap_or(fallback.timeout.as_secs())),
+        ignore_top: defaults.ignore_top.unwrap_or(fallback.ignore_top),
+    };
+    let backend = crate::inject::Prefer::parse(defaults.inject.as_deref().unwrap_or("auto"))?;
+    Ok((options, backend))
+}
+
 /// Outcome of a capture, for the caller to report.
 pub struct LongShotResult {
     pub frame: Frame,

@@ -288,6 +288,9 @@ const QHash<QString, QString> &chineseTable()
          QString::fromUtf8("每逻辑像素对应多少设备像素，1-4；"
                            "`inferred` 表示按 pin 所在的那块屏幕自动推断")},
         {QStringLiteral("Scrolling capture"), QString::fromUtf8("滚动截图")},
+        {QStringLiteral("Scroll"), QString::fromUtf8("长截图")},
+        {QStringLiteral("Scroll the selection and stitch it into one tall image"),
+         QString::fromUtf8("滚动选区并拼成一张长图")},
         {QStringLiteral("Scroll notches"), QString::fromUtf8("滚动格数")},
         {QStringLiteral("Wheel notches sent at a time"),
          QString::fromUtf8("一次发送的滚轮格数")},

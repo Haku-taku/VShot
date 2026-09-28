@@ -963,6 +963,27 @@ QIcon recognizeTextIcon(const QColor &color = QColor(230, 225, 229),
     return QIcon(pixmap);
 }
 
+// The scrolling-capture action's icon: a downward arrow over stacked rows,
+// which is what "scroll this and stitch what comes back" looks like.
+QIcon scrollIcon(const QColor &color = QColor(230, 225, 229), qreal devicePixelRatio = 1.0)
+{
+    const qreal ratio = std::max(1.0, devicePixelRatio);
+    QPixmap pixmap(qRound(24 * ratio), qRound(24 * ratio));
+    pixmap.setDevicePixelRatio(ratio);
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(QPen(color, 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    painter.setBrush(Qt::NoBrush);
+    // The arrow points down at the rows the scroll will stack underneath.
+    painter.drawLine(QPointF(12.0, 3.5), QPointF(12.0, 13.5));
+    painter.drawPolyline(QPolygonF{QPointF(8.0, 9.5), QPointF(12.0, 13.5), QPointF(16.0, 9.5)});
+    // The stacked rows below: the tall image the stitch builds.
+    painter.drawLine(QPointF(6.0, 17.0), QPointF(18.0, 17.0));
+    painter.drawLine(QPointF(6.0, 20.5), QPointF(18.0, 20.5));
+    return QIcon(pixmap);
+}
+
 // Draws a dark rounded label (dimensions, pixel coordinates) anchored at `anchor`
 // inside `bounds`; flips above the anchor when there is no room below.
 void drawInfoPill(QPainter *painter, const QPointF &anchor, const QString &text,
@@ -2593,6 +2614,25 @@ public:
                 textButton_->setText(uiTr("Text+"));
             });
         });
+        // Scrolling capture: the region the user drew is scrolled with
+        // synthetic wheels and stitched into one tall image.  It is not a mode
+        // -- nothing stays selected -- and it is not the ordinary confirmation
+        // either: it ends the session, and the CLI reads the answer as "scroll
+        // this, do not keep this frame".  Only the region editor is offered
+        // it: window editing and the pin editor reuse this toolbar on a
+        // picture that has nothing to scroll, and a button that can never be
+        // pressed is worse than no button at all.  Whether it can be pressed
+        // right now -- the selection has to fit in one output -- is
+        // `syncState`'s to say.
+        if (controller_->longAllowed_) {
+            longButton_ = addToolAction(
+                toolLayout, uiTr("Scroll"),
+                scrollIcon(QColor(230, 225, 229), devicePixelRatioF()),
+                uiTr("Scroll the selection and stitch it into one tall image"),
+                QStringLiteral("longButton"));
+            connect(longButton_, &QToolButton::clicked,
+                    [controller = controller_] { controller->requestLongCapture(); });
+        }
         // Every button in this row, the two above included, gets the frame's
         // hover and press painting; it finds them by type, so this has to run
         // after the last one was added.
@@ -2928,6 +2968,13 @@ public:
         }
         if (textButton_ != nullptr) {
             setButtonActive(textButton_, textMode);
+        }
+        if (longButton_ != nullptr) {
+            // The action needs a selection that fits in one output: a scroll
+            // container never spans two monitors, and the CLI would refuse the
+            // region anyway.  Saying so on the button beats a failure after
+            // the fact.
+            longButton_->setEnabled(!textMode && controller_->canRequestLongCapture());
         }
         const Annotation *selected = nullptr;
         if (controller_->selectedAnnotation_ >= 0 &&
@@ -3624,6 +3671,10 @@ private:
     // result can come from a key the toolbar never sees, so it is stored rather
     // than reached through the click handler's capture.
     QToolButton *textButton_ = nullptr;
+    // The scrolling-capture button, enabled only when the session offers the
+    // action and the selection fits in one output; its state is set by
+    // `syncState` along with every other button's.
+    QToolButton *longButton_ = nullptr;
     QVector<QColor> swatchColors_;
     QVector<QPushButton *> swatchButtons_;
     QWidget *colorGroup_ = nullptr;
@@ -3714,6 +3765,10 @@ OverlayController::OverlayController(Session session)
     : session_(std::move(session))
     , gesture_(new Gesture)
 {
+    // Whether the toolbar offers the scrolling-capture action.  Read from
+    // `session_` rather than the parameter: the parameter has already been
+    // moved from by the time this body runs.
+    longAllowed_ = session_.longAllowed;
     // Window picking is driven by the session's candidate list instead of a
     // free-hand drag: the pointer highlights a candidate and a click takes it.
     if (session_.mode == QStringLiteral("window-pick")) {
@@ -6867,6 +6922,33 @@ bool OverlayController::hasValidSelection() const
            selection_->height >= kMinimumSelection;
 }
 
+bool OverlayController::canRequestLongCapture() const
+{
+    if (!longAllowed_ || finished_ || cancelled_ || !hasValidSelection()) {
+        return false;
+    }
+    // A scrolling capture needs the region inside a single output; the CLI
+    // resolves the output from the region and refuses anything wider.
+    for (const OutputSession &output : session_.outputs) {
+        const LogicalRect &surface = output.surface;
+        if (selection_->x >= surface.x && selection_->y >= surface.y &&
+            selection_->right() <= surface.right() &&
+            selection_->bottom() <= surface.bottom()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void OverlayController::requestLongCapture()
+{
+    if (finished_ || cancelled_ || !canRequestLongCapture()) {
+        return;
+    }
+    longRequested_ = true;
+    terminal(false);
+}
+
 void OverlayController::beginPinEdit()
 {
     if (!pinEdit_ || finished_ || cancelled_) {
@@ -7026,6 +7108,11 @@ QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
         selection.insert(QStringLiteral("height"), static_cast<qint64>(selection_->height));
     }
     root.insert(QStringLiteral("selection"), selection);
+    // The scrolling-capture action ends the session like a confirmation, so
+    // the answer travels here rather than in `status`.
+    if (longRequested_) {
+        root.insert(QStringLiteral("long"), true);
+    }
     // Picking reports the click position as well: it runs on a live desktop,
     // so the caller re-resolves there which window the click actually landed
     // on before it captures the frame.

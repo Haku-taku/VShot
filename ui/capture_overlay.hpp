@@ -335,6 +335,18 @@ public:
     // enabled; the CLI may answer with nothing, which keeps the current list.
     void requestCandidateRefresh();
     bool hasValidSelection() const;
+    // Whether the scrolling-capture action would do anything: the session
+    // offers it, the selection is big enough, and it sits inside a single
+    // output -- a scroll container never spans two monitors. The toolbar asks
+    // this to decide whether to offer the button, and the action asks again
+    // before it commits.
+    bool canRequestLongCapture() const;
+    // Takes the scrolling-capture action: the session ends the way a
+    // confirmation does, but the CLI reads the answer as "scroll this region
+    // and stitch it" rather than "keep this frame". A no-op when
+    // `canRequestLongCapture` is false.
+    void requestLongCapture();
+    bool longRequested() const { return longRequested_; }
     const std::optional<LogicalRect> &selection() const;
     const QVector<Annotation> &annotations() const;
     // How many freehand segments the live preview has baked since the stroke
@@ -356,6 +368,11 @@ private:
     InlineTextEdit *textEdit_ = nullptr;
     std::optional<LogicalRect> selection_;
     QVector<Annotation> annotations_;
+    // Whether the session offered the scrolling-capture action, and whether
+    // the user took it.  The action ends the session like a confirmation, so
+    // the answer travels back beside the selection.
+    bool longAllowed_ = false;
+    bool longRequested_ = false;
     // Window picking: the session's candidate windows are what the pointer may
     // snap to, so the first click replaces the free-hand drag that region
     // capture starts with.

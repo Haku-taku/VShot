@@ -280,6 +280,19 @@ bool loadSession(const QString &sessionPath, Session *session, QString *error)
         parsed.selection = selection;
     }
 
+    // Region editing only: whether the toolbar offers the scrolling-capture
+    // action. Window editing reuses the same editor on a frame that has
+    // nothing to scroll, so the CLI leaves the key out there.
+    if (parsed.mode == QStringLiteral("region")) {
+        const QJsonValue longValue = root.value(QStringLiteral("long_allowed"));
+        if (!longValue.isUndefined() && !longValue.isNull()) {
+            if (!longValue.isBool()) {
+                return fail(error, QStringLiteral("session `long_allowed` must be a boolean"));
+            }
+            parsed.longAllowed = longValue.toBool();
+        }
+    }
+
     const QJsonArray outputs = outputsValue.toArray();
     parsed.outputs.reserve(outputs.size());
     for (int index = 0; index < outputs.size(); ++index) {

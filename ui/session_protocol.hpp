@@ -67,6 +67,11 @@ struct Session {
     // Pin-edit only: which part of the editor to open on, absent for the
     // ordinary annotation editor. `"text"` opens it in the text-selection mode.
     QString action;
+    // `region` editing only: whether the toolbar offers the scrolling-capture
+    // action. Window editing reuses the same editor on a frame that has
+    // nothing to scroll, so the CLI leaves this false there and the action
+    // never appears.
+    bool longAllowed = false;
 };
 
 bool loadSession(const QString &sessionPath, Session *session, QString *error);

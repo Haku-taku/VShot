@@ -112,7 +112,10 @@ follow the pointer, then confirm with Enter, a double-click inside the selection
 or the toolbar's OK. Esc or a right-click cancels; Esc inside a text box closes
 only that box. The toolbar annotates with Rect, Ellipse, Arrow, Draw, Text and
 Mosaic: Ctrl+Z / Ctrl+Y undo and redo, Delete removes the selected annotation,
-Ctrl+V pastes a clipboard image. The final PNG is re-rendered from the
+Ctrl+V pastes a clipboard image. Scroll hands the selection to the scrolling
+capture instead (`vshot long`), which scrolls the region and stitches it into
+one tall image; the marks drawn are dropped with it, because the picture the
+stitch is made of does not exist yet. The final PNG is re-rendered from the
 annotations, so it matches the preview.
 
 VSHOT_QT_HELPER overrides which vshot-qt-ui is run, VSHOT_LANG its language."#

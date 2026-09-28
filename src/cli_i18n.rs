@@ -120,7 +120,9 @@ $XDG_CONFIG_HOME/vshot/config.json（或 ~/.config/vshot/config.json）可选：
         r#"在冻结场景里拖出矩形，用八个手柄或方向键调整（按住 Shift 一次走 10px），放大镜与尺寸
 读数跟着指针，然后 Enter、在选区内双击或工具栏 OK 确认。Esc 或右键取消；文本框里的 Esc 只关
 那个框。工具栏用矩形、椭圆、箭头、涂鸦、文本和马赛克标注：Ctrl+Z / Ctrl+Y 撤销重做，Delete
-删除选中的标注，Ctrl+V 贴上剪贴板里的图片。最终 PNG 由标注重新渲染，与预览一致。
+删除选中的标注，Ctrl+V 贴上剪贴板里的图片。「长截图」把这块选区交给滚动长截图（`vshot long`）
+而不是保留它：选区被滚动并拼成一张长图，画在浮层上的标注随之丢弃，因为拼接用的画面此刻还不
+存在。最终 PNG 由标注重新渲染，与预览一致。
 
 VSHOT_QT_HELPER 指定运行哪一份 vshot-qt-ui，VSHOT_LANG 指定它的语言。"#,
     ),
