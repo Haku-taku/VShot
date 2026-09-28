@@ -58,6 +58,26 @@ public:
         Line,
         Wave,
         Text,
+        // A numbered badge: one click places one badge and the count advances.
+        // Unlike every other tool here it commits on the press, not on a
+        // release, because there is no drag for it to preview.
+        Number,
+    };
+
+    // The looks a numbered badge can be drawn with.  All four are one tool: the
+    // toolbar carries a single button, because the palette is long already, and
+    // a second click on that button cycles the style instead of adding three
+    // more buttons beside it.
+    enum class NumberStyle {
+        // A filled disc with the count knocked out of it -- the ①②③ look.
+        FilledCircle,
+        // A hollow ring whose line is the current stroke width.
+        Ring,
+        // A rounded square filled like the disc.
+        Square,
+        // No background at all: the glyphs alone, given a thin contrasting
+        // halo so they stay readable over a busy desktop.
+        Plain,
     };
 
     explicit AnnotateSurface(QScreen *screen);
@@ -82,6 +102,10 @@ public:
     void setPenWidth(int width);
     int penWidth() const { return width_; }
 
+    // The badge style the next numbered mark is drawn with.
+    void setNumberStyle(NumberStyle style);
+    NumberStyle numberStyle() const { return numberStyle_; }
+
     void undo();
     void redo();
     bool canUndo() const;
@@ -91,6 +115,13 @@ public:
     void clear();
     int strokeCount() const;
     bool isEmpty() const;
+
+    // The count the stroke at `index` carries, or 0 when that stroke is not a
+    // numbered badge (or the index is outside the list).  The counts start at
+    // one, so zero can never be a real one.  Read by the offline check, which
+    // has to see the numbers a run of clicks produced and not merely how many
+    // strokes there are.
+    int strokeNumber(int index) const;
 
     // How many times a stroke's ink has been rasterized into its own image.
     // Each stroke is rasterized once and then reused, which is what makes the
@@ -146,6 +177,12 @@ private:
         int width = 3;
         QVector<QPointF> points;
         QString text;
+        // The number tool's badge: which look it is drawn with, and the count it
+        // carries.  `number` is zero for every other tool, which is what makes
+        // "is this a badge" a question about the number rather than about the
+        // whole enum.
+        NumberStyle numberStyle = NumberStyle::FilledCircle;
+        int number = 0;
         // The ink of this stroke, rasterized into its own image on first paint.
         // A committed stroke is never modified, so the only thing that can
         // invalidate this is a change of device ratio; the shared pointer means
@@ -200,6 +237,10 @@ private:
     void beginText(const QPointF &local);
     // Commits (`accept`) or drops the open text editor.
     void finishText(bool accept);
+    // Places one numbered badge at `local` and advances the count.  The whole
+    // tool is a press: there is no drag to preview, so nothing waits for a
+    // release.
+    void placeNumber(const QPointF &local);
     // Hands the keyboard to the compositor, or asks for it, for text entry.
     // Only the text editor needs the keyboard: drawing a stroke does not, and a
     // surface that held it would stop the user from typing anywhere else.
@@ -240,6 +281,13 @@ private:
     Tool tool_ = Tool::Pen;
     QColor color_{229, 57, 53};
     int width_ = kWidths[1];
+    NumberStyle numberStyle_ = NumberStyle::FilledCircle;
+    // The count the next badge carries.  It starts over with the canvas: a
+    // `clear()` puts it back to one, while an undo leaves it where it is.  That
+    // asymmetry is deliberate -- the count is not part of the drawing, and
+    // making an undo rewind it would mean carrying it inside every history
+    // snapshot for no gain the user can see.
+    int nextNumber_ = 1;
     Toolbar *toolbar_ = nullptr;
     bool toolbarHidden_ = false;
     // Where the user dragged the toolbar to, in this surface's logical pixels;

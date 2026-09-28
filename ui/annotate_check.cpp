@@ -84,6 +84,16 @@ constexpr int kLineWidth = 6;
 constexpr int kHalfWidth = kLineWidth / 2;
 constexpr int kWaveAmplitude = 12; // max(6 * 2, 4)
 
+// The number tool's own numbers, spelled out here like the ink colour and the
+// wave's amplitude.  kNumberWidth is the pen width the checks set; a badge is
+// `clamp(width * 6, 18, 96)` logical pixels across -- 36 here -- and lands
+// centred on the point the click hit.  The spot is well clear of the toolbar,
+// which draws its own number button in the armed style.
+constexpr int kNumberWidth = 6;
+constexpr int kNumberDiameter = 36; // clamp(6 * 6, 18, 96)
+constexpr int kNumberX = 400;
+constexpr int kNumberY = 300;
+
 // Distance from a point to the segment `a`..`b`.
 double distanceToSegment(const QPointF &p, const QPointF &a, const QPointF &b)
 {
@@ -651,6 +661,118 @@ void checkText(vshot::AnnotateSurface &surface)
            QStringLiteral("strokeCount=%1").arg(surface.strokeCount()));
 }
 
+// The number tool: one click places one badge and the count advances, an undo
+// steps back over a badge without handing its number to the next one, and a
+// clear starts the count over.  The count itself is read back, not just how many
+// strokes there are -- "two clicks made two marks" would pass even if both marks
+// read "1".
+void checkNumberCounts(QScreen *screen)
+{
+    vshot::AnnotateSurface surface(screen);
+    resizeSurface(surface, kSurfaceWidth, kSurfaceHeight);
+    surface.setTool(vshot::AnnotateSurface::Tool::Number);
+    surface.setPenWidth(kNumberWidth);
+
+    const QPoint first(kNumberX, kNumberY);
+    const QPoint second(kNumberX + 120, kNumberY);
+    press(&surface, first);
+    release(&surface, first);
+    press(&surface, second);
+    release(&surface, second);
+
+    expect("two number clicks place two badges", surface.strokeCount() == 2,
+           QStringLiteral("strokeCount=%1").arg(surface.strokeCount()));
+    expect("the first badge counts 1", surface.strokeNumber(0) == 1,
+           QStringLiteral("number=%1").arg(surface.strokeNumber(0)));
+    expect("the second badge counts 2", surface.strokeNumber(1) == 2,
+           QStringLiteral("number=%1").arg(surface.strokeNumber(1)));
+
+    // An undo takes the badge off the canvas but leaves the count where it is,
+    // so the next badge takes a fresh number rather than the undone one's.
+    surface.undo();
+    expect("an undo takes the last badge off the canvas", surface.strokeCount() == 1,
+           QStringLiteral("strokeCount=%1").arg(surface.strokeCount()));
+    press(&surface, second);
+    release(&surface, second);
+    expect("the count does not rewind with an undo", surface.strokeNumber(1) == 3,
+           QStringLiteral("number=%1").arg(surface.strokeNumber(1)));
+
+    // A clear is the one thing that does put the count back to one.
+    surface.clear();
+    press(&surface, first);
+    release(&surface, first);
+    expect("a clear starts the count over at 1", surface.strokeNumber(0) == 1,
+           QStringLiteral("number=%1").arg(surface.strokeNumber(0)));
+}
+
+// One badge, in one style, at the same spot on its own surface, so the four
+// looks can be compared pixel for pixel without the toolbar's number button
+// (which redraws itself in the armed style) getting in the way.
+QImage renderBadge(QScreen *screen, vshot::AnnotateSurface::NumberStyle style)
+{
+    vshot::AnnotateSurface surface(screen);
+    resizeSurface(surface, kSurfaceWidth, kSurfaceHeight);
+    surface.setTool(vshot::AnnotateSurface::Tool::Number);
+    surface.setPenWidth(kNumberWidth);
+    surface.setNumberStyle(style);
+    press(&surface, QPoint(kNumberX, kNumberY));
+    release(&surface, QPoint(kNumberX, kNumberY));
+    return renderSurface(surface);
+}
+
+// Whether two renders agree over `area`: a style that painted a different mark
+// is one that put different pixels inside the badge's own box.
+bool sameRegion(const QImage &first, const QImage &second, const QRect &area)
+{
+    const QRect scan = area.intersected(first.rect());
+    for (int y = scan.top(); y <= scan.bottom(); ++y) {
+        for (int x = scan.left(); x <= scan.right(); ++x) {
+            if (first.pixel(x, y) != second.pixel(x, y)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// The four badge styles are four different looks, not one look with four names.
+// "Has a background" is the difference the eye reads first, and a point inside
+// the badge but off its glyph says it in one pixel: the disc covers it, the bare
+// glyphs do not.  The badge's own centre is not usable for this -- the count is
+// drawn centred, so its stem lands on the centre in every style -- which is why
+// the sample sits between the centre and the edge, on the background the styles
+// disagree about.
+void checkNumberStyles(QScreen *screen)
+{
+    const QImage filled = renderBadge(screen, vshot::AnnotateSurface::NumberStyle::FilledCircle);
+    const QImage ring = renderBadge(screen, vshot::AnnotateSurface::NumberStyle::Ring);
+    const QImage square = renderBadge(screen, vshot::AnnotateSurface::NumberStyle::Square);
+    const QImage plain = renderBadge(screen, vshot::AnnotateSurface::NumberStyle::Plain);
+
+    const QRect badge(kNumberX - kNumberDiameter / 2, kNumberY - kNumberDiameter / 2,
+                      kNumberDiameter, kNumberDiameter);
+    const QPoint centre(kNumberX, kNumberY);
+    const QPoint background(kNumberX - kNumberDiameter / 3, kNumberY);
+
+    expect("the filled disc covers the badge's centre",
+           filled.pixelColor(centre).alpha() == 255,
+           QStringLiteral("alpha=%1").arg(filled.pixelColor(centre).alpha()));
+    expect("the bare glyphs leave the badge's background clear",
+           plain.pixelColor(background).alpha() == 0,
+           QStringLiteral("alpha=%1").arg(plain.pixelColor(background).alpha()));
+    expect("the disc covers the background a bare number leaves clear",
+           filled.pixelColor(background).alpha() == 255,
+           QStringLiteral("alpha=%1").arg(filled.pixelColor(background).alpha()));
+
+    expect("each of the four styles paints inside the badge",
+           hasInk(filled, badge) && hasInk(ring, badge) && hasInk(square, badge) &&
+               hasInk(plain, badge));
+    expect("the four styles paint four different marks",
+           !sameRegion(filled, ring, badge) && !sameRegion(filled, square, badge) &&
+               !sameRegion(filled, plain, badge) && !sameRegion(ring, square, badge) &&
+               !sameRegion(ring, plain, badge) && !sameRegion(square, plain, badge));
+}
+
 // The repaint region of every interactive step has to cover the pixels the step
 // changed: a pixel it changed outside that region is one the surface would have
 // left stale until something else repainted it.
@@ -778,6 +900,8 @@ int main(int argc, char **argv)
     checkToolbar(surface);
     checkToolbarWrapping(screen);
     checkLineAndWave(screen);
+    checkNumberCounts(screen);
+    checkNumberStyles(screen);
 
     checkStepCoverage(screen);
     checkRasterReuse(screen);

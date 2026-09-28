@@ -262,6 +262,160 @@ QRectF textBounds(const QVector<QPointF> &points, int width, const QString &text
                   QSizeF(metrics.horizontalAdvance(text), metrics.height()));
 }
 
+// A numbered badge is sized from the stroke width rather than from a control of
+// its own, so the one width slider covers it too: six pen widths across, floored
+// at 18 logical pixels so the thinnest pen still draws something legible and
+// capped at 96 so the thickest one does not paint a billboard.
+constexpr int kNumberMinDiameter = 18;
+constexpr int kNumberMaxDiameter = 96;
+
+int numberDiameter(int width)
+{
+    return std::clamp(width * 6, kNumberMinDiameter, kNumberMaxDiameter);
+}
+
+// The glyphs are a touch over half the badge, bold, so that a two-digit count
+// still sits inside the disc.
+int numberFontPixels(int diameter)
+{
+    return std::max(1, static_cast<int>(std::lround(diameter * 0.55)));
+}
+
+QFont numberFont(int diameter)
+{
+    QFont font = QApplication::font();
+    font.setPixelSize(numberFontPixels(diameter));
+    font.setBold(true);
+    return font;
+}
+
+// The square the badge occupies, centred on the point the click landed on.  The
+// click is the badge's centre rather than its corner so that a badge lands
+// exactly where the pointer was, the way a click-to-place tool should.
+QRectF numberBadgeRect(const QPointF &center, int width)
+{
+    const double diameter = numberDiameter(width);
+    return QRectF(center.x() - diameter / 2.0, center.y() - diameter / 2.0, diameter, diameter);
+}
+
+// The halo the bare-number style outlines its glyphs with: a light glyph gets a
+// dark rim and a dark glyph a light one, so the count reads over a desktop of
+// any colour.  The ink itself is never changed -- the halo sits under it.
+QColor numberHalo(const QColor &ink)
+{
+    return ink.lightness() > 140 ? QColor(0, 0, 0, 210) : QColor(255, 255, 255, 210);
+}
+
+// The glyph colour that reads on top of a badge filled with `ink`.  White is the
+// ①②③ look and what a red, green, blue or black badge gets, but the palette
+// also carries a yellow and a white: white-on-white would erase the count, so a
+// light badge takes near-black glyphs instead.
+QColor numberOnInk(const QColor &ink)
+{
+    return ink.lightness() > 160 ? QColor(20, 20, 20) : QColor(255, 255, 255);
+}
+
+constexpr qreal kNumberHaloWidth = 2.0;
+
+// The badge style's name, spelled the same way by the standalone toolbar's
+// tooltip and the capture editor's style row.
+QString numberStyleName(AnnotateSurface::NumberStyle style)
+{
+    switch (style) {
+    case AnnotateSurface::NumberStyle::FilledCircle:
+        return uiTr("Filled circle");
+    case AnnotateSurface::NumberStyle::Ring:
+        return uiTr("Ring");
+    case AnnotateSurface::NumberStyle::Square:
+        return uiTr("Square");
+    case AnnotateSurface::NumberStyle::Plain:
+        return uiTr("Plain");
+    }
+    return QString();
+}
+
+// The style a second click on the armed number button lands on.  One button
+// cycling through the four keeps the palette on one row.
+AnnotateSurface::NumberStyle nextNumberStyle(AnnotateSurface::NumberStyle style)
+{
+    switch (style) {
+    case AnnotateSurface::NumberStyle::FilledCircle:
+        return AnnotateSurface::NumberStyle::Ring;
+    case AnnotateSurface::NumberStyle::Ring:
+        return AnnotateSurface::NumberStyle::Square;
+    case AnnotateSurface::NumberStyle::Square:
+        return AnnotateSurface::NumberStyle::Plain;
+    case AnnotateSurface::NumberStyle::Plain:
+        break;
+    }
+    return AnnotateSurface::NumberStyle::FilledCircle;
+}
+
+// The one place a numbered badge is turned into ink.  Every path a number takes
+// to the screen -- the live surface's preview, its per-stroke raster and the
+// capture editor's bitmap -- draws through here, so the four styles cannot drift
+// apart between them.
+void paintNumberBadge(QPainter &painter, const QRectF &box, const QString &text,
+                      AnnotateSurface::NumberStyle style, const QColor &color, int width)
+{
+    const int diameter = std::max(1, static_cast<int>(std::lround(box.width())));
+    painter.setFont(numberFont(diameter));
+    switch (style) {
+    case AnnotateSurface::NumberStyle::FilledCircle:
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(color);
+        painter.drawEllipse(box);
+        // The glyphs are the badge's own knockout: the disc carries the colour,
+        // and the count reads against it.
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(numberOnInk(color));
+        painter.drawText(box, Qt::AlignCenter, text);
+        break;
+    case AnnotateSurface::NumberStyle::Ring: {
+        // A hollow ring whose line is the current stroke width, inset by half of
+        // it so the ink stays inside the badge's own box.
+        const qreal pen = std::clamp(static_cast<qreal>(std::max(1, width)), 1.0,
+                                     std::max(1.0, box.width() / 4.0));
+        const qreal inset = pen / 2.0;
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(QPen(color, pen, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        painter.drawEllipse(box.adjusted(inset, inset, -inset, -inset));
+        painter.setPen(color);
+        painter.drawText(box, Qt::AlignCenter, text);
+        break;
+    }
+    case AnnotateSurface::NumberStyle::Square: {
+        const qreal radius = box.width() * 0.22;
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(color);
+        painter.drawRoundedRect(box, radius, radius);
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(numberOnInk(color));
+        painter.drawText(box, Qt::AlignCenter, text);
+        break;
+    }
+    case AnnotateSurface::NumberStyle::Plain: {
+        // No background: the glyphs themselves, stroked once with a thin
+        // contrasting halo before the fill lands on top of it.  A path rather
+        // than drawText because only a path can be stroked.
+        const QFontMetricsF metrics(painter.font());
+        const QRectF glyph = metrics.boundingRect(text);
+        const QPointF origin(box.center().x() - glyph.width() / 2.0 - glyph.left(),
+                             box.center().y() + metrics.capHeight() / 2.0);
+        QPainterPath path;
+        path.addText(origin, painter.font(), text);
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(QPen(numberHalo(color), kNumberHaloWidth, Qt::SolidLine, Qt::RoundCap,
+                            Qt::RoundJoin));
+        painter.drawPath(path);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(color);
+        painter.drawPath(path);
+        break;
+    }
+    }
+}
+
 // The logical rect a stroke can have painted into, already grown by its width
 // and, for an arrow, by its head.  Both the repaint region and the eraser's
 // reach are asked from here.
@@ -270,6 +424,16 @@ QRectF strokeBounds(AnnotateSurface::Tool tool, const QVector<QPointF> &points, 
 {
     if (tool == AnnotateSurface::Tool::Text) {
         return textBounds(points, width, text);
+    }
+    if (tool == AnnotateSurface::Tool::Number) {
+        if (points.isEmpty()) {
+            return QRectF();
+        }
+        // The badge's box, grown by half the pen width: the ring style draws its
+        // line centred on the ellipse, so its ink reaches that far past the box,
+        // and the repaint region has to cover it.
+        const qreal grow = width / 2.0 + 1.0;
+        return numberBadgeRect(points.constFirst(), width).adjusted(-grow, -grow, grow, grow);
     }
     if (points.isEmpty()) {
         return QRectF();
@@ -312,10 +476,12 @@ QRectF strokeBounds(AnnotateSurface::Tool tool, const QVector<QPointF> &points, 
 }
 
 // The one place a stroke is turned into ink.  The pen, the rectangle, the
-// arrow, the line, the wave and the text label are drawn here, whether into the
-// backing image or straight onto the surface as a preview.
+// arrow, the line, the wave, the text label and the numbered badge are drawn
+// here, whether into the backing image or straight onto the surface as a
+// preview.
 void paintStrokeInk(QPainter &painter, AnnotateSurface::Tool tool, const QVector<QPointF> &points,
-                    const QColor &color, int width, const QString &text)
+                    const QColor &color, int width, const QString &text,
+                    AnnotateSurface::NumberStyle numberStyle, int number)
 {
     painter.setPen(QPen(color, width, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
     painter.setBrush(Qt::NoBrush);
@@ -373,6 +539,12 @@ void paintStrokeInk(QPainter &painter, AnnotateSurface::Tool tool, const QVector
             painter.drawText(textBounds(points, width, text), Qt::AlignLeft | Qt::AlignTop, text);
         }
         break;
+    case AnnotateSurface::Tool::Number:
+        if (!points.isEmpty()) {
+            paintNumberBadge(painter, numberBadgeRect(points.constFirst(), width),
+                             QString::number(number), numberStyle, color, width);
+        }
+        break;
     case AnnotateSurface::Tool::Eraser:
         // Not a drawing tool: it removes whole strokes.
         break;
@@ -399,6 +571,9 @@ public:
         Swatch,
         Width,
         Cross,
+        // The number tool's button: a badge drawn in the style that is armed,
+        // so the look on the button is the look the next click will place.
+        Number,
     };
 
     ToolbarButton(QWidget *parent, Kind kind, const QString &label, const QColor &swatch,
@@ -421,6 +596,16 @@ public:
             active_ = active;
             update();
         }
+    }
+    // The badge the number button shows.  Only that one button has a style of
+    // its own; for every other kind the setter is a no-op.
+    void setNumberStyle(AnnotateSurface::NumberStyle style)
+    {
+        if (numberStyle_ == style) {
+            return;
+        }
+        numberStyle_ = style;
+        update();
     }
     void setEnabled(bool enabled)
     {
@@ -492,7 +677,8 @@ protected:
         QPainter painter(this);
         painter.setRenderHint(QPainter::Antialiasing, true);
         const QRectF box = QRectF(rect()).adjusted(1.0, 2.0, -1.0, -2.0);
-        const bool contentActive = active_ && (kind_ == Kind::Label || kind_ == Kind::Cross);
+        const bool contentActive =
+            active_ && (kind_ == Kind::Label || kind_ == Kind::Cross || kind_ == Kind::Number);
         if (contentActive) {
             painter.setPen(Qt::NoPen);
             painter.setBrush(QColor(221, 225, 255));
@@ -539,6 +725,20 @@ protected:
             painter.drawEllipse(center, radius, radius);
             break;
         }
+        case Kind::Number: {
+            // A miniature of the armed badge.  The button borrows the panel's
+            // own content colour rather than the pen's: a black pen would leave
+            // a black badge on a black panel, and the swatch already shows the
+            // colour.  The tooltip names the style.
+            const qreal side = std::min(box.width(), box.height()) - 6.0;
+            if (side > 4.0) {
+                const QRectF badge(center.x() - side / 2.0, center.y() - side / 2.0, side,
+                                   side);
+                paintNumberBadge(painter, badge, QStringLiteral("1"), numberStyle_, content,
+                                 2);
+            }
+            break;
+        }
         case Kind::Cross: {
             // A drawn glyph keeps the quit button independent of whichever font
             // the session happens to have.
@@ -558,6 +758,7 @@ private:
     QString label_;
     QColor swatch_;
     int diameter_ = 0;
+    AnnotateSurface::NumberStyle numberStyle_ = AnnotateSurface::NumberStyle::FilledCircle;
     bool hovered_ = false;
     bool pressed_ = false;
     bool active_ = false;
@@ -758,6 +959,7 @@ public:
         addTool(layout, uiTr("Line"), AnnotateSurface::Tool::Line);
         addTool(layout, uiTr("Wave"), AnnotateSurface::Tool::Wave);
         addTool(layout, uiTr("Text"), AnnotateSurface::Tool::Text);
+        addNumberTool(layout);
 
         addDivider(layout);
         // The palette's order is the requirement's: the default red first, then
@@ -813,6 +1015,15 @@ public:
         }
         for (const auto &entry : widthButtons_) {
             entry.first->setActive(surface_->penWidth() == entry.second);
+        }
+        if (numberButton_ != nullptr) {
+            // The button carries two things at once: whether the number tool is
+            // armed, and which badge it would place.
+            numberButton_->setActive(surface_->tool() == AnnotateSurface::Tool::Number);
+            numberButton_->setNumberStyle(surface_->numberStyle());
+            numberButton_->setToolTip(
+                uiTr("Number: %1 (click again to change the style)")
+                    .arg(numberStyleName(surface_->numberStyle())));
         }
         if (alphaSlider_ != nullptr) {
             // The colour can also be set from outside the toolbar; the slider
@@ -1020,6 +1231,27 @@ private:
         toolButtons_.append(qMakePair(button, tool));
     }
 
+    // The number tool's single button.  Its first click arms the tool; a click
+    // on the already-armed button cycles the badge style instead, because the
+    // palette is long already and four buttons for one tool would push the row
+    // onto a second line.  The thumbnail on the button is the style that is
+    // armed, and the tooltip names it.
+    void addNumberTool(FlowLayout *layout)
+    {
+        auto *button =
+            new ToolbarButton(this, ToolbarButton::Kind::Number, QString(), QColor(), 0);
+        button->setAccessibleName(uiTr("Number"));
+        button->setOnClick([this] {
+            if (surface_->tool() == AnnotateSurface::Tool::Number) {
+                surface_->setNumberStyle(nextNumberStyle(surface_->numberStyle()));
+            } else {
+                surface_->setTool(AnnotateSurface::Tool::Number);
+            }
+        });
+        layout->addWidget(button);
+        numberButton_ = button;
+    }
+
     void addSwatch(FlowLayout *layout, const QColor &color)
     {
         auto *button =
@@ -1115,6 +1347,7 @@ private:
     QVector<QPair<ToolbarButton *, AnnotateSurface::Tool>> toolButtons_;
     QVector<QPair<ToolbarButton *, QColor>> swatchButtons_;
     QVector<QPair<ToolbarButton *, int>> widthButtons_;
+    ToolbarButton *numberButton_ = nullptr;
     ToolbarButton *undo_ = nullptr;
     ToolbarButton *redo_ = nullptr;
     QSlider *alphaSlider_ = nullptr;
@@ -1258,9 +1491,29 @@ void AnnotateSurface::setPenWidth(int width)
     }
 }
 
+void AnnotateSurface::setNumberStyle(NumberStyle style)
+{
+    if (numberStyle_ == style) {
+        return;
+    }
+    numberStyle_ = style;
+    if (toolbar_ != nullptr) {
+        toolbar_->syncState();
+    }
+}
+
 int AnnotateSurface::strokeCount() const
 {
     return static_cast<int>(strokes_.size());
+}
+
+int AnnotateSurface::strokeNumber(int index) const
+{
+    if (index < 0 || index >= strokes_.size()) {
+        return 0;
+    }
+    const Stroke &stroke = strokes_.at(index);
+    return stroke.tool == Tool::Number ? stroke.number : 0;
 }
 
 bool AnnotateSurface::isEmpty() const
@@ -1311,7 +1564,8 @@ double AnnotateSurface::deviceRatio() const
 
 void AnnotateSurface::paintStroke(QPainter &painter, const Stroke &stroke) const
 {
-    paintStrokeInk(painter, stroke.tool, stroke.points, stroke.color, stroke.width, stroke.text);
+    paintStrokeInk(painter, stroke.tool, stroke.points, stroke.color, stroke.width, stroke.text,
+                   stroke.numberStyle, stroke.number);
 }
 
 const AnnotateSurface::StrokeRaster *AnnotateSurface::rasterFor(Stroke &stroke)
@@ -1384,6 +1638,16 @@ bool AnnotateSurface::strokeHits(const Stroke &stroke, const QPointF &local) con
     if (stroke.tool == Tool::Text) {
         return rectOutlineDistance(local, textBounds(stroke.points, stroke.width, stroke.text))
             <= kEraserRadius;
+    }
+    if (stroke.tool == Tool::Number) {
+        if (stroke.points.isEmpty()) {
+            return false;
+        }
+        // A badge is a solid mark: the eraser takes it from anywhere in its box,
+        // not only from the outline, which is what a click on the disc does.
+        const QRectF box = numberBadgeRect(stroke.points.constFirst(), stroke.width);
+        return box.adjusted(-kEraserRadius, -kEraserRadius, kEraserRadius, kEraserRadius)
+            .contains(local);
     }
     if (stroke.points.isEmpty()) {
         return false;
@@ -1514,6 +1778,10 @@ void AnnotateSurface::clear()
     }
     pushHistory(dirty);
     strokes_.clear();
+    // The count starts over with an empty canvas.  This is the one place it is
+    // reset: an undo restores strokes and deliberately leaves the count alone,
+    // so stepping back over a badge does not hand its number to the next one.
+    nextNumber_ = 1;
     touch(dirty);
     if (toolbar_ != nullptr) {
         toolbar_->syncState();
@@ -1605,6 +1873,30 @@ void AnnotateSurface::finishText(bool accept)
     }
 }
 
+void AnnotateSurface::placeNumber(const QPointF &local)
+{
+    Stroke stroke;
+    stroke.tool = Tool::Number;
+    stroke.color = color_;
+    stroke.width = width_;
+    stroke.points = {local};
+    stroke.numberStyle = numberStyle_;
+    stroke.number = nextNumber_;
+    const QRect dirty =
+        grownDirtyRect(strokeBounds(stroke.tool, stroke.points, stroke.width, stroke.text));
+    pushHistory(dirty);
+    // The ink is built on the next paint by `rasterFor`, like any other stroke's.
+    strokes_.append(stroke);
+    // The count advances on every placed badge and never goes back: undoing a
+    // badge does not free its number for the next one, so the numbers always
+    // read in the order they were placed.
+    ++nextNumber_;
+    touch(dirty);
+    if (toolbar_ != nullptr) {
+        toolbar_->syncState();
+    }
+}
+
 void AnnotateSurface::paintEvent(QPaintEvent *event)
 {
     QPainter painter(this);
@@ -1681,6 +1973,11 @@ void AnnotateSurface::mousePressEvent(QMouseEvent *event)
         break;
     case Tool::Text:
         beginText(local);
+        break;
+    case Tool::Number:
+        // A numbered badge is placed on the press and never dragged: the whole
+        // gesture is the click, so nothing waits for a release.
+        placeNumber(local);
         break;
     case Tool::Eraser:
         erasing_ = true;

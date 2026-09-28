@@ -246,6 +246,8 @@ QString toolName(Tool tool)
         return QStringLiteral("mosaic");
     case Tool::Text:
         return QStringLiteral("text");
+    case Tool::Number:
+        return QStringLiteral("number");
     case Tool::Select:
         return QStringLiteral("select");
     }
@@ -309,6 +311,193 @@ QSize textMetrics(const Annotation &annotation)
     return QSize(width, std::max(1, static_cast<int>(lines.size()) * metrics.lineSpacing()));
 }
 
+// A numbered badge is sized from the stroke width rather than from a control of
+// its own, so the width slider covers it too: six pen widths across, floored at
+// 18 logical pixels so the thinnest pen still draws something legible and capped
+// at 96 so the thickest one does not paint a billboard.  The standalone annotate
+// surface spells the same two numbers out for itself: the two files share no
+// code on purpose, and this is the price of that.
+constexpr int kNumberMinDiameter = 18;
+constexpr int kNumberMaxDiameter = 96;
+
+int numberDiameter(int width)
+{
+    return std::clamp(width * 6, kNumberMinDiameter, kNumberMaxDiameter);
+}
+
+// The glyphs are a touch over half the badge, bold, so that a two-digit count
+// still sits inside the disc.
+int numberFontPixels(int diameter)
+{
+    return std::max(1, static_cast<int>(std::lround(diameter * 0.55)));
+}
+
+QFont numberFont(int diameter)
+{
+    QFont font = QApplication::font();
+    font.setPixelSize(numberFontPixels(diameter));
+    font.setBold(true);
+    return font;
+}
+
+// The halo the bare-number style outlines its glyphs with, and the glyph colour
+// that reads on top of a filled badge.  Both are chosen from the ink so the
+// count stays legible whatever colour the pen is -- the palette carries a yellow
+// and a white, and white-on-white would erase the count.
+QColor numberHalo(const QColor &ink)
+{
+    return ink.lightness() > 140 ? QColor(0, 0, 0, 210) : QColor(255, 255, 255, 210);
+}
+
+QColor numberOnInk(const QColor &ink)
+{
+    return ink.lightness() > 160 ? QColor(20, 20, 20) : QColor(255, 255, 255);
+}
+
+constexpr qreal kNumberHaloWidth = 2.0;
+
+// The one place a numbered badge is turned into ink.  The overlay's live
+// preview, its cached per-mark raster and the bitmap the renderer is handed all
+// draw through here, so the four styles cannot drift apart between them -- and
+// the bitmap the Rust side composites is exactly what the user saw.
+void paintNumberBadge(QPainter &painter, const QRectF &box, const QString &text, NumberStyle style,
+                      const QColor &color, int width)
+{
+    const int diameter = std::max(1, static_cast<int>(std::lround(box.width())));
+    painter.setFont(numberFont(diameter));
+    switch (style) {
+    case NumberStyle::FilledCircle:
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(color);
+        painter.drawEllipse(box);
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(numberOnInk(color));
+        painter.drawText(box, Qt::AlignCenter, text);
+        break;
+    case NumberStyle::Ring: {
+        const qreal pen = std::clamp(static_cast<qreal>(std::max(1, width)), 1.0,
+                                     std::max(1.0, box.width() / 4.0));
+        const qreal inset = pen / 2.0;
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(QPen(color, pen, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        painter.drawEllipse(box.adjusted(inset, inset, -inset, -inset));
+        painter.setPen(color);
+        painter.drawText(box, Qt::AlignCenter, text);
+        break;
+    }
+    case NumberStyle::Square: {
+        const qreal radius = box.width() * 0.22;
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(color);
+        painter.drawRoundedRect(box, radius, radius);
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(numberOnInk(color));
+        painter.drawText(box, Qt::AlignCenter, text);
+        break;
+    }
+    case NumberStyle::Plain: {
+        const QFontMetricsF metrics(painter.font());
+        const QRectF glyph = metrics.boundingRect(text);
+        const QPointF origin(box.center().x() - glyph.width() / 2.0 - glyph.left(),
+                             box.center().y() + metrics.capHeight() / 2.0);
+        QPainterPath path;
+        path.addText(origin, painter.font(), text);
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(QPen(numberHalo(color), kNumberHaloWidth, Qt::SolidLine, Qt::RoundCap,
+                            Qt::RoundJoin));
+        painter.drawPath(path);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(color);
+        painter.drawPath(path);
+        break;
+    }
+    }
+}
+
+// The badge style's name, for the style row's segment tooltips and the number
+// tool's own tooltip.
+QString numberStyleName(NumberStyle style)
+{
+    switch (style) {
+    case NumberStyle::FilledCircle:
+        return uiTr("Filled circle");
+    case NumberStyle::Ring:
+        return uiTr("Ring");
+    case NumberStyle::Square:
+        return uiTr("Square");
+    case NumberStyle::Plain:
+        return uiTr("Plain");
+    }
+    return QString();
+}
+
+// The tag the four number-style segments carry.  It never leaves this file: the
+// segment row is a Qt-side control and nothing about it is serialized.
+QString numberStyleValue(NumberStyle style)
+{
+    switch (style) {
+    case NumberStyle::FilledCircle:
+        return QStringLiteral("filled_circle");
+    case NumberStyle::Ring:
+        return QStringLiteral("ring");
+    case NumberStyle::Square:
+        return QStringLiteral("square");
+    case NumberStyle::Plain:
+        break;
+    }
+    return QStringLiteral("plain");
+}
+
+NumberStyle numberStyleForName(const QString &value)
+{
+    if (value == QStringLiteral("ring")) {
+        return NumberStyle::Ring;
+    }
+    if (value == QStringLiteral("square")) {
+        return NumberStyle::Square;
+    }
+    if (value == QStringLiteral("plain")) {
+        return NumberStyle::Plain;
+    }
+    return NumberStyle::FilledCircle;
+}
+
+// Whether an annotation is the number tool's badge rather than a typed label.
+// Both travel as text annotations with a bitmap, and the difference is the one
+// name -- which is exactly why the renderer never has to know about it.
+bool isNumberAnnotation(const Annotation &annotation)
+{
+    return annotation.kind == Annotation::Kind::Text &&
+        annotation.tool == QStringLiteral("number");
+}
+
+// The point a badge is centred on, recovered from its own box.
+Point numberCenter(const Annotation &annotation)
+{
+    return Point{annotation.rect.x + static_cast<std::int32_t>(annotation.rect.width / 2),
+                 annotation.rect.y + static_cast<std::int32_t>(annotation.rect.height / 2)};
+}
+
+// Lays a badge's box out around `center` for the width it currently carries.
+//
+// The box is not decoration: the hit test, the drag clamp, the raster cache and
+// the bitmap the renderer is handed are all sized from it, so it is re-derived
+// wherever the width it comes from changes -- at placement, and when the width
+// control restyles the badge under the selection.
+void layoutNumberBox(Annotation &annotation, Point center)
+{
+    const int diameter = numberDiameter(static_cast<int>(annotation.width));
+    const Point origin{center.x - diameter / 2, center.y - diameter / 2};
+    annotation.origin = origin;
+    annotation.rect = LogicalRect{origin.x, origin.y, static_cast<std::uint32_t>(diameter),
+                                  static_cast<std::uint32_t>(diameter)};
+    // The legacy glyph multiple the protocol derives from this is only ever read
+    // by the renderer's no-bitmap fallback, so the count it means is the badge's
+    // own diameter: the fallback then draws glyphs about as tall as the bitmap
+    // the helper ships, rather than a label at some unrelated size.
+    annotation.textPixels = static_cast<std::uint32_t>(diameter);
+}
+
 // The logical rect an annotation occupies, whatever its kind.  Shared by the
 // hit test, the drag clamps and the render cache so all three agree on what a
 // mark covers; `false` means there is nothing to draw or hit.
@@ -324,6 +513,15 @@ bool annotationLogicalBounds(const Annotation &annotation, LogicalRect *bounds)
         *bounds = annotation.rect;
         return !annotation.pixels.isNull() && !bounds->isEmpty();
     case Annotation::Kind::Text: {
+        // A numbered badge's box is the badge itself, recorded on the
+        // annotation when it was placed.  The hit test, the drag clamp, the
+        // raster cache and the paint all read it from here, so filling `rect`
+        // at placement is what makes a badge selectable, draggable and
+        // deletable rather than only visible.
+        if (isNumberAnnotation(annotation)) {
+            *bounds = annotation.rect;
+            return !bounds->isEmpty();
+        }
         if (annotation.text.isEmpty()) {
             return false;
         }
@@ -432,6 +630,12 @@ QIcon toolbarIcon(Tool tool, const QColor &color = QColor(230, 225, 229),
     case Tool::Text:
         painter.setFont(QFont(QStringLiteral("Sans"), 15, QFont::Bold));
         painter.drawText(QRectF(3, 2, 18, 20), Qt::AlignCenter, QStringLiteral("T"));
+        break;
+    case Tool::Number:
+        // A miniature of the badge itself, drawn with the same painter as the
+        // mark so the button and the click agree on the look.
+        paintNumberBadge(painter, QRectF(4.0, 4.0, 16.0, 16.0), QStringLiteral("1"),
+                         NumberStyle::FilledCircle, color, 2);
         break;
     case Tool::Mosaic:
         painter.setPen(Qt::NoPen);
@@ -2080,6 +2284,7 @@ public:
         addTool(toolLayout, uiTr("Wave"), Tool::Wave);
         addTool(toolLayout, uiTr("Draw"), Tool::Pen);
         addTool(toolLayout, uiTr("Text"), Tool::Text);
+        addTool(toolLayout, uiTr("Number"), Tool::Number);
         addTool(toolLayout, uiTr("Mosaic"), Tool::Mosaic);
         // The two one-shot actions sit at the end of the tool row, drawn the
         // same way: they are the same kind of thing to click, and a second row
@@ -2365,6 +2570,23 @@ public:
                             controller->setMosaicShape(value);
                         });
 
+        // Number badge styles: the four looks the number tool can place.  One
+        // segment per look, shown only while the number tool or a placed badge
+        // is the style target.
+        numberGroup_ = addGroup(optionLayout, true);
+        numberGroup_->setObjectName(QStringLiteral("numberGroup"));
+        addStyleButtons(numberGroup_,
+                        {uiTr("Fill"), uiTr("Ring"), uiTr("Square"), uiTr("Plain")},
+                        uiTr("Number style"),
+                        {numberStyleValue(NumberStyle::FilledCircle),
+                         numberStyleValue(NumberStyle::Ring),
+                         numberStyleValue(NumberStyle::Square),
+                         numberStyleValue(NumberStyle::Plain)},
+                        &numberButtons_, &numberValues_,
+                        [controller = controller_](QString value) {
+                            controller->setNumberStyle(numberStyleForName(value));
+                        });
+
         // Mosaic strength.
         strengthGroup_ = addGroup(numericLayout);
         strengthGroup_->setObjectName(QStringLiteral("strengthGroup"));
@@ -2463,20 +2685,25 @@ public:
             target == QStringLiteral("wave");
         const bool text = target == QStringLiteral("text");
         const bool mosaic = target == QStringLiteral("mosaic");
+        // A numbered badge is a text annotation by wire but nothing like one on
+        // the panel: the number tool shares the colour and width controls, and
+        // takes the badge-style segments instead of the font and size boxes.
+        const bool number = target == QStringLiteral("number");
         const bool mosaicBrush = mosaic &&
             (selected != nullptr ? selected->kind == Annotation::Kind::Stroke
                                  : controller_->mosaicShape_ == QStringLiteral("brush"));
         const bool selectedMosaicShape = selected != nullptr &&
             selected->kind == Annotation::Kind::Shape && mosaic;
-        const bool showColor = stroke || text;
+        const bool showColor = stroke || text || number;
         const bool showDash = stroke && target != QStringLiteral("wave");
         const bool showArrowHead = target == QStringLiteral("arrow");
-        const bool showWidth = stroke || mosaicBrush;
+        const bool showWidth = stroke || mosaicBrush || number;
         const bool showTextSize = text;
         const bool showFont = text;
         const bool showArrowSize = target == QStringLiteral("arrow");
         const bool showMosaic = mosaic;
         const bool showStrength = mosaic;
+        const bool showNumberStyle = number;
         colorGroup_->setVisible(showColor);
         fontGroup_->setVisible(showFont);
         dashGroup_->setVisible(showDash);
@@ -2486,6 +2713,7 @@ public:
         arrowGroup_->setVisible(showArrowSize);
         mosaicGroup_->setVisible(showMosaic);
         strengthGroup_->setVisible(showStrength);
+        numberGroup_->setVisible(showNumberStyle);
         for (int index = 0; index < mosaicButtons_.size(); ++index) {
             const bool brush = mosaicValues_.at(index) == QStringLiteral("brush");
             mosaicButtons_.at(index)->setEnabled(
@@ -2505,6 +2733,7 @@ public:
             {colorGroup_, showColor, true},          {fontGroup_, showFont, true},
             {dashGroup_, showDash, true},
             {arrowStyleGroup_, showArrowHead, true}, {mosaicGroup_, showMosaic, true},
+            {numberGroup_, showNumberStyle, true},
             {widthGroup_, showWidth, false},         {arrowGroup_, showArrowSize, false},
             {textGroup_, showTextSize, false},       {strengthGroup_, showStrength, false},
         };
@@ -2526,7 +2755,8 @@ public:
             optionLayout->contentsMargins().left() + optionLayout->contentsMargins().right() +
             4; // styleRow_ side margins
         const bool singleRow = groupCount > 0 && mergedWidth <= kStyleRowMaxWidth;
-        const bool anyOptionsGroup = showColor || showFont || showDash || showArrowHead || showMosaic;
+        const bool anyOptionsGroup =
+            showColor || showFont || showDash || showArrowHead || showMosaic || showNumberStyle;
         const bool anyNumericGroup = showWidth || showArrowSize || showTextSize || showStrength;
         for (const StyleGroup &entry : orderedGroups) {
             QWidget *homeRow = (singleRow || entry.optionsRow) ? optionsRow_ : numericRow_;
@@ -2573,6 +2803,9 @@ public:
             : controller_->mosaicShape_;
         const std::uint32_t strength =
             selected != nullptr ? selected->strength : controller_->mosaicStrength_;
+        const NumberStyle numberStyle =
+            selected != nullptr && isNumberAnnotation(*selected) ? selected->numberStyle
+                                                                 : controller_->numberStyle_;
         lastColor_ = color;
         // A swatch is "selected" when its RGB matches, whatever the current
         // alpha: the swatches carry no alpha, so a translucent version of a
@@ -2589,6 +2822,17 @@ public:
         fontButton_->setText(font.isEmpty() ? QApplication::font().family() : font);
         syncToggleGroup(arrowStyleButtons_, arrowStyleValues_, arrowStyle);
         syncToggleGroup(mosaicButtons_, mosaicValues_, mask);
+        syncToggleGroup(numberButtons_, numberValues_, numberStyleValue(numberStyle));
+        // The number tool's button names the style that is armed, the way the
+        // standalone toolbar's does; the badge it would place is what the style
+        // row shows.
+        for (int index = 0; index < tools_.size(); ++index) {
+            if (tools_.at(index) == Tool::Number) {
+                toolButtons_.at(index)->setToolTip(
+                    uiTr("Number: %1 (click to place a number)")
+                        .arg(numberStyleName(numberStyle)));
+            }
+        }
         {
             const QSignalBlocker widthBlocker(widthSlider_);
             const QSignalBlocker arrowBlocker(arrowSlider_);
@@ -3023,6 +3267,8 @@ private:
             return uiTr("Draw a freehand line");
         case Tool::Text:
             return uiTr("Click to place a text label, click text to re-edit");
+        case Tool::Number:
+            return uiTr("Click to place a number; each click counts up from one");
         case Tool::Mosaic:
             return uiTr("Pixelate an area: rectangle, ellipse or freehand brush");
         }
@@ -3116,12 +3362,15 @@ private:
     QWidget *textGroup_ = nullptr;
     QWidget *mosaicGroup_ = nullptr;
     QWidget *strengthGroup_ = nullptr;
+    QWidget *numberGroup_ = nullptr;
     QWidget *optionsRow_ = nullptr;
     QWidget *numericRow_ = nullptr;
     QVector<QPushButton *> dashButtons_;
     QVector<QString> dashValues_;
     QVector<QPushButton *> mosaicButtons_;
     QVector<QString> mosaicValues_;
+    QVector<QPushButton *> numberButtons_;
+    QVector<QString> numberValues_;
     QVector<QPushButton *> arrowStyleButtons_;
     QVector<QString> arrowStyleValues_;
     QSlider *widthSlider_ = nullptr;
@@ -3346,6 +3595,13 @@ void OverlayController::translateAnnotations(std::int32_t dx, std::int32_t dy)
         case Annotation::Kind::Text:
             annotation.origin.x = static_cast<std::int32_t>(annotation.origin.x + dx);
             annotation.origin.y = static_cast<std::int32_t>(annotation.origin.y + dy);
+            if (isNumberAnnotation(annotation)) {
+                // A badge's box travels with it: the hit test and the raster
+                // bounds are read from it, so leaving it behind would strand the
+                // badge where the image used to be.
+                annotation.rect.x = static_cast<std::int32_t>(annotation.rect.x + dx);
+                annotation.rect.y = static_cast<std::int32_t>(annotation.rect.y + dy);
+            }
             break;
         }
     }
@@ -3847,6 +4103,13 @@ void OverlayController::mutateAnnotations(QVector<Annotation> next)
     if (selectedAnnotation_ >= annotations_.size()) {
         selectedAnnotation_ = -1;
     }
+    if (annotations_.isEmpty()) {
+        // An emptied canvas numbers from one again -- the same rule the
+        // standalone annotate surface's `clear()` follows.  It is deliberately
+        // here rather than in `undo`: an undo that leaves marks in place must
+        // not rewind the count, and the count is never part of a snapshot.
+        nextNumber_ = 1;
+    }
     updateAll();
 }
 
@@ -3862,6 +4125,32 @@ bool OverlayController::canDrawAt(Point point) const
            point.y >= limits.y && point.y < limits.bottom();
 }
 
+void OverlayController::placeNumber(Point point)
+{
+    Annotation annotation;
+    annotation.kind = Annotation::Kind::Text;
+    annotation.tool = QStringLiteral("number");
+    annotation.number = nextNumber_;
+    annotation.numberStyle = numberStyle_;
+    annotation.color = currentColor_;
+    annotation.width = currentWidth_;
+    // The badge hangs from the point the click landed on, and its box is
+    // recorded on the annotation: the hit test, the drag clamp, the raster cache
+    // and the paint all read it from there, which is what makes a badge
+    // selectable, movable and deletable rather than merely visible.  `origin` is
+    // the same corner, because that is where the renderer blits the bitmap.
+    layoutNumberBox(annotation, clampPoint(point));
+    // The count is advanced as the badge is placed and never handed back: an
+    // undo of a badge leaves the count where it is, so the numbers always read
+    // in the order the clicks were made.
+    ++nextNumber_;
+    QVector<Annotation> next = annotations_;
+    next.push_back(annotation);
+    const int newIndex = next.size() - 1;
+    mutateAnnotations(std::move(next));
+    selectAnnotation(newIndex);
+}
+
 void OverlayController::beginText(CaptureOverlay *overlay, Point point)
 {
     if (textEdit_ != nullptr) {
@@ -3871,7 +4160,12 @@ void OverlayController::beginText(CaptureOverlay *overlay, Point point)
     int index = -1;
     for (int i = annotations_.size() - 1; i >= 0; --i) {
         LogicalRect bounds;
+        // Only a real label is re-editable.  A numbered badge is a text
+        // annotation by wire but carries no typed string, so letting the scan
+        // find one would open an empty editor over it and replace the badge with
+        // a label on commit.
         if (annotations_.at(i).kind == Annotation::Kind::Text &&
+            !isNumberAnnotation(annotations_.at(i)) &&
             annotationBounds(annotations_.at(i), &bounds) && bounds.x - 3 <= point.x &&
             point.x < bounds.right() + 3 && bounds.y - 3 <= point.y &&
             point.y < bounds.bottom() + 3) {
@@ -4437,6 +4731,12 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
         beginText(overlay, point);
         return;
     }
+    if (tool_ == Tool::Number) {
+        // One click, one badge.  Nothing waits for a release: the tool has no
+        // drag to preview, so the press is the whole gesture.
+        placeNumber(point);
+        return;
+    }
     if (tool_ == Tool::Select) {
         // Annotation handles and annotations take precedence over the outer
         // capture selection, so every existing mark remains adjustable.
@@ -4611,7 +4911,10 @@ void OverlayController::doubleClick(CaptureOverlay *overlay, const QPointF &loca
     }
     const Point point = globalPoint(overlay, local);
     const int index = annotationHitAt(point);
-    if (index >= 0 && annotations_.at(index).kind == Annotation::Kind::Text) {
+    if (index >= 0 && annotations_.at(index).kind == Annotation::Kind::Text &&
+        !isNumberAnnotation(annotations_.at(index))) {
+        // Only a typed label re-edits.  Opening the editor over a badge would
+        // take the badge out of the list and commit a label in its place.
         startTextEditor(overlay, index, annotations_.at(index).origin);
         return;
     }
@@ -4916,8 +5219,19 @@ void OverlayController::setWidth(std::uint32_t width)
     }
     currentWidth_ = std::clamp(width, 1u, 64u);
     applyStyleToSelected([this](Annotation &annotation) {
+        // A numbered badge is a text annotation, but its size *is* derived from
+        // the stroke width, so the width control has to reach it; a label's is
+        // its own size box and must not be overwritten here.
         if (annotation.kind != Annotation::Kind::Text) {
             annotation.width = currentWidth_;
+            return;
+        }
+        if (isNumberAnnotation(annotation)) {
+            const Point center = numberCenter(annotation);
+            annotation.width = currentWidth_;
+            // The box travels with the width, or the badge would keep the size
+            // it was placed at while the slider moved.
+            layoutNumberBox(annotation, center);
         }
     });
     updateAll();
@@ -4985,7 +5299,10 @@ void OverlayController::setTextSize(std::uint32_t size)
         textEdit_->setFixedHeight(height);
     }
     applyStyleToSelected([this](Annotation &annotation) {
-        if (annotation.kind == Annotation::Kind::Text) {
+        // A badge's pixel size *is* its diameter, kept in step by the width
+        // control; letting the label size box write over it would decouple the
+        // bitmap's density from the scale the protocol derives.
+        if (annotation.kind == Annotation::Kind::Text && !isNumberAnnotation(annotation)) {
             annotation.textPixels = textSize_;
         }
     });
@@ -5034,6 +5351,22 @@ void OverlayController::setMosaicStrength(std::uint32_t strength)
     applyStyleToSelected([this](Annotation &annotation) {
         if (annotation.tool == QStringLiteral("mosaic")) {
             annotation.strength = mosaicStrength_;
+        }
+    });
+    updateAll();
+}
+
+void OverlayController::setNumberStyle(NumberStyle style)
+{
+    if (finished_ || cancelled_) {
+        return;
+    }
+    numberStyle_ = style;
+    applyStyleToSelected([style](Annotation &annotation) {
+        if (isNumberAnnotation(annotation)) {
+            // The box is the same square for all four looks, so only the style
+            // travels: no re-layout, no change to where the badge sits.
+            annotation.numberStyle = style;
         }
     });
     updateAll();
@@ -5379,6 +5712,11 @@ QString OverlayController::styleTargetTool() const
 {
     if (selectedAnnotation_ >= 0 && selectedAnnotation_ < annotations_.size()) {
         const Annotation &annotation = annotations_.at(selectedAnnotation_);
+        if (isNumberAnnotation(annotation)) {
+            // A selected badge restyles as a badge, not as a label: the style
+            // row offers the four badge looks rather than the font picker.
+            return QStringLiteral("number");
+        }
         if (annotation.kind == Annotation::Kind::Text) {
             return QStringLiteral("text");
         }
@@ -5718,6 +6056,13 @@ Annotation OverlayController::translatedAnnotation(const Annotation &original, i
     case Annotation::Kind::Text:
         result.origin.x = static_cast<std::int32_t>(result.origin.x + clampedDx);
         result.origin.y = static_cast<std::int32_t>(result.origin.y + clampedDy);
+        if (isNumberAnnotation(result)) {
+            // A badge's box is its content rather than a label box derived from
+            // the text, so it has to travel with the badge -- the hit test and
+            // the raster bounds are read from it.
+            result.rect.x = static_cast<std::int32_t>(result.rect.x + clampedDx);
+            result.rect.y = static_cast<std::int32_t>(result.rect.y + clampedDy);
+        }
         break;
     }
     return result;
@@ -6019,12 +6364,22 @@ QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
             }
             value.insert(QStringLiteral("points"), points);
         } else {
+            const bool number = isNumberAnnotation(annotation);
             value.insert(QStringLiteral("kind"), QStringLiteral("text"));
+            if (number) {
+                // The number tool rides the text annotation, and the one extra
+                // name is what tells the two apart on the way out.  The renderer
+                // does not read it -- it composites the bitmap like any other
+                // text annotation -- which is why the Rust side needs no change
+                // at all to carry a numbered badge.
+                value.insert(QStringLiteral("tool"), QStringLiteral("number"));
+            }
             QJsonObject origin;
             origin.insert(QStringLiteral("x"), static_cast<qint64>(annotation.origin.x));
             origin.insert(QStringLiteral("y"), static_cast<qint64>(annotation.origin.y));
             value.insert(QStringLiteral("origin"), origin);
-            value.insert(QStringLiteral("text"), annotation.text);
+            value.insert(QStringLiteral("text"),
+                         number ? QString::number(annotation.number) : annotation.text);
             // The protocol still carries the legacy integer glyph multiple;
             // it is derived from the pixel size here and nowhere else.  A
             // helper that ships a bitmap below renders the exact size, so this
@@ -6035,13 +6390,19 @@ QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
             if (!annotation.font.isEmpty()) {
                 value.insert(QStringLiteral("font"), annotation.font);
             }
-            // Rasterize the label with the exact preview font so the final PNG
-            // matches what the user saw. The bitmap is rendered in scene device
-            // pixels (the highest output scale), matching how Rust composites
-            // the label onto the cropped frame.
+            // Rasterize the label -- or the badge -- so the final PNG matches
+            // what the user saw. The bitmap is rendered in scene device pixels
+            // (the highest output scale), matching how Rust composites it onto
+            // the cropped frame; the renderer is handed that same density, so
+            // the composite is a straight blit at 1:1 rather than a resample.
             if (!bitmapDirectory.isEmpty()) {
                 const int scale = sceneScale();
-                const QSize logical = textMetrics(annotation);
+                // A label's box comes from its glyphs; a badge's is the box it
+                // was placed with, which is also where its ink is drawn.
+                const QSize logical =
+                    number ? QSize(static_cast<int>(annotation.rect.width),
+                                   static_cast<int>(annotation.rect.height))
+                           : textMetrics(annotation);
                 const int width = logical.width() * scale;
                 const int height = logical.height() * scale;
                 if (width > 0 && height > 0 &&
@@ -6053,18 +6414,31 @@ QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
                         QPainter bitmapPainter(&bitmap);
                         bitmapPainter.setRenderHint(QPainter::Antialiasing, true);
                         bitmapPainter.setRenderHint(QPainter::TextAntialiasing, true);
-                        QFont font = textFont(
-                            annotation.font,
-                            std::max(1, static_cast<int>(annotation.textPixels) * scale));
-                        bitmapPainter.setFont(font);
-                        bitmapPainter.setPen(annotation.color);
-                        const QStringList lines = annotation.text.split(QLatin1Char('\n'));
-                        const QFontMetrics metrics(font);
-                        qreal y = 0.0;
-                        for (const QString &line : lines) {
-                            bitmapPainter.drawText(QRectF(0, y, width, metrics.height()),
-                                                   Qt::AlignLeft | Qt::AlignTop, line);
-                            y += metrics.lineSpacing();
+                        if (number) {
+                            // The badge is drawn at the scene's density, into
+                            // the whole bitmap: its top-left is the annotation's
+                            // own origin, which is exactly where the renderer
+                            // blits the file.
+                            bitmapPainter.scale(scale, scale);
+                            paintNumberBadge(bitmapPainter,
+                                             QRectF(0, 0, logical.width(), logical.height()),
+                                             QString::number(annotation.number),
+                                             annotation.numberStyle, annotation.color,
+                                             static_cast<int>(annotation.width));
+                        } else {
+                            QFont font = textFont(
+                                annotation.font,
+                                std::max(1, static_cast<int>(annotation.textPixels) * scale));
+                            bitmapPainter.setFont(font);
+                            bitmapPainter.setPen(annotation.color);
+                            const QStringList lines = annotation.text.split(QLatin1Char('\n'));
+                            const QFontMetrics metrics(font);
+                            qreal y = 0.0;
+                            for (const QString &line : lines) {
+                                bitmapPainter.drawText(QRectF(0, y, width, metrics.height()),
+                                                       Qt::AlignLeft | Qt::AlignTop, line);
+                                y += metrics.lineSpacing();
+                            }
                         }
                         bitmapPainter.end();
                         const QString path = QStringLiteral("%1/text-%2.rgba")
@@ -6504,6 +6878,49 @@ protected:
     int padding(const Annotation &) const override { return 2; }
 };
 
+// A numbered badge, rasterized like a label: its pixels depend on the count,
+// the style, the colour and the width it is sized from -- not on where it sits,
+// so dragging one reuses the cached bitmap.  It pads by the ordinary stroke
+// reach, which is what covers the ring style's line.
+class NumberRaster final : public AnnotationRaster {
+protected:
+    QRectF bounds(const Annotation &annotation, const OutputSession &output,
+                  const QSize &size) const override
+    {
+        LogicalRect rect;
+        if (!annotationLogicalBounds(annotation, &rect)) {
+            return QRectF();
+        }
+        return localRect(output, rect, size);
+    }
+
+    QByteArray signature(const Annotation &annotation, const OutputSession &output,
+                         const QSize &size) const override
+    {
+        QByteArray data;
+        QDataStream stream(&data, QIODevice::WriteOnly);
+        writeContext(stream, output, size);
+        stream << annotation.number << static_cast<int>(annotation.numberStyle)
+               << static_cast<quint32>(annotation.width)
+               << static_cast<quint32>(annotation.color.rgba());
+        return data;
+    }
+
+    void draw(QPainter *painter, const Annotation &annotation, const OutputSession &output,
+              const QSize &size) const override
+    {
+        LogicalRect rect;
+        if (!annotationLogicalBounds(annotation, &rect)) {
+            return;
+        }
+        // The box *is* the badge's own square, so it is drawn into directly
+        // rather than centred on a point again.
+        paintNumberBadge(*painter, localRect(output, rect, size),
+                         QString::number(annotation.number), annotation.numberStyle,
+                         annotation.color, static_cast<int>(annotation.width));
+    }
+};
+
 // A pasted image, drawn at the rect it was placed at.
 class ImageRaster final : public AnnotationRaster {
 protected:
@@ -6548,6 +6965,11 @@ std::shared_ptr<AnnotationRaster> makeAnnotationRaster(const Annotation &annotat
     case Annotation::Kind::Shape:
         return std::make_shared<ShapeRaster>();
     case Annotation::Kind::Text:
+        // A numbered badge is a text annotation by wire, but not by paint: its
+        // bitmap is drawn from the badge painter, and it caches on its own.
+        if (isNumberAnnotation(annotation)) {
+            return std::make_shared<NumberRaster>();
+        }
         return std::make_shared<TextRaster>();
     case Annotation::Kind::Image:
         return std::make_shared<ImageRaster>();
@@ -6721,6 +7143,15 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
         if (annotation.kind == Annotation::Kind::Text) {
             LogicalRect bounds;
             if (!annotationBounds(annotation, &bounds)) {
+                return;
+            }
+            if (isNumberAnnotation(annotation)) {
+                // The badge's box, drawn as the badge: same painter as the
+                // cached raster and the bitmap, so the preview cannot drift from
+                // the mark the user ends up with.
+                paintNumberBadge(*painter, localRect(output, bounds, overlay->size()),
+                                 QString::number(annotation.number), annotation.numberStyle,
+                                 annotation.color, static_cast<int>(annotation.width));
                 return;
             }
             QFont font = annotationFont(annotation);

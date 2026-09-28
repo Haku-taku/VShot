@@ -48,6 +48,20 @@ inline bool operator==(const Point &first, const Point &second)
     return first.x == second.x && first.y == second.y;
 }
 
+// The looks a numbered badge can be drawn with.  The number tool is one tool;
+// these four are the styles the editor offers for it.
+enum class NumberStyle {
+    // A filled disc with the count knocked out of it -- the ①②③ look.
+    FilledCircle,
+    // A hollow ring whose line is the current stroke width.
+    Ring,
+    // A rounded square filled like the disc.
+    Square,
+    // No background at all: the glyphs alone, given a thin contrasting halo so
+    // they stay readable over a busy frame.
+    Plain,
+};
+
 struct Annotation {
     enum class Kind {
         Shape,
@@ -85,6 +99,13 @@ struct Annotation {
     std::uint32_t strength = 2;
     // Text font family; empty resolves to the application default font.
     QString font;
+    // A numbered badge (`Kind::Text` with `tool == "number"`): which of the four
+    // looks it is drawn with, and the count it carries.  `number` is the value
+    // the digit string is written from -- the model keeps one source of truth
+    // for it so that two badges at the same place with different counts are
+    // plainly different marks, which is what the undo comparison needs.
+    NumberStyle numberStyle = NumberStyle::FilledCircle;
+    int number = 0;
     // Output scale the label was drawn on; the text bitmap is rasterized at
     // this device ratio.
     std::uint32_t deviceRatio = 1;
@@ -117,7 +138,11 @@ inline bool annotationEquals(const Annotation &first, const Annotation &second)
         first.mask != second.mask || first.strength != second.strength ||
         first.textPixels != second.textPixels || first.color != second.color ||
         first.width != second.width || first.font != second.font ||
-        first.deviceRatio != second.deviceRatio) {
+        first.deviceRatio != second.deviceRatio ||
+        // A numbered badge's count and style are content, not decoration: leave
+        // either out and two badges that differ only in their number compare
+        // equal, which silently collapses an undo step.
+        first.numberStyle != second.numberStyle || first.number != second.number) {
         return false;
     }
     if (first.rect.x != second.rect.x || first.rect.y != second.rect.y ||
@@ -149,6 +174,10 @@ enum class Tool {
     Wave,
     Pen,
     Text,
+    // A numbered badge: one click places one badge and the count advances.  It
+    // travels as a text annotation with a bitmap, so the renderer needs no
+    // knowledge of it at all.
+    Number,
     Mosaic,
 };
 
@@ -193,6 +222,10 @@ public:
     void setTextSize(std::uint32_t size);
     void setMosaicShape(const QString &shape);
     void setMosaicStrength(std::uint32_t strength);
+    // The badge style the next numbered mark is placed with, and any number
+    // already selected.
+    void setNumberStyle(NumberStyle style);
+    NumberStyle numberStyle() const { return numberStyle_; }
     // Pastes an image into the selection: it lands centred at its natural size,
     // shrunk to fit if it is larger than the canvas, and is left selected so
     // the handles can resize it. `source` names the file it came from, empty
@@ -314,6 +347,14 @@ private:
     QString currentArrowStyle_ = QStringLiteral("open");
     QString mosaicShape_ = QStringLiteral("rect");
     std::uint32_t mosaicStrength_ = 2;
+    NumberStyle numberStyle_ = NumberStyle::FilledCircle;
+    // The count the next badge carries, and the only state the number tool
+    // keeps.  It starts at one for a fresh session and is put back to one when
+    // the last mark is deleted -- an empty canvas numbers from one again, which
+    // is the same rule the standalone surface's `clear()` follows.  An undo
+    // deliberately leaves it alone: it never rewinds the count, so stepping back
+    // over a badge does not hand its number to the next one.
+    int nextNumber_ = 1;
     bool panelPinned_ = false;
     // Automatic toolbar placement anchor: while the selection stays put, the
     // side of the selection the command bar was placed on stays fixed, so a
@@ -405,6 +446,9 @@ private:
     void updateDrawing(Point point);
     void finishDrawing(Point point);
     void beginText(CaptureOverlay *overlay, Point point);
+    // Places one numbered badge at `point` and advances the count.  The whole
+    // tool is a press: there is no drag to preview.
+    void placeNumber(Point point);
     void startTextEditor(CaptureOverlay *overlay, int index, Point origin);
     void finishText(bool accept);
     int annotationHitAt(Point point) const;

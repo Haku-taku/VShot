@@ -36,6 +36,7 @@
 #include <QRegion>
 #include <QScreen>
 #include <QString>
+#include <QTemporaryDir>
 #include <Qt>
 
 #include <algorithm>
@@ -1055,6 +1056,104 @@ void checkWaveSerializesAsATwoPointStroke()
     }
 }
 
+// A numbered badge rides the text annotation all the way out: `kind=text` with
+// `tool=number`, the count as the decimal string the renderer's no-bitmap
+// fallback would draw, and a bitmap it composites instead.  The one extra name
+// is the whole of the protocol change -- the Rust side reads a badge exactly
+// like a label -- so a badge that stopped carrying its bitmap, or that lost the
+// `tool` name, would still be "a text annotation" and would only be noticed at
+// render time.
+void checkNumberSerializesAsATextBitmap()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+
+    controller.chooseTool(vshot::Tool::Number);
+    controller.setWidth(6);
+    controller.setCurrentColor(QColor(255, 30, 30));
+    const QPointF at(200, 200);
+    controller.press(overlay, at, Qt::LeftButton, Qt::NoModifier);
+    controller.release(overlay, at, Qt::LeftButton, Qt::NoModifier);
+    expect(controller.annotations().size() == 1, "the badge lands as one annotation");
+    if (controller.annotations().size() != 1) {
+        return;
+    }
+    expect(controller.annotations().at(0).number == 1, "the first badge counts one",
+           QStringLiteral("number=%1").arg(controller.annotations().at(0).number));
+
+    QTemporaryDir directory;
+    expect(directory.isValid(), "a temporary directory for the bitmap");
+    if (!directory.isValid()) {
+        return;
+    }
+    const QJsonDocument document = controller.resultDocument(directory.path(), &error);
+    expect(error.isEmpty(), "the export reports no error", error);
+    const QJsonArray annotations =
+        document.object().value(QStringLiteral("annotations")).toArray();
+    expect(annotations.size() == 1, "the document carries the badge");
+    if (annotations.isEmpty()) {
+        return;
+    }
+    const QJsonObject mark = annotations.at(0).toObject();
+    expect(mark.value(QStringLiteral("kind")).toString() == QStringLiteral("text"),
+           "the badge serializes as a text annotation",
+           mark.value(QStringLiteral("kind")).toString());
+    expect(mark.value(QStringLiteral("tool")).toString() == QStringLiteral("number"),
+           "the badge's tool name is `number`",
+           mark.value(QStringLiteral("tool")).toString());
+    expect(mark.value(QStringLiteral("text")).toString() == QStringLiteral("1"),
+           "the badge's text is its count in decimal",
+           mark.value(QStringLiteral("text")).toString());
+    const int width = mark.value(QStringLiteral("bitmap_width")).toInt();
+    const int height = mark.value(QStringLiteral("bitmap_height")).toInt();
+    expect(width == 36 && height == 36,
+           "the badge's bitmap is its 36x36 box at the scene's 1x density",
+           QStringLiteral("got %1x%2").arg(width).arg(height));
+    expect(!mark.value(QStringLiteral("bitmap")).toString().isEmpty(),
+           "the badge names the bitmap file it was written to");
+}
+
+// The undo comparison treats a badge's count and style as content: two badges at
+// the same place that differ only in their number are different marks, and two
+// that differ only in their style are too.  Leaving either out of
+// `annotationEquals` silently collapses an undo step -- the editor would think
+// nothing changed and drop the edit.
+void checkNumberBadgesCompareByCountAndStyle()
+{
+    vshot::Annotation first;
+    first.kind = vshot::Annotation::Kind::Text;
+    first.tool = QStringLiteral("number");
+    first.rect = vshot::LogicalRect{182, 182, 36, 36};
+    first.origin = vshot::Point{182, 182};
+    first.number = 1;
+    first.numberStyle = vshot::NumberStyle::FilledCircle;
+
+    const vshot::Annotation copy = first;
+    expect(vshot::annotationEquals(first, copy), "a badge equals a copy of itself");
+
+    vshot::Annotation otherNumber = first;
+    otherNumber.number = 2;
+    expect(!vshot::annotationEquals(first, otherNumber),
+           "two badges at the same place with different counts are not equal");
+
+    vshot::Annotation otherStyle = first;
+    otherStyle.numberStyle = vshot::NumberStyle::Ring;
+    expect(!vshot::annotationEquals(first, otherStyle),
+           "two badges with the same count but different styles are not equal");
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -1072,6 +1171,8 @@ int main(int argc, char *argv[])
     checkLiveStrokeMatchesTheCommittedMark();
     checkInteractiveUpdateCoversTheChange();
     checkWaveSerializesAsATwoPointStroke();
+    checkNumberSerializesAsATextBitmap();
+    checkNumberBadgesCompareByCountAndStyle();
 
     if (failures != 0) {
         std::printf("\n%d annotation cache checks failed\n", failures);
