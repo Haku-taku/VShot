@@ -20,7 +20,11 @@
 
 #include "capture_overlay.hpp"
 
+#include <QAbstractButton>
 #include <QApplication>
+#include <QCoreApplication>
+#include <QHelpEvent>
+#include <QLabel>
 #include <QPoint>
 #include <QScreen>
 #include <QString>
@@ -202,6 +206,73 @@ void checkPanelBelowKeepsTheStyleRowBelow()
            "the style row grows below the command bar, away from the selection");
 }
 
+// Hovering a button: the panel draws the tip itself.
+//
+// Qt's `QToolTip` is a popup window, and this process's layer-shell platform
+// integration cannot host one: the compositor never gets a usable popup and Qt
+// paints the text into the overlay's own full-output surface, which the user
+// meets as a screen-sized block of panel colour.  This must stay a small child
+// of the overlay, and no Qt tooltip window may appear.
+void checkHoverShowsThePanelTooltip()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(sessionFor(vshot::LogicalRect{150, 150, 100, 100}));
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+
+    QAbstractButton *button = nullptr;
+    const QList<QAbstractButton *> buttons = overlay->findChildren<QAbstractButton *>();
+    for (QAbstractButton *candidate : buttons) {
+        if (candidate->isVisible() && !candidate->toolTip().isEmpty()) {
+            button = candidate;
+            break;
+        }
+    }
+    if (button == nullptr) {
+        expect(false, "a visible toolbar button with a tooltip");
+        return;
+    }
+
+    const QPoint local(button->width() / 2, button->height() / 2);
+    const int windowsBefore = QApplication::topLevelWidgets().size();
+    QHelpEvent hover(QEvent::ToolTip, local, button->mapToGlobal(local));
+    QCoreApplication::sendEvent(button, &hover);
+    const int windowsAfter = QApplication::topLevelWidgets().size();
+    expect(windowsAfter == windowsBefore,
+           "a hover raises no tooltip window of Qt's own",
+           QStringLiteral("%1 window(s) appeared").arg(windowsAfter - windowsBefore));
+
+    auto *tip = overlay->findChild<QLabel *>(QStringLiteral("vshotTooltip"));
+    expect(tip != nullptr && tip->isVisible(), "the panel shows its own tooltip");
+    if (tip == nullptr) {
+        return;
+    }
+    expect(tip->text() == button->toolTip(), "the tip carries the hovered button's text");
+    // A one-line card that fits the overlay: the failure this guards is a block
+    // of panel colour covering the whole surface, not a wide line of text.
+    expect(tip->height() < 60 && tip->width() < overlay->width(),
+           "the tip is a small card, not a screen-sized block",
+           QStringLiteral("tip %1x%2 over %3x%4")
+               .arg(tip->width())
+               .arg(tip->height())
+               .arg(overlay->width())
+               .arg(overlay->height()));
+    const QPoint tipTopLeft = tip->mapTo(overlay, QPoint(0, 0));
+    const QPoint buttonTopLeft = button->mapTo(overlay, QPoint(0, 0));
+    expect(std::abs(tipTopLeft.y() - buttonTopLeft.y()) < 200,
+           "the tip stays near the button it describes");
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -211,6 +282,7 @@ int main(int argc, char *argv[])
     checkCrampedCaptureKeepsTheButtonsStill();
     checkPanelAboveKeepsTheStyleRowAbove();
     checkPanelBelowKeepsTheStyleRowBelow();
+    checkHoverShowsThePanelTooltip();
 
     if (failures != 0) {
         std::printf("\n%d toolbar checks failed\n", failures);

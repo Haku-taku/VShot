@@ -23,6 +23,7 @@
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QHash>
+#include <QHelpEvent>
 #include <QIcon>
 #include <QImage>
 #include <QImageReader>
@@ -1813,6 +1814,48 @@ private:
     qreal hue_ = 0.0;
 };
 
+// The editor's own tooltip, a plain child widget of the overlay.
+//
+// Qt's `QToolTip` is a popup window, and this process runs with the layer-shell
+// platform integration — the same one that makes the overlay a layer surface.  A
+// tooltip's popup is stamped onto that integration, the compositor never gets a
+// usable popup, and Qt ends up painting the tip into the overlay's own
+// full-output surface: a screen-sized block of panel colour with the text tucked
+// into a corner.  A child widget has none of that; it is positioned next to what
+// it describes and drawn with the same card treatment as the picker popups.
+class HoverTip final : public QLabel {
+public:
+    explicit HoverTip(QWidget *parent)
+        : QLabel(parent)
+    {
+        setObjectName(QStringLiteral("vshotTooltip"));
+        // The tip is under the pointer by construction, so it must never take a
+        // mouse event: a Leave it caused would dismiss it again immediately.
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+        setAttribute(Qt::WA_StyledBackground, false);
+        setFocusPolicy(Qt::NoFocus);
+        setTextFormat(Qt::PlainText);
+        setWordWrap(false);
+        setContentsMargins(9, 5, 9, 5);
+        setStyleSheet(QStringLiteral("QLabel { color: #e6e1e5; font-size: 11px; }"));
+        hide();
+    }
+
+protected:
+    void paintEvent(QPaintEvent *event) override
+    {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(30, 34, 41, 246));
+        painter.drawPath(superellipsePath(QRectF(rect()), 9.0, 4.0));
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(QPen(QColor(64, 71, 82), 1.0));
+        painter.drawPath(superellipsePath(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 8.5, 4.0));
+        QLabel::paintEvent(event);
+    }
+};
+
 // In-panel HSV color picker. A native QColorDialog is a regular top-level
 // window and would open underneath the layer-shell overlay, so the picker is
 // a child widget of the toolbar styled like the panel itself.
@@ -3100,6 +3143,10 @@ public:
             controller->setCurrentFont(family);
         }, parent);
         fontPopup_->setOpener(fontButton_);
+        // The tooltips are drawn by the panel itself, not by Qt (see
+        // `HoverTip`), so every event in this process is filtered to catch the
+        // hover and turn it into one.
+        qApp->installEventFilter(this);
         syncState();
     }
 
@@ -3437,8 +3484,43 @@ protected:
             if (fontPopup_ != nullptr) {
                 fontPopup_->setParent(parentWidget());
             }
+            if (tip_ != nullptr) {
+                tip_->setParent(parentWidget());
+            }
         }
         return QWidget::event(event);
+    }
+
+    // Turns a hover into the panel's own tooltip, and swallows the event so Qt
+    // never raises a `QToolTip` popup, which is what the layer-shell platform
+    // integration cannot host (see `HoverTip`).
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        switch (event->type()) {
+        case QEvent::ToolTip: {
+            auto *widget = qobject_cast<QWidget *>(watched);
+            if (widget != nullptr && owns(widget) && !widget->toolTip().isEmpty()) {
+                auto *help = static_cast<QHelpEvent *>(event);
+                showTip(widget, help->globalPos());
+                return true;
+            }
+            break;
+        }
+        // Anything that means the pointer is no longer resting on the widget
+        // that raised the tip takes it away again.
+        case QEvent::Leave:
+        case QEvent::MouseButtonPress:
+        case QEvent::MouseButtonRelease:
+        case QEvent::Wheel:
+        case QEvent::KeyPress:
+        case QEvent::Hide:
+        case QEvent::WindowDeactivate:
+            hideTip();
+            break;
+        default:
+            break;
+        }
+        return QWidget::eventFilter(watched, event);
     }
 
     void hideEvent(QHideEvent *event) override
@@ -3449,6 +3531,7 @@ protected:
         if (fontPopup_ != nullptr) {
             fontPopup_->hide();
         }
+        hideTip();
         QWidget::hideEvent(event);
     }
 
@@ -3526,6 +3609,60 @@ protected:
     }
 
 private:
+    // Whether `widget` is one the panel is responsible for: the panel itself or
+    // one of its descendants, or a popup it put on the overlay.  Every other
+    // widget's tooltips are left to Qt.
+    bool owns(const QWidget *widget) const
+    {
+        if (widget == this || isAncestorOf(widget)) {
+            return true;
+        }
+        for (const QWidget *popup : {static_cast<const QWidget *>(pickerPopup_),
+                                     static_cast<const QWidget *>(fontPopup_)}) {
+            if (popup != nullptr &&
+                (widget == popup || popup->isAncestorOf(widget))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Puts the tip next to `widget`, below it when there is room and above it
+    // otherwise, and never past the overlay's own edges.
+    void showTip(QWidget *widget, const QPoint &globalPos)
+    {
+        Q_UNUSED(globalPos);
+        QWidget *host = parentWidget();
+        if (host == nullptr) {
+            return;
+        }
+        if (tip_ == nullptr) {
+            tip_ = new HoverTip(host);
+        } else if (tip_->parentWidget() != host) {
+            tip_->setParent(host);
+        }
+        tip_->setText(widget->toolTip());
+        tip_->adjustSize();
+        const QPoint anchor = widget->mapTo(host, QPoint(widget->width() / 2, 0));
+        int x = anchor.x() - tip_->width() / 2;
+        int y = anchor.y() + widget->height() + 6;
+        if (y + tip_->height() > host->height() - 4) {
+            y = anchor.y() - tip_->height() - 6;
+        }
+        x = std::clamp(x, 4, std::max(4, host->width() - tip_->width() - 4));
+        y = std::clamp(y, 4, std::max(4, host->height() - tip_->height() - 4));
+        tip_->move(x, y);
+        tip_->show();
+        tip_->raise();
+    }
+
+    void hideTip()
+    {
+        if (tip_ != nullptr) {
+            tip_->hide();
+        }
+    }
+
     QImage toolbarFrame() const
     {
         const QWidget *owner = parentWidget();
@@ -3948,6 +4085,7 @@ private:
     QLabel *usageHint_ = nullptr;
     QPushButton *undo_ = nullptr;
     QPushButton *redo_ = nullptr;
+    HoverTip *tip_ = nullptr;
     bool dragging_ = false;
     QPoint dragOffset_;
     QImage backdrop_;
