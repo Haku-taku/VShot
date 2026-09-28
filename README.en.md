@@ -661,7 +661,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --release --locked
 ```
 
-The Qt helper has no test framework, only **offscreen checks that need no compositor** (not built by default; add `-DVSHOT_BUILD_CHECKS=ON`), covering config reads and writes with the settings window, the text size conversion, clipboard color parsing and color card rendering, a pin's self-declared density and outline, text card padding, the color card's right-click menu, the export format of a pasted image, the annotation overlay's five tools with undo, clear and the toolbar's placement, where the toolbar lands, the annotation render cache being hit, the resolution that cache is built at on a high-DPI screen, and the text layer — which parses the JSON `vshot ocr --json` prints (so the wire format has one end in `src/ocr.rs` and one on the Qt side) and, building no widget, needs no `QT_QPA_PLATFORM`:
+The Qt helper has no test framework, only **offscreen checks that need no compositor** (not built by default; add `-DVSHOT_BUILD_CHECKS=ON`), covering config reads and writes with the settings window, the text size conversion, clipboard color parsing and color card rendering, a pin's self-declared density and outline, text card padding, the color card's right-click menu, the export format of a pasted image, the file dialog's stylesheet and thumbnail grid, the annotation surface's ink, eraser and undo with a stray drag across its toolbar, where the editor's floating toolbar lands, the annotation render cache being hit, the resolution that cache is built at on a high-DPI screen, and the text layer — which parses the JSON `vshot ocr --json` prints (so the wire format has one end in `src/ocr.rs` and one on the Qt side) and, building no widget, needs no `QT_QPA_PLATFORM`:
 
 ```sh
 cmake -S . -B build-qt -DVSHOT_BUILD_CHECKS=ON && cmake --build build-qt
@@ -674,6 +674,7 @@ QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-outline-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-text-card-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-menu-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-paste-check
+QT_QPA_PLATFORM=offscreen build-qt/vshot-file-dialog-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-annotate-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-toolbar-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-annotation-check

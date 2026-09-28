@@ -661,7 +661,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --release --locked
 ```
 
-Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**（默认不构建，加 `-DVSHOT_BUILD_CHECKS=ON`），覆盖配置读写与设置窗口、字号换算、剪贴板颜色解析与色卡渲染、pin 的图片自述密度与描边、文字卡片留白、色卡右键菜单、贴图的导出格式、标注浮层的五个工具与撤销/清除/工具栏位置、工具栏的落位、标注渲染缓存的命中、高 DPI 屏上的缓存分辨率，以及文字层——它解析 `vshot ocr --json` 打印的 JSON（这套线格式一头在 `src/ocr.rs`、一头在 Qt 侧），并且不建控件，因此不需要 `QT_QPA_PLATFORM`：
+Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**（默认不构建，加 `-DVSHOT_BUILD_CHECKS=ON`），覆盖配置读写与设置窗口、字号换算、剪贴板颜色解析与色卡渲染、文件对话框的样式表与缩略图、pin 的图片自述密度与描边、文字卡片留白、色卡右键菜单、贴图的导出格式、标注浮层的落笔/橡皮/撤销与工具栏上误拖不落笔、编辑器浮动工具栏的落位、标注渲染缓存的命中、高 DPI 屏上的缓存分辨率，以及文字层——它解析 `vshot ocr --json` 打印的 JSON（这套线格式一头在 `src/ocr.rs`、一头在 Qt 侧），并且不建控件，因此不需要 `QT_QPA_PLATFORM`：
 
 ```sh
 cmake -S . -B build-qt -DVSHOT_BUILD_CHECKS=ON && cmake --build build-qt
@@ -674,6 +674,7 @@ QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-outline-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-text-card-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-menu-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-paste-check
+QT_QPA_PLATFORM=offscreen build-qt/vshot-file-dialog-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-annotate-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-toolbar-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-annotation-check
