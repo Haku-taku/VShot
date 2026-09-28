@@ -22,6 +22,7 @@ mod selection;
 mod stitch;
 mod wayland;
 
+use std::io::Write;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -89,7 +90,8 @@ fn run() -> Result<()> {
         Action::Ocr {
             source,
             destination,
-        } => return run_ocr(source, destination),
+            json,
+        } => return run_ocr(source, destination, json),
         Action::Record(action) => {
             // Recording owns its own loop and writer; nothing below is shared
             // with the screenshot routes beyond the `Capturer`.
@@ -562,7 +564,7 @@ fn replay_background(request: &record::ReplayRequest) -> Result<()> {
 /// frames the text, and the frame is cropped.  What differs is what happens
 /// next — no annotation editor, no PNG, just the recognized text going to
 /// stdout or the clipboard.
-fn run_ocr(source: cli::OcrSource, destination: cli::OcrDestination) -> Result<()> {
+fn run_ocr(source: cli::OcrSource, destination: cli::OcrDestination, json: bool) -> Result<()> {
     // A file needs no compositor at all, so it takes the shortest path: the
     // annotation editor's text tool goes through here, and it has no scene.
     if let cli::OcrSource::File(path) = &source {
@@ -571,7 +573,7 @@ fn run_ocr(source: cli::OcrSource, destination: cli::OcrDestination) -> Result<(
         })?;
         let frame = Frame::from_png(&bytes)?;
         let lines = ocr::recognize(&frame);
-        return finish_ocr(lines.map(|lines| ocr::join_lines(&lines)), destination);
+        return finish_recognition(lines, destination, json);
     }
 
     let mut wayland = WaylandSession::connect()?;
@@ -608,7 +610,35 @@ fn run_ocr(source: cli::OcrSource, destination: cli::OcrDestination) -> Result<(
 
     let lines = ocr::recognize(&frame);
     cleanup?;
-    finish_ocr(lines.map(|lines| ocr::join_lines(&lines)), destination)
+    finish_recognition(lines, destination, json)
+}
+
+/// Ends a recognition: JSON to stdout when it was asked for, otherwise the
+/// text to wherever the caller wanted it and a notification about it.
+fn finish_recognition(
+    lines: Result<Vec<ocr::OcrLine>>,
+    destination: cli::OcrDestination,
+    json: bool,
+) -> Result<()> {
+    if json {
+        // A caller that asked for JSON is a program, not a person: the result
+        // is machine-readable, so there is nothing to announce and no desktop
+        // notification is sent.  A failure is returned as itself, unwrapped by
+        // `?`, and never announced either.
+        let lines = lines?;
+        // `to_json` adds no trailing newline, for the same reason `join_lines`
+        // does not: stdout is the one destination where a line without an end
+        // leaves the shell prompt sitting on the last line.
+        let mut written = ocr::to_json(&lines);
+        written.push('\n');
+        let mut stdout = std::io::stdout();
+        stdout
+            .write_all(written.as_bytes())
+            .and_then(|()| stdout.flush())
+            .map_err(|error| VshotError::Ocr(format!("cannot write to stdout: {error}")))
+    } else {
+        finish_ocr(lines.map(|lines| ocr::join_lines(&lines)), destination)
+    }
 }
 
 /// Sends the recognized text where the request pointed, and says so once it is

@@ -495,6 +495,9 @@ text, as `vshot region` does but without the annotation editor: pick a rectangle
 press Enter, and its text comes back -- to stdout, or to the clipboard with
 --clipboard. --input reads an image file instead.
 
+--json writes the lines and where each character sat as JSON on stdout, for a
+program to place the text rather than read it.
+
 Recognition runs PaddleOCR's PP-OCR models (the ONNX conversions) on ONNX
 Runtime, on the CPU, in this process. The models are installed under
 /usr/share/vshot/models and looked for beside the executable as well.
@@ -514,6 +517,10 @@ stdout. See the README's OCR section."#
         /// annotation editor's text tool takes the same route.
         #[arg(long, value_name = "PATH", conflicts_with_all = ["geometry", "interactive"])]
         input: Option<PathBuf>,
+        /// Write the recognized lines and where each character sat as JSON,
+        /// instead of plain text.
+        #[arg(long, conflicts_with = "clipboard")]
+        json: bool,
     },
 }
 
@@ -830,6 +837,9 @@ pub enum Action {
         /// Fixed region, `None` to frame it interactively, or a file to read.
         source: OcrSource,
         destination: OcrDestination,
+        /// Write the lines and their character geometry as JSON to stdout
+        /// instead of plain text.
+        json: bool,
     },
     /// Record the screen to a file; `Stop` ends a running recording.
     Record(RecordAction),
@@ -1470,6 +1480,7 @@ impl Cli {
             geometry,
             interactive: _,
             input,
+            json,
         } = &self.command
         {
             // The text is the whole result, so the only destination that makes
@@ -1494,6 +1505,7 @@ impl Cli {
                 } else {
                     OcrDestination::Stdout
                 },
+                json: *json,
             });
         }
         if let Command::Pin {

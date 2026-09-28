@@ -356,6 +356,8 @@ Qt overlay 拖出矩形，确认之前不打开任何设备、不创建任何文
 标注编辑器：框一个矩形，按 Enter，文字就回来了（写到 stdout，加 --clipboard 则进剪贴板）。
 --input 改为读一个图片文件。
 
+--json 则把每一行以及每个字的位置写成 JSON 到 stdout，给程序用来放置文字，而不是阅读它。
+
 识别跑 PaddleOCR 的 PP-OCR 模型（ONNX 版本），在本进程的 ONNX Runtime 上，用 CPU。模型装在
 /usr/share/vshot/models，也在可执行文件旁边找。
 
@@ -410,6 +412,7 @@ const ARGS: &[(&str, &str)] = &[
     ("geometry", "固定的全局矩形，格式为 `x,y 宽x高`。"),
     ("interactive", "明确要求用指针选区；不给 --geometry 时这就是默认行为。"),
     ("input", "改为读这个文件里的图片，而不是截屏；标注编辑器的取字按钮走的也是这条路。"),
+    ("json", "把识别出的每一行以及每个字的位置写成 JSON，而不是纯文本。"),
     (
         "name",
         "输出名（`current` 是合成器说你在的那块，也是缺省值）；`record window` / `replay start window` 下是窗口的 app id 或标题，省略即焦点窗口。",

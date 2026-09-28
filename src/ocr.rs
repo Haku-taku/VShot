@@ -34,12 +34,31 @@ const DETECTION_MODEL: &str = "det.onnx";
 const RECOGNITION_MODEL: &str = "rec.onnx";
 const CHARACTER_DICT: &str = "dict.txt";
 
+/// One recognized character: the glyph and where it sat.
+///
+/// The boxes come from the recognition model's CTC alignment rather than from a
+/// second detection pass, so they separate a line horizontally and nothing
+/// else: every box spans the line's full height.  That is enough to decide
+/// which character the pointer is on, which is what they are for; it is not
+/// enough to outline a glyph.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OcrChar {
+    pub ch: char,
+    /// Top-left corner and size in pixels of the image handed to `recognize`.
+    pub rect: crate::geometry::Rect,
+}
+
 /// One recognized line: its text and where it sat in the image.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OcrLine {
     pub text: String,
     /// Top-left corner and size in pixels of the image handed to `recognize`.
     pub rect: crate::geometry::Rect,
+    /// One box per character of `text`, in order, spaces included.  Empty when
+    /// the engine reports no character positions at all -- an external engine
+    /// does not -- or when the count the model returned did not match the text,
+    /// which would misplace every character after the mismatch.
+    pub chars: Vec<OcrChar>,
 }
 
 /// Which engine does the work, resolved from the config file.
@@ -151,6 +170,9 @@ impl Builtin {
             directory.join(RECOGNITION_MODEL),
             directory.join(CHARACTER_DICT),
         )
+        // The recognition model only fills each region's `word_boxes` when
+        // asked, and those boxes are what let the editor place the text, so ask.
+        .return_word_box(true)
         .build()
         .map_err(|error| VshotError::Ocr(format!("failed to load the OCR models: {error}")))?;
         Ok(Self { ocr })
@@ -170,6 +192,33 @@ impl Builtin {
         };
         Ok(lines_from_regions(&result.text_regions))
     }
+}
+
+/// Pairs each character of `text` with the box the recognition model put it in.
+///
+/// The model emits one box per decoded character, spaces included, so the two
+/// lists are only meaningful together.  A count that does not match is dropped
+/// whole rather than zipped short: a box pointing at the wrong glyph is worse
+/// than no box at all, and the caller falls back to the line's own rect.
+fn chars_from_region(region: &oar_ocr::prelude::TextRegion, text: &str) -> Vec<OcrChar> {
+    let Some(boxes) = region.word_boxes.as_ref() else {
+        return Vec::new();
+    };
+    if boxes.len() != text.chars().count() {
+        return Vec::new();
+    }
+    text.chars()
+        .zip(boxes)
+        .map(|(ch, box_rect)| OcrChar {
+            ch,
+            rect: crate::geometry::Rect::new(
+                box_rect.x_min().round() as i32,
+                box_rect.y_min().round() as i32,
+                (box_rect.x_max() - box_rect.x_min()).max(0.0).round() as u32,
+                (box_rect.y_max() - box_rect.y_min()).max(0.0).round() as u32,
+            ),
+        })
+        .collect()
 }
 
 /// Turns the engine's regions into lines, in reading order.
@@ -196,6 +245,7 @@ fn lines_from_regions(regions: &[oar_ocr::prelude::TextRegion]) -> Vec<OcrLine> 
                     (rect.x_max() - rect.x_min()).max(0.0).round() as u32,
                     (rect.y_max() - rect.y_min()).max(0.0).round() as u32,
                 ),
+                chars: chars_from_region(region, text),
             })
         })
         .collect();
@@ -300,8 +350,10 @@ pub fn recognize_external(
         .map(|line| OcrLine {
             text: line.to_string(),
             // An external engine reports text, not geometry, so the rect is
-            // empty: there is nothing to place, only something to read.
+            // empty and no character positions come back: there is nothing to
+            // place, only something to read.
             rect: crate::geometry::Rect::new(0, 0, 0, 0),
+            chars: Vec::new(),
         })
         .collect())
 }
@@ -337,6 +389,58 @@ pub fn join_lines(lines: &[OcrLine]) -> String {
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The recognized lines and their character geometry as JSON, for a caller that
+/// draws the text where it was rather than just reading it.
+///
+/// `geometry` says whether the positions mean anything at all: an external
+/// engine reports text and no geometry, so its lines carry no `rect` and no
+/// `chars`.  When it is `true` every line carries both, and a line whose `chars`
+/// is empty is the count-mismatch fallback, which the consumer reads as "use
+/// the line's own rect".  The string has no trailing newline; the caller adds
+/// one for stdout, exactly as it does for `join_lines`.
+pub fn to_json(lines: &[OcrLine]) -> String {
+    let geometry = lines
+        .iter()
+        .any(|line| line.rect.size.width > 0 && line.rect.size.height > 0);
+    let lines: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|line| {
+            if geometry {
+                serde_json::json!({
+                    "text": line.text,
+                    "rect": rect_json(line.rect),
+                    "chars": line
+                        .chars
+                        .iter()
+                        .map(|character| serde_json::json!({
+                            "ch": character.ch.to_string(),
+                            "rect": rect_json(character.rect),
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+            } else {
+                serde_json::json!({ "text": line.text })
+            }
+        })
+        .collect();
+    serde_json::json!({
+        "version": 1,
+        "geometry": geometry,
+        "lines": lines,
+    })
+    .to_string()
+}
+
+/// A rectangle as the `x`/`y`/`width`/`height` object the JSON output uses.
+fn rect_json(rect: crate::geometry::Rect) -> serde_json::Value {
+    serde_json::json!({
+        "x": rect.origin.x,
+        "y": rect.origin.y,
+        "width": rect.size.width,
+        "height": rect.size.height,
+    })
 }
 
 #[cfg(test)]
@@ -422,14 +526,105 @@ mod tests {
             OcrLine {
                 text: "first".into(),
                 rect: crate::geometry::Rect::new(0, 0, 10, 10),
+                chars: Vec::new(),
             },
             OcrLine {
                 text: "second".into(),
                 rect: crate::geometry::Rect::new(0, 20, 10, 10),
+                chars: Vec::new(),
             },
         ];
         assert_eq!(join_lines(&lines), "first\nsecond");
         assert_eq!(join_lines(&[]), "");
+    }
+
+    #[test]
+    fn to_json_carries_the_line_and_character_geometry() {
+        // The wire format the Qt side parses: a line's text, its rect, and one
+        // box per character, under a versioned envelope that says the positions
+        // are real.  Parsed rather than compared as a raw string so key order
+        // does not matter.
+        let lines = vec![OcrLine {
+            text: "HELLO WORLD".into(),
+            rect: crate::geometry::Rect::new(11, 12, 275, 45),
+            chars: vec![OcrChar {
+                ch: 'H',
+                rect: crate::geometry::Rect::new(11, 12, 33, 45),
+            }],
+        }];
+        let parsed: serde_json::Value = serde_json::from_str(&to_json(&lines)).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "version": 1,
+                "geometry": true,
+                "lines": [{
+                    "text": "HELLO WORLD",
+                    "rect": {"x": 11, "y": 12, "width": 275, "height": 45},
+                    "chars": [{"ch": "H", "rect": {"x": 11, "y": 12, "width": 33, "height": 45}}],
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn to_json_drops_geometry_when_the_engine_reported_none() {
+        // An external engine reports text and no positions, so the envelope
+        // says the geometry is meaningless and each line carries only its text:
+        // a consumer must not see a `rect` or `chars` key it would misread.
+        let lines = vec![
+            OcrLine {
+                text: "alpha".into(),
+                rect: crate::geometry::Rect::new(0, 0, 0, 0),
+                chars: Vec::new(),
+            },
+            OcrLine {
+                text: "beta".into(),
+                rect: crate::geometry::Rect::new(0, 0, 0, 0),
+                chars: Vec::new(),
+            },
+        ];
+        let parsed: serde_json::Value = serde_json::from_str(&to_json(&lines)).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "version": 1,
+                "geometry": false,
+                "lines": [{"text": "alpha"}, {"text": "beta"}],
+            })
+        );
+        for line in parsed["lines"].as_array().unwrap() {
+            assert!(line.get("rect").is_none(), "{line}");
+            assert!(line.get("chars").is_none(), "{line}");
+        }
+    }
+
+    #[test]
+    fn to_json_of_no_lines_is_an_empty_list() {
+        let parsed: serde_json::Value = serde_json::from_str(&to_json(&[])).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({"version": 1, "geometry": false, "lines": []})
+        );
+    }
+
+    #[test]
+    fn to_json_keeps_an_empty_chars_list_for_a_mismatch_fallback() {
+        // When the model's character count did not match the text, the line
+        // keeps its own rect and an empty `chars`, which the consumer reads as
+        // "fall back to the line rect", not as "there is no line here".
+        let lines = vec![OcrLine {
+            text: "fallback".into(),
+            rect: crate::geometry::Rect::new(1, 2, 3, 4),
+            chars: Vec::new(),
+        }];
+        let parsed: serde_json::Value = serde_json::from_str(&to_json(&lines)).unwrap();
+        assert_eq!(parsed["geometry"], serde_json::json!(true));
+        assert_eq!(
+            parsed["lines"][0]["rect"],
+            serde_json::json!({"x": 1, "y": 2, "width": 3, "height": 4})
+        );
+        assert_eq!(parsed["lines"][0]["chars"], serde_json::json!([]));
     }
 
     #[test]
@@ -547,6 +742,16 @@ mod tests {
         assert!(
             first.rect.size.width > 0 && first.rect.size.height > 0,
             "{first:?}"
+        );
+        // This is what pins `return_word_box(true)`: without it every `chars`
+        // would be empty.  The drawn font is monospaced, so this is the easy
+        // case -- one box per character, marching left to right.
+        assert!(!first.chars.is_empty(), "{first:?}");
+        assert_eq!(first.chars.len(), first.text.chars().count(), "{first:?}");
+        let x_positions: Vec<i32> = first.chars.iter().map(|c| c.rect.origin.x).collect();
+        assert!(
+            x_positions.windows(2).all(|pair| pair[0] <= pair[1]),
+            "character x positions have to be non-decreasing, got {x_positions:?}"
         );
     }
 }
