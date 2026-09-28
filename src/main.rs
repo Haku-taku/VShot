@@ -15,6 +15,7 @@ mod model;
 mod notify;
 mod ocr;
 mod output;
+mod parallel;
 mod pin;
 mod qt_overlay;
 mod record;
@@ -788,6 +789,13 @@ fn finish_capture(
     request: &cli::Request,
     wayland: &mut WaylandSession,
 ) -> Result<()> {
+    // The desktop is unfrozen before either image is encoded.  The editor's own
+    // overlay is the helper's and goes when it exits, but the surfaces VShot
+    // still holds — the HDR backdrop, when the frame is being shown on one —
+    // keep the screen frozen while a full-output tone map and a Radiance encode
+    // run.  That is the delay the user meets as a slow close, and nothing below
+    // needs those surfaces, so they go first.
+    let cleanup = wayland.destroy_overlays();
     let (sdr, hdr_out) = sdr_and_hdr(&edits, frame, hdr)?;
     let result = output::write_frame_with_hdr(
         &sdr,
@@ -796,7 +804,6 @@ fn finish_capture(
         density,
         request.compression,
     );
-    let cleanup = wayland.destroy_overlays();
     result.and(cleanup)
 }
 

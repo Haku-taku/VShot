@@ -22,6 +22,7 @@
 use crate::error::{Result, VshotError};
 use crate::geometry::{Point, Rect, Size};
 use crate::model::Frame;
+use crate::parallel::{collect_rows, map_rows};
 
 /// The scRGB reference white: linear value 1.0 is this many cd/m².
 ///
@@ -336,36 +337,40 @@ impl HdrFrame {
                 words.len()
             )));
         }
-        let mut pixels = Vec::with_capacity(expected);
-        for word in words {
-            let mut rgb = [
-                decode_transfer(
-                    ((word >> 20) & 0x3ff) as f32 / 1023.0,
-                    transfer,
-                    reference_nits,
-                ),
-                decode_transfer(
-                    ((word >> 10) & 0x3ff) as f32 / 1023.0,
-                    transfer,
-                    reference_nits,
-                ),
-                decode_transfer((word & 0x3ff) as f32 / 1023.0, transfer, reference_nits),
-            ];
-            // HLG needs the whole triple: BT.2100's opto-optical transfer takes
-            // the frame's own luma, so it cannot ride on a per-channel decode.
-            if transfer == Transfer::Hlg {
-                rgb = hlg_ootf(rgb, reference_nits);
+        let mut pixels = vec![[0.0f32; 4]; expected];
+        map_rows(&mut pixels, size.width as usize, |offset, row| {
+            for (index, destination) in row.iter_mut().enumerate() {
+                let word = words[offset + index];
+                let mut rgb = [
+                    decode_transfer(
+                        ((word >> 20) & 0x3ff) as f32 / 1023.0,
+                        transfer,
+                        reference_nits,
+                    ),
+                    decode_transfer(
+                        ((word >> 10) & 0x3ff) as f32 / 1023.0,
+                        transfer,
+                        reference_nits,
+                    ),
+                    decode_transfer((word & 0x3ff) as f32 / 1023.0, transfer, reference_nits),
+                ];
+                // HLG needs the whole triple: BT.2100's opto-optical transfer
+                // takes the frame's own luma, so it cannot ride on a per-channel
+                // decode.
+                if transfer == Transfer::Hlg {
+                    rgb = hlg_ootf(rgb, reference_nits);
+                }
+                if primaries == Primaries::Bt2020 {
+                    rgb = multiply(BT2020_TO_BT709, rgb);
+                }
+                let alpha = if alpha {
+                    ((word >> 30) & 0x3) as f32 / 3.0
+                } else {
+                    1.0
+                };
+                *destination = [rgb[0], rgb[1], rgb[2], alpha];
             }
-            if primaries == Primaries::Bt2020 {
-                rgb = multiply(BT2020_TO_BT709, rgb);
-            }
-            let alpha = if alpha {
-                ((word >> 30) & 0x3) as f32 / 3.0
-            } else {
-                1.0
-            };
-            pixels.push([rgb[0], rgb[1], rgb[2], alpha]);
-        }
+        });
         Self::new(size, pixels)
     }
 
@@ -396,39 +401,51 @@ impl HdrFrame {
                 .round()
                 .clamp(0.0, 1023.0) as u32
         };
-        self.pixels
-            .iter()
-            .map(|pixel| {
+        let mut words = vec![0u32; self.pixels.len()];
+        map_rows(&mut words, self.size.width as usize, |offset, row| {
+            for (index, destination) in row.iter_mut().enumerate() {
+                let pixel = self.pixels[offset + index];
                 let rgb = multiply(BT709_TO_BT2020, [pixel[0], pixel[1], pixel[2]]);
-                (3 << 30) | (code(rgb[0]) << 20) | (code(rgb[1]) << 10) | code(rgb[2])
-            })
-            .collect()
+                *destination =
+                    (3 << 30) | (code(rgb[0]) << 20) | (code(rgb[1]) << 10) | code(rgb[2]);
+            }
+        });
+        words
     }
 
     /// Tone-maps the whole frame to an 8-bit sRGB frame, the SDR half of the
-    /// pair, with extended Reinhard and the frame's own peak as the white point:
-    /// the brightest sample lands on white and nothing clips, and hue is kept
-    /// because the whole triple is scaled by one factor.  Alpha is quantised to
-    /// a byte like every other channel (a capture is opaque).
+    /// pair.
+    ///
+    /// The map is **display-referred**: linear 1.0 is the output's own SDR white
+    /// (see [`OutputColor::reference_nits`]) and it lands on sRGB white, so a
+    /// sample inside the SDR range keeps exactly the code its light deserves.
+    /// The frame's own peak deliberately does **not** set the white point: with
+    /// that, one capture of a window would come out at a different brightness
+    /// from the next depending on what else shared the frame, and a pinned copy
+    /// of a capture would not match the content it was taken from.
+    ///
+    /// Light beyond SDR white has nowhere to go in an 8-bit SDR image — the
+    /// format ends at white — so it is rolled off: the whole triple is scaled by
+    /// one factor until its brightest channel lands on white, which keeps hue
+    /// and clips only what the format cannot hold.  The `.hdr` half is what
+    /// carries that light.  Alpha is quantised to a byte like every other
+    /// channel (a capture is opaque).
     pub fn tone_map_to_srgb(&self) -> Result<Frame> {
-        let white = self.peak().max(1.0);
-        let mut bytes = Vec::with_capacity(self.pixels.len() * 4);
-        for pixel in &self.pixels {
-            let mut rgb = [pixel[0].max(0.0), pixel[1].max(0.0), pixel[2].max(0.0)];
-            if white > 1.0 {
-                let luminance = rgb[0].max(rgb[1]).max(rgb[2]);
-                if luminance > 0.0 {
-                    let mapped =
-                        luminance * (1.0 + luminance / (white * white)) / (1.0 + luminance);
-                    let scale = mapped / luminance;
-                    rgb = [rgb[0] * scale, rgb[1] * scale, rgb[2] * scale];
-                }
+        let mut bytes = vec![0u8; self.pixels.len() * 4];
+        map_rows(&mut bytes, self.size.width as usize * 4, |offset, row| {
+            for (index, destination) in row.chunks_exact_mut(4).enumerate() {
+                let pixel = self.pixels[offset / 4 + index];
+                let rgb = [pixel[0].max(0.0), pixel[1].max(0.0), pixel[2].max(0.0)];
+                // One factor for the whole triple, so hue survives the roll-off
+                // of anything brighter than white.
+                let peak = rgb[0].max(rgb[1]).max(rgb[2]);
+                let scale = if peak > 1.0 { 1.0 / peak } else { 1.0 };
+                destination[0] = to_u8(srgb_oetf(rgb[0] * scale));
+                destination[1] = to_u8(srgb_oetf(rgb[1] * scale));
+                destination[2] = to_u8(srgb_oetf(rgb[2] * scale));
+                destination[3] = to_u8(pixel[3]);
             }
-            bytes.push(to_u8(srgb_oetf(rgb[0])));
-            bytes.push(to_u8(srgb_oetf(rgb[1])));
-            bytes.push(to_u8(srgb_oetf(rgb[2])));
-            bytes.push(to_u8(pixel[3]));
-        }
+        });
         Frame::new(self.size, bytes)
     }
 
@@ -448,28 +465,32 @@ impl HdrFrame {
                 self.size.height
             )));
         }
-        for (destination, rgba) in self.pixels.iter_mut().zip(layer.pixels().chunks_exact(4)) {
-            let alpha = f32::from(rgba[3]) / 255.0;
-            if alpha == 0.0 {
-                continue;
+        let layer = layer.pixels();
+        map_rows(&mut self.pixels, self.size.width as usize, |offset, row| {
+            for (index, destination) in row.iter_mut().enumerate() {
+                let rgba = &layer[(offset + index) * 4..][..4];
+                let alpha = f32::from(rgba[3]) / 255.0;
+                if alpha == 0.0 {
+                    continue;
+                }
+                let source = [
+                    srgb_eotf(f32::from(rgba[0]) / 255.0),
+                    srgb_eotf(f32::from(rgba[1]) / 255.0),
+                    srgb_eotf(f32::from(rgba[2]) / 255.0),
+                ];
+                let below = destination[3];
+                let out_alpha = alpha + below * (1.0 - alpha);
+                if out_alpha <= 0.0 {
+                    continue;
+                }
+                for channel in 0..3 {
+                    destination[channel] = (source[channel] * alpha
+                        + destination[channel] * below * (1.0 - alpha))
+                        / out_alpha;
+                }
+                destination[3] = out_alpha;
             }
-            let source = [
-                srgb_eotf(f32::from(rgba[0]) / 255.0),
-                srgb_eotf(f32::from(rgba[1]) / 255.0),
-                srgb_eotf(f32::from(rgba[2]) / 255.0),
-            ];
-            let below = destination[3];
-            let out_alpha = alpha + below * (1.0 - alpha);
-            if out_alpha <= 0.0 {
-                continue;
-            }
-            for channel in 0..3 {
-                destination[channel] = (source[channel] * alpha
-                    + destination[channel] * below * (1.0 - alpha))
-                    / out_alpha;
-            }
-            destination[3] = out_alpha;
-        }
+        });
         Ok(())
     }
 
@@ -485,26 +506,41 @@ impl HdrFrame {
         out.extend_from_slice(b"\n");
         out.extend_from_slice(format!("-Y {height} +X {width}\n").as_bytes());
         let rle = (8..=0x7fff).contains(&width);
-        for row in 0..height as usize {
-            let start = row * width as usize;
-            let scanline = &self.pixels[start..start + width as usize];
-            if rle {
-                out.extend_from_slice(&[2, 2, (width >> 8) as u8, (width & 0xff) as u8]);
-                // Four component planes, each run-length encoded on its own.
-                for channel in 0..4 {
-                    let plane: Vec<u8> = scanline
-                        .iter()
-                        .map(|pixel| to_rgbe(*pixel)[channel])
-                        .collect();
-                    encode_rle_plane(&plane, &mut out);
-                }
-            } else {
-                for pixel in scanline {
-                    out.extend_from_slice(&to_rgbe(*pixel));
-                }
+        // Scanlines are independent — a run never crosses one — so each is
+        // encoded on its own and they are laid down in order.  The chunks the
+        // encoder is split into are whole rows, and every row in one gets its
+        // own scanline: emitting a chunk as a single scanline would shift every
+        // row after the first.
+        for rows in collect_rows(&self.pixels, width as usize, |chunk| {
+            let mut bytes = Vec::new();
+            for scanline in chunk.chunks(width as usize) {
+                encode_scanline(scanline, width, rle, &mut bytes);
             }
+            bytes
+        }) {
+            out.extend_from_slice(&rows);
         }
         out
+    }
+}
+
+/// Appends one Radiance scanline: the run-length form when the width allows it,
+/// which is every width but a tiny one, and the flat form otherwise.
+fn encode_scanline(scanline: &[[f32; 4]], width: u32, rle: bool, out: &mut Vec<u8>) {
+    if rle {
+        out.extend_from_slice(&[2, 2, (width >> 8) as u8, (width & 0xff) as u8]);
+        // Four component planes, each run-length encoded on its own.
+        for channel in 0..4 {
+            let plane: Vec<u8> = scanline
+                .iter()
+                .map(|pixel| to_rgbe(*pixel)[channel])
+                .collect();
+            encode_rle_plane(&plane, out);
+        }
+    } else {
+        for pixel in scanline {
+            out.extend_from_slice(&to_rgbe(*pixel));
+        }
     }
 }
 
@@ -1169,18 +1205,70 @@ mod tests {
     }
 
     #[test]
-    fn tone_mapping_reinhard_lands_the_peak_on_white_and_leaves_sdr_alone() {
+    fn tone_mapping_is_anchored_to_sdr_white_whatever_else_is_in_the_frame() {
+        // A sample inside SDR white keeps the code its own light deserves — the
+        // frame's peak is not a white point — so the same content tone-maps to
+        // the same bytes whether or not something brighter shares the frame.
+        let alone = HdrFrame::new(
+            Size::new(2, 1),
+            vec![[0.5, 0.25, 0.1, 1.0], [0.5, 0.25, 0.1, 1.0]],
+        )
+        .unwrap();
+        let beside = HdrFrame::new(
+            Size::new(2, 1),
+            vec![[0.5, 0.25, 0.1, 1.0], [4.0, 2.0, 1.0, 1.0]],
+        )
+        .unwrap();
+        for channel in 0..3 {
+            assert_eq!(
+                alone
+                    .tone_map_to_srgb()
+                    .unwrap()
+                    .pixel(Point::new(0, 0))
+                    .unwrap()[channel],
+                beside
+                    .tone_map_to_srgb()
+                    .unwrap()
+                    .pixel(Point::new(0, 0))
+                    .unwrap()[channel],
+                "channel {channel} moved with the frame's peak"
+            );
+        }
+        // SDR white is sRGB white, exactly.
+        let white = one_pixel([1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(
+            white
+                .tone_map_to_srgb()
+                .unwrap()
+                .pixel(Point::new(0, 0))
+                .unwrap()[0],
+            255
+        );
+        // And a value with no light of its own stays black.
+        let black = one_pixel([0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(
+            black
+                .tone_map_to_srgb()
+                .unwrap()
+                .pixel(Point::new(0, 0))
+                .unwrap()[0],
+            0
+        );
+    }
+
+    #[test]
+    fn tone_mapping_rolls_light_over_white_off_and_keeps_hue() {
+        // Light beyond SDR white cannot be shown by an 8-bit SDR image: the
+        // brightest channel lands on white and the rest of the triple is scaled
+        // with it, which clips only that light and leaves the hue alone.
         let frame = one_pixel([4.0, 2.0, 1.0, 1.0]);
         let sdr = frame.tone_map_to_srgb().unwrap();
-        assert_eq!(sdr.pixel(Point::new(0, 0)).unwrap()[0], 255);
-        // The mid 2.0 is pulled down but stays bright.
-        assert!(sdr.pixel(Point::new(0, 0)).unwrap()[1] > 180);
-
-        // A frame already inside SDR white does not get compressed.
-        let flat = one_pixel([0.5, 0.5, 0.5, 1.0]);
-        let sdr = flat.tone_map_to_srgb().unwrap();
-        let expected = to_u8(srgb_oetf(0.5));
-        assert_eq!(sdr.pixel(Point::new(0, 0)).unwrap()[0], expected);
+        let pixel = sdr.pixel(Point::new(0, 0)).unwrap();
+        assert_eq!(pixel[0], 255, "the brightest channel did not reach white");
+        // The ratio between the channels is what the light had, so the mark on
+        // the image keeps its colour instead of washing out towards white.
+        assert_eq!(pixel[1], to_u8(srgb_oetf(0.5)));
+        assert_eq!(pixel[2], to_u8(srgb_oetf(0.25)));
     }
 
     #[test]
@@ -1282,6 +1370,74 @@ mod tests {
         }
         assert_eq!(frame.pixel(0, 0).unwrap()[0], 0.0);
         assert_eq!(frame.pixel(2, 2).unwrap()[0], 8.0);
+    }
+
+    /// Every per-pixel pass splits a frame into row chunks, and one whose body
+    /// still assumed a chunk was a single row left the rest of the buffer as it
+    /// was allocated — invisible on the few-pixel frames the other tests use,
+    /// and a screenshot in black bands on a real one.  This frame is big enough
+    /// to be split, which is the whole point of it.
+    #[test]
+    fn a_frame_big_enough_to_be_split_is_filled_row_by_row() {
+        let side = 640u32;
+        let (width, height) = (side, side);
+        // Every row a distinct neutral grey: the BT.2020 to BT.709 matrix keeps a
+        // neutral neutral, so every channel of every pixel is positive and a row
+        // that was never written is unmistakable.
+        let words: Vec<u32> = (0..width * height)
+            .map(|index| {
+                let code = 100 + (index / width) % 900;
+                (code << 20) | (code << 10) | code
+            })
+            .collect();
+        let frame = HdrFrame::from_rgb10(
+            &words,
+            Size::new(width, height),
+            Transfer::Pq,
+            Primaries::Bt2020,
+            false,
+            REFERENCE_WHITE_NITS,
+        )
+        .unwrap();
+        for y in 0..height {
+            for x in [0, width / 2, width - 1] {
+                let pixel = frame.pixel(x, y).unwrap();
+                assert!(
+                    pixel[0] > 0.0 && pixel[1] > 0.0 && pixel[2] > 0.0,
+                    "row {y} column {x} was left as it was allocated: {pixel:?}"
+                );
+            }
+        }
+
+        // The passes that go the other way have to cover the whole frame too.
+        let back = frame.to_rgb10_pq(REFERENCE_WHITE_NITS);
+        assert!(
+            back.iter().all(|word| (word >> 20) & 0x3ff > 0),
+            "a ten-bit re-encode left pixels unset"
+        );
+        let sdr = frame.tone_map_to_srgb().unwrap();
+        assert!(
+            sdr.pixels().iter().step_by(4).all(|red| *red > 0),
+            "the SDR tone map left pixels unset"
+        );
+
+        // A Radiance file whose chunks were emitted as single scanlines puts
+        // every row after the first of each chunk in the wrong place, so the
+        // decoder has to hand back what went in.
+        let encoded = frame.encode_radiance();
+        let decoded = decode_radiance(&encoded, width as usize, height as usize);
+        for y in [0usize, 1, 100, 639] {
+            let expected = frame.pixel(0, y as u32).unwrap();
+            let got = decoded[y * width as usize];
+            for channel in 0..3 {
+                assert!(
+                    (got[channel] - expected[channel]).abs() <= expected[channel] * 0.02 + 1e-4,
+                    "row {y} channel {channel}: {} vs {}",
+                    got[channel],
+                    expected[channel]
+                );
+            }
+        }
     }
 
     /// A tiny Radiance RGBE decoder, enough to check the encoder: header,

@@ -25,6 +25,7 @@ use crate::error::{Result, VshotError};
 use crate::geometry::{Rect, Size};
 use crate::model::hdr::{OutputColor, Primaries, Rgb10Summary, Transfer};
 use crate::model::{Frame, HdrFrame};
+use crate::parallel::map_rows;
 
 use super::dmabuf::{is_hdr_fourcc, swap_red_blue_10, DmabufFrame, GbmBuffer};
 
@@ -306,19 +307,25 @@ fn ten_bit_words(
             "capture SHM mapping is smaller than the advertised stride".into(),
         ));
     }
-    let mut words = Vec::with_capacity(width * height);
-    for destination_y in 0..height {
-        let source_y = if y_invert {
-            height - 1 - destination_y
-        } else {
-            destination_y
-        };
-        let source_row = &map[source_y * stride..source_y * stride + row_bytes];
-        for source in source_row.chunks_exact(4) {
-            let word = u32::from_le_bytes([source[0], source[1], source[2], source[3]]);
-            words.push(if bgr { swap_red_blue_10(word) } else { word });
+    let mut words = vec![0u32; width * height];
+    map_rows(&mut words, width, |offset, chunk| {
+        // The chunk is a whole number of rows, not one row: every row in it has
+        // to be read, or the rest of the buffer keeps the zeros it was made
+        // with and a capture comes back in black bands.
+        let first_row = offset / width;
+        for (index, row) in chunk.chunks_mut(width).enumerate() {
+            let source_y = if y_invert {
+                height - 1 - (first_row + index)
+            } else {
+                first_row + index
+            };
+            let source_row = &map[source_y * stride..source_y * stride + row_bytes];
+            for (destination, source) in row.iter_mut().zip(source_row.chunks_exact(4)) {
+                let word = u32::from_le_bytes([source[0], source[1], source[2], source[3]]);
+                *destination = if bgr { swap_red_blue_10(word) } else { word };
+            }
         }
-    }
+    });
     Ok(words)
 }
 
@@ -500,8 +507,43 @@ struct ColorQuery {
     failed: bool,
     done: bool,
     transfer: Option<u32>,
-    primaries: Option<u32>,
+    /// The gamut, when the description named one.
+    primaries_named: Option<u32>,
+    /// The gamut read from the description's chromaticity coordinates.
+    primaries_coords: Option<Primaries>,
     reference_nits: Option<f32>,
+}
+
+/// The gamut behind an explicit set of primaries, in the protocol's units of one
+/// millionth.
+///
+/// Every description carries the coordinates whether or not it also names a
+/// gamut, and one built from a monitor rule or an EDID often names none — so
+/// this is the only reading available then.  The two gamuts this pipeline knows
+/// are told apart by all three primaries at once; anything else lands on the
+/// nearer of them, which is a near miss (a P3 description reads as BT.709)
+/// rather than a wrong transfer function.
+fn classify_primaries(r_x: i32, r_y: i32, g_x: i32, g_y: i32, b_x: i32, b_y: i32) -> Primaries {
+    const SCALE: f32 = 1_000_000.0;
+    const BT709: [(f32, f32); 3] = [(0.640, 0.330), (0.300, 0.600), (0.150, 0.060)];
+    const BT2020: [(f32, f32); 3] = [(0.708, 0.292), (0.170, 0.797), (0.131, 0.046)];
+    let given = [
+        (r_x as f32 / SCALE, r_y as f32 / SCALE),
+        (g_x as f32 / SCALE, g_y as f32 / SCALE),
+        (b_x as f32 / SCALE, b_y as f32 / SCALE),
+    ];
+    let distance = |known: [(f32, f32); 3]| -> f32 {
+        given
+            .iter()
+            .zip(known)
+            .map(|((x, y), (kx, ky))| (x - kx).abs() + (y - ky).abs())
+            .sum()
+    };
+    if distance(BT2020) < distance(BT709) {
+        Primaries::Bt2020
+    } else {
+        Primaries::Bt709
+    }
 }
 
 impl ColorQuery {
@@ -515,9 +557,12 @@ impl ColorQuery {
             5 => Transfer::Linear,
             _ => Transfer::Srgb,
         };
-        let primaries = match self.primaries {
+        let primaries = match self.primaries_named {
+            // The named set is authoritative when there is one; the coordinates
+            // are read only when it is absent.
             Some(6) => Primaries::Bt2020,
-            _ => Primaries::Bt709,
+            Some(_) => Primaries::Bt709,
+            None => self.primaries_coords.unwrap_or(Primaries::Bt709),
         };
         Some(OutputColor {
             transfer,
@@ -1425,7 +1470,18 @@ impl Dispatch<wp_image_description_info_v1::WpImageDescriptionInfoV1, ()> for Ca
                 query.transfer = Some(named!(tf))
             }
             wp_image_description_info_v1::Event::PrimariesNamed { primaries } => {
-                query.primaries = Some(named!(primaries));
+                query.primaries_named = Some(named!(primaries));
+            }
+            wp_image_description_info_v1::Event::Primaries {
+                r_x,
+                r_y,
+                g_x,
+                g_y,
+                b_x,
+                b_y,
+                ..
+            } => {
+                query.primaries_coords = Some(classify_primaries(r_x, r_y, g_x, g_y, b_x, b_y));
             }
             wp_image_description_info_v1::Event::Luminances { reference_lum, .. } => {
                 query.reference_nits = Some(reference_lum as f32)
@@ -1720,6 +1776,51 @@ mod tests {
     }
 
     #[test]
+    fn a_wide_capture_is_read_row_by_row() {
+        // The reader splits a capture into row chunks.  A chunk treated as a
+        // single row left 59 of every 60 rows at zero, which came back as black
+        // bands across the whole screenshot.
+        let (width, height) = (640u32, 640u32);
+        let stride = width as usize * 4;
+        let mut map = vec![0u8; stride * height as usize];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let word: u32 = ((100 + y % 900) as u32) << 20
+                    | ((200 + y % 700) as u32) << 10
+                    | (300 + y % 500) as u32;
+                map[y * stride + x * 4..][..4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        let words = ten_bit_words(
+            &map,
+            width,
+            height,
+            stride,
+            wl_shm::Format::Xrgb2101010,
+            false,
+        )
+        .unwrap();
+        for y in 0..height as usize {
+            assert_ne!(
+                words[y * width as usize] >> 20 & 0x3ff,
+                0,
+                "row {y} was never read"
+            );
+        }
+        // A flipped read keeps the same rows, bottom to top.
+        let flipped = ten_bit_words(
+            &map,
+            width,
+            height,
+            stride,
+            wl_shm::Format::Xrgb2101010,
+            true,
+        )
+        .unwrap();
+        assert_eq!(flipped[0], words[(height as usize - 1) * width as usize]);
+    }
+
+    #[test]
     fn a_ten_bit_code_rounds_to_the_nearest_byte() {
         assert_eq!(ten_to_eight(0), 0);
         assert_eq!(ten_to_eight(1023), 255);
@@ -1733,7 +1834,7 @@ mod tests {
     fn an_output_description_maps_its_transfer_and_primaries() {
         let hdr = ColorQuery {
             transfer: Some(11),
-            primaries: Some(6),
+            primaries_named: Some(6),
             reference_nits: Some(203.0),
             ..ColorQuery::default()
         }
@@ -1746,7 +1847,7 @@ mod tests {
 
         let sdr = ColorQuery {
             transfer: Some(9),
-            primaries: Some(1),
+            primaries_named: Some(1),
             reference_nits: Some(80.0),
             ..ColorQuery::default()
         }
@@ -1757,12 +1858,59 @@ mod tests {
         assert_eq!(sdr.primaries, Primaries::Bt709);
     }
 
+    /// The coordinates are what a description built from a monitor rule or an
+    /// EDID carries, and Hyprland sends them for every description while naming
+    /// a gamut only sometimes — reading the name alone saw BT.2020 as BT.709.
+    #[test]
+    fn a_description_without_a_named_gamut_is_read_from_its_coordinates() {
+        let coords = ColorQuery {
+            transfer: Some(11),
+            primaries_coords: Some(Primaries::Bt2020),
+            reference_nits: Some(203.0),
+            ..ColorQuery::default()
+        }
+        .into_output_color()
+        .unwrap();
+        assert_eq!(coords.primaries, Primaries::Bt2020);
+
+        // A name, when there is one, is the description's own word on it.
+        let both = ColorQuery {
+            transfer: Some(11),
+            primaries_named: Some(1),
+            primaries_coords: Some(Primaries::Bt2020),
+            reference_nits: Some(203.0),
+            ..ColorQuery::default()
+        }
+        .into_output_color()
+        .unwrap();
+        assert_eq!(both.primaries, Primaries::Bt709);
+    }
+
+    #[test]
+    fn explicit_primaries_are_recognised_by_their_coordinates() {
+        // The protocol multiplies every coordinate by a million.
+        assert_eq!(
+            classify_primaries(708_000, 292_000, 170_000, 797_000, 131_000, 46_000),
+            Primaries::Bt2020
+        );
+        assert_eq!(
+            classify_primaries(640_000, 330_000, 300_000, 600_000, 150_000, 60_000),
+            Primaries::Bt709
+        );
+        // A gamut that is neither lands on the nearer set rather than nowhere:
+        // here Display P3, whose blue and red sit between the two.
+        assert_eq!(
+            classify_primaries(680_000, 320_000, 265_000, 690_000, 150_000, 60_000),
+            Primaries::Bt709
+        );
+    }
+
     /// A description that never stated its reference white cannot be read.
     #[test]
     fn an_output_description_without_luminances_is_not_read() {
         let query = ColorQuery {
             transfer: Some(11),
-            primaries: Some(6),
+            primaries_named: Some(6),
             ..ColorQuery::default()
         };
         assert!(query.into_output_color().is_none());
