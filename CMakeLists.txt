@@ -24,6 +24,8 @@ add_executable(vshot-qt-ui
     ui/session_protocol.hpp
     ui/capture_overlay.cpp
     ui/capture_overlay.hpp
+    ui/text_layer.cpp
+    ui/text_layer.hpp
     ui/color_card.cpp
     ui/color_card.hpp
     ui/i18n.cpp
@@ -231,6 +233,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/paste_check.cpp
         ui/capture_overlay.cpp
         ui/capture_overlay.hpp
+        ui/text_layer.cpp
+        ui/text_layer.hpp
         ui/session_protocol.cpp
         ui/session_protocol.hpp
         ui/config.cpp
@@ -261,6 +265,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/toolbar_check.cpp
         ui/capture_overlay.cpp
         ui/capture_overlay.hpp
+        ui/text_layer.cpp
+        ui/text_layer.hpp
         ui/session_protocol.cpp
         ui/session_protocol.hpp
         ui/config.cpp
@@ -290,6 +296,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/annotation_check.cpp
         ui/capture_overlay.cpp
         ui/capture_overlay.hpp
+        ui/text_layer.cpp
+        ui/text_layer.hpp
         ui/session_protocol.cpp
         ui/session_protocol.hpp
         ui/config.cpp
@@ -320,6 +328,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/dpr_check.cpp
         ui/capture_overlay.cpp
         ui/capture_overlay.hpp
+        ui/text_layer.cpp
+        ui/text_layer.hpp
         ui/session_protocol.cpp
         ui/session_protocol.hpp
         ui/config.cpp

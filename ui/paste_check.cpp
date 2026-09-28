@@ -21,11 +21,14 @@
 // One section goes through the toolbar: the region overlay is created for
 // real (no layer surface is ever shown), the preset-edit path puts the command
 // bar up, and the paste button is looked up on it. Without that the feature
-// would be reachable from Ctrl+V only, and nothing here would notice.
+// would be reachable from Ctrl+V only, and nothing here would notice. The same
+// section drives the Text+ button and the text-selection mode it opens: a real
+// `vshot ocr --json` document is fed in, a drag is turned into a range, and the
+// keys that copy it and leave the mode are sent.
 //
-// Needs QApplication and the offscreen platform plugin; no compositor, no
-// layer shell and no clipboard. `QT_QPA_PLATFORM=offscreen` supplies the one
-// screen the overlay is parented to.
+// Needs QApplication and the offscreen platform plugin; no compositor and no
+// layer shell. The clipboard is real where `wl-copy` is on PATH and can reach a
+// compositor, which is what lets the copy path be exercised end to end.
 //
 // Built only with `-DVSHOT_BUILD_CHECKS=ON`; see the README's verification
 // section.
@@ -43,7 +46,9 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QKeyEvent>
 #include <QLayout>
+#include <QMouseEvent>
 #include <QPushButton>
 #include <QScreen>
 #include <QString>
@@ -72,8 +77,11 @@ void expect(bool condition, const char *what, const QString &detail = QString())
 }
 
 // A one-output region session whose selection is already made, so the
-// controller opens in editing state -- which is what a paste needs.
-vshot::Session editingSession(std::uint32_t scale, vshot::LogicalRect canvas)
+// controller opens in editing state -- which is what a paste needs.  The
+// optional `image` is the captured frame the output carries; a text selection
+// needs real pixels under the selection, a paste check does not.
+vshot::Session editingSession(std::uint32_t scale, vshot::LogicalRect canvas,
+                              const QImage &image = QImage())
 {
     vshot::Session session;
     session.mode = QStringLiteral("region");
@@ -86,6 +94,7 @@ vshot::Session editingSession(std::uint32_t scale, vshot::LogicalRect canvas)
     output.scale = scale;
     output.pixelWidth = 400 * scale;
     output.pixelHeight = 400 * scale;
+    output.image = image;
     session.outputs.push_back(output);
     session.selection = canvas;
     return session;
@@ -471,10 +480,12 @@ void checkTextButton()
            "the text button is drawn like the tool buttons");
     expect(text->property("toolButton").toBool(),
            "the text button carries the tool-button property the frame paints by");
-    // Clicking it with a session that has a selection must not crash and must
-    // report a failure rather than claiming a copy: there is no `vshot` child
-    // to run under the offscreen platform, and a silent success here would be
-    // the worst outcome -- the user would paste stale clipboard contents.
+    // Clicking it with a session whose selection has no pixels under it must
+    // not crash and must report a failure rather than claiming a copy: the
+    // button no longer copies anything itself, it asks the controller for the
+    // text mode and the controller reports back through the callback, and a
+    // silent success here would be the worst outcome -- the user would paste
+    // stale clipboard contents.
     text->click();
     expect(text->text() == vshot::uiTr(QStringLiteral("Failed")),
            "a text read that cannot run reports failure", text->text());
@@ -507,6 +518,158 @@ void checkTextButton()
     }
 }
 
+// A synthetic pointer step on the overlay, the same shape the other checks
+// send.  The local position is what the controller converts, so the events
+// need no compositor and no shown window.
+void pressAt(QWidget *overlay, const QPoint &local)
+{
+    QMouseEvent event(QEvent::MouseButtonPress, QPointF(local),
+                      QPointF(overlay->mapToGlobal(local)), Qt::LeftButton, Qt::LeftButton,
+                      Qt::NoModifier);
+    QApplication::sendEvent(overlay, &event);
+}
+
+void dragTo(QWidget *overlay, const QPoint &local)
+{
+    QMouseEvent event(QEvent::MouseMove, QPointF(local), QPointF(overlay->mapToGlobal(local)),
+                      Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(overlay, &event);
+}
+
+void releaseAt(QWidget *overlay, const QPoint &local)
+{
+    QMouseEvent event(QEvent::MouseButtonRelease, QPointF(local),
+                      QPointF(overlay->mapToGlobal(local)), Qt::LeftButton, Qt::NoButton,
+                      Qt::NoModifier);
+    QApplication::sendEvent(overlay, &event);
+}
+
+// The event Qt sends for the second *and* third press of a rapid run: a triple
+// click is two of these, and the controller tells them apart by their timing.
+void doubleClickAt(QWidget *overlay, const QPoint &local)
+{
+    QMouseEvent event(QEvent::MouseButtonDblClick, QPointF(local),
+                      QPointF(overlay->mapToGlobal(local)), Qt::LeftButton, Qt::LeftButton,
+                      Qt::NoModifier);
+    QApplication::sendEvent(overlay, &event);
+}
+
+void sendKey(QWidget *overlay, int key, Qt::KeyboardModifiers modifiers = Qt::NoModifier)
+{
+    QKeyEvent event(QEvent::KeyPress, key, modifiers);
+    QApplication::sendEvent(overlay, &event);
+}
+
+// The text-selection mode: the recognized characters of the selection are
+// drawn where they were and a drag turns them into a range.  What this pins is
+// that a real `vshot ocr --json` document drives the mode, that the range a
+// drag describes is the substring a copy would hand over, that Escape leaves
+// the mode without cancelling the capture, that a triple click widens a word
+// to its line, and that an engine which reports no positions falls back to
+// copying the whole text instead of entering it.  The clipboard write is
+// injected, so the check verifies the text that *would* be copied without
+// touching the real clipboard.
+void checkTextSelection()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    // A frame with pixels under the whole overlay, so the crop is the frame
+    // and the engine's device pixels are the overlay's own logical ones.
+    QImage frame(400, 400, QImage::Format_ARGB32_Premultiplied);
+    frame.fill(QColor(30, 30, 30));
+    vshot::OverlayController controller(
+        editingSession(1, vshot::LogicalRect{0, 0, 400, 400}, frame));
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    controller.beginPresetEdit();
+
+    // Stand in for the clipboard: every copy the mode makes lands here, so the
+    // text can be checked exactly and the user's own clipboard is left alone.
+    QString copied;
+    controller.setClipboardWriter([&copied](const QString &text) {
+        copied = text;
+        return true;
+    });
+
+    // Two lines, a word with a space then a two-character word, each character
+    // with its own box in the engine's device pixels -- the shape
+    // `vshot ocr --json` prints.
+    const QByteArray document = QByteArray(R"json(
+{"version":1,"geometry":true,"lines":[
+ {"text":"AB C","rect":{"x":10,"y":10,"width":90,"height":30},
+  "chars":[{"ch":"A","rect":{"x":10,"y":10,"width":20,"height":30}},
+           {"ch":"B","rect":{"x":30,"y":10,"width":20,"height":30}},
+           {"ch":" ","rect":{"x":50,"y":10,"width":10,"height":30}},
+           {"ch":"C","rect":{"x":60,"y":10,"width":40,"height":30}}]},
+ {"text":"DE","rect":{"x":10,"y":50,"width":40,"height":30},
+  "chars":[{"ch":"D","rect":{"x":10,"y":50,"width":20,"height":30}},
+           {"ch":"E","rect":{"x":30,"y":50,"width":20,"height":30}}]}]}
+)json");
+
+    expect(controller.enterTextSelection(document, &error),
+           "the document enters the text mode", error);
+    expect(controller.textMode(), "the text mode is on");
+    expect(controller.selectedText().isEmpty(), "nothing is selected to begin with",
+           controller.selectedText());
+
+    // A press on a character starts the range there, the drag to another one
+    // widens it, and the release fixes it: the three steps a mouse makes.
+    pressAt(overlay, QPoint(15, 20));
+    dragTo(overlay, QPoint(35, 20));
+    releaseAt(overlay, QPoint(35, 20));
+    expect(controller.selectedText() == QStringLiteral("AB"),
+           "a drag from one character to another selects the range between them",
+           controller.selectedText());
+
+    // Escape leaves the mode; it must not reach the capture's own cancel, or
+    // the key that leaves the text would throw the whole session away.
+    sendKey(overlay, Qt::Key_Escape);
+    expect(!controller.textMode(), "Escape leaves the text mode");
+    expect(!controller.isFinished() && !controller.isCancelled(),
+           "leaving the text mode does not cancel the capture");
+
+    // Back in the mode: a double click takes the word under the pointer and a
+    // triple click -- a second double-click event in immediate succession --
+    // widens it to the whole line.
+    expect(controller.enterTextSelection(document, &error), "the mode can be entered again",
+           error);
+    doubleClickAt(overlay, QPoint(15, 20));
+    expect(controller.selectedText() == QStringLiteral("AB"),
+           "a double click takes the word under the pointer", controller.selectedText());
+    doubleClickAt(overlay, QPoint(15, 20));
+    expect(controller.selectedText() == QStringLiteral("AB C"),
+           "a triple click widens the word to its whole line", controller.selectedText());
+
+    // Ctrl+A takes the whole layer and Enter copies it; the copy leaves the
+    // mode, the text reaches the writer and the session is ready to carry on.
+    sendKey(overlay, Qt::Key_A, Qt::ControlModifier);
+    expect(controller.selectedText() == QStringLiteral("AB C\nDE"),
+           "Ctrl+A selects the whole layer", controller.selectedText());
+    sendKey(overlay, Qt::Key_Return);
+    expect(!controller.textMode(), "Enter copies the selection and leaves the mode");
+    expect(copied == QStringLiteral("AB C\nDE"),
+           "Enter copies exactly what the selection held", copied);
+
+    // An external engine reports text and no positions: there is nothing to
+    // select, so the whole text is copied and the mode is not entered.
+    const QByteArray noGeometry = QByteArray(R"json(
+{"version":1,"geometry":false,"lines":[{"text":"alpha"},{"text":"beta"}]}
+)json");
+    expect(controller.enterTextSelection(noGeometry, &error),
+           "a document with no positions still copies the text", error);
+    expect(!controller.textMode(),
+           "a document with no positions does not enter the text mode");
+    expect(copied == QStringLiteral("alpha\nbeta"),
+           "the fallback copies the whole text it was given", copied);
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -520,6 +683,7 @@ int main(int argc, char **argv)
     checkUndoKeepsPixels();
     checkToolbarButton();
     checkTextButton();
+    checkTextSelection();
 
     if (failures != 0) {
         std::printf("\n%d check(s) failed\n", failures);

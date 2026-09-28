@@ -4,6 +4,7 @@
 #pragma once
 
 #include "session_protocol.hpp"
+#include "text_layer.hpp"
 
 #include <QByteArray>
 #include <QColor>
@@ -259,12 +260,23 @@ public:
     // Whether a paste would have anything to work with, so the toolbar can
     // disable its button rather than offering a no-op.
     bool canPaste() const;
-    // Reads the text in the selection and puts it on the clipboard. The
-    // recognition itself runs in a `vshot ocr --input` child, because the
-    // engine is on the Rust side and this process draws a layer surface that
-    // cannot be blocked on a model load. `error` is filled when there is
-    // nothing to read, the child cannot be started, or it fails.
-    bool copySelectionText(QString *error);
+    /// Runs recognition over the selection and enters the text mode.  Returns
+    /// false and fills `error` when there is nothing to select.
+    bool beginTextSelection(QString *error);
+    /// The recognition came back: parse it and either enter the text mode or,
+    /// when the engine reported no positions, hand the whole text over the way
+    /// this used to.  Separate from `beginTextSelection` so a check can drive
+    /// the mode without a recognition run.
+    bool enterTextSelection(const QByteArray &document, QString *error);
+    void leaveTextMode();
+    bool textMode() const { return textMode_; }
+    /// The text the current range would copy, empty when nothing is selected.
+    QString selectedText() const;
+    void setTextResultCallback(std::function<void(bool, const QString &)> callback);
+    /// Replaces the clipboard write the text paths use.  It exists so a check
+    /// can verify what would be copied without a clipboard; the default writes
+    /// through `wl-copy`.
+    void setClipboardWriter(std::function<bool(const QString &)> writer);
     void notifyPanelDragged();
     void undo();
     void redo();
@@ -324,6 +336,27 @@ private:
     // snap to, so the first click replaces the free-hand drag that region
     // capture starts with.
     bool pickMode_ = false;
+    /// The text-selection mode: the recognized characters of the selection are
+    /// drawn where they were and the pointer selects a range of them.  It is a
+    /// mode rather than a tool because the selection it works on is the one the
+    /// capture already has, and because Escape has to leave it before it means
+    /// "cancel the capture" -- the same shape `pickMode_` has.
+    bool textMode_ = false;
+    std::optional<TextLayer> textLayer_;
+    int textAnchor_ = -1;
+    int textFocus_ = -1;
+    bool textDragging_ = false;
+    /// When the last text-mode double click landed, so a second one in quick
+    /// succession -- Qt's third press, reported as another double click -- can
+    /// widen the word it took to the whole line.
+    QElapsedTimer textClickClock_;
+    /// Told when the text mode starts or a copy finishes, so the toolbar can say
+    /// so on the button the user pressed.  The copy can be triggered by a key,
+    /// which the controller sees and the toolbar does not.
+    std::function<void(bool ok, const QString &error)> textResultCallback_;
+    /// Writes the text the mode copies.  The default is `wl-copy`; a check
+    /// replaces it so the copy can be verified without a clipboard.
+    std::function<bool(const QString &)> clipboardWriter_;
     QVector<WindowCandidate> candidates_;
     int hoveredCandidate_ = -1;
     // Live candidate refresh: the picker's stdin carries fresh lists from the
@@ -517,6 +550,18 @@ private:
     bool drawsGrowingStroke() const;
     void terminal(bool cancelled);
     void removeTextEditor();
+    // The text-selection mode's own steps: turning two indices into the range
+    // the pointer described, widening one to a word or a line, copying what the
+    // range holds, and the pointer shape the mode shows while it is idle.
+    void copyTextSelection();
+    void textSelectAll();
+    void textSelectWord(int index);
+    void textSelectLine(int index);
+    void selectTextRange(int anchor, int focus);
+    void updateTextModeCursor();
+    // The one place the mode's text reaches the clipboard: the injected writer
+    // when there is one, `wl-copy` otherwise.
+    bool writeClipboard(const QString &text);
     void mutateAnnotations(QVector<Annotation> next);
     void drawLoupe(CaptureOverlay *overlay, QPainter *painter);
     // Draws the in-progress freehand stroke from a raster that only grows by the

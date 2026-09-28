@@ -88,6 +88,13 @@ constexpr int kLoupeZoom = 8;
 constexpr int kLoupeDiameter = (2 * kLoupeRadius + 1) * kLoupeZoom;
 constexpr int kLoupeMargin = 10;
 
+// The text-selection colour and the outline that shows what was recognized: a
+// translucent blue fill over the characters in the range and a lighter blue
+// line around each recognized line.  Both are legible over an undimmed
+// screenshot without hiding the text underneath.
+const QColor kTextSelectionFill(64, 132, 240, 110);
+const QColor kTextOutline(150, 195, 255, 140);
+
 std::int64_t right(const LogicalRect &rect)
 {
     return rect.right();
@@ -158,6 +165,27 @@ QRect sourceRect(const OutputSession &output, const LogicalRect &rect)
     const std::int64_t height = static_cast<std::int64_t>(rect.height) * output.scale;
     return QRect(static_cast<int>(x), static_cast<int>(y), static_cast<int>(width),
                  static_cast<int>(height));
+}
+
+// The exact inverse of `sourceRect`: a rect in one output's captured device
+// pixels becomes the global logical rect the overlay draws in.  The engine's
+// coordinates are counted from a crop of that frame, so this is also the one
+// place a placement's origin comes from.  The division stays in `double` and
+// each edge is rounded only at the end, the same way the text layer places a
+// box, so a rect that was mapped out and back comes home.
+LogicalRect logicalFromSource(const OutputSession &output, const QRect &rect)
+{
+    const double scale = output.scale > 0 ? static_cast<double>(output.scale) : 1.0;
+    const double x = static_cast<double>(output.geometry.x) + static_cast<double>(rect.x()) / scale;
+    const double y = static_cast<double>(output.geometry.y) + static_cast<double>(rect.y()) / scale;
+    const double width = static_cast<double>(rect.width()) / scale;
+    const double height = static_cast<double>(rect.height()) / scale;
+    LogicalRect result;
+    result.x = static_cast<std::int32_t>(std::lround(x));
+    result.y = static_cast<std::int32_t>(std::lround(y));
+    result.width = static_cast<std::uint32_t>(std::max(0L, std::lround(width)));
+    result.height = static_cast<std::uint32_t>(std::max(0L, std::lround(height)));
+    return result;
 }
 
 QPointF localPoint(const OutputSession &output, const Point &point, const QSize &size)
@@ -2513,30 +2541,37 @@ public:
                 std::fflush(stderr);
             }
         });
-        // Text recognition reads the selection and leaves the text on the
-        // clipboard, and the capture itself is unchanged -- which is why it is
-        // an action and not a mode.
+        // Text selection: the recognized characters of the selection are drawn
+        // where they were and the pointer selects a range of them, then the
+        // range is copied.  The mode lives in the controller -- the toolbar has
+        // no selection to work on -- so the button only asks for it, and the
+        // controller reports the result back through the callback below.
         auto *text = addToolAction(toolLayout, uiTr("Text+"),
                                    recognizeTextIcon(QColor(230, 225, 229), devicePixelRatioF()),
-                                   uiTr("Copy the text in the selection to the clipboard"),
+                                   uiTr("Select the text in the selection and copy what you "
+                                        "select"),
                                    QStringLiteral("ocrButton"),
                                    {uiTr("Copied"), uiTr("Failed")});
-        connect(text, &QToolButton::clicked, [controller = controller_, text] {
-            QString error;
-            if (!controller->copySelectionText(&error)) {
-                std::fprintf(stderr, "vshot-qt-ui: %s\n", error.toUtf8().constData());
-                std::fflush(stderr);
+        textButton_ = text;
+        connect(text, &QToolButton::clicked, [controller = controller_] {
+            controller->beginTextSelection(nullptr);
+        });
+        // The result is reported where the user is looking: the button itself,
+        // which is the thing they just clicked.  The copy can be triggered by a
+        // key, which the controller sees and this toolbar does not, so the
+        // controller reports through this callback rather than the handler
+        // above.  The width was settled for every label it can show when it was
+        // built, so the word is not elided now.
+        controller_->setTextResultCallback([this](bool ok, const QString &) {
+            if (textButton_ == nullptr) {
+                return;
             }
-            // The result is reported where the user is looking: the button
-            // itself, which is the thing they just clicked.  The width was
-            // settled for every label it can show when it was built, so the
-            // word is not elided now.
-            text->setText(error.isEmpty() ? uiTr("Copied") : uiTr("Failed"));
-            QTimer::singleShot(1200, text, [text, controller] {
-                if (controller->isFinished() || controller->isCancelled()) {
+            textButton_->setText(ok ? uiTr("Copied") : uiTr("Failed"));
+            QTimer::singleShot(1200, textButton_, [this] {
+                if (controller_->isFinished() || controller_->isCancelled()) {
                     return;
                 }
-                text->setText(uiTr("Text+"));
+                textButton_->setText(uiTr("Text+"));
             });
         });
         // Every button in this row, the two above included, gets the frame's
@@ -2863,9 +2898,17 @@ public:
     void syncState()
     {
         const qreal ratio = devicePixelRatioF();
+        // The text mode is exclusive: a tool change would drop the recognized
+        // layer, so the tools are not offered while it is on.  The Text+ button
+        // itself stays enabled and shows the mode is up.
+        const bool textMode = controller_->textMode_;
         for (int index = 0; index < toolButtons_.size(); ++index) {
             setToolButtonActive(toolButtons_.at(index), tools_.at(index),
                                 tools_.at(index) == controller_->tool_, ratio);
+            toolButtons_.at(index)->setEnabled(!textMode);
+        }
+        if (textButton_ != nullptr) {
+            setButtonActive(textButton_, textMode);
         }
         const Annotation *selected = nullptr;
         if (controller_->selectedAnnotation_ >= 0 &&
@@ -3558,6 +3601,10 @@ private:
     QFrame *styleDivider_ = nullptr;
     QVector<QAbstractButton *> toolButtons_;
     QVector<Tool> tools_;
+    // The Text+ button, whose label reports what a text selection did.  The
+    // result can come from a key the toolbar never sees, so it is stored rather
+    // than reached through the click handler's capture.
+    QToolButton *textButton_ = nullptr;
     QVector<QColor> swatchColors_;
     QVector<QPushButton *> swatchButtons_;
     QWidget *colorGroup_ = nullptr;
@@ -5000,6 +5047,26 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
     if (button != Qt::LeftButton) {
         return;
     }
+    if (textMode_) {
+        // The mode owns the left button: a press on a character starts the
+        // range there, a press on the empty canvas clears it.  No tool path
+        // runs while the mode is on, and the pointer the mode selects with is
+        // the press itself, so the range starts where the button went down.
+        pointer_ = globalPoint(overlay, local);
+        pointerOutput_ = overlay->outputIndex();
+        const int index =
+            textLayer_.has_value() ? textLayer_->indexAt(pointer_.x, pointer_.y) : -1;
+        if (index >= 0) {
+            selectTextRange(index, index);
+            textDragging_ = true;
+        } else {
+            textAnchor_ = -1;
+            textFocus_ = -1;
+            textDragging_ = false;
+        }
+        updateAll();
+        return;
+    }
     if (textEdit_ != nullptr) {
         finishText(true);
     }
@@ -5135,6 +5202,22 @@ void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::
     const Point point = globalPoint(overlay, local);
     pointer_ = point;
     pointerOutput_ = overlay->outputIndex();
+    if (textMode_) {
+        // The mode has the pointer to itself: no candidate hover, no gesture.
+        // A drag widens the range to the character nearest the pointer, which
+        // is what keeps a drag that left the text meaning something; an idle
+        // pointer is the caret the mode selects with.
+        if (textDragging_ && textLayer_.has_value()) {
+            const int index = textLayer_->nearestIndex(point.x, point.y);
+            if (index >= 0) {
+                selectTextRange(textAnchor_, index);
+                updateAll();
+            }
+        } else {
+            overlay->setCursor(Qt::IBeamCursor);
+        }
+        return;
+    }
     if (pickMode_ && !editing_ && buttons == Qt::NoButton &&
         gesture_->type == Gesture::Type::None) {
         // Nothing is committed yet: the pointer only previews which window a
@@ -5216,6 +5299,10 @@ void OverlayController::release(CaptureOverlay *overlay, const QPointF &local,
     if (finished_ || cancelled_ || button != Qt::LeftButton) {
         return;
     }
+    if (textMode_) {
+        textDragging_ = false;
+        return;
+    }
     const Point point = globalPoint(overlay, local);
     switch (gesture_->type) {
     case Gesture::Type::Selecting:
@@ -5258,6 +5345,27 @@ void OverlayController::doubleClick(CaptureOverlay *overlay, const QPointF &loca
         return;
     }
     const Point point = globalPoint(overlay, local);
+    if (textMode_) {
+        // A double click takes the word under the pointer, the way it does in
+        // a text field, and the index is -1 off the text, which takes nothing.
+        //
+        // A third click is the same event: Qt has no triple-click, it reports
+        // the second *and* the third press of a rapid run as a double click.
+        // So a double click that lands within the platform's double-click
+        // interval of the last one is the third press, and widens the word to
+        // its whole line -- otherwise a triple click would read as a second
+        // double click and reselect the same word.
+        const int index = textLayer_.has_value() ? textLayer_->indexAt(point.x, point.y) : -1;
+        const bool third = index >= 0 && textClickClock_.isValid() &&
+            textClickClock_.elapsed() <= QApplication::doubleClickInterval();
+        textClickClock_.restart();
+        if (third) {
+            textSelectLine(index);
+        } else {
+            textSelectWord(index);
+        }
+        return;
+    }
     if (tool_ == Tool::Bezier && gesture_->type == Gesture::Type::Bezier) {
         // A double click ends the path where it stands, open.  Qt delivers the
         // second click of the pair as this event rather than as a press, so the
@@ -5285,6 +5393,10 @@ void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifi
     if (key == Qt::Key_Escape) {
         if (textEdit_ != nullptr) {
             finishText(false);
+        } else if (textMode_) {
+            // The mode goes first: Escape leaves the text selection without
+            // ending the capture, so a second Escape is what cancels it.
+            leaveTextMode();
         } else if (gesture_->type == Gesture::Type::Bezier) {
             // The pen path in progress goes first: Escape drops it without
             // ending the session, the way it drops any other in-progress
@@ -5300,12 +5412,28 @@ void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifi
     if (key == Qt::Key_Return || key == Qt::Key_Enter) {
         if (textEdit_ != nullptr) {
             finishText(true);
+        } else if (textMode_) {
+            // Enter copies what the range holds and leaves the mode.
+            copyTextSelection();
         } else {
             confirm();
         }
         return;
     }
     if (textEdit_ != nullptr) {
+        return;
+    }
+    if (textMode_) {
+        // The mode owns the keys: Ctrl+C copies the range and Ctrl+A selects
+        // it all, and every other key is swallowed so the arrow keys cannot
+        // move the capture's selection out from under the text.
+        if (modifiers & Qt::ControlModifier) {
+            if (key == Qt::Key_C) {
+                copyTextSelection();
+            } else if (key == Qt::Key_A) {
+                textSelectAll();
+            }
+        }
         return;
     }
     if (modifiers & Qt::ControlModifier) {
@@ -5522,6 +5650,9 @@ void OverlayController::applyPinRect(const LogicalRect &rect)
 
 void OverlayController::chooseTool(Tool tool)
 {
+    // Any tool change invalidates the recognized layer: the marks are about to
+    // be drawn over the text, and the pointer is no longer selecting it.
+    leaveTextMode();
     if (finished_ || cancelled_) {
         return;
     }
@@ -5800,69 +5931,57 @@ bool OverlayController::canPaste() const
     return !finished_ && !cancelled_ && editing_ && selection_.has_value();
 }
 
-bool OverlayController::copySelectionText(QString *error)
+bool OverlayController::beginTextSelection(QString *error)
 {
-    if (!canPaste()) {
+    // Every way this can fail is reported both to the caller and to the button
+    // the user pressed: the copy can be triggered by a key the toolbar never
+    // sees, so the label cannot be driven from the click handler alone.
+    const auto fail = [this, error](const QString &message) {
         if (error != nullptr) {
-            *error = uiTr("Reading text needs a selection to read from.");
+            *error = message;
+        }
+        if (textResultCallback_) {
+            textResultCallback_(false, message);
         }
         return false;
+    };
+    if (!canPaste()) {
+        return fail(uiTr("Reading text needs a selection to read from."));
     }
     const LogicalRect &canvas = *selection_;
     if (canvas.isEmpty()) {
-        if (error != nullptr) {
-            *error = uiTr("The selection is empty.");
-        }
-        return false;
+        return fail(uiTr("The selection is empty."));
     }
     // The pixels come from the output the selection sits on, at that output's
     // own scale -- the same source the mosaic preview reads, so what is
     // recognized is what the user sees under the rectangle.
     const int index = outputContaining(canvas);
     if (index < 0 || index >= session_.outputs.size()) {
-        if (error != nullptr) {
-            *error = uiTr("The selection is on no output.");
-        }
-        return false;
+        return fail(uiTr("The selection is on no output."));
     }
     const OutputSession &output = session_.outputs.at(index);
     if (output.image.isNull()) {
-        if (error != nullptr) {
-            *error = uiTr("The captured frame is not available.");
-        }
-        return false;
+        return fail(uiTr("The captured frame is not available."));
     }
     // The rect is clipped to the output: a selection dragged past the edge of
     // its screen has no pixels beyond it to read.
     const QRect source = sourceRect(output, canvas)
                              .intersected(QRect(0, 0, output.image.width(), output.image.height()));
     if (source.isEmpty()) {
-        if (error != nullptr) {
-            *error = uiTr("The selection has no pixels on this output.");
-        }
-        return false;
+        return fail(uiTr("The selection has no pixels on this output."));
     }
     const QImage pixels = output.image.copy(source);
     if (pixels.isNull()) {
-        if (error != nullptr) {
-            *error = uiTr("The selection has no pixels on this output.");
-        }
-        return false;
+        return fail(uiTr("The selection has no pixels on this output."));
     }
 
     QTemporaryDir directory;
     if (!directory.isValid()) {
-        if (error != nullptr) {
-            *error = uiTr("Cannot create a temporary directory for the text.");
-        }
-        return false;
+        return fail(uiTr("Cannot create a temporary directory for the text."));
     }
     const QString path = directory.filePath(QStringLiteral("selection.png"));
     if (!pixels.save(path, "PNG")) {
-        if (error != nullptr) {
-            *error = uiTr("Cannot write the selection to read its text.");
-        }
-        return false;
+        return fail(uiTr("Cannot write the selection to read its text."));
     }
 
     // The engine lives in `vshot`, which is a sibling of this helper: the
@@ -5871,10 +5990,7 @@ bool OverlayController::copySelectionText(QString *error)
     char buffer[4096];
     const ssize_t length = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
     if (length <= 0) {
-        if (error != nullptr) {
-            *error = uiTr("Cannot locate vshot to read the text.");
-        }
-        return false;
+        return fail(uiTr("Cannot locate vshot to read the text."));
     }
     buffer[length] = '\0';
     const QString helper = QString::fromLocal8Bit(buffer);
@@ -5894,14 +6010,14 @@ bool OverlayController::copySelectionText(QString *error)
 
     QProcess process;
     process.setProgram(program);
-    process.setArguments({QStringLiteral("ocr"), QStringLiteral("--input"), path});
+    // `--json` carries the position of every character, which is what the text
+    // mode draws and selects with; without it the engine prints only the text.
+    process.setArguments(
+        {QStringLiteral("ocr"), QStringLiteral("--input"), path, QStringLiteral("--json")});
     process.setStandardInputFile(QProcess::nullDevice());
     process.start();
     if (!process.waitForStarted(kClipboardProcessTimeoutMs)) {
-        if (error != nullptr) {
-            *error = uiTr("Cannot start vshot to read the text.");
-        }
-        return false;
+        return fail(uiTr("Cannot start vshot to read the text."));
     }
     // A model load takes a moment on the first run and the recognition itself
     // is a fraction of a second, so the wait is generous compared to the
@@ -5910,33 +6026,245 @@ bool OverlayController::copySelectionText(QString *error)
     if (!process.waitForFinished(ocrTimeoutMs)) {
         process.kill();
         process.waitForFinished(kClipboardProcessTimeoutMs);
-        if (error != nullptr) {
-            *error = uiTr("Reading the text took too long.");
-        }
-        return false;
+        return fail(uiTr("Reading the text took too long."));
     }
-    const QByteArray output_bytes = process.readAllStandardOutput();
+    const QByteArray document = process.readAllStandardOutput();
     if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+        const QString stderr = QString::fromUtf8(process.readAllStandardError()).trimmed();
+        return fail(stderr.isEmpty() ? uiTr("Reading the text failed.") : stderr);
+    }
+    // The recognition came back: the mode starts, or -- for an engine that
+    // reported no positions -- the whole text is copied here and now.
+    if (!enterTextSelection(document, error)) {
+        return fail(error != nullptr ? *error : QString());
+    }
+    if (textResultCallback_) {
+        textResultCallback_(true, QString());
+    }
+    return true;
+}
+
+bool OverlayController::enterTextSelection(const QByteArray &document, QString *error)
+{
+    if (!canPaste()) {
         if (error != nullptr) {
-            const QString stderr = QString::fromUtf8(process.readAllStandardError()).trimmed();
-            *error = stderr.isEmpty() ? uiTr("Reading the text failed.") : stderr;
+            *error = uiTr("Reading text needs a selection to read from.");
         }
         return false;
     }
-    const QString text = QString::fromUtf8(output_bytes).trimmed();
-    if (text.isEmpty()) {
+    const LogicalRect &canvas = *selection_;
+    if (canvas.isEmpty()) {
+        if (error != nullptr) {
+            *error = uiTr("The selection is empty.");
+        }
+        return false;
+    }
+    const int index = outputContaining(canvas);
+    if (index < 0 || index >= session_.outputs.size()) {
+        if (error != nullptr) {
+            *error = uiTr("The selection is on no output.");
+        }
+        return false;
+    }
+    const OutputSession &output = session_.outputs.at(index);
+    if (output.image.isNull()) {
+        if (error != nullptr) {
+            *error = uiTr("The captured frame is not available.");
+        }
+        return false;
+    }
+    // The same crop `beginTextSelection` recognized: the engine's coordinates
+    // are counted from it, so its top-left in the overlay's own logical pixels
+    // is where the layer is placed.
+    const QRect source = sourceRect(output, canvas)
+                             .intersected(QRect(0, 0, output.image.width(), output.image.height()));
+    if (source.isEmpty()) {
+        if (error != nullptr) {
+            *error = uiTr("The selection has no pixels on this output.");
+        }
+        return false;
+    }
+
+    const LogicalRect sourceLogical = logicalFromSource(output, source);
+    TextLayerPlacement placement;
+    placement.scale = static_cast<double>(output.scale);
+    placement.originX = sourceLogical.x;
+    placement.originY = sourceLogical.y;
+
+    QString parseError;
+    std::optional<TextLayer> layer = TextLayer::fromJson(document, placement, &parseError);
+    if (!layer.has_value()) {
+        if (error != nullptr) {
+            *error = uiTr("Reading the text failed.");
+        }
+        // The parser's own message says what was actually wrong with the
+        // document, which is a diagnostic rather than something to show.
+        std::fprintf(stderr, "vshot-qt-ui: %s\n", parseError.toUtf8().constData());
+        std::fflush(stderr);
+        return false;
+    }
+    if (layer->hasGeometry()) {
+        textLayer_ = std::move(layer);
+        textMode_ = true;
+        textAnchor_ = -1;
+        textFocus_ = -1;
+        textDragging_ = false;
+        // A label being typed would take the keys the mode now needs.
+        if (textEdit_ != nullptr) {
+            finishText(false);
+        }
+        updateTextModeCursor();
+        updateAll();
+        return true;
+    }
+    // An external engine reports text and no positions, so there is nothing to
+    // select: the whole text is handed over the way this used to be the only
+    // thing it did.
+    if (layer->plainText().isEmpty()) {
         if (error != nullptr) {
             *error = uiTr("No text was found in the selection.");
         }
         return false;
     }
-    if (!runWlCopy(text)) {
+    std::fprintf(stderr, "vshot-qt-ui: the engine reported no character positions; "
+                         "copying the whole text instead\n");
+    std::fflush(stderr);
+    if (!writeClipboard(layer->plainText())) {
         if (error != nullptr) {
             *error = uiTr("Cannot copy the text to the clipboard.");
         }
         return false;
     }
     return true;
+}
+
+void OverlayController::leaveTextMode()
+{
+    if (!textMode_) {
+        return;
+    }
+    textMode_ = false;
+    textLayer_.reset();
+    textAnchor_ = -1;
+    textFocus_ = -1;
+    textDragging_ = false;
+    // A triple-click run cannot outlive the mode: the next entry starts a
+    // fresh one.
+    textClickClock_.invalidate();
+    updateTextModeCursor();
+    updateAll();
+}
+
+QString OverlayController::selectedText() const
+{
+    if (!textMode_ || !textLayer_.has_value() || textAnchor_ < 0 || textFocus_ < 0) {
+        return QString();
+    }
+    return textLayer_->rangeText(textAnchor_, textFocus_);
+}
+
+void OverlayController::setTextResultCallback(std::function<void(bool, const QString &)> callback)
+{
+    textResultCallback_ = std::move(callback);
+}
+
+void OverlayController::setClipboardWriter(std::function<bool(const QString &)> writer)
+{
+    clipboardWriter_ = std::move(writer);
+}
+
+bool OverlayController::writeClipboard(const QString &text)
+{
+    if (clipboardWriter_) {
+        return clipboardWriter_(text);
+    }
+    return runWlCopy(text);
+}
+
+void OverlayController::selectTextRange(int anchor, int focus)
+{
+    if (!textLayer_.has_value() || textLayer_->count() == 0) {
+        textAnchor_ = -1;
+        textFocus_ = -1;
+        return;
+    }
+    const int last = textLayer_->count() - 1;
+    textAnchor_ = std::clamp(anchor, 0, last);
+    textFocus_ = std::clamp(focus, 0, last);
+}
+
+void OverlayController::textSelectAll()
+{
+    if (!textLayer_.has_value() || textLayer_->count() == 0) {
+        return;
+    }
+    selectTextRange(0, textLayer_->count() - 1);
+    updateAll();
+}
+
+void OverlayController::textSelectWord(int index)
+{
+    if (!textLayer_.has_value() || index < 0) {
+        return;
+    }
+    int first = -1;
+    int last = -1;
+    textLayer_->wordRange(index, &first, &last);
+    if (first < 0) {
+        return;
+    }
+    selectTextRange(first, last);
+    updateAll();
+}
+
+void OverlayController::textSelectLine(int index)
+{
+    if (!textLayer_.has_value() || index < 0) {
+        return;
+    }
+    int first = -1;
+    int last = -1;
+    textLayer_->lineRange(index, &first, &last);
+    if (first < 0) {
+        return;
+    }
+    selectTextRange(first, last);
+    updateAll();
+}
+
+void OverlayController::copyTextSelection()
+{
+    if (!textMode_ || !textLayer_.has_value()) {
+        return;
+    }
+    const QString text = selectedText();
+    if (text.isEmpty()) {
+        // Nothing is selected, so there is nothing to copy and the mode stays
+        // up for the user to try again.
+        if (textResultCallback_) {
+            textResultCallback_(false, uiTr("No text is selected."));
+        }
+        return;
+    }
+    if (!writeClipboard(text)) {
+        // The selection is not lost: the copy can be tried again.
+        if (textResultCallback_) {
+            textResultCallback_(false, uiTr("Cannot copy the text to the clipboard."));
+        }
+        return;
+    }
+    if (textResultCallback_) {
+        textResultCallback_(true, QString());
+    }
+    leaveTextMode();
+}
+
+void OverlayController::updateTextModeCursor()
+{
+    const Qt::CursorShape shape = textMode_ ? Qt::IBeamCursor : Qt::CrossCursor;
+    for (CaptureOverlay *overlay : overlays_) {
+        overlay->setCursor(shape);
+    }
 }
 
 bool OverlayController::pasteFromFile(QString *error)
@@ -7517,6 +7845,51 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
                 painter->drawImage(localRect(output, visible, overlay->size()), output.image,
                                    sourceRect(output, visible));
             }
+        }
+    }
+
+    // The recognized characters of the selection, drawn where they were: above
+    // the dim veil and below the marks.  It is drawn on every frame and never
+    // composited into `baseComposite_`, whose key does not include the
+    // selection -- a layer baked into that cache would freeze the highlight the
+    // moment the range moved.
+    if (textMode_ && textLayer_.has_value() && textLayer_->count() > 0) {
+        const int count = textLayer_->count();
+        const int low = textAnchor_ >= 0 ? std::min(textAnchor_, textFocus_) : -1;
+        const int high = textAnchor_ >= 0 ? std::max(textAnchor_, textFocus_) : -1;
+        // The fills first, so the outlines below stay visible on top of them.
+        // Adjacent unit boxes tile exactly, so the fills join into one bar the
+        // way a text selection does.
+        if (low >= 0) {
+            painter->setPen(Qt::NoPen);
+            painter->setBrush(kTextSelectionFill);
+            for (int index = low; index <= high; ++index) {
+                painter->drawRect(localRect(output, textLayer_->unit(index).rect, overlay->size()));
+            }
+        }
+        // One outline per line, around the union of its units: the user can see
+        // what was recognized without a grid of touching boxes.
+        painter->setPen(QPen(kTextOutline, 1.0));
+        painter->setBrush(Qt::NoBrush);
+        int lineStart = 0;
+        while (lineStart < count) {
+            const int line = textLayer_->unit(lineStart).line;
+            int lineEnd = lineStart;
+            while (lineEnd + 1 < count && textLayer_->unit(lineEnd + 1).line == line) {
+                ++lineEnd;
+            }
+            bool haveBounds = false;
+            QRectF lineBounds;
+            for (int index = lineStart; index <= lineEnd; ++index) {
+                const QRectF box =
+                    localRect(output, textLayer_->unit(index).rect, overlay->size());
+                lineBounds = haveBounds ? lineBounds.united(box) : box;
+                haveBounds = true;
+            }
+            if (haveBounds) {
+                painter->drawRect(lineBounds);
+            }
+            lineStart = lineEnd + 1;
         }
     }
 
