@@ -227,6 +227,180 @@ QVector<QPointF> wavePolyline(const QPointF &start, const QPointF &end, int widt
     return points;
 }
 
+// The pen tool's geometry.  The model stores one handle per anchor, interleaved
+// [anchor0, handleOut0, anchor1, handleOut1, ...] -- exactly the shape the wire
+// format carries -- and derives the incoming side by mirroring, so a handle is
+// symmetric by construction and the preview, the cached raster and the JSON
+// cannot disagree about the curve.
+
+// One point on the cubic whose control points are `p0`..`p3`, at parameter `t`.
+// The Bernstein form is the one `QPainterPath::cubicTo` evaluates, so a sample
+// taken here lies on the very curve the painter draws.
+QPointF cubicPoint(const QPointF &p0, const QPointF &p1, const QPointF &p2, const QPointF &p3,
+                   double t)
+{
+    const double u = 1.0 - t;
+    const double a = u * u * u;
+    const double b = 3.0 * u * u * t;
+    const double c = 3.0 * u * t * t;
+    const double d = t * t * t;
+    return QPointF(a * p0.x() + b * p1.x() + c * p2.x() + d * p3.x(),
+                   a * p0.y() + b * p1.y() + c * p2.y() + d * p3.y());
+}
+
+// The incoming control point of an anchor: the mirror of its outgoing handle
+// through the anchor itself.
+QPointF mirrorHandle(const QPointF &anchor, const QPointF &handleOut)
+{
+    return QPointF(2.0 * anchor.x() - handleOut.x(), 2.0 * anchor.y() - handleOut.y());
+}
+
+// How many anchors a pen path has: the interleaved list is always even, and the
+// anchors are half of it.
+int bezierAnchors(const QVector<Point> &points)
+{
+    return static_cast<int>(points.size() / 2);
+}
+
+// The same list in the floating-point coordinates the painter works in.
+QVector<QPointF> pointFs(const QVector<Point> &points)
+{
+    QVector<QPointF> result;
+    result.reserve(points.size());
+    for (const Point &point : points) {
+        result.append(QPointF(point.x, point.y));
+    }
+    return result;
+}
+
+// The pen path as a QPainterPath, from points already in the painter's own
+// coordinates.  The live preview, the cached raster and the hit test all build
+// it here, so the three cannot disagree about the curve.  A closed path joins
+// the last anchor back to the first through both their handles.
+QPainterPath bezierPathAt(const QVector<QPointF> &at, bool closed)
+{
+    QPainterPath path;
+    const int anchors = static_cast<int>(at.size() / 2);
+    if (anchors <= 0) {
+        return path;
+    }
+    path.moveTo(at.at(0));
+    const int segments = closed ? anchors : anchors - 1;
+    for (int index = 0; index < segments; ++index) {
+        const int next = (index + 1) % anchors;
+        path.cubicTo(at.at(2 * index + 1), mirrorHandle(at.at(2 * next), at.at(2 * next + 1)),
+                     at.at(2 * next));
+    }
+    if (closed) {
+        path.closeSubpath();
+    }
+    return path;
+}
+
+// The same path from the session-space points the model stores.
+QPainterPath bezierPath(const QVector<Point> &points, bool closed)
+{
+    return bezierPathAt(pointFs(points), closed);
+}
+
+// The pen path's ink, in whatever coordinate space the caller has converted its
+// points into.  The preview and the committed mark both draw through here, so a
+// closed path cannot end up filled in one place and only stroked in another.
+void paintBezierInk(QPainter *painter, const QVector<QPointF> &at, bool closed, const QColor &color,
+                    int width)
+{
+    if (at.isEmpty()) {
+        return;
+    }
+    if (at.size() < 4) {
+        // A click that was never dragged past its own anchor is a dot, the same
+        // ink the freehand pen gives one.
+        painter->setPen(QPen(color, width, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        painter->setBrush(Qt::NoBrush);
+        painter->drawPoint(at.constFirst());
+        return;
+    }
+    const QPainterPath path = bezierPathAt(at, closed);
+    if (!closed) {
+        painter->setPen(QPen(color, width, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        painter->setBrush(Qt::NoBrush);
+        painter->drawPath(path);
+        return;
+    }
+    // Fill first and stroke second, the order the Rust renderer bakes in.  The
+    // fill is the stroke's own colour at half its alpha, floored: that is what
+    // "a translucent fill under a solid outline" means for a colour the user
+    // picked an opacity for.
+    QColor fill = color;
+    fill.setAlpha(color.alpha() / 2);
+    painter->fillPath(path, fill);
+    painter->strokePath(path, QPen(color, width, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+}
+
+// The same path sampled into a polyline, about one sample per two logical
+// pixels of control polygon so the sample follows the curve's own turning.  The
+// samples lie on the curve, which is what the tight bounding box and the hit
+// test need: a box over the control points alone would be far larger than the
+// ink, and one over the anchors alone would clip the very bulge the handles pull
+// out.
+QVector<QPointF> bezierPolyline(const QVector<Point> &points, bool closed)
+{
+    QVector<QPointF> samples;
+    const int anchors = bezierAnchors(points);
+    if (anchors <= 0) {
+        return samples;
+    }
+    const QVector<QPointF> at = pointFs(points);
+    samples.append(at.at(0));
+    const int segments = closed ? anchors : anchors - 1;
+    for (int index = 0; index < segments; ++index) {
+        const int next = (index + 1) % anchors;
+        const QPointF &start = at.at(2 * index);
+        const QPointF &handle = at.at(2 * index + 1);
+        const QPointF &end = at.at(2 * next);
+        const QPointF incoming = mirrorHandle(end, at.at(2 * next + 1));
+        const double span = QLineF(start, handle).length() + QLineF(handle, incoming).length() +
+            QLineF(incoming, end).length();
+        const int steps = std::clamp(static_cast<int>(std::ceil(span / 2.0)), 8, 96);
+        for (int step = 1; step <= steps; ++step) {
+            samples.append(cubicPoint(start, handle, incoming, end,
+                                      static_cast<double>(step) / steps));
+        }
+    }
+    return samples;
+}
+
+// The tight box of a sampled polyline in session coordinates, rounded outward,
+// or `false` when there is nothing to bound.  Folded by hand rather than with
+// `QRectF::united`: uniting onto a null rect returns the other operand, which
+// turns a box that was never seeded into whatever the last point happened to be
+// -- a bounding box that collapses to a point, and stale ink left on screen.
+bool polylineLogicalBounds(const QVector<QPointF> &samples, LogicalRect *bounds)
+{
+    if (samples.isEmpty()) {
+        return false;
+    }
+    double left = samples.constFirst().x();
+    double right = left;
+    double top = samples.constFirst().y();
+    double bottom = top;
+    for (const QPointF &point : samples) {
+        left = std::min(left, point.x());
+        right = std::max(right, point.x());
+        top = std::min(top, point.y());
+        bottom = std::max(bottom, point.y());
+    }
+    const std::int32_t x = static_cast<std::int32_t>(std::floor(left));
+    const std::int32_t y = static_cast<std::int32_t>(std::floor(top));
+    bounds->x = x;
+    bounds->y = y;
+    bounds->width = static_cast<std::uint32_t>(
+        static_cast<std::int64_t>(std::ceil(right)) - x + 1);
+    bounds->height = static_cast<std::uint32_t>(
+        static_cast<std::int64_t>(std::ceil(bottom)) - y + 1);
+    return true;
+}
+
 QString toolName(Tool tool)
 {
     switch (tool) {
@@ -240,6 +414,8 @@ QString toolName(Tool tool)
         return QStringLiteral("line");
     case Tool::Wave:
         return QStringLiteral("wave");
+    case Tool::Bezier:
+        return QStringLiteral("bezier");
     case Tool::Pen:
         return QStringLiteral("pen");
     case Tool::Mosaic:
@@ -273,6 +449,9 @@ Tool toolForName(const QString &name)
     }
     if (name == QStringLiteral("wave")) {
         return Tool::Wave;
+    }
+    if (name == QStringLiteral("bezier")) {
+        return Tool::Bezier;
     }
     if (name == QStringLiteral("pen")) {
         return Tool::Pen;
@@ -537,6 +716,15 @@ bool annotationLogicalBounds(const Annotation &annotation, LogicalRect *bounds)
     if (annotation.points.isEmpty()) {
         return false;
     }
+    if (annotation.tool == QStringLiteral("bezier")) {
+        // A pen path is a cubic per segment and a cubic leaves the box of its
+        // own anchors, so the box has to come from the sampled curve.  Taking
+        // the control points instead would report a rect -- and so a raster --
+        // far larger than the ink, and taking the anchors alone would clip the
+        // bulge and leave a stale arc on screen.
+        return polylineLogicalBounds(bezierPolyline(annotation.points, annotation.closed),
+                                     bounds);
+    }
     // The box of a stroke's own points.  For a wave those are its two ends and
     // the box is the segment between them; the crests that reach off it are
     // accounted for by the raster's padding (`StrokeRaster::padding`, read here
@@ -620,6 +808,20 @@ QIcon toolbarIcon(Tool tool, const QColor &color = QColor(230, 225, 229),
             wave.lineTo(3.0 + step, 12.0 + std::sin(step * kTau / 9.0) * 5.0);
         }
         painter.drawPath(wave);
+        break;
+    }
+    case Tool::Bezier: {
+        // A curve with both its end anchors: the one icon in the row that says
+        // "this one bends between the points you click".
+        QPainterPath curve;
+        curve.moveTo(4.0, 19.0);
+        curve.cubicTo(4.0, 8.0, 20.0, 16.0, 20.0, 5.0);
+        painter.drawPath(curve);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(color);
+        painter.drawRect(QRectF(2.0, 17.0, 4.0, 4.0));
+        painter.drawRect(QRectF(18.0, 3.0, 4.0, 4.0));
+        painter.setBrush(Qt::NoBrush);
         break;
     }
     case Tool::Pen:
@@ -2177,6 +2379,10 @@ struct OverlayController::Gesture {
         MovingAnnotation,
         ResizingAnnotation,
         Drawing,
+        // The pen path.  It is the one gesture that outlives a release: a path
+        // spans as many presses as it has anchors, so `release` leaves this
+        // state standing until the path is closed or double-clicked.
+        Bezier,
     };
 
     Type type = Type::None;
@@ -2282,6 +2488,7 @@ public:
         addTool(toolLayout, uiTr("Arrow"), Tool::Arrow);
         addTool(toolLayout, uiTr("Line"), Tool::Line);
         addTool(toolLayout, uiTr("Wave"), Tool::Wave);
+        addTool(toolLayout, uiTr("Bezier"), Tool::Bezier);
         addTool(toolLayout, uiTr("Draw"), Tool::Pen);
         addTool(toolLayout, uiTr("Text"), Tool::Text);
         addTool(toolLayout, uiTr("Number"), Tool::Number);
@@ -2676,13 +2883,14 @@ public:
         const bool shape = target == QStringLiteral("rectangle") ||
             target == QStringLiteral("ellipse");
         // Every tool that paints a stroked shape: the rectangle and ellipse
-        // outlines, the arrow, the pen, and the two segment tools.  They share
-        // the colour and width controls; the dash is only meaningful to the
-        // tools the Rust renderer walks with a dashes pattern -- the wave is
-        // sampled as a solid sine, so it is offered no dash control.
+        // outlines, the arrow, the pen, the two segment tools and the bezier
+        // pen.  They share the colour and width controls; the dash is only
+        // meaningful to the tools the Rust renderer walks with a dashes
+        // pattern -- the wave is sampled as a solid sine and a bezier path is
+        // stroked whole, so neither is offered a dash control.
         const bool stroke = shape || target == QStringLiteral("arrow") ||
             target == QStringLiteral("pen") || target == QStringLiteral("line") ||
-            target == QStringLiteral("wave");
+            target == QStringLiteral("wave") || target == QStringLiteral("bezier");
         const bool text = target == QStringLiteral("text");
         const bool mosaic = target == QStringLiteral("mosaic");
         // A numbered badge is a text annotation by wire but nothing like one on
@@ -2695,7 +2903,8 @@ public:
         const bool selectedMosaicShape = selected != nullptr &&
             selected->kind == Annotation::Kind::Shape && mosaic;
         const bool showColor = stroke || text || number;
-        const bool showDash = stroke && target != QStringLiteral("wave");
+        const bool showDash = stroke && target != QStringLiteral("wave") &&
+            target != QStringLiteral("bezier");
         const bool showArrowHead = target == QStringLiteral("arrow");
         const bool showWidth = stroke || mosaicBrush || number;
         const bool showTextSize = text;
@@ -3263,6 +3472,10 @@ private:
             return uiTr("Draw a straight line");
         case Tool::Wave:
             return uiTr("Draw a wavy line");
+        case Tool::Bezier:
+            return uiTr("Draw a curved path: click to add an anchor, drag to bend the "
+                        "curve, click the first anchor to close and fill it, "
+                        "double-click to finish it open");
         case Tool::Pen:
             return uiTr("Draw a freehand line");
         case Tool::Text:
@@ -4064,6 +4277,62 @@ void OverlayController::finishDrawing(Point point)
     selectAnnotation(newIndex);
 }
 
+void OverlayController::beginBezier(Point point)
+{
+    gesture_->type = Gesture::Type::Bezier;
+    gesture_->anchor = clampPoint(point);
+    gesture_->current = gesture_->anchor;
+    gesture_->points.clear();
+    // None of the freehand stroke's incremental raster is used here: a pen path
+    // is redrawn whole from its anchors on every paint, which is what it always
+    // was, so there is nothing to accumulate.
+    gesture_->liveRaster = QImage();
+    gesture_->liveOrigin = QPoint();
+    gesture_->liveBaked = 0;
+    gesture_->liveLength = 0.0;
+    gesture_->liveKey.clear();
+}
+
+void OverlayController::updateBezier(Point point, bool dragging)
+{
+    const Point bounded = clampPoint(point);
+    gesture_->current = bounded;
+    if (dragging && !gesture_->points.isEmpty()) {
+        // The drag pulls the outgoing handle of the anchor just placed out; the
+        // incoming side is its mirror, so only one of the two is ever stored --
+        // the same symmetric handle the wire format describes.
+        gesture_->points.last() = bounded;
+    }
+}
+
+void OverlayController::finishBezier(bool closed)
+{
+    const QVector<Point> points = gesture_->points;
+    gesture_->type = Gesture::Type::None;
+    gesture_->points.clear();
+    if (points.isEmpty()) {
+        updateAll();
+        return;
+    }
+    Annotation annotation;
+    annotation.kind = Annotation::Kind::Stroke;
+    annotation.tool = toolName(Tool::Bezier);
+    // A single anchor has no segment to close, so a path that was somehow closed
+    // before it had two of them stays open rather than being filled as a point.
+    annotation.closed = closed && bezierAnchors(points) >= 2;
+    annotation.color = currentColor_;
+    annotation.width = currentWidth_;
+    annotation.dash = currentDash_;
+    annotation.points = points;
+    QVector<Annotation> next = annotations_;
+    next.push_back(annotation);
+    const int newIndex = next.size() - 1;
+    mutateAnnotations(std::move(next));
+    // Newly drawn annotations stay selected so the panel restyles them and the
+    // Select tool can immediately move them.
+    selectAnnotation(newIndex);
+}
+
 void OverlayController::undo()
 {
     if (finished_ || cancelled_ || undoStack_.isEmpty()) {
@@ -4628,6 +4897,48 @@ LogicalRect OverlayController::drawingTouch(int pointsBefore) const
     return growBy(touched, margin);
 }
 
+LogicalRect OverlayController::bezierTouch() const
+{
+    // A path always holds whole [anchor, handle] pairs, so anything shorter than
+    // two has nothing to bound and nothing to join.
+    if (gesture_->points.size() < 2) {
+        return LogicalRect{};
+    }
+    // The preview is the path plus the rubber band, so its rect is the path's
+    // own box united with the band.  Both are measured through the same two
+    // helpers the preview paints through, so a step can never invalidate less
+    // than it changed.
+    LogicalRect bounds;
+    if (!annotationLogicalBounds(previewAnnotation(), &bounds)) {
+        return LogicalRect{};
+    }
+    // The rubber band is a straight segment from the path's last anchor to the
+    // pointer, so its own rect is the box between the two -- the segment never
+    // leaves it.
+    const Point &anchor = gesture_->points.at(gesture_->points.size() - 2);
+    const Point &cursor = gesture_->current;
+    const LogicalRect band{std::min(anchor.x, cursor.x), std::min(anchor.y, cursor.y),
+                           static_cast<std::uint32_t>(std::abs(cursor.x - anchor.x) + 1),
+                           static_cast<std::uint32_t>(std::abs(cursor.y - anchor.y) + 1)};
+    return growBy(uniteLogical(bounds, band),
+                  annotationReach(previewAnnotation()) + kSelectionChrome);
+}
+
+// The mark the pen path in progress would commit: the path's anchors and
+// handles as they stand.  The preview, its bounds and the rubber band's own
+// segment all read the same shape from it.
+Annotation OverlayController::previewAnnotation() const
+{
+    Annotation preview;
+    preview.kind = Annotation::Kind::Stroke;
+    preview.tool = QStringLiteral("bezier");
+    preview.color = currentColor_;
+    preview.width = currentWidth_;
+    preview.dash = currentDash_;
+    preview.points = gesture_->points;
+    return preview;
+}
+
 bool OverlayController::drawsGrowingStroke() const
 {
     return (tool_ == Tool::Pen && currentColor_.alpha() == 255) ||
@@ -4735,6 +5046,35 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
         // One click, one badge.  Nothing waits for a release: the tool has no
         // drag to preview, so the press is the whole gesture.
         placeNumber(point);
+        return;
+    }
+    if (tool_ == Tool::Bezier) {
+        if (!canDrawAt(point)) {
+            return;
+        }
+        // A press back onto the first anchor closes the path.  It commits here
+        // rather than on a release: the click is the whole closing gesture, and
+        // waiting for the button to come up would leave the filled shape
+        // hanging on a press the user already made.
+        const double reach = std::max(8.0, static_cast<double>(currentWidth_) * 2.0);
+        if (gesture_->type == Gesture::Type::Bezier &&
+            bezierAnchors(gesture_->points) >= 2 &&
+            std::hypot(static_cast<double>(gesture_->points.constFirst().x - point.x),
+                       static_cast<double>(gesture_->points.constFirst().y - point.y)) <= reach) {
+            finishBezier(true);
+            return;
+        }
+        if (gesture_->type != Gesture::Type::Bezier) {
+            beginBezier(point);
+        }
+        // The anchor, and its outgoing handle starting on top of it: the drag
+        // that follows pulls the handle out, and the incoming side is its
+        // mirror, so the handle is symmetric by construction.
+        const Point bounded = clampPoint(point);
+        gesture_->points.push_back(bounded);
+        gesture_->points.push_back(bounded);
+        gesture_->current = bounded;
+        updateAll();
         return;
     }
     if (tool_ == Tool::Select) {
@@ -4862,6 +5202,12 @@ void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::
         const int pointsBefore = gesture_->points.size();
         updateDrawing(point);
         updateTouch(drawingTouch(pointsBefore));
+    } else if (gesture_->type == Gesture::Type::Bezier) {
+        // With the button down the pointer is pulling the last anchor's handle
+        // out; with it up the pointer only says where the rubber band reaches.
+        // Both are the same step to the path, and both repaint the same rect.
+        updateBezier(point, buttons != Qt::NoButton);
+        updateTouch(bezierTouch());
     } else {
         return;
     }
@@ -4897,6 +5243,12 @@ void OverlayController::release(CaptureOverlay *overlay, const QPointF &local,
     case Gesture::Type::Drawing:
         finishDrawing(point);
         break;
+    case Gesture::Type::Bezier:
+        // A release only ends the handle drag that followed the last press.  The
+        // path itself is not finished until it is closed or double-clicked, so
+        // the gesture stays in progress and the preview stays on screen.
+        updateBezier(point, false);
+        break;
     case Gesture::Type::None:
         break;
     }
@@ -4910,6 +5262,14 @@ void OverlayController::doubleClick(CaptureOverlay *overlay, const QPointF &loca
         return;
     }
     const Point point = globalPoint(overlay, local);
+    if (tool_ == Tool::Bezier && gesture_->type == Gesture::Type::Bezier) {
+        // A double click ends the path where it stands, open.  Qt delivers the
+        // second click of the pair as this event rather than as a press, so the
+        // anchor it would have placed is the one the first click already did --
+        // the path is not left with a duplicate point on its end.
+        finishBezier(false);
+        return;
+    }
     const int index = annotationHitAt(point);
     if (index >= 0 && annotations_.at(index).kind == Annotation::Kind::Text &&
         !isNumberAnnotation(annotations_.at(index))) {
@@ -4929,6 +5289,13 @@ void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifi
     if (key == Qt::Key_Escape) {
         if (textEdit_ != nullptr) {
             finishText(false);
+        } else if (gesture_->type == Gesture::Type::Bezier) {
+            // The pen path in progress goes first: Escape drops it without
+            // ending the session, the way it drops any other in-progress
+            // gesture.  A second Escape then cancels the capture.
+            gesture_->type = Gesture::Type::None;
+            gesture_->points.clear();
+            updateAll();
         } else {
             cancel();
         }
@@ -5164,6 +5531,14 @@ void OverlayController::chooseTool(Tool tool)
     }
     if (textEdit_ != nullptr) {
         finishText(true);
+    }
+    if (gesture_->type == Gesture::Type::Bezier && tool != Tool::Bezier) {
+        // An unfinished pen path goes with the tool: it is one gesture rather
+        // than a drawing that outlives a tool change, and leaving it in the
+        // gesture would have the next press extend a path nobody is looking at
+        // any more.
+        gesture_->type = Gesture::Type::None;
+        gesture_->points.clear();
     }
     tool_ = tool;
     // Keep the annotation selection when moving to Select so a freshly drawn
@@ -5835,6 +6210,35 @@ int OverlayController::annotationHitAt(Point point) const
             }
             continue;
         }
+        if (annotation.tool == QStringLiteral("bezier")) {
+            // A closed path is a solid mark: its fill reaches the inside, so a
+            // click there selects it, exactly as it does for a badge.
+            if (annotation.closed &&
+                bezierPath(annotation.points, true)
+                    .contains(QPointF(point.x, point.y))) {
+                return index;
+            }
+            // Otherwise the ink is the sampled curve, not the anchors: a click
+            // on a bulge the handles pulled out has to reach the path.
+            const QVector<QPointF> curve = bezierPolyline(annotation.points, annotation.closed);
+            const auto toPoint = [](const QPointF &value) {
+                return Point{static_cast<std::int32_t>(std::lround(value.x())),
+                             static_cast<std::int32_t>(std::lround(value.y()))};
+            };
+            if (curve.size() == 1) {
+                const Point only = toPoint(curve.constFirst());
+                if (distanceToSegment(point, only, only) <= radius + 4.0) {
+                    return index;
+                }
+            }
+            for (int segment = 1; segment < curve.size(); ++segment) {
+                if (distanceToSegment(point, toPoint(curve.at(segment - 1)),
+                                      toPoint(curve.at(segment))) <= radius + 4.0) {
+                    return index;
+                }
+            }
+            continue;
+        }
         for (int segment = 1; segment < annotation.points.size(); ++segment) {
             if (distanceToSegment(point, annotation.points.at(segment - 1),
                                   annotation.points.at(segment)) <= radius + 4.0) {
@@ -6355,6 +6759,13 @@ QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
                 value.insert(QStringLiteral("strength"),
                              static_cast<qint64>(annotation.strength));
             }
+            if (annotation.tool == QStringLiteral("bezier")) {
+                // The pen path's closure, and the one field that makes the two
+                // ends of the protocol agree: the renderer fills a closed path
+                // before it strokes it.  Only a bezier carries it, the same way
+                // only an arrow carries `size`.
+                value.insert(QStringLiteral("closed"), annotation.closed);
+            }
             QJsonArray points;
             for (const Point &point : annotation.points) {
                 QJsonObject item;
@@ -6715,7 +7126,7 @@ protected:
         writeContext(stream, output, size);
         stream << annotation.tool << annotation.dash << annotation.width
                << static_cast<quint32>(annotation.color.rgba()) << annotation.size
-               << annotation.arrowStyle << annotation.strength;
+               << annotation.arrowStyle << annotation.strength << annotation.closed;
         if (annotation.tool == QStringLiteral("mosaic")) {
             // The freehand mosaic brush averages the source image under the
             // path, so every point's absolute position has to stay in the key.
@@ -6748,6 +7159,20 @@ protected:
             // Freehand mosaic brush: smear discs along the path.
             drawMosaicBrush(painter, output, annotation.points, annotation.width,
                             annotation.strength, size);
+            return;
+        }
+        if (annotation.tool == QStringLiteral("bezier")) {
+            // A pen path is a cubic per segment rather than a polyline, and a
+            // closed one is filled as well as stroked.  The points are put in
+            // this overlay's own coordinates first: the same helper then serves
+            // the live preview and the cached raster.
+            QVector<QPointF> at;
+            at.reserve(annotation.points.size());
+            for (const Point &point : annotation.points) {
+                at.append(localPoint(output, point, size));
+            }
+            paintBezierInk(painter, at, annotation.closed, annotation.color,
+                           static_cast<int>(annotation.width));
             return;
         }
         const double scale = output.scale > 0 ? static_cast<double>(output.scale) : 1.0;
@@ -7172,6 +7597,18 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
                             annotation.strength, overlay->size());
             return;
         }
+        if (annotation.tool == QStringLiteral("bezier")) {
+            // Drawn through the very helper the committed mark's rasterizer
+            // uses, so letting go changes nothing on screen.
+            QVector<QPointF> at;
+            at.reserve(annotation.points.size());
+            for (const Point &point : annotation.points) {
+                at.append(localPoint(output, point, overlay->size()));
+            }
+            paintBezierInk(painter, at, annotation.closed, annotation.color,
+                           static_cast<int>(annotation.width));
+            return;
+        }
         QPolygonF polygon;
         QPen pen = annotationPen;
         if (annotation.tool == QStringLiteral("wave") && annotation.points.size() >= 2) {
@@ -7234,6 +7671,23 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
         }
         annotation.raster->paint(painter, annotation, output, overlay->size(),
                                  overlay->outputIndex());
+    }
+    if (gesture_->type == Gesture::Type::Bezier && gesture_->points.size() >= 2) {
+        // The pen path so far, plus the rubber band from its last anchor to the
+        // pointer.  The band is a straight segment: the curve the next segment
+        // would take is not known until its anchor is placed, and a band drawn
+        // through the last anchor's own handle would loop back on the anchor
+        // while that handle is being dragged.
+        drawAnnotation(previewAnnotation());
+        const Point &anchor = gesture_->points.at(gesture_->points.size() - 2);
+        const QPointF from = localPoint(output, anchor, overlay->size());
+        const QPointF to = localPoint(output, gesture_->current, overlay->size());
+        if (QLineF(from, to).length() > 0.0) {
+            painter->setPen(QPen(currentColor_, static_cast<double>(currentWidth_), Qt::SolidLine,
+                                 Qt::RoundCap, Qt::RoundJoin));
+            painter->setBrush(Qt::NoBrush);
+            painter->drawLine(from, to);
+        }
     }
     if (gesture_->type == Gesture::Type::Drawing && !gesture_->points.isEmpty()) {
         // Rectangle, ellipse, the area mosaic and the arrow all depend on two

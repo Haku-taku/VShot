@@ -43,6 +43,7 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("Arrow"), QString::fromUtf8("箭头")},
         {QStringLiteral("Line"), QString::fromUtf8("直线")},
         {QStringLiteral("Wave"), QString::fromUtf8("波浪线")},
+        {QStringLiteral("Bezier"), QString::fromUtf8("钢笔")},
         {QStringLiteral("Draw"), QString::fromUtf8("涂鸦")},
         {QStringLiteral("Text"), QString::fromUtf8("文本")},
         {QStringLiteral("Mosaic"), QString::fromUtf8("马赛克")},
@@ -139,6 +140,11 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("Draw an arrow with an adjustable head"),
          QString::fromUtf8("绘制箭头，头部大小可调")},
         {QStringLiteral("Draw a freehand line"), QString::fromUtf8("自由绘制线条")},
+        {QStringLiteral("Draw a curved path: click to add an anchor, drag to bend the "
+                        "curve, click the first anchor to close and fill it, "
+                        "double-click to finish it open"),
+         QString::fromUtf8("绘制曲线路径：点击添加锚点，拖动弯曲曲线，"
+                           "点回第一个锚点闭合并填充，双击结束为开放路径")},
         {QStringLiteral("Click to place a text label, click text to re-edit"),
          QString::fromUtf8("点击放置文本标签，点击已有文本可重新编辑")},
         {QStringLiteral("Pixelate an area: rectangle, ellipse or freehand brush"),

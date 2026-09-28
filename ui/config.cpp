@@ -30,8 +30,8 @@ namespace {
 const QStringList kToolNames = {QStringLiteral("select"), QStringLiteral("rectangle"),
                                 QStringLiteral("ellipse"), QStringLiteral("arrow"),
                                 QStringLiteral("line"), QStringLiteral("wave"),
-                                QStringLiteral("pen"), QStringLiteral("text"),
-                                QStringLiteral("mosaic")};
+                                QStringLiteral("bezier"), QStringLiteral("pen"),
+                                QStringLiteral("text"), QStringLiteral("mosaic")};
 const QStringList kDashNames = {QStringLiteral("solid"), QStringLiteral("dashed"),
                                 QStringLiteral("dotted")};
 const QStringList kArrowStyleNames = {QStringLiteral("open"), QStringLiteral("filled")};

@@ -57,6 +57,13 @@ public:
         // as the pointer wanders.
         Line,
         Wave,
+        // The pen: clicks lay down anchors and the drag after each one pulls its
+        // outgoing handle out, so every segment is a cubic and the handle is
+        // symmetric by construction.  It is the one tool here whose gesture is
+        // not a single drag -- a path spans as many presses as it has anchors,
+        // and ends either closed back onto its first anchor or double-clicked
+        // open.
+        Bezier,
         Text,
         // A numbered badge: one click places one badge and the count advances.
         // Unlike every other tool here it commits on the press, not on a
@@ -123,6 +130,14 @@ public:
     // strokes there are.
     int strokeNumber(int index) const;
 
+    // How many anchors the stroke at `index` carries, or 0 when it is not a pen
+    // path (or the index is outside the list).  A pen path stores one anchor and
+    // one outgoing handle per joint, interleaved, so its anchors are half its
+    // points.  Read by the offline check, which has to see how many anchors a
+    // run of clicks produced and not merely how many strokes there are -- a
+    // stray press would add a segment without adding a stroke.
+    int strokeAnchorCount(int index) const;
+
     // How many times a stroke's ink has been rasterized into its own image.
     // Each stroke is rasterized once and then reused, which is what makes the
     // eraser, an undo and a redo cheap; the checks read this to see that it
@@ -153,6 +168,7 @@ protected:
     void mousePressEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
+    void mouseDoubleClickEvent(QMouseEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
 
@@ -175,7 +191,16 @@ private:
         Tool tool = Tool::Pen;
         QColor color;
         int width = 3;
+        // A bezier path's anchors and their outgoing handles, interleaved
+        // [anchor0, handleOut0, anchor1, handleOut1, ...]; every other tool
+        // stores the plain points it was dragged through.  The incoming handle
+        // of an anchor is the mirror of its outgoing one, so only one side is
+        // ever stored -- the same shape the capture editor sends Rust.
         QVector<QPointF> points;
+        // Whether a bezier path was closed back onto its first anchor.  Only
+        // that tool reads it: a closed path is filled as well as stroked, so its
+        // inside is ink and the eraser can take it from there.
+        bool closed = false;
         QString text;
         // The number tool's badge: which look it is drawn with, and the count it
         // carries.  `number` is zero for every other tool, which is what makes
@@ -241,6 +266,16 @@ private:
     // tool is a press: there is no drag to preview, so nothing waits for a
     // release.
     void placeNumber(const QPointF &local);
+    // Ends the pen path in `pending_` and commits it: closed when the user
+    // pressed back onto its first anchor, open when they double-clicked.  `stale`
+    // is the rect the preview covered, which the committed ink may not, and is
+    // repainted along with it.
+    void commitBezier(const QRect &stale);
+    // The logical rect the in-progress stroke's preview covers: the stroke
+    // itself plus, for the pen, the rubber band from its last anchor to the
+    // pointer.  Every step of a gesture repaints this, and the checks read the
+    // invalidated region back.
+    QRect previewRect() const;
     // Hands the keyboard to the compositor, or asks for it, for text entry.
     // Only the text editor needs the keyboard: drawing a stroke does not, and a
     // surface that held it would stop the user from typing anywhere else.
@@ -267,6 +302,13 @@ private:
     // button comes up.
     bool drawing_ = false;
     Stroke pending_;
+    // Where the pointer is while a pen path is being built, so the preview can
+    // draw the rubber band from the path's last anchor to it.  The band is a
+    // straight segment rather than a cubic: the curve the next segment will take
+    // is not known until its anchor is placed, and a band through the last
+    // anchor's own handle would loop back on the anchor while that handle is
+    // being dragged.
+    QPointF bezierCursor_;
     // Where the eraser last looked, so a fast drag does not step over a stroke.
     QPointF eraseFrom_;
     bool erasing_ = false;

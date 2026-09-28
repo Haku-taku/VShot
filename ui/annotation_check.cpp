@@ -42,10 +42,34 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 
 namespace {
 
 int failures = 0;
+
+// The pen tool's own numbers, spelled out here rather than imported from the
+// overlay, the way the other checks spell out the ink colour they assert on.
+// The path is three anchors whose handles run along the edges of the triangle
+// they make, so the closed shape is that triangle with every side bowed outward
+// and its middle is a large, plainly-inside area.  It sits low on the 1600x1200
+// canvas of `largeSession`, well clear of the floating toolbar.
+//
+// kPenAlpha is the pen opacity the checks set; the fill is the stroke's colour
+// at half that alpha, floored -- the overlay's own rule, spelled out here so a
+// change to it cannot pass by moving both sides of the assertion.
+constexpr int kPenAlpha = 200;
+constexpr int kPenFillAlpha = kPenAlpha / 2;
+constexpr int kPenRed = 255;
+constexpr int kPenGreen = 30;
+constexpr int kPenBlue = 30;
+constexpr int kPenAnchorCount = 3;
+const vshot::Point kPenAnchors[] = {{400, 800}, {1200, 800}, {800, 1100}};
+const vshot::Point kPenHandles[] = {{640, 800}, {1080, 890}, {680, 1010}};
+// A point deep inside the triangle the anchors make, far from every edge and
+// every corner: where the closed path's fill is read, and where an open path has
+// to leave the frame alone.
+const QPoint kPenInside(800, 900);
 
 void expect(bool condition, const char *what, const QString &detail = QString())
 {
@@ -59,6 +83,36 @@ void expect(bool condition, const char *what, const QString &detail = QString())
     } else {
         std::printf("FAIL  %s -- %s\n", what, qPrintable(detail));
     }
+}
+
+QPointF penAnchor(int index)
+{
+    return QPointF(kPenAnchors[index].x, kPenAnchors[index].y);
+}
+
+QPointF penHandle(int index)
+{
+    return QPointF(kPenHandles[index].x, kPenHandles[index].y);
+}
+
+// The colour a source at `alpha` over `background` composites to, in the check's
+// own arithmetic: premultiplied SourceOver, which is what the painter does.  The
+// assertions below compare the rendered pixel against this rather than against a
+// constant, so they say "half the stroke's alpha" and not "this exact byte".
+QColor over(const QColor &source, int alpha, const QColor &background)
+{
+    const double a = alpha / 255.0;
+    return QColor(qRound(source.red() * a + background.red() * (1.0 - a)),
+                  qRound(source.green() * a + background.green() * (1.0 - a)),
+                  qRound(source.blue() * a + background.blue() * (1.0 - a)));
+}
+
+// The largest channel difference between two colours.
+int colorDistance(const QColor &first, const QColor &second)
+{
+    return std::max({std::abs(first.red() - second.red()),
+                     std::abs(first.green() - second.green()),
+                     std::abs(first.blue() - second.blue())});
 }
 
 // A one-output region session whose selection is already made, so the editor
@@ -129,12 +183,12 @@ QRegion childAreas(vshot::CaptureOverlay *overlay)
 // asked to be repainted.  A null rect means the step repainted the whole
 // surface, so there is nothing to compare -- a full repaint is its own eraser
 // and needs no narrow region to be correct.
-void expectStepCovered(vshot::OverlayController &controller, vshot::CaptureOverlay *overlay,
-                       const QPointF &to, const char *gesture)
+void expectStepCoveredBy(vshot::OverlayController &controller, vshot::CaptureOverlay *overlay,
+                         const std::function<void()> &step, const char *gesture)
 {
     QImage before(overlay->size(), QImage::Format_ARGB32_Premultiplied);
     paintOnce(overlay, &before);
-    controller.move(overlay, to, Qt::LeftButton, Qt::NoModifier);
+    step();
     QImage after(overlay->size(), QImage::Format_ARGB32_Premultiplied);
     paintOnce(overlay, &after);
     const QRect claimed = controller.lastInteractiveUpdate();
@@ -152,6 +206,73 @@ void expectStepCovered(vshot::OverlayController &controller, vshot::CaptureOverl
     }
     expect(outside == 0, gesture,
            QStringLiteral("%1 px changed outside the invalidated region").arg(outside));
+}
+
+// A pointer move with the left button down, which is the step most gestures are
+// made of.
+void expectStepCovered(vshot::OverlayController &controller, vshot::CaptureOverlay *overlay,
+                       const QPointF &to, const char *gesture)
+{
+    expectStepCoveredBy(
+        controller, overlay,
+        [&] { controller.move(overlay, to, Qt::LeftButton, Qt::NoModifier); }, gesture);
+}
+
+// The same, for a pointer move with nothing held down.  The pen's rubber band is
+// the one thing that follows those, and driving it as a drag would bend the
+// curve instead of moving the band.
+void expectHoverCovered(vshot::OverlayController &controller, vshot::CaptureOverlay *overlay,
+                        const QPointF &to, const char *gesture)
+{
+    expectStepCoveredBy(controller, overlay,
+                        [&] { controller.move(overlay, to, Qt::NoButton, Qt::NoModifier); },
+                        gesture);
+}
+
+// Opens a `largeSession` overlay in edit state, ready to draw on.  The pen paths
+// below sit low on its 1600x1200 canvas, clear of the floating toolbar.
+bool openLargeOverlay(vshot::OverlayController &controller, vshot::CaptureOverlay **overlay)
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return false;
+    }
+    QString error;
+    *overlay = controller.addOverlay(0, screen, &error);
+    if (*overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return false;
+    }
+    (*overlay)->show();
+    controller.beginPresetEdit();
+    return true;
+}
+
+// Draws the pen path the checks below describe.  `closed` ends it by pressing
+// back onto the first anchor, which fills it; otherwise it ends on a double
+// click, whose first click places the last anchor and whose second arrives as a
+// double-click event in place of a press -- exactly how Qt delivers the two
+// clicks of a double click.
+void drawPenPath(vshot::OverlayController &controller, vshot::CaptureOverlay *overlay, bool closed)
+{
+    controller.chooseTool(vshot::Tool::Bezier);
+    const int dragged = closed ? kPenAnchorCount : kPenAnchorCount - 1;
+    for (int index = 0; index < dragged; ++index) {
+        controller.press(overlay, penAnchor(index), Qt::LeftButton, Qt::NoModifier);
+        controller.move(overlay, penHandle(index), Qt::LeftButton, Qt::NoModifier);
+        controller.release(overlay, penHandle(index), Qt::LeftButton, Qt::NoModifier);
+    }
+    if (closed) {
+        controller.press(overlay, penAnchor(0), Qt::LeftButton, Qt::NoModifier);
+        controller.release(overlay, penAnchor(0), Qt::LeftButton, Qt::NoModifier);
+        return;
+    }
+    const QPointF last = penAnchor(kPenAnchorCount - 1);
+    controller.press(overlay, last, Qt::LeftButton, Qt::NoModifier);
+    controller.release(overlay, last, Qt::LeftButton, Qt::NoModifier);
+    controller.doubleClick(overlay, last, Qt::LeftButton);
+    controller.release(overlay, last, Qt::LeftButton, Qt::NoModifier);
 }
 
 // A committed mark rasterizes once and a repaint that changes nothing reuses
@@ -1154,6 +1275,269 @@ void checkNumberBadgesCompareByCountAndStyle()
            "two badges with the same count but different styles are not equal");
 }
 
+// The pen path's wire form: one stroke, `tool=bezier`, the anchors and their
+// outgoing handles interleaved and absolute, and the closure as its own field.
+// The renderer fills a closed path before it strokes it, so a path that lost its
+// closure -- or whose points came out as the incoming handles rather than the
+// outgoing ones -- would still be "a stroke" and would only be noticed in the
+// baked PNG.
+void checkBezierSerializesWithItsClosure()
+{
+    vshot::OverlayController controller(largeSession());
+    vshot::CaptureOverlay *overlay = nullptr;
+    if (!openLargeOverlay(controller, &overlay)) {
+        return;
+    }
+    controller.setWidth(6);
+    controller.setCurrentColor(QColor(kPenRed, kPenGreen, kPenBlue, kPenAlpha));
+    drawPenPath(controller, overlay, true);
+    expect(controller.annotations().size() == 1, "the closed pen path lands as one annotation");
+    if (controller.annotations().size() != 1) {
+        return;
+    }
+    const vshot::Annotation &mark = controller.annotations().at(0);
+    expect(mark.kind == vshot::Annotation::Kind::Stroke, "the pen path is a stroke annotation");
+    expect(mark.tool == QStringLiteral("bezier"), "the pen path's tool is `bezier`", mark.tool);
+    expect(mark.closed, "the pen path records that it was closed");
+    expect(mark.points.size() == 2 * kPenAnchorCount,
+           "the pen path carries one anchor and one outgoing handle per joint",
+           QStringLiteral("points=%1").arg(mark.points.size()));
+    if (mark.points.size() != 2 * kPenAnchorCount) {
+        return;
+    }
+    // Every point is absolute, and the odd ones are the outgoing handles: the
+    // incoming side is the mirror the renderer derives, so sending it would put
+    // two control points where the wire format has room for one.
+    bool placed = true;
+    for (int index = 0; index < kPenAnchorCount; ++index) {
+        placed = placed && mark.points.at(2 * index) == kPenAnchors[index] &&
+            mark.points.at(2 * index + 1) == kPenHandles[index];
+    }
+    expect(placed, "the points are the anchors and the handles they were dragged to");
+
+    const QJsonDocument document = controller.resultDocument();
+    const QJsonArray annotations =
+        document.object().value(QStringLiteral("annotations")).toArray();
+    expect(annotations.size() == 1, "the document carries the pen path");
+    if (annotations.isEmpty()) {
+        return;
+    }
+    const QJsonObject value = annotations.at(0).toObject();
+    expect(value.value(QStringLiteral("kind")).toString() == QStringLiteral("stroke"),
+           "the pen path serializes as a stroke",
+           value.value(QStringLiteral("kind")).toString());
+    expect(value.value(QStringLiteral("tool")).toString() == QStringLiteral("bezier"),
+           "the pen path's tool name is `bezier`",
+           value.value(QStringLiteral("tool")).toString());
+    const QJsonArray points = value.value(QStringLiteral("points")).toArray();
+    expect(points.size() == 2 * kPenAnchorCount && points.size() % 2 == 0,
+           "the serialized points are the anchors and their handles, interleaved",
+           QStringLiteral("points=%1").arg(points.size()));
+    expect(value.value(QStringLiteral("closed")).toBool(),
+           "the serialized path carries its closure");
+
+    // The same three anchors, ended open on a double click: the one field that
+    // differs is the closure, and it has to say so.
+    vshot::OverlayController open(largeSession());
+    vshot::CaptureOverlay *openOverlay = nullptr;
+    if (!openLargeOverlay(open, &openOverlay)) {
+        return;
+    }
+    open.setWidth(6);
+    open.setCurrentColor(QColor(kPenRed, kPenGreen, kPenBlue, kPenAlpha));
+    drawPenPath(open, openOverlay, false);
+    expect(open.annotations().size() == 1, "the open pen path lands as one annotation");
+    if (open.annotations().size() != 1) {
+        return;
+    }
+    expect(!open.annotations().at(0).closed, "the open pen path is not closed");
+    expect(open.annotations().at(0).points.size() == 2 * kPenAnchorCount,
+           "the open pen path carries the same three anchors",
+           QStringLiteral("points=%1").arg(open.annotations().at(0).points.size()));
+    const QJsonArray openAnnotations =
+        open.resultDocument().object().value(QStringLiteral("annotations")).toArray();
+    if (openAnnotations.isEmpty()) {
+        expect(false, "the document carries the open pen path");
+        return;
+    }
+    const QJsonObject openValue = openAnnotations.at(0).toObject();
+    expect(openValue.value(QStringLiteral("tool")).toString() == QStringLiteral("bezier") &&
+               !openValue.value(QStringLiteral("closed")).toBool(),
+           "the open pen path serializes as an unclosed bezier");
+}
+
+// The closure is content: an open path and the closed one that fills it are
+// different marks.  Leaving it out of `annotationEquals` silently collapses an
+// undo step -- the editor would think closing a path changed nothing and drop
+// the edit.
+void checkClosedPathsCompareByTheirClosure()
+{
+    vshot::Annotation open;
+    open.kind = vshot::Annotation::Kind::Stroke;
+    open.tool = QStringLiteral("bezier");
+    open.points = {vshot::Point{400, 800}, vshot::Point{640, 800}, vshot::Point{1200, 800},
+                   vshot::Point{1080, 890}, vshot::Point{800, 1100}, vshot::Point{680, 1010}};
+
+    const vshot::Annotation copy = open;
+    expect(vshot::annotationEquals(open, copy), "a pen path equals a copy of itself");
+
+    vshot::Annotation closed = open;
+    closed.closed = true;
+    expect(!vshot::annotationEquals(open, closed),
+           "an open pen path and the closed one that fills it are not equal");
+}
+
+// The fill is the stroke's colour at half its alpha, and the outline over it is
+// more solid.  Both are read off the rendered overlay and compared against the
+// composite the check computes for itself from the pixel the mark was drawn
+// over: an unfilled path, or a fill as solid as its outline, is invisible in the
+// model and only shows up here.
+void checkBezierFillsAtHalfAlpha()
+{
+    vshot::OverlayController controller(largeSession());
+    vshot::CaptureOverlay *overlay = nullptr;
+    if (!openLargeOverlay(controller, &overlay)) {
+        return;
+    }
+    // The frame and the toolbar before any mark, so the composite below is
+    // measured against the very pixels the mark is drawn over.
+    QImage background(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &background);
+    const QColor ink(kPenRed, kPenGreen, kPenBlue);
+
+    controller.setWidth(6);
+    controller.setCurrentColor(QColor(kPenRed, kPenGreen, kPenBlue, kPenAlpha));
+    drawPenPath(controller, overlay, true);
+    expect(controller.annotations().size() == 1, "the closed pen path lands as one annotation");
+    if (controller.annotations().size() != 1) {
+        return;
+    }
+    QImage target(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &target);
+
+    const QColor behind = background.pixelColor(kPenInside);
+    const QColor fill = target.pixelColor(kPenInside);
+    const QColor outline =
+        target.pixelColor(QPoint(kPenAnchors[0].x, kPenAnchors[0].y));
+    expect(colorDistance(fill, behind) > 20, "a closed pen path fills its inside",
+           QStringLiteral("inside %1,%2,%3 vs background %4,%5,%6")
+               .arg(fill.red())
+               .arg(fill.green())
+               .arg(fill.blue())
+               .arg(behind.red())
+               .arg(behind.green())
+               .arg(behind.blue()));
+    const QColor wanted = over(ink, kPenFillAlpha, behind);
+    expect(colorDistance(fill, wanted) <= 3,
+           "the fill is the stroke's colour at half its alpha",
+           QStringLiteral("got %1,%2,%3 wanted %4,%5,%6")
+               .arg(fill.red())
+               .arg(fill.green())
+               .arg(fill.blue())
+               .arg(wanted.red())
+               .arg(wanted.green())
+               .arg(wanted.blue()));
+    expect(colorDistance(outline, ink) < colorDistance(fill, ink),
+           "the outline is more solid than the fill it encloses",
+           QStringLiteral("outline %1,%2,%3 vs fill %4,%5,%6")
+               .arg(outline.red())
+               .arg(outline.green())
+               .arg(outline.blue())
+               .arg(fill.red())
+               .arg(fill.green())
+               .arg(fill.blue()));
+
+    // The same three anchors, ended open: the middle the closed path painted is
+    // the frame again, and the outline there is the stroke's colour at its own
+    // alpha rather than at half of it.
+    vshot::OverlayController open(largeSession());
+    vshot::CaptureOverlay *openOverlay = nullptr;
+    if (!openLargeOverlay(open, &openOverlay)) {
+        return;
+    }
+    open.setWidth(6);
+    open.setCurrentColor(QColor(kPenRed, kPenGreen, kPenBlue, kPenAlpha));
+    drawPenPath(open, openOverlay, false);
+    expect(open.annotations().size() == 1, "the open pen path lands as one annotation");
+    if (open.annotations().size() != 1) {
+        return;
+    }
+    QImage openTarget(openOverlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(openOverlay, &openTarget);
+    const QColor openBehind = background.pixelColor(kPenInside);
+    expect(colorDistance(openTarget.pixelColor(kPenInside), openBehind) <= 2,
+           "an open pen path leaves its inside clear",
+           QStringLiteral("inside %1,%2,%3 vs background %4,%5,%6")
+               .arg(openTarget.pixelColor(kPenInside).red())
+               .arg(openTarget.pixelColor(kPenInside).green())
+               .arg(openTarget.pixelColor(kPenInside).blue())
+               .arg(openBehind.red())
+               .arg(openBehind.green())
+               .arg(openBehind.blue()));
+    const QColor openOutline =
+        openTarget.pixelColor(QPoint(kPenAnchors[0].x, kPenAnchors[0].y));
+    expect(colorDistance(openOutline, over(ink, kPenAlpha, openBehind)) <= 3,
+           "an open pen path strokes at the pen's own alpha",
+           QStringLiteral("outline %1,%2,%3")
+               .arg(openOutline.red())
+               .arg(openOutline.green())
+               .arg(openOutline.blue()));
+}
+
+// Every step of the pen gesture repaints what it changed.  The rubber band is
+// the one step driven by a pointer move with nothing held down, and the closing
+// press is the one step that turns a curve into a filled shape.
+void checkBezierStepCoverage()
+{
+    vshot::OverlayController controller(largeSession());
+    vshot::CaptureOverlay *overlay = nullptr;
+    if (!openLargeOverlay(controller, &overlay)) {
+        return;
+    }
+    controller.chooseTool(vshot::Tool::Bezier);
+    controller.setWidth(6);
+
+    // The step right after a press repaints the whole surface: a press leaves it
+    // in a state only a full repaint describes, so there is no narrow region to
+    // hold that step to.  Each block below therefore runs that step first and
+    // asserts on the one after it, which is the step that has a rect to answer
+    // for.
+    controller.press(overlay, penAnchor(0), Qt::LeftButton, Qt::NoModifier);
+    controller.move(overlay, penHandle(0), Qt::LeftButton, Qt::NoModifier);
+    expectStepCovered(controller, overlay, penHandle(0) + QPointF(60, -40),
+                      "a pen handle drag invalidates the bend it pulled out");
+    controller.release(overlay, penHandle(0), Qt::LeftButton, Qt::NoModifier);
+
+    controller.move(overlay, QPointF(900, 700), Qt::NoButton, Qt::NoModifier);
+    expectHoverCovered(controller, overlay, QPointF(1000, 760),
+                       "the pen rubber band invalidates where the pointer reaches");
+
+    controller.press(overlay, penAnchor(1), Qt::LeftButton, Qt::NoModifier);
+    controller.move(overlay, penHandle(1), Qt::LeftButton, Qt::NoModifier);
+    expectStepCovered(controller, overlay, penHandle(1) + QPointF(60, 40),
+                      "a second pen handle drag invalidates the bend it pulled out");
+    controller.release(overlay, penHandle(1), Qt::LeftButton, Qt::NoModifier);
+
+    controller.move(overlay, QPointF(1000, 1000), Qt::NoButton, Qt::NoModifier);
+    expectHoverCovered(controller, overlay, penAnchor(2),
+                       "the rubber band invalidates the last anchor it reaches for");
+
+    controller.press(overlay, penAnchor(2), Qt::LeftButton, Qt::NoModifier);
+    controller.move(overlay, penHandle(2), Qt::LeftButton, Qt::NoModifier);
+    expectStepCovered(controller, overlay, penHandle(2) + QPointF(-60, -40),
+                      "the third pen handle drag invalidates the bend it pulled out");
+    controller.release(overlay, penHandle(2), Qt::LeftButton, Qt::NoModifier);
+
+    // Closing the path is itself a press, so it repaints the whole surface and
+    // has no narrow region to answer for; what it has to do is land the mark,
+    // and land it closed.
+    controller.press(overlay, penAnchor(0), Qt::LeftButton, Qt::NoModifier);
+    controller.release(overlay, penAnchor(0), Qt::LeftButton, Qt::NoModifier);
+    expect(controller.annotations().size() == 1, "the closed pen path lands as one annotation");
+    expect(controller.annotations().size() == 1 && controller.annotations().at(0).closed,
+           "the pen path that lands is the closed one");
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -1173,6 +1557,10 @@ int main(int argc, char *argv[])
     checkWaveSerializesAsATwoPointStroke();
     checkNumberSerializesAsATextBitmap();
     checkNumberBadgesCompareByCountAndStyle();
+    checkBezierSerializesWithItsClosure();
+    checkClosedPathsCompareByTheirClosure();
+    checkBezierFillsAtHalfAlpha();
+    checkBezierStepCoverage();
 
     if (failures != 0) {
         std::printf("\n%d annotation cache checks failed\n", failures);

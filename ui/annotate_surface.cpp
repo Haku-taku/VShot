@@ -202,6 +202,118 @@ QVector<QPointF> wavePolyline(const QPointF &start, const QPointF &end, double a
     return points;
 }
 
+// One point on the cubic whose control points are `p0`..`p3`, at parameter `t`.
+// The Bernstein form is the one `QPainterPath::cubicTo` evaluates, so a sample
+// taken here lies on the very curve the painter draws -- which is what lets the
+// bounding box and the eraser's hit test be built from samples.
+QPointF cubicPoint(const QPointF &p0, const QPointF &p1, const QPointF &p2, const QPointF &p3,
+                   double t)
+{
+    const double u = 1.0 - t;
+    const double a = u * u * u;
+    const double b = 3.0 * u * u * t;
+    const double c = 3.0 * u * t * t;
+    const double d = t * t * t;
+    return QPointF(a * p0.x() + b * p1.x() + c * p2.x() + d * p3.x(),
+                   a * p0.y() + b * p1.y() + c * p2.y() + d * p3.y());
+}
+
+// The incoming control point of an anchor: the mirror of its outgoing handle
+// through the anchor itself.  The wire format the capture editor sends Rust
+// carries one handle per anchor and the curve is symmetric, so the incoming side
+// is derived rather than stored.
+QPointF mirrorHandle(const QPointF &anchor, const QPointF &handleOut)
+{
+    return QPointF(2.0 * anchor.x() - handleOut.x(), 2.0 * anchor.y() - handleOut.y());
+}
+
+// How many anchors a pen path has.  `points` is interleaved
+// [anchor0, handleOut0, anchor1, handleOut1, ...], so it is always even and the
+// anchors are half of it.
+int bezierAnchors(const QVector<QPointF> &points)
+{
+    return static_cast<int>(points.size() / 2);
+}
+
+// The pen path as a QPainterPath.  The preview and the committed ink both draw
+// through it, so the two cannot disagree about the curve.  A closed path joins
+// the last anchor back to the first, through both their handles.
+QPainterPath bezierPath(const QVector<QPointF> &points, bool closed)
+{
+    QPainterPath path;
+    const int anchors = bezierAnchors(points);
+    if (anchors <= 0) {
+        return path;
+    }
+    path.moveTo(points.at(0));
+    const int segments = closed ? anchors : anchors - 1;
+    for (int index = 0; index < segments; ++index) {
+        const int next = (index + 1) % anchors;
+        path.cubicTo(points.at(2 * index + 1),
+                     mirrorHandle(points.at(2 * next), points.at(2 * next + 1)),
+                     points.at(2 * next));
+    }
+    if (closed) {
+        path.closeSubpath();
+    }
+    return path;
+}
+
+// The same path sampled into a polyline, about one sample per two logical
+// pixels of control polygon so the sample follows the curve's own turning.  The
+// samples lie on the curve, which is what the tight bounding box and the
+// eraser's hit test need: a box over the control points alone would be far
+// larger than the ink, and one over the anchors alone would clip the very bulge
+// the handles pull out.
+QVector<QPointF> bezierPolyline(const QVector<QPointF> &points, bool closed)
+{
+    QVector<QPointF> samples;
+    const int anchors = bezierAnchors(points);
+    if (anchors <= 0) {
+        return samples;
+    }
+    samples.append(points.at(0));
+    const int segments = closed ? anchors : anchors - 1;
+    for (int index = 0; index < segments; ++index) {
+        const int next = (index + 1) % anchors;
+        const QPointF &start = points.at(2 * index);
+        const QPointF &handle = points.at(2 * index + 1);
+        const QPointF &end = points.at(2 * next);
+        const QPointF incoming = mirrorHandle(end, points.at(2 * next + 1));
+        const double span = QLineF(start, handle).length() + QLineF(handle, incoming).length() +
+            QLineF(incoming, end).length();
+        const int steps = std::clamp(static_cast<int>(std::ceil(span / 2.0)), 8, 96);
+        for (int step = 1; step <= steps; ++step) {
+            samples.append(cubicPoint(start, handle, incoming, end,
+                                      static_cast<double>(step) / steps));
+        }
+    }
+    return samples;
+}
+
+// The tight logical box of a sampled polyline, or a null rect when there is
+// nothing to bound.  Folded by hand rather than with `QRectF::united`: uniting
+// onto a null rect returns the other operand, which turns a box that was never
+// seeded into whatever the last point happened to be -- a bounding box that
+// collapses to a point, and stale ink left on screen.
+QRectF polylineBounds(const QVector<QPointF> &samples)
+{
+    if (samples.isEmpty()) {
+        return QRectF();
+    }
+    double left = samples.constFirst().x();
+    double right = left;
+    double top = samples.constFirst().y();
+    double bottom = top;
+    for (const QPointF &point : samples) {
+        left = std::min(left, point.x());
+        right = std::max(right, point.x());
+        top = std::min(top, point.y());
+        bottom = std::max(bottom, point.y());
+    }
+    return QRectF(QPointF(left, top), QPointF(right, bottom));
+}
+
 // Distance from a point to a rectangle's outline, zero inside it.  A rectangle
 // stroke is only its outline: the eraser must not be able to take it by
 // brushing the empty middle.
@@ -418,9 +530,10 @@ void paintNumberBadge(QPainter &painter, const QRectF &box, const QString &text,
 
 // The logical rect a stroke can have painted into, already grown by its width
 // and, for an arrow, by its head.  Both the repaint region and the eraser's
-// reach are asked from here.
+// reach are asked from here.  `closed` is only ever true for a committed pen
+// path: an in-progress preview has not been closed yet.
 QRectF strokeBounds(AnnotateSurface::Tool tool, const QVector<QPointF> &points, int width,
-                    const QString &text)
+                    const QString &text, bool closed = false)
 {
     if (tool == AnnotateSurface::Tool::Text) {
         return textBounds(points, width, text);
@@ -437,6 +550,22 @@ QRectF strokeBounds(AnnotateSurface::Tool tool, const QVector<QPointF> &points, 
     }
     if (points.isEmpty()) {
         return QRectF();
+    }
+    // A pen path is a cubic per segment, and a cubic leaves the box of its own
+    // anchors -- the handles pull it out.  The box therefore comes from the
+    // sampled curve, not from the points the model holds; a box over the
+    // control points instead would be far larger than the ink, and one over the
+    // anchors alone would clip the bulge and leave a stale arc on screen.
+    if (tool == AnnotateSurface::Tool::Bezier) {
+        const qreal grow = width / 2.0 + 1.0;
+        if (bezierAnchors(points) < 2) {
+            // One anchor and no segment between anything: the click is a dot,
+            // and it gets the box the pen gives one.
+            return QRectF(points.constFirst(), QSizeF(0, 0))
+                .adjusted(-grow, -grow, grow, grow);
+        }
+        return polylineBounds(bezierPolyline(points, closed))
+            .adjusted(-grow, -grow, grow, grow);
     }
     // A wave is not the straight line between its two points: its crests reach
     // `amplitude` off that line, so its box has to come from the sampled
@@ -476,12 +605,12 @@ QRectF strokeBounds(AnnotateSurface::Tool tool, const QVector<QPointF> &points, 
 }
 
 // The one place a stroke is turned into ink.  The pen, the rectangle, the
-// arrow, the line, the wave, the text label and the numbered badge are drawn
-// here, whether into the backing image or straight onto the surface as a
-// preview.
+// arrow, the line, the wave, the bezier pen, the text label and the numbered
+// badge are drawn here, whether into the backing image or straight onto the
+// surface as a preview.
 void paintStrokeInk(QPainter &painter, AnnotateSurface::Tool tool, const QVector<QPointF> &points,
                     const QColor &color, int width, const QString &text,
-                    AnnotateSurface::NumberStyle numberStyle, int number)
+                    AnnotateSurface::NumberStyle numberStyle, int number, bool closed)
 {
     painter.setPen(QPen(color, width, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
     painter.setBrush(Qt::NoBrush);
@@ -530,6 +659,33 @@ void paintStrokeInk(QPainter &painter, AnnotateSurface::Tool tool, const QVector
             } else if (wave.size() == 1) {
                 painter.drawPoint(wave.constFirst());
             }
+        }
+        break;
+    case AnnotateSurface::Tool::Bezier:
+        if (points.isEmpty()) {
+            break;
+        }
+        if (bezierAnchors(points) < 2) {
+            // A click that was never dragged past its own anchor is a dot, the
+            // same ink the pen gives one.
+            painter.drawPoint(points.constFirst());
+            break;
+        }
+        {
+            const QPainterPath path = bezierPath(points, closed);
+            if (closed) {
+                // Fill first and stroke second, the order the Rust renderer
+                // bakes in.  The fill is the stroke's own colour at half its
+                // alpha, floored: that is what "a translucent fill under a solid
+                // outline" means for a colour the user picked an opacity for.
+                QColor fill = color;
+                fill.setAlpha(color.alpha() / 2);
+                painter.fillPath(path, fill);
+                painter.strokePath(path, QPen(color, width, Qt::SolidLine, Qt::RoundCap,
+                                              Qt::RoundJoin));
+                break;
+            }
+            painter.drawPath(path);
         }
         break;
     case AnnotateSurface::Tool::Text:
@@ -958,6 +1114,7 @@ public:
         addTool(layout, uiTr("Arrow"), AnnotateSurface::Tool::Arrow);
         addTool(layout, uiTr("Line"), AnnotateSurface::Tool::Line);
         addTool(layout, uiTr("Wave"), AnnotateSurface::Tool::Wave);
+        addTool(layout, uiTr("Bezier"), AnnotateSurface::Tool::Bezier);
         addTool(layout, uiTr("Text"), AnnotateSurface::Tool::Text);
         addNumberTool(layout);
 
@@ -1466,6 +1623,16 @@ void AnnotateSurface::setTool(Tool tool)
     if (tool_ == tool) {
         return;
     }
+    if (drawing_ && pending_.tool == Tool::Bezier && tool != Tool::Bezier) {
+        // An unfinished pen path goes with the tool: it is one gesture rather
+        // than a drawing that outlives a tool change, and leaving it in
+        // `pending_` would have the next press extend a path nobody is looking
+        // at any more.
+        const QRect dirty = previewRect();
+        drawing_ = false;
+        pending_ = Stroke();
+        touch(dirty);
+    }
     tool_ = tool;
     if (toolbar_ != nullptr) {
         toolbar_->syncState();
@@ -1514,6 +1681,15 @@ int AnnotateSurface::strokeNumber(int index) const
     }
     const Stroke &stroke = strokes_.at(index);
     return stroke.tool == Tool::Number ? stroke.number : 0;
+}
+
+int AnnotateSurface::strokeAnchorCount(int index) const
+{
+    if (index < 0 || index >= strokes_.size()) {
+        return 0;
+    }
+    const Stroke &stroke = strokes_.at(index);
+    return stroke.tool == Tool::Bezier ? bezierAnchors(stroke.points) : 0;
 }
 
 bool AnnotateSurface::isEmpty() const
@@ -1565,7 +1741,7 @@ double AnnotateSurface::deviceRatio() const
 void AnnotateSurface::paintStroke(QPainter &painter, const Stroke &stroke) const
 {
     paintStrokeInk(painter, stroke.tool, stroke.points, stroke.color, stroke.width, stroke.text,
-                   stroke.numberStyle, stroke.number);
+                   stroke.numberStyle, stroke.number, stroke.closed);
 }
 
 const AnnotateSurface::StrokeRaster *AnnotateSurface::rasterFor(Stroke &stroke)
@@ -1573,7 +1749,8 @@ const AnnotateSurface::StrokeRaster *AnnotateSurface::rasterFor(Stroke &stroke)
     if (stroke.tool == Tool::Eraser) {
         return nullptr;
     }
-    const QRectF bounds = strokeBounds(stroke.tool, stroke.points, stroke.width, stroke.text);
+    const QRectF bounds =
+        strokeBounds(stroke.tool, stroke.points, stroke.width, stroke.text, stroke.closed);
     if (bounds.isNull()) {
         return nullptr;
     }
@@ -1610,7 +1787,7 @@ const AnnotateSurface::StrokeRaster *AnnotateSurface::rasterFor(Stroke &stroke)
 QRect AnnotateSurface::deviceDirtyRect(const Stroke &stroke) const
 {
     const QRectF box =
-        strokeBounds(stroke.tool, stroke.points, stroke.width, stroke.text);
+        strokeBounds(stroke.tool, stroke.points, stroke.width, stroke.text, stroke.closed);
     if (box.isNull()) {
         return QRect();
     }
@@ -1674,6 +1851,26 @@ bool AnnotateSurface::strokeHits(const Stroke &stroke, const QPointF &local) con
         }
         return nearest <= kEraserRadius;
     }
+    if (stroke.tool == Tool::Bezier) {
+        // A closed path is a solid mark: its fill reaches the inside, so an
+        // eraser landing there has to take it, exactly as it does for a badge.
+        if (stroke.closed && bezierAnchors(stroke.points) >= 2 &&
+            bezierPath(stroke.points, true).contains(local)) {
+            return true;
+        }
+        // Otherwise the ink is the sampled curve, not the anchors: an eraser
+        // landing on a bulge the handles pulled out has to take the stroke.
+        const QVector<QPointF> curve = bezierPolyline(stroke.points, stroke.closed);
+        double nearest = std::numeric_limits<double>::infinity();
+        if (curve.size() == 1) {
+            nearest = QLineF(local, curve.constFirst()).length();
+        }
+        for (qsizetype i = 1; i < curve.size(); ++i) {
+            nearest =
+                std::min(nearest, pointSegmentDistance(local, curve.at(i - 1), curve.at(i)));
+        }
+        return nearest <= kEraserRadius;
+    }
     double nearest = std::numeric_limits<double>::infinity();
     if (stroke.points.size() == 1) {
         nearest = QLineF(local, stroke.points.constFirst()).length();
@@ -1712,7 +1909,7 @@ bool AnnotateSurface::eraseStrokeAt(const QPointF &local)
             continue;
         }
         const QRectF box =
-            strokeBounds(stroke.tool, stroke.points, stroke.width, stroke.text);
+            strokeBounds(stroke.tool, stroke.points, stroke.width, stroke.text, stroke.closed);
         const QRect dirty = grownDirtyRect(box);
         pushHistory(dirty);
         // Dropping the stroke out of the list is the whole change: every other
@@ -1774,7 +1971,7 @@ void AnnotateSurface::clear()
     QRect dirty;
     for (const Stroke &stroke : strokes_) {
         dirty = dirty.united(grownDirtyRect(
-            strokeBounds(stroke.tool, stroke.points, stroke.width, stroke.text)));
+            strokeBounds(stroke.tool, stroke.points, stroke.width, stroke.text, stroke.closed)));
     }
     pushHistory(dirty);
     strokes_.clear();
@@ -1897,6 +2094,50 @@ void AnnotateSurface::placeNumber(const QPointF &local)
     }
 }
 
+QRect AnnotateSurface::previewRect() const
+{
+    QRectF box = strokeBounds(pending_.tool, pending_.points, pending_.width, pending_.text,
+                              pending_.closed);
+    if (pending_.tool == Tool::Bezier && pending_.points.size() >= 2) {
+        // The rubber band is drawn from the path's last anchor to the pointer,
+        // so the region a move has to repaint is the path plus that segment.  A
+        // pointer sitting exactly on the anchor leaves a zero-length band, which
+        // is not ink and is skipped -- including it would only inflate the rect.
+        const QLineF band(pending_.points.at(pending_.points.size() - 2), bezierCursor_);
+        if (band.length() > 0.0) {
+            const qreal grow = pending_.width / 2.0 + 1.0;
+            box = box.united(QRectF(band.p1(), band.p2())
+                                 .normalized()
+                                 .adjusted(-grow, -grow, grow, grow));
+        }
+    }
+    return grownDirtyRect(box);
+}
+
+void AnnotateSurface::commitBezier(const QRect &stale)
+{
+    Stroke committed = pending_;
+    pending_ = Stroke();
+    if (committed.points.isEmpty()) {
+        return;
+    }
+    QRect dirty = grownDirtyRect(strokeBounds(committed.tool, committed.points, committed.width,
+                                              committed.text, committed.closed));
+    if (stale.isValid()) {
+        // The preview may have covered a rubber band the committed path does
+        // not: the band has to be painted over, not left behind it.
+        dirty = dirty.united(stale);
+    }
+    pushHistory(dirty);
+    // The ink is built on the next paint by `rasterFor`, like any other
+    // stroke's.
+    strokes_.append(committed);
+    touch(dirty);
+    if (toolbar_ != nullptr) {
+        toolbar_->syncState();
+    }
+}
+
 void AnnotateSurface::paintEvent(QPaintEvent *event)
 {
     QPainter painter(this);
@@ -1930,6 +2171,18 @@ void AnnotateSurface::paintEvent(QPaintEvent *event)
     if (drawing_) {
         painter.setRenderHint(QPainter::Antialiasing, true);
         paintStroke(painter, pending_);
+        // The pen's path is built from a run of clicks, so between two of them
+        // the preview also shows where the next segment would reach: a rubber
+        // band from the last anchor to the pointer.
+        if (pending_.tool == Tool::Bezier && pending_.points.size() >= 2) {
+            const QLineF band(pending_.points.at(pending_.points.size() - 2), bezierCursor_);
+            if (band.length() > 0.0) {
+                painter.setPen(QPen(pending_.color, pending_.width, Qt::SolidLine, Qt::RoundCap,
+                                    Qt::RoundJoin));
+                painter.setBrush(Qt::NoBrush);
+                painter.drawLine(band);
+            }
+        }
     }
 }
 
@@ -1971,6 +2224,43 @@ void AnnotateSurface::mousePressEvent(QMouseEvent *event)
         pending_.points = {local, local};
         drawing_ = true;
         break;
+    case Tool::Bezier: {
+        // The pen is the one tool whose gesture is not a single drag: every
+        // press adds an anchor, and the drag that follows bends the segment
+        // arriving at it.
+        const QRect stale = drawing_ ? previewRect() : QRect();
+        const double reach = std::max(8.0, width_ * 2.0);
+        if (drawing_ && pending_.tool == Tool::Bezier && bezierAnchors(pending_.points) >= 2 &&
+            QLineF(pending_.points.constFirst(), local).length() <= reach) {
+            // A press back onto the first anchor closes the path.  It is
+            // committed here rather than on a release: the click is the whole
+            // closing gesture, and waiting for the button to come up would leave
+            // the filled shape hanging on a press the user already made.
+            pending_.closed = true;
+            drawing_ = false;
+            commitBezier(stale);
+            break;
+        }
+        if (!drawing_) {
+            pending_ = Stroke();
+            pending_.tool = Tool::Bezier;
+            pending_.color = color_;
+            pending_.width = width_;
+            drawing_ = true;
+        }
+        // The anchor, and its outgoing handle starting on top of it: the drag
+        // that follows pulls the handle out, and the incoming side is its
+        // mirror, so the handle is symmetric by construction.
+        pending_.points.append(local);
+        pending_.points.append(local);
+        bezierCursor_ = local;
+        QRect dirty = previewRect();
+        if (stale.isValid()) {
+            dirty = dirty.united(stale);
+        }
+        touch(dirty);
+        break;
+    }
     case Tool::Text:
         beginText(local);
         break;
@@ -2007,6 +2297,20 @@ void AnnotateSurface::mouseMoveEvent(QMouseEvent *event)
         return;
     }
     if (!drawing_ || !(event->buttons() & Qt::LeftButton)) {
+        // The pen's rubber band follows the pointer with the button up: the
+        // path is built from a run of clicks, so the preview has to track the
+        // pointer between them or the user cannot see where the next anchor
+        // would land.
+        if (drawing_ && pending_.tool == Tool::Bezier) {
+            const QRect before = previewRect();
+            bezierCursor_ = local;
+            const QRect after = previewRect();
+            if (after != before) {
+                touch(before);
+                touch(after);
+            }
+            return;
+        }
         QWidget::mouseMoveEvent(event);
         return;
     }
@@ -2018,6 +2322,24 @@ void AnnotateSurface::mouseMoveEvent(QMouseEvent *event)
         touch(grownDirtyRect(
             normalizedRect(from, local)
                 .adjusted(-pending_.width, -pending_.width, pending_.width, pending_.width)));
+    } else if (tool_ == Tool::Bezier) {
+        // The drag pulls the outgoing handle of the anchor just placed.  The
+        // incoming side is its mirror, so the handle is symmetric by
+        // construction and only one of the two is ever stored.  The pointer is
+        // the rubber band's target too: while the handle is being pulled out the
+        // band *is* the handle line, which is what shows the user the bend they
+        // are making.
+        const QRect before = previewRect();
+        if (pending_.points.size() >= 2) {
+            pending_.points.last() = local;
+        }
+        bezierCursor_ = local;
+        const QRect after = previewRect();
+        if (after != before) {
+            // Repaint what the path left before drawing the new preview.
+            touch(before);
+            touch(after);
+        }
     } else if (tool_ == Tool::Rect || tool_ == Tool::Arrow || tool_ == Tool::Line ||
                tool_ == Tool::Wave) {
         const QRect before = grownDirtyRect(
@@ -2049,6 +2371,14 @@ void AnnotateSurface::mouseReleaseEvent(QMouseEvent *event)
         QWidget::mouseReleaseEvent(event);
         return;
     }
+    if (pending_.tool == Tool::Bezier) {
+        // A release only ends the handle drag that followed the last press.  The
+        // path itself is not finished until it is closed or double-clicked, so
+        // nothing is committed and `drawing_` stays set: the preview is still
+        // what the user is looking at.
+        QWidget::mouseReleaseEvent(event);
+        return;
+    }
     drawing_ = false;
     QRect stalePreview;
     if (tool_ == Tool::Rect || tool_ == Tool::Arrow || tool_ == Tool::Line ||
@@ -2067,7 +2397,8 @@ void AnnotateSurface::mouseReleaseEvent(QMouseEvent *event)
         const Stroke committed = pending_;
         pending_ = Stroke();
         QRect dirty = grownDirtyRect(strokeBounds(committed.tool, committed.points,
-                                                  committed.width, committed.text));
+                                                  committed.width, committed.text,
+                                                  committed.closed));
         if (stalePreview.isValid()) {
             dirty = dirty.united(stalePreview);
         }
@@ -2082,6 +2413,26 @@ void AnnotateSurface::mouseReleaseEvent(QMouseEvent *event)
         return;
     }
     pending_ = Stroke();
+}
+
+void AnnotateSurface::mouseDoubleClickEvent(QMouseEvent *event)
+{
+    if (event->button() != Qt::LeftButton) {
+        QWidget::mouseDoubleClickEvent(event);
+        return;
+    }
+    if (drawing_ && pending_.tool == Tool::Bezier) {
+        // A double click ends the path where it stands, open.  Qt delivers the
+        // second click of the pair as this event rather than as a press, so the
+        // anchor it would have placed is the one the first click already did --
+        // the path is not left with a duplicate point on its end.
+        const QRect stale = previewRect();
+        drawing_ = false;
+        commitBezier(stale);
+        event->accept();
+        return;
+    }
+    QWidget::mouseDoubleClickEvent(event);
 }
 
 void AnnotateSurface::resizeEvent(QResizeEvent *event)
@@ -2104,9 +2455,10 @@ void AnnotateSurface::keyPressEvent(QKeyEvent *event)
         }
         if (drawing_) {
             // Drop the in-progress stroke.  It lives only in `pending_`, which
-            // the preview paints, so repainting its rect is the whole undo.
-            const QRect dirty = grownDirtyRect(
-                strokeBounds(pending_.tool, pending_.points, pending_.width, pending_.text));
+            // the preview paints, so repainting its rect is the whole undo.  For
+            // the pen that rect is the path plus the rubber band, which is what
+            // `previewRect` gives.
+            const QRect dirty = previewRect();
             drawing_ = false;
             pending_ = Stroke();
             touch(dirty);

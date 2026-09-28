@@ -81,6 +81,11 @@ struct Annotation {
     QVector<Point> points;
     Point origin;
     QString text;
+    // Whether a bezier path was closed back onto its first anchor (`tool ==
+    // "bezier"` only).  A closed path is filled as well as stroked, so this is
+    // content rather than decoration: it changes the pixels and travels to the
+    // renderer as its own field.
+    bool closed = false;
     // Font height in logical pixels, exactly as the size box shows it.  The
     // legacy integer `scale` the JSON protocol carries is derived from this
     // only when the result is written out (`textPixelsToScale`).
@@ -142,7 +147,11 @@ inline bool annotationEquals(const Annotation &first, const Annotation &second)
         // A numbered badge's count and style are content, not decoration: leave
         // either out and two badges that differ only in their number compare
         // equal, which silently collapses an undo step.
-        first.numberStyle != second.numberStyle || first.number != second.number) {
+        first.numberStyle != second.numberStyle || first.number != second.number ||
+        // Likewise for a bezier path's closure: an open curve and the closed
+        // one that fills it are different marks, and leaving this out would let
+        // an undo step that only closes a path look like no change at all.
+        first.closed != second.closed) {
         return false;
     }
     if (first.rect.x != second.rect.x || first.rect.y != second.rect.y ||
@@ -172,6 +181,12 @@ enum class Tool {
     // wanders.
     Line,
     Wave,
+    // The pen: clicks lay down anchors and the drag after each one pulls its
+    // outgoing handle out, so every segment is a cubic and the handle is
+    // symmetric by construction.  It is the one tool here whose gesture is not
+    // a single drag -- a path spans as many presses as it has anchors, and ends
+    // either closed back onto its first anchor or double-clicked open.
+    Bezier,
     Pen,
     Text,
     // A numbered badge: one click places one badge and the count advances.  It
@@ -445,6 +460,17 @@ private:
     void beginDrawing(Point point);
     void updateDrawing(Point point);
     void finishDrawing(Point point);
+    // The pen path: a press adds an anchor, the drag after it bends the segment
+    // arriving at that anchor, and the path is only finished by closing it or
+    // double-clicking.  It therefore outlives the release that ends a normal
+    // drag, which is why it has its own three steps rather than reusing
+    // `beginDrawing`/`finishDrawing`.
+    void beginBezier(Point point);
+    // Extends the path in progress: `dragging` pulls the last anchor's outgoing
+    // handle to `point`, otherwise `point` is only where the rubber band reaches.
+    void updateBezier(Point point, bool dragging);
+    // Commits the path in progress, closed or open.
+    void finishBezier(bool closed);
     void beginText(CaptureOverlay *overlay, Point point);
     // Places one numbered badge at `point` and advances the count.  The whole
     // tool is a press: there is no drag to preview.
@@ -484,6 +510,12 @@ private:
     LogicalRect selectionTouch() const;
     LogicalRect annotationTouch() const;
     LogicalRect drawingTouch(int pointsBefore) const;
+    // The rects a step of the pen path can have changed, in session coordinates:
+    // the path so far plus the rubber band from its last anchor to the pointer.
+    LogicalRect bezierTouch() const;
+    // The mark the pen path in progress would commit, as it stands.  The
+    // preview and its bounds both read the shape from here.
+    Annotation previewAnnotation() const;
     // The magnifier the editor draws around the pointer while a gesture drags
     // something, in session coordinates.
     LogicalRect pointerTouch() const;

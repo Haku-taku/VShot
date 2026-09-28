@@ -94,6 +94,25 @@ constexpr int kNumberDiameter = 36; // clamp(6 * 6, 18, 96)
 constexpr int kNumberX = 400;
 constexpr int kNumberY = 300;
 
+// The pen tool's own numbers, spelled out here rather than imported from the
+// surface, the way the ink colour and the wave's amplitude are.  The path is
+// three anchors whose handles run along the edges of the triangle they make, so
+// the closed shape is that triangle with every side bowed outward and the fill
+// covers a large, plainly-inside middle.
+//
+// kBezierAlpha is the pen opacity the checks set; the fill is the stroke's
+// colour at half that alpha, floored -- the surface's own rule, spelled out here
+// so a change to it cannot pass by moving both sides of the assertion.
+constexpr int kBezierAlpha = 200;
+constexpr int kBezierFillAlpha = kBezierAlpha / 2;
+const QPoint kBezierAnchors[] = {QPoint(250, 200), QPoint(600, 200), QPoint(425, 420)};
+const QPoint kBezierHandles[] = {QPoint(355, 200), QPoint(548, 266), QPoint(373, 354)};
+constexpr int kBezierAnchorsCount = 3;
+// A point deep inside the triangle the anchors make, far from every edge and
+// every corner: where the closed path's fill is read, and where an open path has
+// to leave the canvas alone.
+const QPoint kBezierInside(425, 273);
+
 // Distance from a point to the segment `a`..`b`.
 double distanceToSegment(const QPointF &p, const QPointF &a, const QPointF &b)
 {
@@ -195,6 +214,144 @@ int strayInk(const QImage &image, const QRect &area, const QRect &bounds,
     return stray;
 }
 
+// Whether the pixel at a logical point carries the pen's colour at any alpha.
+// The pen's ink is translucent -- the fill is the stroke's colour at half its
+// alpha -- so the opaque-ink test the other tools use would count nothing at all
+// and every assertion built on it would pass for free.
+bool hasPenInk(const QImage &image, const QPoint &logical)
+{
+    const QColor got = image.pixelColor(logical);
+    return got.alpha() > 0 && std::abs(got.red() - kInkR) <= 8 &&
+        std::abs(got.green() - kInkG) <= 8 && std::abs(got.blue() - kInkB) <= 8;
+}
+
+// Whether a logical point lies outside `bounds`, skipping the rects the
+// toolbar's children cover: the palette's own swatch is the very colour the pen
+// draws in, so a whole-image scan that ignored it would read it as stray ink.
+bool outsideChildren(const QPoint &at, const QVector<QRect> &children)
+{
+    for (const QRect &child : children) {
+        if (child.contains(at)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The box of every pixel carrying the pen's colour, or a null rect when there is
+// none.  Read back from the render rather than asked of the surface, so the
+// assertion is about the ink on screen and not about the rects the surface says
+// it used.
+QRect paintedPenInkBox(const QImage &image, const QVector<QRect> &children)
+{
+    QRect box;
+    for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+            const QPoint at(x, y);
+            if (!hasPenInk(image, at) || !outsideChildren(at, children)) {
+                continue;
+            }
+            const QRect pixel(at, QSize(1, 1));
+            box = box.isNull() ? pixel : box.united(pixel);
+        }
+    }
+    return box;
+}
+
+// Pen ink outside `bounds`.  A scan bounded to the curve's own box would miss
+// the very pixels a box that collapsed to a point leaves behind, so this one
+// walks the whole render.
+int strayPenInk(const QImage &image, const QRectF &bounds, const QVector<QRect> &children)
+{
+    int stray = 0;
+    for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+            const QPoint at(x, y);
+            if (bounds.contains(QPointF(x, y)) || !hasPenInk(image, at) ||
+                !outsideChildren(at, children)) {
+                continue;
+            }
+            ++stray;
+        }
+    }
+    return stray;
+}
+
+// The point at parameter `t` on the cubic through the four control points, in
+// the check's own arithmetic: the curve the pen is meant to draw, spelled out
+// here rather than read back from the surface.
+QPointF cubicAt(const QPointF &p0, const QPointF &p1, const QPointF &p2, const QPointF &p3,
+                double t)
+{
+    const double u = 1.0 - t;
+    return QPointF(u * u * u * p0.x() + 3 * u * u * t * p1.x() + 3 * u * t * t * p2.x() +
+                       t * t * t * p3.x(),
+                   u * u * u * p0.y() + 3 * u * u * t * p1.y() + 3 * u * t * t * p2.y() +
+                       t * t * t * p3.y());
+}
+
+// The pen path as a polyline, from its anchors and their outgoing handles.  The
+// incoming handle of an anchor is its outgoing one mirrored through it -- the
+// symmetric handle the model stores and the wire format carries -- so the curve
+// is fixed by the anchors and the handles alone.
+QVector<QPointF> penCurve(const QVector<QPointF> &anchors, const QVector<QPointF> &handles,
+                          bool closed)
+{
+    QVector<QPointF> curve;
+    curve.append(anchors.constFirst());
+    const int count = anchors.size();
+    const int segments = closed ? count : count - 1;
+    for (int index = 0; index < segments; ++index) {
+        const int next = (index + 1) % count;
+        const QPointF incoming = anchors.at(next) * 2.0 - handles.at(next);
+        for (int step = 1; step <= 24; ++step) {
+            curve.append(cubicAt(anchors.at(index), handles.at(index), incoming, anchors.at(next),
+                                 static_cast<double>(step) / 24.0));
+        }
+    }
+    return curve;
+}
+
+// The tight box of a polyline, folded by hand: `QRectF::united` onto a null rect
+// returns the other operand, so a box seeded from a zero-size rect at the first
+// point would collapse to whatever the last point happened to be -- the very bug
+// these assertions exist to catch.
+QRectF penCurveBox(const QVector<QPointF> &curve)
+{
+    double left = curve.constFirst().x();
+    double right = left;
+    double top = curve.constFirst().y();
+    double bottom = top;
+    for (const QPointF &point : curve) {
+        left = std::min(left, point.x());
+        right = std::max(right, point.x());
+        top = std::min(top, point.y());
+        bottom = std::max(bottom, point.y());
+    }
+    return QRectF(QPointF(left, top), QPointF(right, bottom));
+}
+
+QVector<QPointF> penAnchors()
+{
+    QVector<QPointF> anchors;
+    for (const QPoint &point : kBezierAnchors) {
+        anchors.append(QPointF(point));
+    }
+    return anchors;
+}
+
+// The handle each anchor was dragged out by.  The last one keeps its handle only
+// when the path is closed: a double click places its anchor without a drag, so
+// that handle stays on the anchor.
+QVector<QPointF> penHandles(bool closed)
+{
+    QVector<QPointF> handles;
+    handles.append(QPointF(kBezierHandles[0]));
+    handles.append(QPointF(kBezierHandles[1]));
+    handles.append(closed ? QPointF(kBezierHandles[2]) : QPointF(kBezierAnchors[2]));
+    return handles;
+}
+
 void press(QWidget *surface, const QPoint &local)
 {
     QMouseEvent event(QEvent::MouseButtonPress, QPointF(local),
@@ -208,6 +365,16 @@ void moveTo(QWidget *surface, const QPoint &local)
     QMouseEvent event(QEvent::MouseMove, QPointF(local),
                       QPointF(surface->mapToGlobal(local)), Qt::NoButton,
                       Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(surface, &event);
+}
+
+// A pointer move with nothing held down: the pen's rubber band follows these,
+// and every other tool ignores them.
+void hoverTo(QWidget *surface, const QPoint &local)
+{
+    QMouseEvent event(QEvent::MouseMove, QPointF(local),
+                      QPointF(surface->mapToGlobal(local)), Qt::NoButton, Qt::NoButton,
+                      Qt::NoModifier);
     QApplication::sendEvent(surface, &event);
 }
 
@@ -773,6 +940,175 @@ void checkNumberStyles(QScreen *screen)
                !sameRegion(ring, plain, badge) && !sameRegion(square, plain, badge));
 }
 
+// Draws the pen path the checks below describe.  `closed` ends it by pressing
+// back onto the first anchor, which fills it; otherwise it ends on a double
+// click, whose first click places the last anchor and whose second arrives as a
+// double-click event in place of a press -- which is exactly how Qt delivers the
+// two clicks of a double click.
+void drawPenPath(vshot::AnnotateSurface &surface, bool closed)
+{
+    surface.setTool(vshot::AnnotateSurface::Tool::Bezier);
+    surface.setPenWidth(kLineWidth);
+    surface.setColor(QColor(kInkR, kInkG, kInkB, kBezierAlpha));
+    const int dragged = closed ? kBezierAnchorsCount : kBezierAnchorsCount - 1;
+    for (int index = 0; index < dragged; ++index) {
+        press(&surface, kBezierAnchors[index]);
+        moveTo(&surface, kBezierHandles[index]);
+        release(&surface, kBezierHandles[index]);
+    }
+    if (closed) {
+        press(&surface, kBezierAnchors[0]);
+        release(&surface, kBezierAnchors[0]);
+        return;
+    }
+    const QPoint last = kBezierAnchors[kBezierAnchorsCount - 1];
+    press(&surface, last);
+    release(&surface, last);
+    QMouseEvent again(QEvent::MouseButtonDblClick, QPointF(last),
+                      QPointF(surface.mapToGlobal(last)), Qt::LeftButton, Qt::LeftButton,
+                      Qt::NoModifier);
+    QApplication::sendEvent(&surface, &again);
+    release(&surface, last);
+}
+
+// The pen tool: a run of clicks and handle drags lands one path, a press back
+// onto the first anchor closes it and fills it, and that fill is the stroke's
+// colour at half its alpha.  Every one of those is a pixel claim -- an unfilled
+// path, a fill as solid as the outline it sits under, ink clipped away by a box
+// that collapsed -- and each fails silently if the wiring is wrong.
+void checkBezier(QScreen *screen)
+{
+    vshot::AnnotateSurface surface(screen);
+    resizeSurface(surface, kSurfaceWidth, kSurfaceHeight);
+    const QVector<QRect> children = childAreas(surface);
+
+    drawPenPath(surface, true);
+    expect("three anchors and their handle drags land as one pen path",
+           surface.strokeCount() == 1,
+           QStringLiteral("strokeCount=%1").arg(surface.strokeCount()));
+    expect("the pen path carries the three anchors that were clicked",
+           surface.strokeAnchorCount(0) == kBezierAnchorsCount,
+           QStringLiteral("anchors=%1").arg(surface.strokeAnchorCount(0)));
+
+    const QImage image = renderSurface(surface);
+    // A cubic interpolates its own endpoints, so the anchors are on the curve by
+    // construction and each one carries the outline's ink.
+    expect("a closed pen path paints through every anchor",
+           hasPenInk(image, kBezierAnchors[0]) && hasPenInk(image, kBezierAnchors[1]) &&
+               hasPenInk(image, kBezierAnchors[2]));
+
+    // The fill: the stroke's colour at half its alpha, and the outline over it
+    // more solid than the fill alone.
+    const int fillAlpha = image.pixelColor(kBezierInside).alpha();
+    expect("a closed pen path fills its inside", fillAlpha > 0,
+           QStringLiteral("alpha=%1").arg(fillAlpha));
+    expect("the fill is the stroke's colour at half its alpha",
+           std::abs(fillAlpha - kBezierFillAlpha) <= 2,
+           QStringLiteral("alpha=%1, wanted %2").arg(fillAlpha).arg(kBezierFillAlpha));
+    const int outlineAlpha = image.pixelColor(kBezierAnchors[0]).alpha();
+    expect("the outline is more solid than the fill it encloses",
+           outlineAlpha >= kBezierAlpha && outlineAlpha > fillAlpha,
+           QStringLiteral("outline=%1 fill=%2").arg(outlineAlpha).arg(fillAlpha));
+
+    // The box the ink occupies.  The curve is spelled out here rather than read
+    // back from the surface, and every side of the painted box has to sit on the
+    // corresponding side of it grown by half the pen width: ink clipped away by
+    // a box that collapsed -- the bug the wave's `QRectF::united` hit -- comes
+    // up short on the side it was clipped from, and ink drawn anywhere else
+    // comes up long.
+    const QVector<QPointF> closedCurve = penCurve(penAnchors(), penHandles(true), true);
+    const QRectF closedBox = penCurveBox(closedCurve);
+    const int stray = strayPenInk(image,
+                                  closedBox.adjusted(-kHalfWidth - 2, -kHalfWidth - 2,
+                                                     kHalfWidth + 2, kHalfWidth + 2),
+                                  children);
+    expect("a closed pen path paints nothing outside its own bounds", stray == 0,
+           QStringLiteral("%1 px outside").arg(stray));
+
+    const QRect painted = paintedPenInkBox(image, children);
+    expect("the closed pen path's ink reaches every side of its own box",
+           !painted.isNull() &&
+               std::abs(painted.left() - (closedBox.left() - kHalfWidth)) <= 2 &&
+               std::abs(painted.top() - (closedBox.top() - kHalfWidth)) <= 2 &&
+               std::abs(painted.right() - (closedBox.right() + kHalfWidth)) <= 2 &&
+               std::abs(painted.bottom() - (closedBox.bottom() + kHalfWidth)) <= 2,
+           QStringLiteral("ink %1,%2..%3,%4 vs curve %5,%6..%7,%8")
+               .arg(painted.left())
+               .arg(painted.top())
+               .arg(painted.right())
+               .arg(painted.bottom())
+               .arg(closedBox.left())
+               .arg(closedBox.top())
+               .arg(closedBox.right())
+               .arg(closedBox.bottom()));
+
+    // The same three anchors, ended open on a double click instead.  Nothing is
+    // filled, so the middle the closed path painted is bare canvas -- and the
+    // curve itself is still there, which is what keeps this from passing on an
+    // empty canvas.
+    vshot::AnnotateSurface open(screen);
+    resizeSurface(open, kSurfaceWidth, kSurfaceHeight);
+    const QVector<QRect> openChildren = childAreas(open);
+    drawPenPath(open, false);
+    expect("a double click ends the pen path as one stroke", open.strokeCount() == 1,
+           QStringLiteral("strokeCount=%1").arg(open.strokeCount()));
+    expect("the open pen path carries the three anchors that were clicked",
+           open.strokeAnchorCount(0) == kBezierAnchorsCount,
+           QStringLiteral("anchors=%1").arg(open.strokeAnchorCount(0)));
+
+    const QImage openImage = renderSurface(open);
+    expect("an open pen path leaves its inside clear", isClear(openImage, kBezierInside),
+           QStringLiteral("alpha=%1").arg(openImage.pixelColor(kBezierInside).alpha()));
+    expect("an open pen path still strokes through its anchors",
+           hasPenInk(openImage, kBezierAnchors[0]) && hasPenInk(openImage, kBezierAnchors[1]) &&
+               hasPenInk(openImage, kBezierAnchors[2]));
+
+    const QVector<QPointF> openCurve = penCurve(penAnchors(), penHandles(false), false);
+    const QRectF openBox = penCurveBox(openCurve);
+    const int openStray =
+        strayPenInk(openImage,
+                    openBox.adjusted(-kHalfWidth - 2, -kHalfWidth - 2, kHalfWidth + 2,
+                                     kHalfWidth + 2),
+                    openChildren);
+    expect("an open pen path paints nothing outside its own bounds", openStray == 0,
+           QStringLiteral("%1 px outside").arg(openStray));
+    const QRect openPainted = paintedPenInkBox(openImage, openChildren);
+    expect("the open pen path's ink reaches every side of its own box",
+           !openPainted.isNull() &&
+               std::abs(openPainted.left() - (openBox.left() - kHalfWidth)) <= 2 &&
+               std::abs(openPainted.top() - (openBox.top() - kHalfWidth)) <= 2 &&
+               std::abs(openPainted.right() - (openBox.right() + kHalfWidth)) <= 2 &&
+               std::abs(openPainted.bottom() - (openBox.bottom() + kHalfWidth)) <= 2,
+           QStringLiteral("ink %1,%2..%3,%4 vs curve %5,%6..%7,%8")
+               .arg(openPainted.left())
+               .arg(openPainted.top())
+               .arg(openPainted.right())
+               .arg(openPainted.bottom())
+               .arg(openBox.left())
+               .arg(openBox.top())
+               .arg(openBox.right())
+               .arg(openBox.bottom()));
+
+    // Escape drops the whole unfinished path: it lives only in the preview, so
+    // nothing is committed and the canvas goes back to bare.
+    vshot::AnnotateSurface dropped(screen);
+    resizeSurface(dropped, kSurfaceWidth, kSurfaceHeight);
+    dropped.setTool(vshot::AnnotateSurface::Tool::Bezier);
+    dropped.setPenWidth(kLineWidth);
+    press(&dropped, kBezierAnchors[0]);
+    moveTo(&dropped, kBezierHandles[0]);
+    release(&dropped, kBezierHandles[0]);
+    press(&dropped, kBezierAnchors[1]);
+    moveTo(&dropped, kBezierHandles[1]);
+    release(&dropped, kBezierHandles[1]);
+    QKeyEvent escape(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
+    QApplication::sendEvent(&dropped, &escape);
+    expect("Escape commits no pen path", dropped.strokeCount() == 0,
+           QStringLiteral("strokeCount=%1").arg(dropped.strokeCount()));
+    expect("Escape takes the unfinished pen path off the canvas",
+           !hasPenInk(renderSurface(dropped), kBezierAnchors[0]));
+}
+
 // The repaint region of every interactive step has to cover the pixels the step
 // changed: a pixel it changed outside that region is one the surface would have
 // left stale until something else repainted it.
@@ -833,6 +1169,33 @@ void checkStepCoverage(QScreen *screen)
         expectStepCovered(surface, "Escape repaints the in-progress stroke it drops", [&] {
             QKeyEvent escape(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
             QApplication::sendEvent(&surface, &escape);
+        });
+    }
+
+    // The pen path: every step of the run of clicks and handle drags, and the
+    // press that closes it, has to repaint what it changed.  The rubber band is
+    // the one step here that no other tool has: a pointer move with nothing held
+    // down still changes what is on screen.
+    {
+        vshot::AnnotateSurface surface(screen);
+        surface.setGeometry(0, 0, kSurfaceWidth, kSurfaceHeight);
+        surface.setTool(vshot::AnnotateSurface::Tool::Bezier);
+        surface.setPenWidth(kLineWidth);
+        expectStepCovered(surface, "a pen press repaints the anchor it lays down",
+                          [&] { press(&surface, kBezierAnchors[0]); });
+        expectStepCovered(surface, "a pen handle drag repaints the bend it pulled out",
+                          [&] { moveTo(&surface, kBezierHandles[0]); });
+        expectStepCovered(surface, "a pen release repaints nothing it did not draw",
+                          [&] { release(&surface, kBezierHandles[0]); });
+        expectStepCovered(surface, "a pen rubber band repaints where the pointer reaches",
+                          [&] { hoverTo(&surface, QPoint(700, 260)); });
+        expectStepCovered(surface, "the next pen anchor repaints the dot it adds",
+                          [&] { press(&surface, kBezierAnchors[1]); });
+        expectStepCovered(surface, "a second pen handle drag repaints the bend it pulled out",
+                          [&] { moveTo(&surface, kBezierHandles[1]); });
+        expectStepCovered(surface, "closing a pen path repaints the fill it lands", [&] {
+            press(&surface, kBezierAnchors[0]);
+            release(&surface, kBezierAnchors[0]);
         });
     }
 }
@@ -900,6 +1263,7 @@ int main(int argc, char **argv)
     checkToolbar(surface);
     checkToolbarWrapping(screen);
     checkLineAndWave(screen);
+    checkBezier(screen);
     checkNumberCounts(screen);
     checkNumberStyles(screen);
 
