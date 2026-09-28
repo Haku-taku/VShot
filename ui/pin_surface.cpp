@@ -138,6 +138,40 @@ QRect labelBox(const QFontMetrics &metrics, const QString &text)
     return metrics.boundingRect(text).adjusted(-pad, -pad / 2, pad, pad / 2);
 }
 
+// The font every corner tag is drawn with -- the `HDR` marker and the badge
+// that reports a zoom or a copy.  Fixed, so a tag does not grow with the image
+// it is drawn over.
+QFont tagFont()
+{
+    QFont font;
+    font.setPixelSize(kLabelPixelSize);
+    font.setBold(true);
+    return font;
+}
+
+// The marker's text: the pin under the pointer is one whose light comes from a
+// shape of its own.
+const QString kHdrTag = QStringLiteral("HDR");
+
+// Where a tag of `text` lands when it is anchored at `corner`: just inside the
+// pin's top-left for the marker, just inside its bottom-right for the badge.
+// One definition, because the painter and the repaint region both ask it -- on
+// a pin too small to hold the tag, the tag reaches past the pin, and a repaint
+// region computed without it leaves the tag's outer pixels at the old
+// position every time the pin is zoomed or dragged.
+QRect tagBox(const QString &text, const QPoint &corner, bool atBottomRight, const QRect &bounds)
+{
+    const QFontMetrics metrics(tagFont());
+    const int pad = metrics.height() / 3;
+    QRect box = labelBox(metrics, text);
+    if (atBottomRight) {
+        box.moveBottomRight(corner - QPoint(pad, pad));
+    } else {
+        box.moveTopLeft(corner + QPoint(pad, pad));
+    }
+    return box.intersected(bounds.adjusted(0, 0, -1, -1));
+}
+
 // Wayland has no "no input here" request: an unset input region means the
 // whole surface is interactive, and Qt sends no request at all for an empty
 // mask, which is exactly that default. A region parked outside the surface is
@@ -339,6 +373,18 @@ void PinSurface::setPins(const QVector<Item> &pins)
             dirty |= dirtyRect(localRect(entry.item));
         }
     }
+    // The corner tags are drawn above every pin and are anchored to one pin's
+    // own corner, so on a pin smaller than a tag the tag reaches past the pin --
+    // outside the rect the loops above cover.  Both the stack on its way out and
+    // the one arriving are asked, because a zoom or a drag carries the tag with
+    // its pin; a region computed from the pins alone would leave the tag's outer
+    // pixels at the old position.
+    for (const Entry &entry : entries_) {
+        dirty |= tagBoxes(entry.item.id, localRect(entry.item));
+    }
+    for (const Entry &entry : next) {
+        dirty |= tagBoxes(entry.item.id, localRect(entry.item));
+    }
 
     entries_ = next;
     // A pin that is gone can be neither picked, dragged nor announced.
@@ -361,6 +407,7 @@ void PinSurface::setPins(const QVector<Item> &pins)
         closeMenu();
     }
     applyMask();
+    repaintRegion_ = dirty;
     if (surfaceReady_ && !dirty.isNull()) {
         update(dirty);
     }
@@ -489,6 +536,22 @@ QRect PinSurface::dirtyRect(const QRect &pin) const
     return expandOutline(pin, bleed());
 }
 
+QRect PinSurface::tagBoxes(quint64 id, const QRect &target) const
+{
+    const QRect visible = target.intersected(rect());
+    if (visible.isEmpty()) {
+        return QRect();
+    }
+    QRect boxes;
+    if (id == hoverId_) {
+        boxes |= tagBox(kHdrTag, visible.topLeft(), false, rect());
+    }
+    if (id == badgeId_ && !badgeText_.isEmpty()) {
+        boxes |= tagBox(badgeText_, visible.bottomRight(), true, rect());
+    }
+    return boxes;
+}
+
 bool PinSurface::event(QEvent *event)
 {
     // The window's activation is a separate fact from the widget's focus, and
@@ -567,19 +630,16 @@ void PinSurface::moveHoverTo(quint64 id)
         update(was.adjusted(-1, -1, 1, 1));
     }
     if (const Entry *entry = entryFor(id)) {
-        update(localRect(entry->item));
+        // Only the tag is about to appear: the tag belongs to the pin, and the
+        // pin itself has already been painted.  The box can reach past a small
+        // pin, which the pin's own rect would not have covered.
+        update(tagBoxes(id, localRect(entry->item)));
     }
 }
 
 void PinSurface::paintHdrMarker(QPainter &painter, const QRect &target, bool shownAsHdr)
 {
-    QFont font = painter.font();
-    font.setPixelSize(kLabelPixelSize);
-    font.setBold(true);
-    const QFontMetrics metrics(font);
-    const QString text = QStringLiteral("HDR");
-    const int pad = metrics.height() / 3;
-    QRect box = labelBox(metrics, text);
+    QFont font = tagFont();
     // Anchored inside the part of the pin this output actually shows: a pin
     // hanging off the edge of the screen keeps its tag in the frame instead of
     // pushing it out with the corner it is anchored to.
@@ -587,8 +647,7 @@ void PinSurface::paintHdrMarker(QPainter &painter, const QRect &target, bool sho
     if (visible.isEmpty()) {
         return;
     }
-    box.moveTopLeft(visible.topLeft() + QPoint(pad, pad));
-    box = box.intersected(rect().adjusted(0, 0, -1, -1));
+    const QRect box = tagBox(kHdrTag, visible.topLeft(), false, rect());
     if (box.width() <= 0 || box.height() <= 0) {
         return;
     }
@@ -609,7 +668,7 @@ void PinSurface::paintHdrMarker(QPainter &painter, const QRect &target, bool sho
     painter.drawRoundedRect(QRectF(box).adjusted(0.5, 0.5, -0.5, -0.5), kLabelRadius,
                             kLabelRadius);
     painter.setPen(ink);
-    painter.drawText(box, Qt::AlignCenter, text);
+    painter.drawText(box, Qt::AlignCenter, kHdrTag);
     painter.restore();
     hoverMarker_ = box;
 }
@@ -845,18 +904,11 @@ void PinSurface::paintEvent(QPaintEvent *event)
     // Transient badge pinned to the image's bottom-right corner that is still
     // on this output. The font size is fixed: the badge reports what just
     // happened to the pin, it must not grow with the image itself.
-    QFont font = painter.font();
-    font.setPixelSize(kLabelPixelSize);
-    font.setBold(true);
+    QFont font = tagFont();
     painter.setFont(font);
-    const QFontMetrics metrics(font);
     const QString text = badgeText_;
-    const int pad = metrics.height() / 3;
-    QRect badgeBox = labelBox(metrics, text);
     const QRect corner = localRect(badge->item).intersected(rect());
-    badgeBox.moveBottomRight(corner.bottomRight() - QPoint(pad, pad));
-    // A pin may hang partially off-screen; keep the badge readable.
-    badgeBox = badgeBox.intersected(rect().adjusted(0, 0, -1, -1));
+    const QRect badgeBox = tagBox(text, corner.bottomRight(), true, rect());
     if (badgeBox.width() <= 0 || badgeBox.height() <= 0) {
         return;
     }
@@ -888,9 +940,10 @@ void PinSurface::showBadge(quint64 id, const QString &text)
     badgeText_ = text;
     badgeId_ = id;
     zoomTimer_->start(kBadgeMs);
-    // The badge is painted inside the pin's rect, so repainting that rect is
-    // what puts it up and what takes the previous one down.
-    update(localRect(entry->item));
+    // The badge is painted inside the pin's rect and just outside its corner on
+    // a pin too small to hold it, so both are asked for.
+    const QRect target = localRect(entry->item);
+    update(dirtyRect(target) | tagBoxes(id, target));
 }
 
 void PinSurface::showMessage(quint64 id, const QString &text)

@@ -184,6 +184,11 @@ public:
     // save runs in a helper process, so its outcome is known long after the
     // menu that started it has closed.
     void showMessage(quint64 id, const QString &text);
+    // The region the last setPins() asked Qt to repaint, in this surface's own
+    // coordinates.  The offline check has no compositor to deliver the update,
+    // so this is what it compares a paint it produces itself against: a ghost is
+    // exactly a change outside the region the surface claims it repainted.
+    QRect repaintRegion() const { return repaintRegion_; }
 
 protected:
     bool event(QEvent *event) override;
@@ -260,6 +265,13 @@ private:
     // A pin's rect grown by [`bleed`], i.e. the region that has to be repainted
     // when the pin moves, changes or goes away.
     QRect dirtyRect(const QRect &pin) const;
+    // The region the corner tags reach for pin `id` drawn at `target`: the
+    // `HDR` marker while the pointer is on it, and the badge while it is
+    // reporting something.  Both are a fixed size anchored to a corner of the
+    // pin, so on a pin smaller than the tag they reach past the pin's own
+    // rect -- which [`dirtyRect`] does not cover.  Empty when the pin carries
+    // neither tag.
+    QRect tagBoxes(quint64 id, const QRect &target) const;
     // The id of the frontmost pin whose rect covers `local`, 0 for none.
     quint64 pinAt(const QPoint &local) const;
     // The entry of a pin, null when this output does not show it.
@@ -358,6 +370,8 @@ private:
     // Where that marker was painted last, so clearing it repaints its own box
     // rather than the whole pin it was on.
     QRect hoverMarker_;
+    // What the last setPins() asked to have repainted; see `repaintRegion()`.
+    QRect repaintRegion_;
     // The open right-click menu: the pin it belongs to (0 while closed), the
     // copy rows it offers, where it is painted, and the row the pointer is
     // over. Row indices run over `menuRows_` first and then the action rows,
