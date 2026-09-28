@@ -1059,6 +1059,12 @@ int PinSurface::menuRowAt(const QPoint &local) const
     if (menuId_ == 0 || menuRect_.isEmpty()) {
         return -1;
     }
+    // Both axes: the input region this surface holds also carries the pins, so a
+    // pointer far to the side of the menu still reaches here -- and a row that
+    // only looked at the vertical offset lit up under it.
+    if (local.x() < menuRect_.left() || local.x() > menuRect_.right()) {
+        return -1;
+    }
     const MenuLayout layout = menuLayout();
     if (layout.rowHeight <= 0) {
         return -1;
@@ -1109,6 +1115,13 @@ void PinSurface::paintMenu(QPainter &painter)
 
     const qreal labelX = menuRect_.left() + kMenuPaddingX;
     const qreal valueX = labelX + layout.labelWidth + kMenuLabelGap;
+    // A row is a full-width rectangle, so the first and last of them would square
+    // off the rounded box they sit in -- and the highlight, which is painted over
+    // the fill, would show its corners outside it.  Clip the rows to the box's
+    // own outline, the one the fill above was drawn with.
+    QPainterPath clip;
+    clip.addRoundedRect(QRectF(menuRect_).adjusted(0.5, 0.5, -0.5, -0.5), kMenuRadius, kMenuRadius);
+    painter.setClipPath(clip, Qt::IntersectClip);
     for (int index = 0; index < layout.copyRows; ++index) {
         const QRect row(menuRect_.left(), menuRect_.top() + layout.rowsTop + index * layout.rowHeight,
                         menuRect_.width(), layout.rowHeight);

@@ -387,6 +387,36 @@ int main(int argc, char **argv)
                QStringLiteral("row %1 `%2`").arg(index).arg(name));
     }
 
+    // The pointer does not have to be on the menu at all: this surface's input
+    // region carries the pins too, so a move over one of those reaches the same
+    // code.  A row is only the row when the pointer is on it in both axes -- a
+    // horizontal lookup is as much a part of that as the vertical one.
+    if (!rowMid.isEmpty()) {
+        // From a menu with no row lit, so what the pointer to the side does or
+        // does not do is the only thing the two frames can disagree about.
+        sendMove(surface, QPoint(menu.left() + 5, menu.top() - 5));
+        const QImage unlit = paint(surface);
+        sendMove(surface, QPoint(menu.left() - 40, rowMid.first()));
+        const QImage aside = paint(surface);
+        const int changed = differingPixels(unlit, aside, menu);
+        expect(changed == 0, "a pointer to the side of the menu lights no row",
+               QStringLiteral("%1 pixels changed").arg(changed));
+    }
+
+    // The highlight is a full-width rectangle, and the last row reaches the
+    // bottom of the box: without clipping it to the menu's own outline it squares
+    // off the rounded corner it is painted over.
+    if (!rowMid.isEmpty()) {
+        sendMove(surface, QPoint(menu.left() + 5, rowMid.last()));
+        const QImage rounded = paint(surface);
+        const QPoint corner(menu.left() + 1, menu.bottom() - 1);
+        const QPointF at = device(rounded, corner);
+        const QColor beyond = rounded.pixelColor(qRound(at.x()), qRound(at.y()));
+        expect(beyond.alpha() == 0, "the highlight stops at the menu's rounded corner",
+               QStringLiteral("rgba(%1, %2, %3, %4)").arg(beyond.red()).arg(beyond.green())
+                   .arg(beyond.blue()).arg(beyond.alpha()));
+    }
+
     std::printf("--- picking a row --------------------------------------------------\n");
     // Start from a closed menu: the walk above left it open, and a right-click
     // on an open menu is a dismissal, not an opening.
