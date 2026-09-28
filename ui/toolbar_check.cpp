@@ -24,8 +24,12 @@
 #include <QApplication>
 #include <QCoreApplication>
 #include <QHelpEvent>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QPoint>
+#include <QToolButton>
+#include <QPushButton>
 #include <QScreen>
 #include <QString>
 #include <QWidget>
@@ -273,6 +277,69 @@ void checkHoverShowsThePanelTooltip()
            "the tip stays near the button it describes");
 }
 
+// The toolbar's Pin button: it finishes the session the way OK does and the
+// result asks for the image on the screen instead of on disk.  The pin editor
+// is already editing a pin, so it does not offer it again.
+void checkPinButtonAsksForTheScreen()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(sessionFor(vshot::LogicalRect{100, 100, 120, 90}));
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+
+    auto *pin = overlay->findChild<QToolButton *>(QStringLiteral("pinButton"));
+    expect(pin != nullptr && pin->isVisible(), "the capture editor offers a Pin button");
+    if (pin == nullptr) {
+        return;
+    }
+    // It is drawn as one of the tools -- the same square icon button -- rather
+    // than as a text button beside OK, and it carries a pin glyph.
+    expect(pin->property("toolButton").toBool(),
+           "the Pin button wears the tool buttons' shape");
+    expect(pin->toolButtonStyle() == Qt::ToolButtonTextUnderIcon && !pin->icon().isNull(),
+           "the Pin button shows a pin icon over its label");
+    controller.pin();
+    expect(controller.isFinished() && !controller.isCancelled(),
+           "the Pin button finishes the session like OK does");
+    const QJsonObject result = controller.resultDocument().object();
+    expect(result.value(QStringLiteral("status")).toString() == QStringLiteral("ok"),
+           "the result is a kept capture");
+    expect(result.value(QStringLiteral("pin")).toBool(),
+           "the result asks for the image to be pinned");
+}
+
+void checkThePinEditorOffersNoPinButton()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(sessionFor(vshot::LogicalRect{0, 0, 200, 160}));
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.setPinEditMode(true);
+    controller.beginPinEdit();
+    auto *pin = overlay->findChild<QToolButton *>(QStringLiteral("pinButton"));
+    expect(pin != nullptr && !pin->isVisible(),
+           "the pin editor does not offer Pin a second time");
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -283,6 +350,8 @@ int main(int argc, char *argv[])
     checkPanelAboveKeepsTheStyleRowAbove();
     checkPanelBelowKeepsTheStyleRowBelow();
     checkHoverShowsThePanelTooltip();
+    checkPinButtonAsksForTheScreen();
+    checkThePinEditorOffersNoPinButton();
 
     if (failures != 0) {
         std::printf("\n%d toolbar checks failed\n", failures);

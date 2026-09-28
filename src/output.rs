@@ -10,6 +10,7 @@ use chrono::{DateTime, Local};
 
 use crate::cli::Destination;
 use crate::error::{Result, VshotError};
+use crate::geometry::Point;
 use crate::model::{Frame, HdrFrame, PngCompression};
 
 /// Writes a captured frame to `destination`. `density` is the frame's device
@@ -35,6 +36,12 @@ pub fn write_frame_with_hdr(
     destination: &Destination,
     density: u32,
     compression: PngCompression,
+    // Where the capture came from on the desktop, in global logical pixels,
+    // when it came from a place at all.  Only the pin destination uses it: the
+    // daemon puts the pin back exactly there instead of in the middle of an
+    // output.  Every other destination has no position to keep, and a
+    // composed or synthetic image never had one.
+    pin_origin: Option<Point>,
 ) -> Result<()> {
     match destination {
         Destination::File(path) => {
@@ -52,7 +59,7 @@ pub fn write_frame_with_hdr(
         // The daemon is told the density outright, so the bytes it loads need
         // no declaration of their own, and they only have to survive the trip
         // through the temp file: the default (fastest useful) level is right.
-        Destination::Pin => crate::pin::pin_png(&frame.to_png()?, density),
+        Destination::Pin => crate::pin::pin_png(&frame.to_png()?, density, pin_origin),
     }
 }
 

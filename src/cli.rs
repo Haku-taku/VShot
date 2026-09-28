@@ -110,7 +110,9 @@ pub enum Command {
 the arrow keys (hold Shift for 10px steps) while a magnifier and a size readout
 follow the pointer, then confirm with Enter, a double-click inside the selection
 or the toolbar's OK. Esc or a right-click cancels; Esc inside a text box closes
-only that box. The toolbar annotates with Rect, Ellipse, Arrow, Draw, Text and
+only that box. The toolbar's Pin finishes the same way but sends the finished
+image to the screen instead of saving it. The toolbar annotates with Rect,
+Ellipse, Arrow, Draw, Text and
 Mosaic: Ctrl+Z / Ctrl+Y undo and redo, Delete removes the selected annotation,
 Ctrl+V pastes a clipboard image. Scroll hands the selection to the scrolling
 capture instead (`vshot long`), which scrolls the region and stitches it into

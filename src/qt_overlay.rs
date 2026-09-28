@@ -398,10 +398,18 @@ struct QtResult {
     // than a still to keep.
     #[serde(default)]
     long: bool,
+    // Set when the user finished with the toolbar's Pin button: the image goes
+    // to the screen instead of to the destination the command line asked for.
+    pin: Option<bool>,
 }
 
-/// What an editing session reported: the region to keep, the marks drawn
-/// on it, and whether the user asked for a scrolling capture instead.
+/// What an editing session reported: the region to keep, the marks drawn on it,
+/// and the session's two other answers — a scrolling capture instead of a still,
+/// an image to pin instead of to save.
+///
+/// Neither answer decides what the image *is*: they come back with the rest of
+/// the session rather than as destinations of their own, so the CLI composes the
+/// image once and only then chooses what to do with it.
 pub(crate) struct SelectionOutcome {
     pub(crate) rect: Rect,
     pub(crate) annotations: Vec<Annotation>,
@@ -409,6 +417,8 @@ pub(crate) struct SelectionOutcome {
     /// marks are still carried, but the caller drops them: the picture the
     /// stitch is made of does not exist yet, so a mark has nowhere to land.
     pub(crate) long: bool,
+    /// True when the toolbar's Pin button was pressed.
+    pub(crate) pin: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -491,12 +501,12 @@ pub fn edit_selection(
     scene: &SceneSnapshot,
     selection: Rect,
     backdrop: &[String],
-) -> Result<(Rect, Vec<Annotation>)> {
+) -> Result<SelectionOutcome> {
     let (_directory, session_path) =
         write_session(scene, "region", &[], Some(selection.into()), false, backdrop)?;
     let helper = helper_program()?;
     let output = run_helper(&helper, &session_path)?;
-    parse_result(output, scene.bounds())
+    parse_outcome(output, scene.bounds())
 }
 
 /// Asks for a region without offering to annotate it.  Scrolling capture is
@@ -506,8 +516,7 @@ pub fn select_region(scene: &SceneSnapshot) -> Result<Rect> {
     let (_directory, session_path) = write_session(scene, "region-only", &[], None, false, &[])?;
     let helper = helper_program()?;
     let output = run_helper(&helper, &session_path)?;
-    let (selection, _annotations) = parse_result(output, scene.bounds())?;
-    Ok(selection)
+    Ok(parse_outcome(output, scene.bounds())?.rect)
 }
 
 /// What the hint overlay of a scrolling capture said.
@@ -969,6 +978,9 @@ fn compact_error(bytes: &[u8]) -> String {
     text
 }
 
+/// Reads one editing session's answer.  Every mode that can edit goes through
+/// here, so the region, the marks and the two answers that decide what happens
+/// to the image all come back together.
 fn parse_outcome(bytes: Vec<u8>, bounds: Rect) -> Result<SelectionOutcome> {
     let result: QtResult = serde_json::from_slice(&bytes).map_err(|error| {
         VshotError::Selection(format!("Qt helper returned invalid result JSON: {error}"))
@@ -998,6 +1010,7 @@ fn parse_outcome(bytes: Vec<u8>, bounds: Rect) -> Result<SelectionOutcome> {
                 rect: selection,
                 annotations,
                 long: result.long,
+                pin: result.pin.unwrap_or(false),
             })
         }
         status => Err(VshotError::Selection(format!(
@@ -1006,13 +1019,6 @@ fn parse_outcome(bytes: Vec<u8>, bounds: Rect) -> Result<SelectionOutcome> {
     }
 }
 
-fn parse_result(bytes: Vec<u8>, bounds: Rect) -> Result<(Rect, Vec<Annotation>)> {
-    let outcome = parse_outcome(bytes, bounds)?;
-    Ok((outcome.rect, outcome.annotations))
-}
-
-/// A picking session's answer: the window it took and where the click landed.
-/// Annotations never come back from one — picking only chooses.
 fn parse_picked_window(bytes: Vec<u8>, bounds: Rect) -> Result<PickedWindow> {
     let result: QtResult = serde_json::from_slice(&bytes).map_err(|error| {
         VshotError::Selection(format!("Qt helper returned invalid result JSON: {error}"))
@@ -1333,7 +1339,11 @@ mod tests {
     #[test]
     fn parses_qt_result_with_annotations() {
         let bytes = br#"{"status":"ok","selection":{"x":-2,"y":3,"width":10,"height":8},"annotations":[{"kind":"shape","tool":"rectangle","rect":{"x":0,"y":1,"width":3,"height":4}},{"kind":"stroke","tool":"arrow","points":[{"x":0,"y":0},{"x":5,"y":6}]},{"kind":"text","origin":{"x":1,"y":2},"text":"A","scale":2}]}"#.to_vec();
-        let (selection, annotations) = parse_result(bytes, Rect::new(-10, -10, 100, 100)).unwrap();
+        let SelectionOutcome {
+            rect: selection,
+            annotations,
+            ..
+        } = parse_outcome(bytes, Rect::new(-10, -10, 100, 100)).unwrap();
         assert_eq!(selection, Rect::new(-2, 3, 10, 8));
         assert_eq!(annotations.len(), 3);
         assert_eq!(annotations[0].tool(), EditorTool::Rectangle);
@@ -1357,25 +1367,41 @@ mod tests {
         let bytes = br#"{"status":"ok","selection":{"x":1,"y":2,"width":10,"height":8},"long":true,"annotations":[{"kind":"shape","tool":"rectangle","rect":{"x":0,"y":1,"width":3,"height":4}}]}"#.to_vec();
         let outcome = parse_outcome(bytes.clone(), Rect::new(0, 0, 100, 100)).unwrap();
         assert!(outcome.long);
+        assert!(!outcome.pin);
         assert_eq!(outcome.rect, Rect::new(1, 2, 10, 8));
         assert_eq!(outcome.annotations.len(), 1);
-        let (selection, annotations) = parse_result(bytes, Rect::new(0, 0, 100, 100)).unwrap();
+        let SelectionOutcome { rect: selection, annotations, .. } = parse_outcome(bytes, Rect::new(0, 0, 100, 100)).unwrap();
         assert_eq!(selection, Rect::new(1, 2, 10, 8));
         assert_eq!(annotations.len(), 1);
         // A document without the key -- window editing never sends it -- reads
         // as an ordinary capture.
         let plain = br#"{"status":"ok","selection":{"x":0,"y":0,"width":10,"height":8}}"#.to_vec();
-        assert!(
-            !parse_outcome(plain, Rect::new(0, 0, 100, 100))
-                .unwrap()
-                .long
-        );
+        let plain = parse_outcome(plain, Rect::new(0, 0, 100, 100)).unwrap();
+        assert!(!plain.long);
+        assert!(!plain.pin);
+    }
+
+    #[test]
+    fn a_result_can_ask_for_the_image_to_be_pinned() {
+        // The toolbar's Pin button: the session is a kept one like OK's, and the
+        // flag is what says the image goes to the screen.  A helper too old to
+        // send it is read as "no", which is the ordinary save.
+        let pinned =
+            br#"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"pin":true}"#
+                .to_vec();
+        assert!(parse_outcome(pinned, Rect::new(0, 0, 100, 100)).unwrap().pin);
+        let saved = br#"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50}}"#.to_vec();
+        assert!(!parse_outcome(saved, Rect::new(0, 0, 100, 100)).unwrap().pin);
     }
 
     #[test]
     fn parses_annotation_styles_from_wire() {
         let bytes = br##"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"stroke","tool":"pen","color":"#00FF88","width":4,"dash":"dotted","points":[{"x":0,"y":0},{"x":9,"y":9}]},{"kind":"stroke","tool":"arrow","arrow_style":"filled","points":[{"x":0,"y":0},{"x":9,"y":9}]},{"kind":"text","origin":{"x":1,"y":2},"text":"A","scale":3,"color":"#112233"}]}"##.to_vec();
-        let (selection, annotations) = parse_result(bytes, Rect::new(0, 0, 100, 100)).unwrap();
+        let SelectionOutcome {
+            rect: selection,
+            annotations,
+            ..
+        } = parse_outcome(bytes, Rect::new(0, 0, 100, 100)).unwrap();
         assert_eq!(selection, Rect::new(0, 0, 50, 50));
         assert_eq!(annotations[0].color(), [0, 255, 136, 255]);
         assert_eq!(annotations[0].width(), 4);
@@ -1509,7 +1535,8 @@ mod tests {
     #[test]
     fn parses_shape_styles_and_mosaic_masks_from_wire() {
         let bytes = br##"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"shape","tool":"rectangle","rect":{"x":0,"y":0,"width":8,"height":6},"dash":"dashed"},{"kind":"stroke","tool":"arrow","points":[{"x":0,"y":0},{"x":5,"y":6}],"size":3},{"kind":"shape","tool":"mosaic","rect":{"x":0,"y":0,"width":8,"height":6},"mask":"ellipse","strength":1}]}"##.to_vec();
-        let (_, annotations) = parse_result(bytes, Rect::new(0, 0, 100, 100)).unwrap();
+        let SelectionOutcome { annotations, .. } =
+            parse_outcome(bytes, Rect::new(0, 0, 100, 100)).unwrap();
         assert_eq!(annotations.len(), 3);
         assert_eq!(annotations[0].dash(), LineDash::Dashed);
         assert_eq!(annotations[0].head(), 1);
@@ -1535,7 +1562,7 @@ mod tests {
     #[test]
     fn parses_a_bezier_stroke_with_its_closed_flag() {
         let bytes = br##"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"stroke","tool":"bezier","points":[{"x":1,"y":2},{"x":3,"y":4},{"x":5,"y":6},{"x":7,"y":8}],"closed":true,"color":"#11223380"},{"kind":"stroke","tool":"bezier","points":[{"x":0,"y":0},{"x":1,"y":1}]}]}"##.to_vec();
-        let (_, annotations) = parse_result(bytes, Rect::new(0, 0, 100, 100)).unwrap();
+        let SelectionOutcome { annotations, .. } = parse_outcome(bytes, Rect::new(0, 0, 100, 100)).unwrap();
         assert_eq!(annotations[0].tool(), EditorTool::Bezier);
         assert!(annotations[0].closed());
         assert_eq!(annotations[0].color(), [0x11, 0x22, 0x33, 0x80]);
@@ -1547,7 +1574,8 @@ mod tests {
     #[test]
     fn parses_arrow_style_and_clamps_text_scale() {
         let bytes = br#"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"stroke","tool":"arrow","arrow_style":"filled","points":[{"x":0,"y":0},{"x":5,"y":5}]},{"kind":"text","origin":{"x":1,"y":2},"text":"A","scale":99},{"kind":"text","origin":{"x":3,"y":4},"text":"B","scale":0}]}"#.to_vec();
-        let (_, annotations) = parse_result(bytes, Rect::new(0, 0, 100, 100)).unwrap();
+        let SelectionOutcome { annotations, .. } =
+            parse_outcome(bytes, Rect::new(0, 0, 100, 100)).unwrap();
         assert_eq!(annotations[0].arrow_style(), ArrowStyle::Filled);
         assert_eq!(annotations[1].text_content().map(|value| value.2), Some(64));
         assert_eq!(annotations[2].text_content().map(|value| value.2), Some(1));
@@ -1571,7 +1599,8 @@ mod tests {
         })
         .to_string()
         .into_bytes();
-        let (_, annotations) = parse_result(bytes, Rect::new(0, 0, 100, 100)).unwrap();
+        let SelectionOutcome { annotations, .. } =
+            parse_outcome(bytes, Rect::new(0, 0, 100, 100)).unwrap();
         assert_eq!(
             annotations[0].text_content().map(|value| value.0),
             Some("Hi")
@@ -1582,7 +1611,8 @@ mod tests {
         }
         // Missing font keeps the empty default.
         let legacy = br#"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"text","origin":{"x":1,"y":2},"text":"A","scale":2}]}"#;
-        let (_, annotations) = parse_result(legacy.to_vec(), Rect::new(0, 0, 100, 100)).unwrap();
+        let SelectionOutcome { annotations, .. } =
+            parse_outcome(legacy.to_vec(), Rect::new(0, 0, 100, 100)).unwrap();
         match &annotations[0] {
             Annotation::Text { font, .. } => assert!(font.is_empty()),
             other => panic!("expected text annotation, got {other:?}"),
@@ -1599,12 +1629,13 @@ mod tests {
             path.display()
         )
         .into_bytes();
-        let (_, annotations) = parse_result(bytes, Rect::new(0, 0, 100, 100)).unwrap();
+        let SelectionOutcome { annotations, .. } =
+            parse_outcome(bytes, Rect::new(0, 0, 100, 100)).unwrap();
         let bitmap = annotations[0].text_bitmap().unwrap();
         assert_eq!((bitmap.width, bitmap.height), (2, 1));
         assert_eq!(bitmap.pixels, vec![10, 20, 30, 255, 0, 0, 0, 0]);
         // Legacy helpers without bitmaps still parse into the fallback path.
-        let (_, legacy) = parse_result(
+        let SelectionOutcome { annotations: legacy, .. } = parse_outcome(
             br#"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"text","origin":{"x":1,"y":2},"text":"A","scale":2}]}"#
                 .to_vec(),
             Rect::new(0, 0, 100, 100),
@@ -1614,7 +1645,7 @@ mod tests {
         // Payload/dimension mismatches and partial fields are rejected.
         assert!(read_text_bitmap(path.to_str().unwrap(), 3, 1).is_err());
         assert!(
-            parse_result(
+            parse_outcome(
                 br#"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"text","origin":{"x":1,"y":2},"text":"A","scale":2,"bitmap_width":2}]}"#
                     .to_vec(),
                 Rect::new(0, 0, 100, 100),
@@ -1633,7 +1664,8 @@ mod tests {
             path.display()
         )
         .into_bytes();
-        let (_, annotations) = parse_result(bytes, Rect::new(0, 0, 100, 100)).unwrap();
+        let SelectionOutcome { annotations, .. } =
+            parse_outcome(bytes, Rect::new(0, 0, 100, 100)).unwrap();
         match &annotations[0] {
             Annotation::Image { rect, pixels } => {
                 assert_eq!(*rect, Rect::new(12, 24, 4, 6));
@@ -1646,7 +1678,7 @@ mod tests {
         assert_eq!(annotations[0].tool(), EditorTool::Select);
         // Pixels are mandatory: a rect alone would draw nothing at all.
         assert!(
-            parse_result(
+            parse_outcome(
                 br#"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"image","rect":{"x":1,"y":2,"width":4,"height":6}}]}"#
                     .to_vec(),
                 Rect::new(0, 0, 100, 100),
@@ -1655,7 +1687,7 @@ mod tests {
         );
         // So is the rect: without one the pasted image has nowhere to go.
         assert!(
-            parse_result(
+            parse_outcome(
                 br#"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"image","bitmap_width":2,"bitmap_height":1,"bitmap":"/nonexistent"}]}"#
                     .to_vec(),
                 Rect::new(0, 0, 100, 100),
@@ -1687,7 +1719,11 @@ mod tests {
             path.display()
         )
         .into_bytes();
-        let (selection, annotations) = parse_result(bytes, Rect::new(0, 0, 100, 100)).unwrap();
+        let SelectionOutcome {
+            rect: selection,
+            annotations,
+            ..
+        } = parse_outcome(bytes, Rect::new(0, 0, 100, 100)).unwrap();
         assert_eq!(selection, Rect::new(10, 20, 8, 8));
         let pipeline = crate::edit::pipeline_for_annotations(annotations, selection, 1, 1).unwrap();
         let document = pipeline
@@ -1710,13 +1746,13 @@ mod tests {
     #[test]
     fn rejects_cancelled_and_invalid_selection() {
         assert!(matches!(
-            parse_result(
+            parse_outcome(
                 br#"{"status":"cancelled"}"#.to_vec(),
                 Rect::new(0, 0, 20, 20)
             ),
             Err(VshotError::SelectionCancelled)
         ));
-        assert!(parse_result(
+        assert!(parse_outcome(
             br#"{"status":"ok","selection":{"x":0,"y":0,"width":4,"height":5}}"#.to_vec(),
             Rect::new(0, 0, 20, 20),
         )

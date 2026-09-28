@@ -914,6 +914,13 @@ QIcon toolbarIcon(Tool tool, const QColor &color = QColor(230, 225, 229),
     return QIcon(pixmap);
 }
 
+// The ink of the undo/redo arrows.  The glyph is a pixmap, so the stylesheet's
+// disabled colour never reaches it: the button has to pick its own ink, and
+// this is what makes "there is a step to go back to" visible at a glance
+// rather than by hovering.
+const QColor kHistoryInk(QStringLiteral("#e6e1e5"));
+const QColor kHistoryInkDimmed(QStringLiteral("#4b525d"));
+
 QIcon historyIcon(bool redo, const QColor &color = QColor(67, 72, 84),
                   qreal devicePixelRatio = 1.0)
 {
@@ -1011,6 +1018,30 @@ QIcon scrollIcon(const QColor &color = QColor(230, 225, 229), qreal devicePixelR
     // The stacked rows below: the tall image the stitch builds.
     painter.drawLine(QPointF(6.0, 17.0), QPointF(18.0, 17.0));
     painter.drawLine(QPointF(6.0, 20.5), QPointF(18.0, 20.5));
+    return QIcon(pixmap);
+}
+
+// The pin action's icon: a thumbtack seen from the side -- a solid head, the
+// collar under it and the needle -- the shape everyone reads as "pin this".
+// It is drawn at the tool icons' weight and size, because it is the same kind
+// of button.
+QIcon pinIcon(const QColor &color = QColor(230, 225, 229), qreal devicePixelRatio = 1.0)
+{
+    const qreal ratio = std::max(1.0, devicePixelRatio);
+    QPixmap pixmap(qRound(24 * ratio), qRound(24 * ratio));
+    pixmap.setDevicePixelRatio(ratio);
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    // The needle and the collar, in the same stroke as every other icon.
+    painter.setPen(QPen(color, 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawLine(QPointF(6.5, 11.0), QPointF(17.5, 11.0));
+    painter.drawLine(QPointF(12.0, 11.0), QPointF(12.0, 20.5));
+    // The head, filled so it reads as a tack rather than as another circle.
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(color);
+    painter.drawEllipse(QPointF(12.0, 7.0), 3.6, 3.6);
     return QIcon(pixmap);
 }
 
@@ -2554,6 +2585,12 @@ public:
             "QToolButton:disabled { background: transparent; color: #6f7680; } "
             "QPushButton#undoButton, QPushButton#redoButton { "
             "border-radius: 10px; padding: 0; } "
+            "QPushButton#undoButton:enabled, QPushButton#redoButton:enabled { "
+            "background: #2e353f; } "
+            "QPushButton#undoButton:enabled:hover, QPushButton#redoButton:enabled:hover { "
+            "background: #3a424e; } "
+            "QPushButton#undoButton:disabled, QPushButton#redoButton:disabled { "
+            "background: transparent; } "
             "QPushButton#confirmButton { background: #dde1ff; color: #00145c; "
             "font-weight: 600; } "
             "QPushButton#confirmButton:hover { background: #e9ecff; } "
@@ -2723,7 +2760,7 @@ public:
         undo_ = addActionButton(toolLayout, uiTr("Undo"));
         undo_->setObjectName(QStringLiteral("undoButton"));
         undo_->setText(QString());
-        undo_->setIcon(historyIcon(false, QColor(QStringLiteral("#dfe4ec"))));
+        undo_->setIcon(historyIcon(false, kHistoryInk));
         undo_->setIconSize(QSize(18, 18));
         undo_->setFixedSize(32, 28);
         undo_->setToolTip(uiTr("Undo last change (Ctrl+Z)"));
@@ -2731,7 +2768,7 @@ public:
         redo_ = addActionButton(toolLayout, uiTr("Redo"));
         redo_->setObjectName(QStringLiteral("redoButton"));
         redo_->setText(QString());
-        redo_->setIcon(historyIcon(true, QColor(QStringLiteral("#dfe4ec"))));
+        redo_->setIcon(historyIcon(true, kHistoryInk));
         redo_->setIconSize(QSize(18, 18));
         redo_->setFixedSize(32, 28);
         redo_->setToolTip(uiTr("Redo last change (Ctrl+Y)"));
@@ -2745,6 +2782,20 @@ public:
         actionDivider->setCursor(Qt::ArrowCursor);
         toolLayout->addWidget(actionDivider);
         toolLayout->addSpacing(3);
+        // Pinning finishes the session like OK does, so it sits with it -- but
+        // it wears the tool buttons' shape to its left, the same square icon
+        // over the same label, because it is clicked the same way as the tools
+        // and a text button among them read as a different kind of thing.  It
+        // is hidden in the pin editor, which is already editing a pin.
+        auto *pin = addToolAction(toolLayout, uiTr("Pin"),
+                                  pinIcon(QColor(230, 225, 229), devicePixelRatioF()),
+                                  uiTr("Pin the result on the screen"),
+                                  QStringLiteral("pinButton"));
+        connect(pin, &QToolButton::clicked, [controller = controller_] { controller->pin(); });
+        // The frame's hover and press painting walks its tool buttons by type,
+        // and this one was added after that pass ran.
+        pin->installEventFilter(toolSurface);
+        pinButton_ = pin;
         auto *ok = addActionButton(toolLayout, uiTr("OK"));
         ok->setObjectName(QStringLiteral("confirmButton"));
         ok->setToolTip(uiTr("Confirm capture (Enter)"));
@@ -3179,8 +3230,15 @@ public:
         }
         undo_->setEnabled(!controller_->undoStack_.isEmpty());
         redo_->setEnabled(!controller_->redoStack_.isEmpty());
-        undo_->setIcon(historyIcon(false, QColor(QStringLiteral("#dfe4ec")), ratio));
-        redo_->setIcon(historyIcon(true, QColor(QStringLiteral("#dfe4ec")), ratio));
+        // An available step is drawn in the toolbar's bright ink; one that is
+        // not there is dimmed to a fraction of it.  Without this the two states
+        // looked the same -- the icon is a pixmap, so the stylesheet's disabled
+        // colour never reached it -- and the button said nothing about whether
+        // pressing it would do anything.
+        const QColor undoInk = undo_->isEnabled() ? kHistoryInk : kHistoryInkDimmed;
+        const QColor redoInk = redo_->isEnabled() ? kHistoryInk : kHistoryInkDimmed;
+        undo_->setIcon(historyIcon(false, undoInk, ratio));
+        redo_->setIcon(historyIcon(true, redoInk, ratio));
 
         // The style row edits the selected annotation when one is active,
         // otherwise it edits the pending drawing style.
@@ -3324,6 +3382,12 @@ public:
         numericRow_->updateGeometry();
         styleRow_->updateGeometry();
 
+        // The pin editor is already showing a pin: pinning again from here
+        // would have nothing to mean, so the button is only in the capture
+        // editor.
+        if (pinButton_ != nullptr) {
+            pinButton_->setVisible(!controller_->isPinEdit());
+        }
         // The style the row shows while nothing is selected: the tool the row is
         // pointed at owns its colour and its numbers, so switching tools shows
         // that tool's values rather than one shared set.
@@ -4085,6 +4149,7 @@ private:
     QLabel *usageHint_ = nullptr;
     QPushButton *undo_ = nullptr;
     QPushButton *redo_ = nullptr;
+    QToolButton *pinButton_ = nullptr;
     HoverTip *tip_ = nullptr;
     bool dragging_ = false;
     QPoint dragOffset_;
@@ -7533,6 +7598,21 @@ void OverlayController::confirm()
     terminal(false);
 }
 
+void OverlayController::pin()
+{
+    if (finished_ || cancelled_) {
+        return;
+    }
+    if (textEdit_ != nullptr) {
+        finishText(true);
+    }
+    if (!hasValidSelection()) {
+        return;
+    }
+    pinResult_ = true;
+    terminal(false);
+}
+
 void OverlayController::cancel()
 {
     if (finished_ || cancelled_) {
@@ -7609,6 +7689,13 @@ QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
         return QJsonDocument(root);
     }
     root.insert(QStringLiteral("status"), QStringLiteral("ok"));
+    // The Pin button finished the session asking for the image on the screen
+    // rather than on disk.  The composition happens on the CLI side, so it is
+    // told here; it is never set by the pin editor, which writes back to the
+    // pin it is already showing.
+    if (pinResult_) {
+        root.insert(QStringLiteral("pin"), true);
+    }
     QJsonObject selection;
     if (selection_.has_value()) {
         selection.insert(QStringLiteral("x"), static_cast<qint64>(selection_->x));

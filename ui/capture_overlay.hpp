@@ -360,9 +360,15 @@ public:
     void redo();
     void confirm();
     void cancel();
+    // Finishes the session asking for the image to be pinned on the screen
+    // instead of saved.  The image is composed on the CLI side, so the request
+    // travels back with the result; see `resultDocument`.
+    void pin();
 
     bool isFinished() const;
     bool isCancelled() const;
+    // Whether the user finished with the Pin button rather than OK.
+    bool isPinResult() const { return pinResult_; }
     bool isPinEdit() const { return pinEdit_; }
     // Pin-edit mode: the whole session bounds is the editable canvas; the
     // selection is fixed and the toolbar shows immediately. Call before the
@@ -534,6 +540,8 @@ private:
     QRect lastTouchLocal_;
     bool editing_ = false;
     bool pinEdit_ = false;
+    // Set by the Pin button and reported in the result document.
+    bool pinResult_ = false;
     /// `region-only`: a finished drag ends the session with the rectangle
     /// instead of opening the editor.  Scrolling capture asks for this, since
     /// the pixels it will annotate do not exist until the stitch is done.

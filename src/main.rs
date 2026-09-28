@@ -180,8 +180,13 @@ fn run() -> Result<()> {
                 frame,
                 None,
                 density,
+                // niri's own picker gives no rectangle on this side, so there
+                // is no place to put a pin back on.
+                None,
                 &request,
                 &mut wayland,
+                // niri's own picker has no annotation editor, so no Pin button.
+                false,
             );
         }
     }
@@ -257,6 +262,15 @@ fn run() -> Result<()> {
     // scene was taken: `Some` only when the selection's own output offered a
     // 10-bit buffer.  A capture that has one is written as the SDR/HDR pair.
     let mut hdr_frame: Option<HdrFrame> = None;
+    // Where on the desktop the capture came from, in global logical pixels, for
+    // the destinations that put the image back on the screen: a pin lands back
+    // exactly there.  `None` for a target with no place of its own (a composed
+    // desktop, or a window the compositor drew itself).
+    let mut capture_rect: Option<crate::geometry::Rect> = None;
+    // Set when the user finished an editing session with the toolbar's Pin
+    // button: the composed image goes to the screen instead of to the
+    // destination the command line named.
+    let mut pin_result = false;
     let (frame, density) = if let Some(window) = native_window {
         window
     } else {
@@ -284,6 +298,7 @@ fn run() -> Result<()> {
             CaptureTarget::RegionFixed(geometry) => {
                 let (frame, density) = crop_native(&scene, *geometry)?;
                 hdr_frame = hdr_for_region(&hdr_outputs, &scene, *geometry);
+                capture_rect = Some(*geometry);
                 wayland.show_frozen(false)?;
                 (frame, density)
             }
@@ -320,12 +335,21 @@ fn run() -> Result<()> {
                         // from the scroll as ordinary 8-bit pixels.
                         None,
                         result.density,
+                        // A stitched capture is drawn from rows the scroll
+                        // handed back, so it has no place on the desktop to put
+                        // a pin back onto.
+                        None,
                         &request,
                         &mut wayland,
+                        // A stitched capture is written, never pinned: the
+                        // scrolling action ends the session the way OK does.
+                        false,
                     );
                 }
                 let (frame, density) = crop_native(&scene, geometry)?;
                 hdr_frame = hdr_for_region(&hdr_outputs, &scene, geometry);
+                capture_rect = Some(geometry);
+                pin_result = outcome.pin;
                 // The helper drew its text bitmaps at the scene's scale, which
                 // is only the crop's density when the selection fell on the
                 // highest-density output.
@@ -372,6 +396,7 @@ fn run() -> Result<()> {
                     wayland.show_frozen(false)?;
                     let geometry = selection::validate_selection(&scene, geometry)?;
                     hdr_frame = hdr_for_region(&hdr_outputs, &scene, geometry);
+                    capture_rect = Some(geometry);
                     // The window's own pixels at its own output's density — cropping
                     // the composed scene would hand back a nearest-upscale of a
                     // window that sits on a lower-density monitor.
@@ -403,6 +428,7 @@ fn run() -> Result<()> {
                     };
                     let geometry = selection::validate_selection(&scene, geometry)?;
                     hdr_frame = hdr_for_region(&hdr_outputs, &scene, geometry);
+                    capture_rect = Some(geometry);
                     crop_native(&scene, geometry)?
                 }
             }
@@ -465,14 +491,16 @@ fn run() -> Result<()> {
                     .point
                     .and_then(|point| ProcessWindowProvider.window_at(point))
                     .unwrap_or(picked.rect);
-                let (geometry, annotations) =
-                    qt_overlay::edit_selection(&scene, geometry, &backdrop)?;
-                let geometry = selection::validate_selection(&scene, geometry)?;
+                let outcome = qt_overlay::edit_selection(&scene, geometry, &backdrop)?;
+                let geometry = selection::validate_selection(&scene, outcome.rect)?;
                 let (frame, density) = crop_native(&scene, geometry)?;
                 hdr_frame = hdr_for_region(&hdr_outputs, &scene, geometry);
+                capture_rect = Some(geometry);
+                pin_result = outcome.pin;
                 // Same reason as the interactive region above: the editor is
                 // shared, so its text bitmaps are in scene device pixels.
-                edits = pipeline_for_annotations(annotations, geometry, density, scene.scale())?;
+                edits =
+                    pipeline_for_annotations(outcome.annotations, geometry, density, scene.scale())?;
                 (frame, density)
             }
             CaptureTarget::LongShot {
@@ -488,6 +516,7 @@ fn run() -> Result<()> {
                     None => qt_overlay::select_region(&scene)?,
                 };
                 let region = selection::validate_selection(&scene, region)?;
+                capture_rect = Some(region);
                 let desktop = longshot::desktop_bounds(&output_infos)?;
                 let mut injector = inject::Injector::open(desktop, *inject)?;
                 let result =
@@ -498,7 +527,16 @@ fn run() -> Result<()> {
         }
     };
 
-    finish_capture(edits, frame, hdr_frame, density, &request, &mut wayland)
+    finish_capture(
+        edits,
+        frame,
+        hdr_frame,
+        density,
+        capture_rect,
+        &request,
+        &mut wayland,
+        pin_result,
+    )
 }
 
 /// Reports a finished scrolling capture: what it stitched, and -- when not one
@@ -778,6 +816,10 @@ fn write_ocr_text(text: &str, destination: cli::OcrDestination) -> Result<()> {
 /// Renders the annotations into the captured frame and writes it where the
 /// request pointed.  The routes that hand over finished pixels — a compositor's
 /// own window screenshot — have nothing to render and pass an empty pipeline.
+///
+/// Every destination leaves through here — the SDR/HDR pair, the clipboard, the
+/// Pin button — so the two halves and the pin's place are decided once.
+#[allow(clippy::too_many_arguments)] // the capture, its two halves, its density and its place
 fn finish_capture(
     edits: EditPipeline,
     frame: Frame,
@@ -786,8 +828,17 @@ fn finish_capture(
     // the SDR one for the PNG, and the HDR one for the `.hdr` written beside it.
     hdr: Option<HdrFrame>,
     density: u32,
+    // Where on the desktop the capture came from, in global logical pixels, for
+    // a destination that puts the image back on the screen: the pin daemon
+    // lands the pin exactly there.  `None` for a target with no place of its own
+    // — a composed desktop, or a window the compositor drew itself, whose
+    // rectangle this side never learns.
+    capture_rect: Option<crate::geometry::Rect>,
     request: &cli::Request,
     wayland: &mut WaylandSession,
+    // The editor's Pin button: the image goes to the screen whatever the command
+    // line asked the destination to be.
+    pin: bool,
 ) -> Result<()> {
     // The desktop is unfrozen before either image is encoded.  The editor's own
     // overlay is the helper's and goes when it exits, but the surfaces VShot
@@ -797,12 +848,15 @@ fn finish_capture(
     // needs those surfaces, so they go first.
     let cleanup = wayland.destroy_overlays();
     let (sdr, hdr_out) = sdr_and_hdr(&edits, frame, hdr)?;
+    let pinned = cli::Destination::Pin;
+    let destination = if pin { &pinned } else { &request.destination };
     let result = output::write_frame_with_hdr(
         &sdr,
         hdr_out.as_ref(),
-        &request.destination,
+        destination,
         density,
         request.compression,
+        capture_rect.map(|rect| rect.origin),
     );
     result.and(cleanup)
 }

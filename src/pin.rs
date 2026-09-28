@@ -41,6 +41,13 @@ pub(crate) enum PinCommand {
         /// compositor reports one.
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<WireOutputRect>,
+        /// Where on the desktop the capture came from, in global logical
+        /// pixels, when it came from a place at all.  A pin made from a capture
+        /// lands back exactly there instead of in the middle of the output, so
+        /// pinning a window over itself is seamless.  Bare files and clipboard
+        /// images have no such place and leave this out.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        at: Option<WirePoint>,
     },
     #[serde(rename = "add-clipboard")]
     AddClipboard {
@@ -77,6 +84,22 @@ pub(crate) struct WireOutputRect {
     pub y: i32,
     pub width: u32,
     pub height: u32,
+}
+
+/// A point on the desktop's global logical grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct WirePoint {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl From<crate::geometry::Point> for WirePoint {
+    fn from(point: crate::geometry::Point) -> Self {
+        Self {
+            x: point.x,
+            y: point.y,
+        }
+    }
 }
 
 impl From<crate::geometry::Rect> for WireOutputRect {
@@ -264,6 +287,7 @@ pub(crate) fn run(invocation: PinInvocation) -> Result<()> {
             density,
             output,
             output_name: output_name.clone(),
+            at: None,
         })?;
     }
     if clipboard {
@@ -430,7 +454,11 @@ fn read_reply(stream: &mut UnixStream) -> Result<PinReply> {
 /// `--pin` capture never leaves a file on the user's disk. `density` is the
 /// capture's device pixels per logical pixel — the scale of the output it was
 /// taken on — so the pin reappears at the size it had there.
-pub(crate) fn pin_png(png: &[u8], density: u32) -> Result<()> {
+/// Pins an in-memory capture.  `at` is the global logical top-left of the
+/// content the capture came from, when it came from the desktop at all: the pin
+/// lands back exactly there, which is what makes pinning a window over itself
+/// seamless.  `None` (a composed or synthetic image) lets the daemon place it.
+pub(crate) fn pin_png(png: &[u8], density: u32, at: Option<crate::geometry::Point>) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let directory = tempfile::Builder::new()
@@ -464,6 +492,7 @@ pub(crate) fn pin_png(png: &[u8], density: u32) -> Result<()> {
         density: Some(density.clamp(1, 4)),
         output,
         output_name,
+        at: at.map(WirePoint::from),
     });
     // The daemon has copied the pixels by the time it replied; the temp file
     // is ours to remove even when the reply said no.
@@ -663,6 +692,7 @@ mod tests {
             density: None,
             output: None,
             output_name: None,
+            at: None,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -672,6 +702,8 @@ mod tests {
         assert!(value.get("output").is_none(), "{value}");
         assert!(value.get("output_name").is_none(), "{value}");
         assert!(value.get("density").is_none(), "{value}");
+        // An image with no place of its own says nothing about where it goes.
+        assert!(value.get("at").is_none(), "{value}");
         let encoded = serde_json::to_vec(&PinCommand::Add {
             path: PathBuf::from("/tmp/x.png"),
             density: Some(2),
@@ -679,6 +711,7 @@ mod tests {
                 1920, 0, 3840, 2160,
             ))),
             output_name: Some("DP-2".into()),
+            at: None,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -693,6 +726,7 @@ mod tests {
             density: None,
             output: None,
             output_name: Some("DP-2".into()),
+            at: None,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -785,10 +819,15 @@ mod tests {
             density: Some(2),
             output: None,
             output_name: None,
+            at: Some(WirePoint { x: 100, y: 240 }),
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(value["density"], 2);
+        // The place the capture came from travels with it, so the pin can land
+        // back on it.
+        assert_eq!(value["at"]["x"], 100);
+        assert_eq!(value["at"]["y"], 240);
         // No density stated: the field is absent and the daemon sizes the
         // image from what it can find out about it.
         let encoded = serde_json::to_vec(&PinCommand::Add {
@@ -796,10 +835,12 @@ mod tests {
             density: None,
             output: None,
             output_name: None,
+            at: None,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         assert!(value.get("density").is_none(), "{value}");
+        assert!(value.get("at").is_none(), "{value}");
     }
 
     #[test]

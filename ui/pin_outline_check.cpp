@@ -204,7 +204,14 @@ int main(int argc, char **argv)
     dot.id = 3;
     dot.image = solid(1, 1, QColor(255, 0, 0));
     dot.origin = base + QPoint(220, 20);
-    surface.setPins({white, black, dot});
+    // A pin put back on the place it was captured from: it is placed by the
+    // daemon's coordinates like any other pin, and this check is here to keep
+    // its rim from being skipped.
+    vshot::PinSurface::Item inPlace;
+    inPlace.id = 4;
+    inPlace.image = solid(160, 100, QColor(0, 128, 255));
+    inPlace.origin = base + QPoint(230, 170);
+    surface.setPins({white, black, dot, inPlace});
 
     // The 2px stroke is centred on the image edge, so it covers exactly one
     // logical pixel outside the rect: 20..19 on the way in, 20+160..180 on the
@@ -222,6 +229,13 @@ int main(int argc, char **argv)
     expectTransparent("idle: nothing painted beyond the stroke", idle, QPoint(60, 17));
     expectIdle("idle: the one-pixel pin has a stroke", idle, QPoint(219, 20));
     expectTransparent("idle: the one-pixel stroke is its own size", idle, QPoint(218, 20));
+    // A pin put back on the place it was captured from is drawn like any other
+    // pin: the rim is what tells the user the thing on the desktop is a pin and
+    // not the window it covers, so it is the last thing to leave the picture.
+    expectIdle("in place: a pin back on its own place keeps its rim", idle, QPoint(229, 220));
+    expectIdle("in place: the rim covers the image's own edge", idle, QPoint(230, 220));
+    expectIdle("in place: and its top edge too", idle, QPoint(300, 169));
+    expectIdle("in place: the rim is on every side", idle, QPoint(300, 170));
 
     click(surface, QPoint(60, 60), base + QPoint(60, 60));
     // Focus is what turns the picked pin black, so it has to be real: without
@@ -463,6 +477,25 @@ int main(int argc, char **argv)
                 0, 255, 255);
     expectPixel("the pin that is not picked keeps the idle colour", withShadow, QPoint(60, 159),
                 0, 200, 0, 255);
+    // A pin put back on its own place takes the configured rim and the shadow
+    // with every other pin: neither is skipped for it.
+    expectPixel("in place: the configured rim is drawn on it", rounded, QPoint(229, 220), 0, 200, 0,
+                255);
+    expectPixel("in place: the image still reaches its edge", rounded, QPoint(233, 220), 0, 128, 255,
+                255);
+    {
+        const QColor shadow = withShadow.pixelColor(
+            QPoint(qRound(300 * withShadow.devicePixelRatio()),
+                   qRound(272 * withShadow.devicePixelRatio())));
+        if (shadow.alpha() > 0) {
+            std::printf("ok    %-48s alpha %d\n", "in place: and it casts its shadow",
+                        shadow.alpha());
+        } else {
+            std::printf("FAIL  %-48s nothing painted below the pin\n",
+                        "in place: and it casts its shadow");
+            ++failures;
+        }
+    }
 
     // A pin with no stroke at all is the image and nothing else, and a pin with
     // square corners has its corner pixel back -- both are settings the user

@@ -338,6 +338,28 @@ QScreen *screenFromGeometry(const QJsonObject &request)
     return nullptr;
 }
 
+// The point the CLI reported as the capture's own top-left, when it reported
+// one.  A capture made from a place on the desktop pins back onto that place,
+// so pinning a window over itself is seamless; `false` means the request had no
+// place to keep and the daemon centres the pin instead.
+bool pointFromRequest(const QJsonObject &request, QPoint *out)
+{
+    const QJsonValue value = request.value(QStringLiteral("at"));
+    if (!value.isObject()) {
+        return false;
+    }
+    const QJsonObject point = value.toObject();
+    bool xOk = false;
+    bool yOk = false;
+    const int x = point.value(QStringLiteral("x")).toVariant().toInt(&xOk);
+    const int y = point.value(QStringLiteral("y")).toVariant().toInt(&yOk);
+    if (!xOk || !yOk) {
+        return false;
+    }
+    *out = QPoint(x, y);
+    return true;
+}
+
 // The output the CLI asked to pin on, by name first and by geometry second.
 // `nullptr` means the request named no output this daemon can find, which
 // leaves the choice to `fallbackScreen()`.
@@ -954,19 +976,36 @@ wl-clipboard package"));
             pin->scale = std::min(pin->scale, fit);
         }
 
-        // Land on the output the user is looking at, one cascade step apart
-        // from the pins already there so repeated pins stay distinguishable.
-        const int offset = static_cast<int>(pins_.size() % 6) * 28;
-        const QSize size = pin->displaySize();
-        // Vertically centred while the pin fits; an image taller than the
-        // output opens at its top edge, so a long capture starts at its
-        // beginning instead of showing its middle.
-        const int top = size.height() > bounds.height()
-                            ? bounds.top()
-                            : bounds.top() + (bounds.height() - size.height()) / 2;
-        pin->origin = QPoint(bounds.left() + (bounds.width() - size.width()) / 2, top) +
-                      QPoint(offset, offset);
-        pin->origin = clampOrigin(*pin, pin->origin);
+        // A capture that came from a place on the desktop goes back to exactly
+        // that place, so pinning a window over itself needs no dragging.  It is
+        // drawn like any other pin -- rim, shadow and all, as the config says:
+        // the rim is what tells the user the thing sitting on the desktop is a
+        // pin and not the window.  Anything else -- a file, a clipboard image, a
+        // synthetic card -- has no place of its own: it lands on the output the
+        // user is looking at, one cascade step apart from the pins already
+        // there so repeated pins stay distinguishable, and vertically centred
+        // while it fits; an image taller than the output opens at its top edge,
+        // so a long capture starts at its beginning instead of showing its
+        // middle.
+        QPoint where;
+        const bool putBack = pointFromRequest(request, &where);
+        if (!putBack) {
+            const int offset = static_cast<int>(pins_.size() % 6) * 28;
+            const QSize size = pin->displaySize();
+            const int top = size.height() > bounds.height()
+                                ? bounds.top()
+                                : bounds.top() + (bounds.height() - size.height()) / 2;
+            where = QPoint(bounds.left() + (bounds.width() - size.width()) / 2, top) +
+                    QPoint(offset, offset);
+        }
+        pin->origin = clampOrigin(*pin, where);
+        if (debug_) {
+            qWarning("pin %llu: %s at %d,%d (%dx%d logical)",
+                     static_cast<unsigned long long>(pin->id),
+                     putBack ? "put back where it was taken from" : "placed",
+                     pin->origin.x(), pin->origin.y(), pin->displaySize().width(),
+                     pin->displaySize().height());
+        }
 
         // The surfaces only exist while there is something to paint: an empty
         // daemon holds no layer surface of its own.
