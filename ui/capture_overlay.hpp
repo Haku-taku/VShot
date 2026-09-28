@@ -363,13 +363,6 @@ private:
     QString mosaicShape_ = QStringLiteral("rect");
     std::uint32_t mosaicStrength_ = 2;
     NumberStyle numberStyle_ = NumberStyle::FilledCircle;
-    // The count the next badge carries, and the only state the number tool
-    // keeps.  It starts at one for a fresh session and is put back to one when
-    // the last mark is deleted -- an empty canvas numbers from one again, which
-    // is the same rule the standalone surface's `clear()` follows.  An undo
-    // deliberately leaves it alone: it never rewinds the count, so stepping back
-    // over a badge does not hand its number to the next one.
-    int nextNumber_ = 1;
     bool panelPinned_ = false;
     // Automatic toolbar placement anchor: while the selection stays put, the
     // side of the selection the command bar was placed on stays fixed, so a

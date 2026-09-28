@@ -4372,13 +4372,6 @@ void OverlayController::mutateAnnotations(QVector<Annotation> next)
     if (selectedAnnotation_ >= annotations_.size()) {
         selectedAnnotation_ = -1;
     }
-    if (annotations_.isEmpty()) {
-        // An emptied canvas numbers from one again -- the same rule the
-        // standalone annotate surface's `clear()` follows.  It is deliberately
-        // here rather than in `undo`: an undo that leaves marks in place must
-        // not rewind the count, and the count is never part of a snapshot.
-        nextNumber_ = 1;
-    }
     updateAll();
 }
 
@@ -4399,7 +4392,14 @@ void OverlayController::placeNumber(Point point)
     Annotation annotation;
     annotation.kind = Annotation::Kind::Text;
     annotation.tool = QStringLiteral("number");
-    annotation.number = nextNumber_;
+    // One past the highest badge already on the canvas, read fresh every time.
+    // Undoing a badge therefore hands its number back to the next click, and
+    // there is no counter that could drift out of step with the list.
+    int highest = 0;
+    for (const Annotation &existing : annotations_) {
+        highest = std::max(highest, existing.number);
+    }
+    annotation.number = highest + 1;
     annotation.numberStyle = numberStyle_;
     annotation.color = currentColor_;
     annotation.width = currentWidth_;
@@ -4409,10 +4409,6 @@ void OverlayController::placeNumber(Point point)
     // selectable, movable and deletable rather than merely visible.  `origin` is
     // the same corner, because that is where the renderer blits the bitmap.
     layoutNumberBox(annotation, clampPoint(point));
-    // The count is advanced as the badge is placed and never handed back: an
-    // undo of a badge leaves the count where it is, so the numbers always read
-    // in the order the clicks were made.
-    ++nextNumber_;
     QVector<Annotation> next = annotations_;
     next.push_back(annotation);
     const int newIndex = next.size() - 1;

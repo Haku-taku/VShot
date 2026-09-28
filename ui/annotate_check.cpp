@@ -854,17 +854,17 @@ void checkNumberCounts(QScreen *screen)
     expect("the second badge counts 2", surface.strokeNumber(1) == 2,
            QStringLiteral("number=%1").arg(surface.strokeNumber(1)));
 
-    // An undo takes the badge off the canvas but leaves the count where it is,
-    // so the next badge takes a fresh number rather than the undone one's.
+    // An undo takes the badge off the canvas and hands its number back: the
+    // next badge reads the canvas, so it takes the number the undone one had.
     surface.undo();
     expect("an undo takes the last badge off the canvas", surface.strokeCount() == 1,
            QStringLiteral("strokeCount=%1").arg(surface.strokeCount()));
     press(&surface, second);
     release(&surface, second);
-    expect("the count does not rewind with an undo", surface.strokeNumber(1) == 3,
+    expect("an undo hands the badge's number to the next one", surface.strokeNumber(1) == 2,
            QStringLiteral("number=%1").arg(surface.strokeNumber(1)));
 
-    // A clear is the one thing that does put the count back to one.
+    // A clear empties the canvas, so the next badge numbers from one again.
     surface.clear();
     press(&surface, first);
     release(&surface, first);

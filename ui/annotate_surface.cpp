@@ -1975,10 +1975,6 @@ void AnnotateSurface::clear()
     }
     pushHistory(dirty);
     strokes_.clear();
-    // The count starts over with an empty canvas.  This is the one place it is
-    // reset: an undo restores strokes and deliberately leaves the count alone,
-    // so stepping back over a badge does not hand its number to the next one.
-    nextNumber_ = 1;
     touch(dirty);
     if (toolbar_ != nullptr) {
         toolbar_->syncState();
@@ -2078,16 +2074,19 @@ void AnnotateSurface::placeNumber(const QPointF &local)
     stroke.width = width_;
     stroke.points = {local};
     stroke.numberStyle = numberStyle_;
-    stroke.number = nextNumber_;
+    // One past the highest badge already on the canvas, read fresh every time.
+    // Undoing a badge therefore hands its number back to the next click, and
+    // there is no counter that could drift out of step with the list.
+    int highest = 0;
+    for (const Stroke &existing : strokes_) {
+        highest = std::max(highest, existing.number);
+    }
+    stroke.number = highest + 1;
     const QRect dirty =
         grownDirtyRect(strokeBounds(stroke.tool, stroke.points, stroke.width, stroke.text));
     pushHistory(dirty);
     // The ink is built on the next paint by `rasterFor`, like any other stroke's.
     strokes_.append(stroke);
-    // The count advances on every placed badge and never goes back: undoing a
-    // badge does not free its number for the next one, so the numbers always
-    // read in the order they were placed.
-    ++nextNumber_;
     touch(dirty);
     if (toolbar_ != nullptr) {
         toolbar_->syncState();

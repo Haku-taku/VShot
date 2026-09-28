@@ -324,12 +324,6 @@ private:
     QColor color_{229, 57, 53};
     int width_ = kWidths[1];
     NumberStyle numberStyle_ = NumberStyle::FilledCircle;
-    // The count the next badge carries.  It starts over with the canvas: a
-    // `clear()` puts it back to one, while an undo leaves it where it is.  That
-    // asymmetry is deliberate -- the count is not part of the drawing, and
-    // making an undo rewind it would mean carrying it inside every history
-    // snapshot for no gain the user can see.
-    int nextNumber_ = 1;
     Toolbar *toolbar_ = nullptr;
     bool toolbarHidden_ = false;
     // Where the user dragged the toolbar to, in this surface's logical pixels;
