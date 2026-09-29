@@ -103,6 +103,34 @@ impl Primaries {
         invert3(self.to_bt709())
     }
 
+    /// The CIE xy chromaticities of the three primaries, for a file that has to
+    /// declare them.
+    pub fn chromaticities(&self) -> [(f32, f32); 3] {
+        const BT709: [(f32, f32); 3] = [(0.640, 0.330), (0.300, 0.600), (0.150, 0.060)];
+        const DISPLAY_P3: [(f32, f32); 3] = [(0.680, 0.320), (0.265, 0.690), (0.150, 0.060)];
+        const BT2020: [(f32, f32); 3] = [(0.708, 0.292), (0.170, 0.797), (0.131, 0.046)];
+        match self {
+            Primaries::Bt709 => BT709,
+            Primaries::DisplayP3 => DISPLAY_P3,
+            Primaries::Bt2020 => BT2020,
+            // Recovered from the matrix: its columns are the primaries, and
+            // each column's chromaticity is the column normalised to a sum of
+            // one.
+            Primaries::Custom { .. } => {
+                let xyz = multiply3(BT709_TO_XYZ, self.to_bt709());
+                let mut found = [(0.0f32, 0.0f32); 3];
+                for (index, entry) in found.iter_mut().enumerate() {
+                    let column = [xyz[0][index], xyz[1][index], xyz[2][index]];
+                    let sum = column[0] + column[1] + column[2];
+                    if sum > 0.0 {
+                        *entry = (column[0] / sum, column[1] / sum);
+                    }
+                }
+                found
+            }
+        }
+    }
+
     /// The gamut a `wp_color_manager_v1` description's chromaticities describe.
     /// The protocol carries no white point, so D65 is the one assumed; a set
     /// that matches one of the named gamuts reads as that name, and anything
@@ -345,6 +373,14 @@ const DISPLAY_P3_TO_BT2020: [[f32; 3]; 3] = [
     [0.753_833, 0.198_597, 0.047_570],
     [0.045_744, 0.941_777, 0.012_479],
     [-0.001_210, 0.017_602, 0.983_609],
+];
+
+/// BT.709 linear to CIE XYZ (D65): the other direction of `XYZ_TO_BT709`, and
+/// what recovers a gamut's chromaticities from its conversion matrix.
+const BT709_TO_XYZ: [[f32; 3]; 3] = [
+    [0.412_391, 0.357_584, 0.180_481],
+    [0.212_639, 0.715_169, 0.072_192],
+    [0.019_331, 0.119_195, 0.950_532],
 ];
 
 /// CIE XYZ (D65) to BT.709 linear: the other half of `rgb_to_xyz`.
@@ -738,38 +774,31 @@ impl HdrFrame {
         Ok(())
     }
 
-    /// The frame's pixels in BT.709 linear — the space a format with no
-    /// colorimetry to carry (an 8-bit PNG, a Radiance file) is read in.
-    /// Out-of-gamut colours are mapped into it, not clipped.
-    fn bt709_pixels(&self) -> Vec<[f32; 4]> {
-        if self.primaries == Primaries::Bt709 {
-            return self.pixels.clone();
-        }
-        let matrix = self.primaries.to_bt709();
-        self.pixels
-            .iter()
-            .map(|pixel| {
-                let rgb = map_into_gamut(multiply(matrix, [pixel[0], pixel[1], pixel[2]]));
-                [rgb[0], rgb[1], rgb[2], pixel[3]]
-            })
-            .collect()
-    }
-
     /// Encodes the frame as Radiance RGBE (`.hdr`).  The values are linear
     /// light, which is exactly what the format holds, so an HDR viewer shows
     /// the content as captured.
     ///
-    /// The file is written in BT.709 linear: RGBE carries no colorimetry, so a
-    /// file of BT.2020 numbers would be read as Rec.709 by every viewer and
-    /// come out over-saturated.  The wide gamut lives where it can be shown —
-    /// on the colour-managed surface an HDR pin is drawn on.
+    /// The pixels go out **as captured**, in the output's own primaries: the
+    /// file is the archival half, and converting it would throw away the wide
+    /// gamut for good.  RGBE has no colorimetry of its own, so the gamut is
+    /// declared in a `PRIMARIES=` header — the line Radiance reads.  Readers
+    /// that ignore it (ffmpeg and ImageMagick both do) assume Rec.709 and show
+    /// a wide gamut over-saturated; the SDR half beside it is the one that is
+    /// converted for them.
     pub fn encode_radiance(&self) -> Vec<u8> {
-        let pixels = self.bt709_pixels();
         let width = self.size.width;
         let height = self.size.height;
         let mut out = Vec::new();
         out.extend_from_slice(b"#?RADIANCE\n");
         out.extend_from_slice(b"FORMAT=32-bit_rle_rgbe\n");
+        let [r, g, b] = self.primaries.chromaticities();
+        out.extend_from_slice(
+            format!(
+                "PRIMARIES={:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}\n",
+                r.0, r.1, g.0, g.1, b.0, b.1, D65.0, D65.1
+            )
+            .as_bytes(),
+        );
         out.extend_from_slice(b"\n");
         out.extend_from_slice(format!("-Y {height} +X {width}\n").as_bytes());
         let rle = (8..=0x7fff).contains(&width);
@@ -778,7 +807,7 @@ impl HdrFrame {
         // encoder is split into are whole rows, and every row in one gets its
         // own scanline: emitting a chunk as a single scanline would shift every
         // row after the first.
-        for rows in collect_rows(&pixels, width as usize, |chunk| {
+        for rows in collect_rows(&self.pixels, width as usize, |chunk| {
             let mut bytes = Vec::new();
             for scanline in chunk.chunks(width as usize) {
                 encode_scanline(scanline, width, rle, &mut bytes);
@@ -1762,6 +1791,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_radiance_file_keeps_the_captures_own_gamut() {
+        // The archival half is not converted: a wide-gamut capture is written
+        // as it came, with its primaries declared, so the data survives even
+        // though RGBE has no colorimetry field of its own.  Converting it to
+        // BT.709 would throw the wide gamut away for good.
+        let frame = HdrFrame::in_primaries(
+            Size::new(1, 1),
+            vec![[0.0, 1.0, 0.0, 1.0]],
+            Primaries::Bt2020,
+        )
+        .unwrap();
+        let encoded = frame.encode_radiance();
+        let header_end = encoded.windows(2).position(|pair| pair == b"\n\n").unwrap();
+        let header = String::from_utf8_lossy(&encoded[..header_end]);
+        assert!(
+            header.contains("PRIMARIES=0.708000 0.292000 0.170000 0.797000 0.131000 0.046000"),
+            "{header}"
+        );
+        // A pure BT.2020 green stays one: its mantissa is half scale, 128.  A
+        // conversion to BT.709 would clip the negative red and blue and raise
+        // green to 144.
+        let pixels = &encoded[header_end + 2..];
+        let start = pixels
+            .windows(4)
+            .position(|pixel| pixel[1] > 100)
+            .expect("the green scanline is there");
+        assert_eq!(&pixels[start..start + 4], &[0, 128, 0, 129]);
     }
 
     /// A tiny Radiance RGBE decoder, enough to check the encoder: header,
