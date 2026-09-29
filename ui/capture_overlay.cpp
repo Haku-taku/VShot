@@ -481,6 +481,8 @@ QString toolName(Tool tool)
         return QStringLiteral("text");
     case Tool::Number:
         return QStringLiteral("number");
+    case Tool::Picker:
+        return QStringLiteral("picker");
     case Tool::Select:
         return QStringLiteral("select");
     }
@@ -916,6 +918,17 @@ QIcon toolbarIcon(Tool tool, const QColor &color = QColor(230, 225, 229),
             }
         }
         break;
+    case Tool::Picker:
+        // An eyedropper: the tip that takes the pixel, the barrel behind it and
+        // the bulb that stands for the colour it brings back.  The bulb is
+        // filled, like the pin's head, so the shape still reads at button size.
+        painter.setBrush(color);
+        painter.drawPolygon(QPolygonF{QPointF(3.5, 20.5), QPointF(6.5, 19.0),
+                                      QPointF(5.0, 17.5)});
+        painter.drawEllipse(QPointF(17.0, 7.0), 4.0, 4.0);
+        painter.setBrush(Qt::NoBrush);
+        painter.drawLine(QPointF(6.0, 18.0), QPointF(14.0, 10.0));
+        break;
     }
     return QIcon(pixmap);
 }
@@ -1080,6 +1093,11 @@ QIcon pinIcon(const QColor &color = QColor(230, 225, 229), qreal devicePixelRati
 // room its text needs.
 constexpr int kInfoPillGap = 8;
 
+// The eyedropper's readout carries the colour itself: a chip of it at the
+// pill's left edge, and this much room between the chip and the hex.
+constexpr qreal kColorChip = 12.0;
+constexpr qreal kColorChipGap = 6.0;
+
 QSizeF pillSize(const QString &text)
 {
     const QFontMetrics metrics(pillFont());
@@ -1087,8 +1105,11 @@ QSizeF pillSize(const QString &text)
 }
 
 // Draws a dark rounded label (dimensions, pixel coordinates) in `pill`, pulled
-// back inside `bounds` when it would hang over an edge.
-void drawPillBox(QPainter *painter, const QRectF &pill, const QString &text, const QRectF &bounds)
+// back inside `bounds` when it would hang over an edge.  A valid `chip` puts
+// that colour at the pill's left edge with the text beside it, which is how the
+// eyedropper reads a pixel out: the colour itself, then its hex.
+void drawPillBox(QPainter *painter, const QRectF &pill, const QString &text, const QRectF &bounds,
+                 const QColor &chip = QColor())
 {
     const qreal x = std::clamp(pill.left(), bounds.left() + 2.0,
                                std::max(bounds.left() + 2.0, bounds.right() - pill.width() - 2.0));
@@ -1102,7 +1123,40 @@ void drawPillBox(QPainter *painter, const QRectF &pill, const QString &text, con
     painter->setPen(QPen(QColor(120, 120, 120), 1.0));
     painter->drawRoundedRect(box.adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
     painter->setPen(Qt::white);
-    painter->drawText(box, Qt::AlignCenter, text);
+    if (!chip.isValid()) {
+        painter->drawText(box, Qt::AlignCenter, text);
+        return;
+    }
+    const QRectF swatch(box.left() + 4.0, box.center().y() - kColorChip / 2.0, kColorChip,
+                        kColorChip);
+    // A picked colour keeps the tool's opacity, so a translucent one is shown
+    // over a checkerboard rather than as a dimmer version of itself.
+    if (chip.alpha() < 255) {
+        const QSizeF half(kColorChip / 2.0, kColorChip / 2.0);
+        painter->save();
+        painter->setClipRect(swatch);
+        painter->fillRect(swatch, QColor(0x6f, 0x76, 0x80));
+        painter->fillRect(QRectF(swatch.topLeft(), half), QColor(0x9a, 0xa3, 0xae));
+        painter->fillRect(QRectF(swatch.center(), half), QColor(0x9a, 0xa3, 0xae));
+        painter->restore();
+    }
+    painter->setPen(Qt::NoPen);
+    painter->setBrush(chip);
+    painter->drawRoundedRect(swatch, 2, 2);
+    painter->setBrush(Qt::NoBrush);
+    painter->setPen(QPen(QColor(120, 120, 120), 1.0));
+    painter->drawRoundedRect(swatch.adjusted(0.5, 0.5, -0.5, -0.5), 2, 2);
+    painter->setPen(Qt::white);
+    painter->drawText(QRectF(swatch.right() + kColorChipGap, box.top(),
+                             box.right() - swatch.right() - kColorChipGap - 4.0, box.height()),
+                      Qt::AlignVCenter | Qt::AlignLeft, text);
+}
+
+// The room the eyedropper's readout needs: the hex, and the chip beside it.
+QSizeF colorPillSize(const QString &text)
+{
+    const QSizeF size = pillSize(text);
+    return QSizeF(size.width() + kColorChip + kColorChipGap, size.height());
 }
 
 // Draws a dark rounded label anchored at `anchor` inside `bounds`; flips above
@@ -1117,6 +1171,22 @@ void drawInfoPill(QPainter *painter, const QPointF &anchor, const QString &text,
     }
     drawPillBox(painter, QRectF(anchor.x() - size.width() / 2.0, y, size.width(), size.height()),
                 text, bounds);
+}
+
+// The loupe's readout while the eyedropper is up: the pixel under the crosshair
+// as a chip with its hex beside it, anchored where the coordinates go.  A pair
+// of numbers says nothing about what a click would take; this says all of it.
+void drawColorPill(QPainter *painter, const QPointF &anchor, const QColor &color,
+                   const QRectF &bounds)
+{
+    const QString text = color.name();
+    const QSizeF size = colorPillSize(text);
+    qreal y = anchor.y() + 10.0;
+    if (y + size.height() > bounds.bottom()) {
+        y = anchor.y() - size.height() - 10.0;
+    }
+    drawPillBox(painter, QRectF(anchor.x() - size.width() / 2.0, y, size.width(), size.height()),
+                text, bounds, color);
 }
 
 // Draws the size pill of a capture selection, which hangs *outside* the region
@@ -2742,7 +2812,7 @@ public:
         // step back the capture pinned to its right-hand edge, one row each:
         // undo over redo, OK over Cancel.
         //
-        // It was one row until the tools filled it: eleven drawing tools, four
+        // It was one row until the tools filled it: twelve drawing tools, four
         // one-shot actions, the history pair and the two ends of the capture came
         // to about a thousand logical pixels, which is most of a 1080p output and
         // wider than the panels it has to sit beside -- a bar that long can only
@@ -2770,18 +2840,22 @@ public:
         commandColumn->addLayout(toolRow);
         commandColumn->addLayout(actionRow);
         cardLayout->addLayout(commandColumn);
-        addTool(toolRow, uiTr("Select"), Tool::Select);
-        addTool(toolRow, uiTr("Rect"), Tool::Rectangle);
-        addTool(toolRow, uiTr("Ellipse"), Tool::Ellipse);
-        addTool(toolRow, uiTr("Arrow"), Tool::Arrow);
-        addTool(toolRow, uiTr("Line"), Tool::Line);
-        addTool(toolRow, uiTr("Wave"), Tool::Wave);
-        addTool(toolRow, uiTr("Bezier"), Tool::Bezier);
-        addTool(toolRow, uiTr("Draw"), Tool::Pen);
-        addTool(toolRow, uiTr("Text"), Tool::Text);
-        addTool(toolRow, uiTr("Number"), Tool::Number);
-        addTool(toolRow, uiTr("Mosaic"), Tool::Mosaic);
-        // The eleven are in, so their one size can be measured from their own
+        addTool(toolRow, Tool::Select);
+        addTool(toolRow, Tool::Rectangle);
+        addTool(toolRow, Tool::Ellipse);
+        addTool(toolRow, Tool::Arrow);
+        addTool(toolRow, Tool::Line);
+        addTool(toolRow, Tool::Wave);
+        addTool(toolRow, Tool::Bezier);
+        addTool(toolRow, Tool::Pen);
+        addTool(toolRow, Tool::Text);
+        addTool(toolRow, Tool::Number);
+        addTool(toolRow, Tool::Mosaic);
+        // The eyedropper closes the row: it draws nothing itself, it reads the
+        // pixel under the click and hands the colour to the tool it was armed
+        // from, which is where the pick leaves the session.
+        addTool(toolRow, Tool::Picker);
+        // The twelve are in, so their one size can be measured from their own
         // labels; the row of actions below is built at it, which is why this
         // stands between the two rows rather than at the end of both.
         sizeToolButtons();
@@ -3701,15 +3775,22 @@ public:
         amplitudeLabel_->setText(uiTr("Amplitude %1").arg(amplitudeSlider_->value()));
         wavelengthLabel_->setText(uiTr("Wavelength %1").arg(wavelengthSlider_->value()));
         // The pen and the wave each need a sentence: neither gesture reads off
-        // its button, and a user said so.
+        // its button, and a user said so.  The eyedropper needs one for the same
+        // reason -- where the colour it takes will land is not visible on the
+        // button -- and it is the one hint keyed off the armed tool rather than
+        // off the style row's target, which the picker borrows from the tool it
+        // is about to hand the colour to.
         const QString usage =
-            target == QStringLiteral("bezier")
-            ? uiTr("Click to drop an anchor, drag from it to bend the curve, click the "
-                   "first anchor to close, double click to finish")
-            : (target == QStringLiteral("wave")
-                   ? uiTr("Drag between two points, then shape the wave with Amplitude "
-                          "and Wavelength")
-                   : QString());
+            controller_->tool_ == Tool::Picker
+            ? uiTr("Click a pixel to take its color for the %1")
+                  .arg(toolLabel(controller_->pickerTarget()))
+            : (target == QStringLiteral("bezier")
+                   ? uiTr("Click to drop an anchor, drag from it to bend the curve, click the "
+                          "first anchor to close, double click to finish")
+                   : (target == QStringLiteral("wave")
+                          ? uiTr("Drag between two points, then shape the wave with Amplitude "
+                                 "and Wavelength")
+                          : QString()));
         usageHint_->setText(usage);
         usageHint_->setVisible(!usage.isEmpty());
         // While a label is being typed the size box must not take the keyboard:
@@ -4184,15 +4265,50 @@ private:
         return button;
     }
 
-    void addTool(QHBoxLayout *layout, const QString &label, Tool tool)
+    // What a tool's button says.  One list rather than one per call site: the
+    // eyedropper's tooltip names the tool it will hand its colour to, and it
+    // has to say the same word the button does.
+    static QString toolLabel(Tool tool)
     {
+        switch (tool) {
+        case Tool::Select:
+            return uiTr("Select");
+        case Tool::Rectangle:
+            return uiTr("Rect");
+        case Tool::Ellipse:
+            return uiTr("Ellipse");
+        case Tool::Arrow:
+            return uiTr("Arrow");
+        case Tool::Line:
+            return uiTr("Line");
+        case Tool::Wave:
+            return uiTr("Wave");
+        case Tool::Bezier:
+            return uiTr("Bezier");
+        case Tool::Pen:
+            return uiTr("Draw");
+        case Tool::Text:
+            return uiTr("Text");
+        case Tool::Number:
+            return uiTr("Number");
+        case Tool::Mosaic:
+            return uiTr("Mosaic");
+        case Tool::Picker:
+            return uiTr("Pick");
+        }
+        return QString();
+    }
+
+    void addTool(QHBoxLayout *layout, Tool tool)
+    {
+        const QString label = toolLabel(tool);
         auto *button = new QToolButton(this);
         button->setProperty("toolButton", true);
         button->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
         button->setText(label);
         button->setIcon(toolbarIcon(tool, QColor(230, 225, 229), devicePixelRatioF()));
         button->setIconSize(QSize(20, 20));
-        // No size of its own: the eleven of them are sized together once the
+        // No size of its own: the twelve of them are sized together once the
         // last one is in, by `sizeToolButtons`.  A button fixed here would
         // report that fixed width back from `sizeHint`, which is the one number
         // that pass has to read.
@@ -4239,6 +4355,9 @@ private:
             return uiTr("Click to place a number; each click counts up from one");
         case Tool::Mosaic:
             return uiTr("Pixelate an area: rectangle, ellipse or freehand brush");
+        case Tool::Picker:
+            return uiTr("Pick a color from the image; the pick hands it to the tool "
+                        "you were using and leaves you on it");
         }
         return QString();
     }
@@ -4270,12 +4389,12 @@ private:
         return widest;
     }
 
-    // One size for all eleven drawing tools, taken from what each label and icon
+    // One size for all twelve drawing tools, taken from what each label and icon
     // actually asks the style for rather than from a number picked by hand.
     //
     // The hand-picked number was 48x46, chosen when the labels were the widest
     // thing in the row; measured against the labels of both languages it stood
-    // about a tenth more than any of them needed, and the eleven buttons put
+    // about a tenth more than any of them needed, and the twelve buttons put
     // that slack on the panel's width and height together.  Reading the size
     // back from the style is also what keeps a wider font -- the desktop's own,
     // which the toolbar is drawn in -- from eliding a label.
@@ -4539,7 +4658,7 @@ OverlayController::OverlayController(Session session)
     const Tool everyTool[] = {
         Tool::Select,  Tool::Rectangle, Tool::Ellipse, Tool::Arrow, Tool::Line,
         Tool::Wave,    Tool::Bezier,    Tool::Pen,     Tool::Text,  Tool::Number,
-        Tool::Mosaic,
+        Tool::Mosaic,  Tool::Picker,
     };
     for (const Tool entry : everyTool) {
         ToolStyle style;
@@ -5367,6 +5486,41 @@ void OverlayController::placeNumber(Point point)
     selectAnnotation(newIndex);
 }
 
+// The eyedropper's whole gesture: read the pixel under the pointer out of the
+// frozen frame and write it into the style of the tool the picker was armed
+// from.  Only the colour is taken -- the tool keeps the opacity the user set,
+// the way a palette swatch leaves it -- and the pick hands the session back to
+// that tool, so the next click draws with what was just read.
+bool OverlayController::pickColorAt(CaptureOverlay *overlay, Point point)
+{
+    if (!canDrawAt(point)) {
+        return false;
+    }
+    const OutputSession &output = overlay->output();
+    const std::uint32_t scale = output.scale > 0 ? output.scale : 1;
+    const int width = static_cast<int>(output.image.width());
+    const int height = static_cast<int>(output.image.height());
+    if (width <= 0 || height <= 0) {
+        return false;
+    }
+    // The mapping the loupe reads its pixels through, so the colour the readout
+    // shows under the crosshair is the one the click takes.
+    const int x = std::clamp(
+        static_cast<int>(std::floor((point.x - output.geometry.x) * static_cast<double>(scale))),
+        0, width - 1);
+    const int y = std::clamp(
+        static_cast<int>(std::floor((point.y - output.geometry.y) * static_cast<double>(scale))),
+        0, height - 1);
+    QColor color = output.image.pixelColor(x, y);
+    if (!color.isValid()) {
+        return false;
+    }
+    color.setAlpha(toolStyle(styleTargetTool()).color.alpha());
+    pickedColor_ = color;
+    setCurrentColor(color);
+    return true;
+}
+
 void OverlayController::beginText(CaptureOverlay *overlay, Point point)
 {
     if (textEdit_ != nullptr) {
@@ -6072,6 +6226,16 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
         placeNumber(point);
         return;
     }
+    if (tool_ == Tool::Picker) {
+        // One click takes one pixel, for the same reason: there is no drag to
+        // preview.  The style row already points at the tool the picker was
+        // armed from, and the pick hands the session back to it -- a colour is
+        // only worth anything on the tool that is about to draw with it.
+        if (pickColorAt(overlay, point)) {
+            chooseTool(pickerReturnTool_);
+        }
+        return;
+    }
     if (tool_ == Tool::Bezier) {
         if (!canDrawAt(point)) {
             return;
@@ -6202,6 +6366,16 @@ void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::
             updateTouch(annotationTouch());
             return;
         }
+    }
+    if (tool_ == Tool::Picker && gesture_->type == Gesture::Type::None) {
+        // The eyedropper reads one pixel at a time, so its loupe follows the
+        // idle pointer rather than a drag: the readout is the instrument.  The
+        // step repaints the loupe and its pill where they were and where they
+        // are now -- `pointerTouch` bounds both around the pointer -- so the
+        // magnified frame is never left behind on the surface.
+        overlay->setCursor(Qt::CrossCursor);
+        updateTouch(pointerTouch());
+        return;
     }
     if (pickMode_ && !editing_ && buttons == Qt::NoButton &&
         gesture_->type == Gesture::Type::None) {
@@ -6695,6 +6869,14 @@ void OverlayController::chooseTool(Tool tool)
         // any more.
         gesture_->type = Gesture::Type::None;
         gesture_->points.clear();
+    }
+    if (tool == Tool::Picker && tool_ != Tool::Picker) {
+        // The colour a pick takes has to land somewhere visible, and the picker
+        // has no style of its own to hold it: it goes to the tool that was
+        // armed, which is the one the user is about to draw with.  Armed from
+        // Select -- a tool that draws nothing -- the pick goes to the pen
+        // instead, whose colour is the session's own ink.
+        pickerReturnTool_ = tool_ == Tool::Select ? Tool::Pen : tool_;
     }
     tool_ = tool;
     // Keep the annotation selection when moving to Select so a freshly drawn
@@ -7888,6 +8070,13 @@ QString OverlayController::styleTargetTool() const
             return QStringLiteral("text");
         }
         return annotation.tool;
+    }
+    // The eyedropper has no style of its own: it reads a pixel and hands it to
+    // the tool it was armed from.  Pointing the style row at that tool is what
+    // makes the pick land there -- every setter on the row goes through this --
+    // and it puts the colour a pick would replace on screen before the click.
+    if (tool_ == Tool::Picker) {
+        return toolName(pickerReturnTool_);
     }
     return toolName(tool_);
 }
@@ -9986,9 +10175,15 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
     // magnifier there would follow the very picture it is magnifying: the loupe
     // belongs to picking a region out of a frozen frame, not to placing a pin.
     const bool pinDrag = pinEdit_ && gesture_->type == Gesture::Type::Moving;
+    // The eyedropper's loupe follows an idle pointer -- that is the whole
+    // instrument, and the readout under it is where the colour is read from --
+    // and it stays off the bare canvas a pin editor leaves around its image,
+    // where there is no pixel to take.
+    const bool pickerLoupe = tool_ == Tool::Picker && gesture_->type == Gesture::Type::None &&
+        (!pinEdit_ || canDrawAt(pointer_));
     const bool loupeActive = !pinDrag &&
-        (gesture_->type == Gesture::Type::Selecting || gesture_->type == Gesture::Type::Moving ||
-         gesture_->type == Gesture::Type::Resizing ||
+        (pickerLoupe || gesture_->type == Gesture::Type::Selecting ||
+         gesture_->type == Gesture::Type::Moving || gesture_->type == Gesture::Type::Resizing ||
          gesture_->type == Gesture::Type::MovingAnnotation ||
          gesture_->type == Gesture::Type::ResizingAnnotation);
     if (loupeActive && pointerOutput_ == overlay->outputIndex()) {
@@ -10201,8 +10396,16 @@ void OverlayController::drawLoupe(CaptureOverlay *overlay, QPainter *painter)
     painter->drawLine(center, center + QPointF(0, radius / 2.5));
     const QString coordinates = QStringLiteral("%1, %2").arg(centerX).arg(centerY);
     painter->restore();
-    drawInfoPill(painter, center + QPointF(0, radius + 2.0), coordinates,
-                 QRectF(0, 0, overlay->width(), overlay->height()));
+    // Under the eyedropper the readout is the pixel itself, chip and hex: that
+    // is the value the click is about to take.  Everywhere else the loupe is
+    // there to place a corner, and the numbers are what is wanted.
+    const QRectF bounds(0, 0, overlay->width(), overlay->height());
+    if (tool_ == Tool::Picker) {
+        drawColorPill(painter, center + QPointF(0, radius + 2.0),
+                      output.image.pixelColor(centerX, centerY), bounds);
+    } else {
+        drawInfoPill(painter, center + QPointF(0, radius + 2.0), coordinates, bounds);
+    }
 }
 
 CaptureOverlay::CaptureOverlay(int outputIndex, OverlayController *controller, QScreen *screen)

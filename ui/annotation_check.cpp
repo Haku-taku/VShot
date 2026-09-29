@@ -1729,6 +1729,157 @@ void checkThePinDragRaisesNoMagnifier()
     controller.release(overlay, QPointF(200, 190), Qt::LeftButton, Qt::NoModifier);
 }
 
+// The eyedropper: one click reads the pixel under it, hands the colour to the
+// tool that was armed when it was chosen, and leaves the session on that tool.
+// The pick takes the colour only -- the tool keeps the opacity the user set --
+// and what it took is reported back, so a caller can say so.
+void checkTheEyedropperTakesThePixelItIsPointedAt()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    // A translucent pen, so "the pick keeps the opacity" is a claim the check
+    // can see: a pick that took the whole pixel would make the pen opaque.
+    controller.chooseTool(vshot::Tool::Pen);
+    QColor pen = controller.toolStyle(QStringLiteral("pen")).color;
+    pen.setAlpha(120);
+    controller.setCurrentColor(pen);
+    expect(!controller.pickedColor().isValid(), "nothing has been picked before the first click");
+
+    // The point the loupe and the pick both map through: the overlay's local
+    // point floors to this pixel, and the check reads the very same one.
+    const QPointF local(100.5, 60.5);
+    const QColor under = overlay->output().image.pixelColor(100, 60);
+    controller.chooseTool(vshot::Tool::Picker);
+    expect(controller.currentTool() == vshot::Tool::Picker, "the eyedropper arms");
+    expect(controller.pickerTarget() == vshot::Tool::Pen,
+           "and knows which tool its colour is for");
+    controller.press(overlay, local, Qt::LeftButton, Qt::NoModifier);
+    controller.release(overlay, local, Qt::LeftButton, Qt::NoModifier);
+
+    const QColor taken = controller.toolStyle(QStringLiteral("pen")).color;
+    expect(taken.rgb() == under.rgb(), "the pen takes the pixel the click was on",
+           QStringLiteral("pen %1, pixel %2").arg(taken.name(), under.name()));
+    expect(taken.alpha() == 120, "and keeps the opacity it was drawn with",
+           QStringLiteral("alpha %1").arg(taken.alpha()));
+    expect(controller.pickedColor().rgb() == under.rgb(),
+           "the pick is reported back as it was taken");
+    expect(controller.currentTool() == vshot::Tool::Pen,
+           "and the pick hands the session back to the pen");
+    expect(controller.annotations().isEmpty(), "the picker draws no mark",
+           QStringLiteral("%1 of them").arg(controller.annotations().size()));
+
+    // Armed from Select, which draws nothing, the colour still has somewhere to
+    // go: the pen is the session's own ink, and the pick leaves the user on it.
+    controller.chooseTool(vshot::Tool::Select);
+    controller.chooseTool(vshot::Tool::Picker);
+    expect(controller.pickerTarget() == vshot::Tool::Pen,
+           "a pick armed from Select is for the pen");
+    controller.press(overlay, local, Qt::LeftButton, Qt::NoModifier);
+    expect(controller.currentTool() == vshot::Tool::Pen, "and leaves the session on it");
+}
+
+// The eyedropper's loupe follows an idle pointer -- that is the whole
+// instrument, and the readout under it is the colour a click would take -- and
+// it goes with the tool: a drawing tool ignores an idle pointer, so switching
+// to one takes the magnified frame off the surface.  The step that moves it
+// repaints the box it left as well as the one it entered, which is what keeps
+// a stale loupe from being left behind.
+void checkTheEyedropperLoupeFollowsThePointer()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    // The overlay's own paint(), not the widget: the floating toolbar is a child
+    // that would be rendered with it, and it is not what this check is about.
+    const auto painted = [&] {
+        QImage target(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+        target.fill(Qt::transparent);
+        QPainter painter(&target);
+        controller.paint(overlay, &painter);
+        painter.end();
+        return target;
+    };
+    const auto changedBox = [](const QImage &before, const QImage &after, int *count) {
+        QRect box;
+        int pixels = 0;
+        for (int y = 0; y < after.height(); ++y) {
+            for (int x = 0; x < after.width(); ++x) {
+                if (before.pixel(x, y) == after.pixel(x, y)) {
+                    continue;
+                }
+                ++pixels;
+                box = box.isNull() ? QRect(x, y, 1, 1) : box.united(QRect(x, y, 1, 1));
+            }
+        }
+        if (count != nullptr) {
+            *count = pixels;
+        }
+        return box;
+    };
+
+    // A drawing tool ignores an idle pointer: the frozen frame is what it is,
+    // and the crosshair is the cursor's business.
+    controller.chooseTool(vshot::Tool::Pen);
+    controller.move(overlay, QPointF(100, 100), Qt::NoButton, Qt::NoModifier);
+    const QImage idle = painted();
+    controller.move(overlay, QPointF(260, 200), Qt::NoButton, Qt::NoModifier);
+    int idlePixels = 0;
+    changedBox(idle, painted(), &idlePixels);
+    expect(idlePixels == 0, "an idle pointer paints nothing under a drawing tool",
+           QStringLiteral("%1 px changed").arg(idlePixels));
+
+    // The loupe hangs beside the pointer and its readout under it, so every
+    // pixel the eyedropper's hover puts on the surface is near the pointer.
+    controller.chooseTool(vshot::Tool::Picker);
+    controller.move(overlay, QPointF(120, 120), Qt::NoButton, Qt::NoModifier);
+    controller.chooseTool(vshot::Tool::Pen);
+    const QImage beforeHover = painted();
+    controller.chooseTool(vshot::Tool::Picker);
+    int loupePixels = 0;
+    const QRect loupe = changedBox(beforeHover, painted(), &loupePixels);
+    expect(loupePixels > 0, "the eyedropper's loupe follows the pointer",
+           QStringLiteral("%1 px").arg(loupePixels));
+    constexpr int reach = 200;
+    const QRect aroundPointer(120 - reach, 120 - reach, 2 * reach, 2 * reach);
+    expect(aroundPointer.contains(loupe), "and stays beside the pointer",
+           QStringLiteral("loupe %1,%2 %3x%4")
+               .arg(loupe.x())
+               .arg(loupe.y())
+               .arg(loupe.width())
+               .arg(loupe.height()));
+
+    // The step's own repaint rect has to cover both where the loupe was and
+    // where it went; a rect that covered only the new place would leave the old
+    // magnified frame on the surface.
+    controller.move(overlay, QPointF(200, 160), Qt::NoButton, Qt::NoModifier);
+    expectStepCoveredBy(controller, overlay,
+                        [&] {
+                            controller.move(overlay, QPointF(300, 280), Qt::NoButton,
+                                            Qt::NoModifier);
+                        },
+                        "the eyedropper's hover repaints the box it left and the one it entered");
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -1764,6 +1915,8 @@ int main(int argc, char *argv[])
     checkBezierStepCoverage();
     checkSelectModeDecidesWhatAPressPicksUp();
     checkThePinDragRaisesNoMagnifier();
+    checkTheEyedropperTakesThePixelItIsPointedAt();
+    checkTheEyedropperLoupeFollowsThePointer();
 
     if (failures != 0) {
         std::printf("\n%d annotation cache checks failed\n", failures);

@@ -259,6 +259,11 @@ enum class Tool {
     // knowledge of it at all.
     Number,
     Mosaic,
+    // The eyedropper: a click reads the pixel under it and hands the colour to
+    // the tool the picker was armed from, which is also the tool the pick hands
+    // the session back to.  It paints nothing of its own, so it is the one tool
+    // with no style row.
+    Picker,
 };
 
 class CaptureOverlay;
@@ -329,6 +334,19 @@ public:
     /// one from construction, so a read never has to invent a value.
     ToolStyle &toolStyle(const QString &tool);
     const ToolStyle &toolStyle(const QString &tool) const;
+    /// The tool the eyedropper hands its colour to: the one that was armed when
+    /// the picker was chosen, which is also the tool a pick leaves the session
+    /// on.  While the picker is up the style row shows this tool's values, so
+    /// what a pick would change is on screen before the click.
+    Tool pickerTarget() const { return pickerReturnTool_; }
+    /// The colour the last pick took, invalid before the first one.  The pick
+    /// writes the target tool's `ToolStyle`; this is the same value kept where
+    /// a caller can read it without knowing which tool that was.
+    QColor pickedColor() const { return pickedColor_; }
+    /// The tool that is armed.  The eyedropper is what makes this worth reading:
+    /// it is the one tool whose press changes the armed tool by itself, handing
+    /// the session back to the tool the pick was for.
+    Tool currentTool() const { return tool_; }
     // The badge style the next numbered mark is placed with, and any number
     // already selected.
     void setNumberStyle(NumberStyle style);
@@ -538,6 +556,12 @@ private:
     Point pointer_;
     int pointerOutput_ = -1;
     Tool tool_ = Tool::Select;
+    // The eyedropper's own state: the tool a pick will hand its colour to --
+    // the one that was armed when the picker was chosen -- and the colour the
+    // last pick took.  The colour itself is written into that tool's
+    // `ToolStyle`, which is what a painter reads; this copy is for readouts.
+    Tool pickerReturnTool_ = Tool::Pen;
+    QColor pickedColor_;
     QString currentFont_;
     // Per-tool colour and numeric parameters, keyed by `toolName`.  A painter
     // path reads the tool it is drawing with; the style row reads and writes
@@ -675,6 +699,11 @@ private:
     // Places one numbered badge at `point` and advances the count.  The whole
     // tool is a press: there is no drag to preview.
     void placeNumber(Point point);
+    // Reads the pixel under `point` and hands its colour to the tool the
+    // picker was armed from, keeping that tool's opacity.  False when there is
+    // no pixel to read -- the pointer is off the frozen image.  The whole tool
+    // is a press, like the number badge.
+    bool pickColorAt(CaptureOverlay *overlay, Point point);
     void startTextEditor(CaptureOverlay *overlay, int index, Point origin);
     void finishText(bool accept);
     int annotationHitAt(Point point) const;

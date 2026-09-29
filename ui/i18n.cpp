@@ -47,6 +47,7 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("Draw"), QString::fromUtf8("涂鸦")},
         {QStringLiteral("Text"), QString::fromUtf8("文本")},
         {QStringLiteral("Mosaic"), QString::fromUtf8("马赛克")},
+        {QStringLiteral("Pick"), QString::fromUtf8("取色")},
         {QStringLiteral("Erase"), QString::fromUtf8("橡皮")},
 
         // Action buttons and their tooltips.
@@ -181,6 +182,9 @@ const QHash<QString, QString> &chineseTable()
          QString::fromUtf8("点击放置文本标签，点击已有文本可重新编辑")},
         {QStringLiteral("Pixelate an area: rectangle, ellipse or freehand brush"),
          QString::fromUtf8("区域打码：矩形、椭圆或自由涂抹")},
+        {QStringLiteral("Pick a color from the image; the pick hands it to the tool "
+                        "you were using and leaves you on it"),
+         QString::fromUtf8("从画面上取色；取到的颜色交给刚才用的工具，取完回到它")},
 
         // Style segment labels.
         {QStringLiteral("Solid"), QString::fromUtf8("实线")},
@@ -508,6 +512,8 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("Drag between two points, then shape the wave with Amplitude "
                         "and Wavelength"),
          QString::fromUtf8("在两点之间拖出波浪线，再用「幅度」「波长」调整形状")},
+        {QStringLiteral("Click a pixel to take its color for the %1"),
+         QString::fromUtf8("点击像素取色，颜色交给「%1」")},
         // How a pen path is painted.
         {QStringLiteral("Pen fill mode"), QString::fromUtf8("钢笔填充方式")},
         // "Outline" rather than "Stroke": the settings window's line-style card

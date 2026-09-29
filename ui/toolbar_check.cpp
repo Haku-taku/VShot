@@ -452,7 +452,7 @@ void checkCommandBarIsTwoRows()
             ++inToolsRow;
         }
     }
-    expect(inToolsRow == 11, "the drawing tools keep its first row to themselves",
+    expect(inToolsRow == 12, "the drawing tools keep its first row to themselves",
            QStringLiteral("%1 of them in it").arg(inToolsRow));
     auto *paste = parts.command->findChild<QToolButton *>(QStringLiteral("pasteButton"));
     expect(paste != nullptr && actions->indexOf(paste) >= 0,
@@ -744,7 +744,7 @@ void checkTheEndsArePinnedToTheRight()
 //
 // The size is read from the style -- the widest label the row has to draw --
 // rather than picked by hand, so the promise worth locking down is not a number:
-// it is that the eleven tools share one box, that the actions which follow them
+// it is that the twelve tools share one box, that the actions which follow them
 // are as tall as that box, that the history pair and the two ends of the capture
 // are too, and that no button is narrower or shorter than its own size hint.
 // Undo and redo were 32x28 in a 46-tall row, which is what a floating box in the
@@ -819,7 +819,7 @@ void checkCommandBarButtonsShareOneSize()
            QStringLiteral("%1 of %2").arg(squeezed).arg(buttons.size()));
 
     // The tools are one column: the widest of their labels sets the width of all
-    // eleven, so the row reads across rather than stepping.  And the width it
+    // twelve, so the row reads across rather than stepping.  And the width it
     // comes to is exactly the widest hint -- not more: a size measured before
     // the buttons were polished is measured in the application's font, which
     // leaves the row wider than any label in it needs.
@@ -958,6 +958,60 @@ void checkTheSizePillStaysOutsideTheCapture()
     }
 }
 
+// The tools' icons come from one switch with no default case, so a tool that is
+// added to the enum and not to that switch is a button with a hole in it: a
+// blank square sitting in the row, which is what the eyedropper was for one
+// build.  The two-row split already asserts how many buttons the row holds;
+// what this adds is that each of them actually draws something.
+void checkEveryToolDrawsItsOwnIcon()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(sessionFor(vshot::LogicalRect{100, 100, 120, 120}));
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+    const ToolbarParts parts = toolbarParts(overlay);
+    QLayout *tools = parts.command != nullptr ? commandRow(parts.command, 0) : nullptr;
+    if (tools == nullptr) {
+        expect(false, "the tool row is laid out as a row");
+        return;
+    }
+    int counted = 0;
+    int blank = 0;
+    for (QToolButton *button : parts.command->findChildren<QToolButton *>()) {
+        if (tools->indexOf(button) < 0) {
+            continue;
+        }
+        ++counted;
+        const QImage icon = button->icon().pixmap(20, 20).toImage();
+        int inked = 0;
+        for (int y = 0; y < icon.height() && inked == 0; ++y) {
+            for (int x = 0; x < icon.width(); ++x) {
+                if (qAlpha(icon.pixel(x, y)) > 8) {
+                    inked = 1;
+                    break;
+                }
+            }
+        }
+        if (inked == 0) {
+            ++blank;
+        }
+    }
+    expect(counted == 12, "the tool row is twelve buttons",
+           QStringLiteral("%1 of them").arg(counted));
+    expect(blank == 0, "and every one of them draws an icon",
+           QStringLiteral("%1 blank").arg(blank));
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -971,6 +1025,7 @@ int main(int argc, char *argv[])
     checkPinButtonAsksForTheScreen();
     checkThePinEditorOffersNoPinButton();
     checkCommandBarIsTwoRows();
+    checkEveryToolDrawsItsOwnIcon();
     checkCommandBarButtonsShareOneSize();
     checkTheEndsArePinnedToTheRight();
     checkTheSizePillStaysOutsideTheCapture();
