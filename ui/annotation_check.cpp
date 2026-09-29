@@ -2221,6 +2221,38 @@ void checkPinDragKeepsOneConnection()
                .arg(requested.isEmpty() ? -1 : requested.constLast().y()));
 }
 
+// The overlays outlive the controller: `main` deletes them after the
+// controller's scope has ended.  So the controller must not delete them too,
+// and must leave nothing pointing at itself, or the caller's delete (or the
+// next repaint) runs through freed memory.
+void checkOverlayOutlivesItsController()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::CaptureOverlay *overlay = nullptr;
+    {
+        vshot::OverlayController controller(editingSession());
+        QString error;
+        overlay = controller.addOverlay(0, screen, &error);
+        if (overlay == nullptr) {
+            expect(false, "the controller accepts an overlay", error);
+            return;
+        }
+        overlay->show();
+        controller.beginPresetEdit();
+        QCoreApplication::processEvents();
+    }
+    // The controller is gone.  The overlay is hidden, and deleting it here --
+    // the one delete, as `main` does it -- must be safe.
+    expect(overlay != nullptr && !overlay->isVisible(),
+           "a controller that dies hides the overlays it was driving");
+    delete overlay;
+    expect(true, "the overlay the caller owns is deleted once");
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -2251,6 +2283,7 @@ int main(int argc, char *argv[])
     checkPinEditStepsCoverTheirChange();
     checkMovedPinLoupeFollowsTheImage();
     checkPinDragKeepsOneConnection();
+    checkOverlayOutlivesItsController();
     checkLiveStrokeSurvivesIncrementalRepaint();
     checkInteractiveUpdateCoversTheChange();
     checkWaveSerializesAsATwoPointStroke();

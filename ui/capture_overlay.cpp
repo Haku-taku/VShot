@@ -4595,11 +4595,11 @@ OverlayController::~OverlayController()
     delete pinSocket_;
     delete candidateReader_;
     delete candidateTimer_;
-    // The overlays are the controller's too.  A window left mapped would keep
-    // painting through a controller that is already gone, which is a crash the
-    // moment anything runs the event loop again.
+    // The overlays are the caller's to delete (see `main`), so they are not
+    // owned here -- but they must stop painting through a controller that is
+    // gone.  Detach them, which hides them too.
     for (CaptureOverlay *overlay : overlays_) {
-        delete overlay;
+        overlay->detachController();
     }
     overlays_.clear();
 }
@@ -10412,40 +10412,59 @@ bool CaptureOverlay::showLayerSurfaceAt(int globalX, int globalY, int width, int
     return true;
 }
 
+void CaptureOverlay::detachController()
+{
+    controller_ = nullptr;
+    hide();
+}
+
 void CaptureOverlay::paintEvent(QPaintEvent *event)
 {
     Q_UNUSED(event);
+    if (controller_ == nullptr) {
+        return;
+    }
     QPainter painter(this);
     controller_->paint(this, &painter);
 }
 
 void CaptureOverlay::mousePressEvent(QMouseEvent *event)
 {
-    controller_->press(this, event->position(), event->button(), event->modifiers());
+    if (controller_ != nullptr) {
+        controller_->press(this, event->position(), event->button(), event->modifiers());
+    }
     event->accept();
 }
 
 void CaptureOverlay::mouseMoveEvent(QMouseEvent *event)
 {
-    controller_->move(this, event->position(), event->buttons(), event->modifiers());
+    if (controller_ != nullptr) {
+        controller_->move(this, event->position(), event->buttons(), event->modifiers());
+    }
     event->accept();
 }
 
 void CaptureOverlay::mouseReleaseEvent(QMouseEvent *event)
 {
-    controller_->release(this, event->position(), event->button(), event->modifiers());
+    if (controller_ != nullptr) {
+        controller_->release(this, event->position(), event->button(), event->modifiers());
+    }
     event->accept();
 }
 
 void CaptureOverlay::mouseDoubleClickEvent(QMouseEvent *event)
 {
-    controller_->doubleClick(this, event->position(), event->button());
+    if (controller_ != nullptr) {
+        controller_->doubleClick(this, event->position(), event->button());
+    }
     event->accept();
 }
 
 void CaptureOverlay::keyPressEvent(QKeyEvent *event)
 {
-    controller_->key(this, event->key(), event->modifiers());
+    if (controller_ != nullptr) {
+        controller_->key(this, event->key(), event->modifiers());
+    }
     event->accept();
 }
 
@@ -10453,7 +10472,9 @@ void CaptureOverlay::closeEvent(QCloseEvent *event)
 {
     // The compositor (or a stray close request) must not hang the Rust side:
     // treat an externally closed overlay as a cancelled session.
-    controller_->cancel();
+    if (controller_ != nullptr) {
+        controller_->cancel();
+    }
     event->accept();
 }
 

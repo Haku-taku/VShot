@@ -786,6 +786,12 @@ public:
     // (top-left anchored + margins): used by the pin editor.
     bool showLayerSurfaceAt(int globalX, int globalY, int width, int height);
 
+    // Called when the controller that drove this overlay is destroyed.  The
+    // overlay outlives it -- the caller owns the widget and deletes it -- and a
+    // window left painting through a dead controller is a crash waiting for the
+    // next turn of the event loop.
+    void detachController();
+
 protected:
     void paintEvent(QPaintEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
