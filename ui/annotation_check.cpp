@@ -35,6 +35,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLineEdit>
+#include <QPainter>
 #include <QPointF>
 #include <QRegion>
 #include <QScreen>
@@ -1663,6 +1664,71 @@ void checkSelectModeDecidesWhatAPressPicksUp()
     run(QStringLiteral("precise"), false);
 }
 
+// The magnifier follows a gesture that is picking something out of the frozen
+// frame.  A pinned image is not that: the pointer is placing a picture that is
+// already the right pixels, so a loupe there magnifies the very thing it is
+// over and says nothing the user can act on.  The check paints the overlay's
+// own paint() -- not the widget, whose floating toolbar is a child that would
+// be rendered with it -- and counts what the drag puts on the surface: the pin
+// editor draws no chrome of its own, so a magnifier would be the only thing
+// there, and a pen stroke drawn right after proves the surface does paint when
+// it has something to say.
+void checkThePinDragRaisesNoMagnifier()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.setPinEditMode(true);
+    controller.beginPinEdit();
+
+    const auto painted = [&] {
+        QImage target(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+        target.fill(Qt::transparent);
+        QPainter painter(&target);
+        controller.paint(overlay, &painter);
+        painter.end();
+        int count = 0;
+        for (int y = 0; y < target.height(); ++y) {
+            for (int x = 0; x < target.width(); ++x) {
+                if (target.pixelColor(x, y).alpha() > 8) {
+                    ++count;
+                }
+            }
+        }
+        return count;
+    };
+
+    // A press inside the image, then a travel: the drag that moves the pin.
+    controller.chooseTool(vshot::Tool::Select);
+    controller.press(overlay, QPointF(150, 150), Qt::LeftButton, Qt::NoModifier);
+    controller.move(overlay, QPointF(180, 180), Qt::LeftButton, Qt::NoModifier);
+    const int dragged = painted();
+    expect(dragged == 0, "dragging a pinned image raises no magnifier",
+           QStringLiteral("%1 px on the surface").arg(dragged));
+    controller.release(overlay, QPointF(180, 180), Qt::LeftButton, Qt::NoModifier);
+
+    // The same editor does paint: a pen stroke is drawn on the surface as it
+    // grows, which is what makes the count above mean "nothing" rather than
+    // "this overlay never paints".
+    controller.chooseTool(vshot::Tool::Pen);
+    controller.press(overlay, QPointF(150, 150), Qt::LeftButton, Qt::NoModifier);
+    controller.move(overlay, QPointF(200, 190), Qt::LeftButton, Qt::NoModifier);
+    const int stroke = painted();
+    expect(stroke > 0, "the pin editor still draws the marks it is given",
+           QStringLiteral("%1 px on the surface").arg(stroke));
+    controller.release(overlay, QPointF(200, 190), Qt::LeftButton, Qt::NoModifier);
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -1697,6 +1763,7 @@ int main(int argc, char *argv[])
     checkBezierFillsAtHalfAlpha();
     checkBezierStepCoverage();
     checkSelectModeDecidesWhatAPressPicksUp();
+    checkThePinDragRaisesNoMagnifier();
 
     if (failures != 0) {
         std::printf("\n%d annotation cache checks failed\n", failures);

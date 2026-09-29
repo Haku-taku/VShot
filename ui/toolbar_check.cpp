@@ -22,15 +22,18 @@
 
 #include <QApplication>
 #include <QBoxLayout>
+#include <QColor>
 #include <QCoreApplication>
 #include <QFontMetrics>
 #include <QFrame>
 #include <QGridLayout>
 #include <QHelpEvent>
+#include <QImage>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
 #include <QLayout>
+#include <QPainter>
 #include <QPoint>
 #include <QPushButton>
 #include <QRect>
@@ -848,6 +851,113 @@ void checkCommandBarButtonsShareOneSize()
            QStringLiteral("%1 against a %2-wide label").arg(toolSize.width()).arg(widest));
 }
 
+// What one rendered editor says about the size pill: the rect its own dark
+// pixels occupy outside the selection, and the rect the floating toolbar was
+// given.
+struct PillPlacement {
+    QRect pill;
+    QRect toolbar;
+    int overCapture = 0;
+};
+
+// The size pill hangs off the selection rather than over it, and it must not
+// end up under the floating toolbar: the toolbar is a child widget, so it
+// paints over whatever the overlay's own paint() put in that spot and a pill
+// behind it is simply not seen.  Neither failure is visible in the arithmetic
+// -- both are questions about where a rounded rectangle lands next to the
+// toolbar and the screen edges -- so the check paints the real overlay and
+// looks for the pill's own pixels.
+//
+// The frame is left unset: the editor then draws the chrome over nothing, and
+// every opaque, nearly black pixel is either the pill or one of the selection's
+// handles, which sit on the selection's edge and are excluded by the bands
+// below.
+PillPlacement pillPlacement(const vshot::LogicalRect &selection, const QSize &screenSize)
+{
+    PillPlacement placement;
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return placement;
+    }
+    vshot::OverlayController controller(sessionFor(selection, screenSize));
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return placement;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+
+    QImage target(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    target.fill(Qt::transparent);
+    QPainter painter(&target);
+    controller.paint(overlay, &painter);
+    painter.end();
+
+    const QRect capture(static_cast<int>(selection.x), static_cast<int>(selection.y),
+                        static_cast<int>(selection.width), static_cast<int>(selection.height));
+    const QRect clear(capture.adjusted(-12, -12, 12, 12));
+    const QRect inside(capture.adjusted(12, 12, -12, -12));
+    for (int y = 0; y < target.height(); ++y) {
+        for (int x = 0; x < target.width(); ++x) {
+            const QColor pixel = target.pixelColor(x, y);
+            if (pixel.alpha() < 200 || pixel.red() > 60 || pixel.green() > 60 ||
+                pixel.blue() > 60) {
+                continue;
+            }
+            if (inside.contains(x, y)) {
+                ++placement.overCapture;
+            } else if (!clear.contains(x, y)) {
+                placement.pill = placement.pill.isNull() ? QRect(x, y, 1, 1)
+                                                         : placement.pill.united(QRect(x, y, 1, 1));
+            }
+        }
+    }
+    if (QWidget *bar = overlay->findChild<QWidget *>(QStringLiteral("toolbarCommandSurface"))) {
+        QWidget *panel = bar->parentWidget();
+        placement.toolbar = QRect(panel->mapTo(overlay, QPoint(0, 0)), panel->size());
+    }
+    return placement;
+}
+
+void checkTheSizePillStaysOutsideTheCapture()
+{
+    // Room on every side of the selection, so the pill has somewhere to go, and
+    // then a selection that reaches both the top and the bottom of the output,
+    // where the toolbar has to double back over the capture and the pill is
+    // left with the side of the region.
+    const vshot::LogicalRect roomy{300, 300, 600, 400};
+    const vshot::LogicalRect fullHeight{300, 0, 600, 1200};
+    const QSize output(1600, 1200);
+    const struct {
+        const char *what;
+        vshot::LogicalRect selection;
+    } cases[] = {
+        {"a selection with room around it", roomy},
+        {"a selection that spans the output's height", fullHeight},
+    };
+    for (const auto &item : cases) {
+        const PillPlacement placement = pillPlacement(item.selection, output);
+        const QString where = QStringLiteral("%1: pill=(%2,%3 %4x%5) toolbar=(%6,%7 %8x%9)")
+                                  .arg(QLatin1String(item.what))
+                                  .arg(placement.pill.x())
+                                  .arg(placement.pill.y())
+                                  .arg(placement.pill.width())
+                                  .arg(placement.pill.height())
+                                  .arg(placement.toolbar.x())
+                                  .arg(placement.toolbar.y())
+                                  .arg(placement.toolbar.width())
+                                  .arg(placement.toolbar.height());
+        expect(!placement.pill.isNull(),
+               "the size pill is drawn outside the capture", where);
+        expect(placement.overCapture == 0, "the size pill never covers the capture", where);
+        expect(!placement.toolbar.intersects(placement.pill),
+               "the size pill is not painted behind the floating toolbar", where);
+    }
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -863,6 +973,7 @@ int main(int argc, char *argv[])
     checkCommandBarIsTwoRows();
     checkCommandBarButtonsShareOneSize();
     checkTheEndsArePinnedToTheRight();
+    checkTheSizePillStaysOutsideTheCapture();
 
     if (failures != 0) {
         std::printf("\n%d toolbar checks failed\n", failures);

@@ -1076,31 +1076,90 @@ QIcon pinIcon(const QColor &color = QColor(230, 225, 229), qreal devicePixelRati
     return QIcon(pixmap);
 }
 
-// Draws a dark rounded label (dimensions, pixel coordinates) anchored at `anchor`
-// inside `bounds`; flips above the anchor when there is no room below.
-void drawInfoPill(QPainter *painter, const QPointF &anchor, const QString &text,
-                  const QRectF &bounds)
+// How far the size pill keeps from the selection it hangs off, and how much
+// room its text needs.
+constexpr int kInfoPillGap = 8;
+
+QSizeF pillSize(const QString &text)
 {
     const QFontMetrics metrics(pillFont());
-    const int textWidth = metrics.horizontalAdvance(text);
-    const int pillWidth = textWidth + 16;
-    const int pillHeight = metrics.height() + 8;
-    qreal x = anchor.x() - pillWidth / 2.0;
-    x = std::clamp(x, bounds.left() + 2.0, std::max(bounds.left() + 2.0, bounds.right() - pillWidth - 2.0));
-    qreal y = anchor.y() + 10.0;
-    if (y + pillHeight > bounds.bottom()) {
-        y = anchor.y() - pillHeight - 10.0;
-    }
-    y = std::clamp(y, bounds.top() + 2.0, std::max(bounds.top() + 2.0, bounds.bottom() - pillHeight - 2.0));
-    const QRectF pill(x, y, pillWidth, pillHeight);
+    return QSizeF(metrics.horizontalAdvance(text) + 16, metrics.height() + 8);
+}
+
+// Draws a dark rounded label (dimensions, pixel coordinates) in `pill`, pulled
+// back inside `bounds` when it would hang over an edge.
+void drawPillBox(QPainter *painter, const QRectF &pill, const QString &text, const QRectF &bounds)
+{
+    const qreal x = std::clamp(pill.left(), bounds.left() + 2.0,
+                               std::max(bounds.left() + 2.0, bounds.right() - pill.width() - 2.0));
+    const qreal y = std::clamp(pill.top(), bounds.top() + 2.0,
+                               std::max(bounds.top() + 2.0, bounds.bottom() - pill.height() - 2.0));
+    const QRectF box(x, y, pill.width(), pill.height());
     painter->setFont(pillFont());
     painter->setPen(Qt::NoPen);
     painter->setBrush(QColor(20, 20, 20, 225));
-    painter->drawRoundedRect(pill, 4, 4);
+    painter->drawRoundedRect(box, 4, 4);
     painter->setPen(QPen(QColor(120, 120, 120), 1.0));
-    painter->drawRoundedRect(pill.adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
+    painter->drawRoundedRect(box.adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
     painter->setPen(Qt::white);
-    painter->drawText(pill, Qt::AlignCenter, text);
+    painter->drawText(box, Qt::AlignCenter, text);
+}
+
+// Draws a dark rounded label anchored at `anchor` inside `bounds`; flips above
+// the anchor when there is no room below.  The loupe's coordinate readout.
+void drawInfoPill(QPainter *painter, const QPointF &anchor, const QString &text,
+                  const QRectF &bounds)
+{
+    const QSizeF size = pillSize(text);
+    qreal y = anchor.y() + 10.0;
+    if (y + size.height() > bounds.bottom()) {
+        y = anchor.y() - size.height() - 10.0;
+    }
+    drawPillBox(painter, QRectF(anchor.x() - size.width() / 2.0, y, size.width(), size.height()),
+                text, bounds);
+}
+
+// Draws the size pill of a capture selection, which hangs *outside* the region
+// so that the label never covers the pixels the capture is about to keep.  The
+// first place it tries is beside the selection, level with its top edge: that
+// is the one side the floating toolbar never reaches -- it settles above the
+// selection or below it -- and it is a fixed spot while the far corner is
+// dragged.  Then above the top-left corner, then below the selection, and a
+// selection that fills the output every way leaves the pill inside, under the
+// corner, where there is nowhere else for it to be.
+//
+// `corner` is the selection's top-left in overlay-local coordinates, `region`
+// the selection itself, `bounds` the whole surface, and `toolbar` the floating
+// toolbar in the same coordinates -- a child widget paints over this paint(),
+// so a pill under the toolbar would simply not be seen.
+void drawSelectionPill(QPainter *painter, const QPointF &corner, const QRectF &region,
+                       const QString &text, const QRectF &bounds, const QRectF &toolbar)
+{
+    const QSizeF size = pillSize(text);
+    // Sideways the pill is centred on the selection's corner, pulled back
+    // inside the surface when the corner is against an edge.
+    const qreal x = std::clamp(corner.x() - size.width() / 2.0, bounds.left() + 2.0,
+                               std::max(bounds.left() + 2.0, bounds.right() - size.width() - 2.0));
+    const bool blocked = !toolbar.isEmpty();
+    const auto free = [&](const QRectF &box) {
+        return box.left() >= bounds.left() + 2.0 && box.top() >= bounds.top() + 2.0 &&
+               box.right() <= bounds.right() - 2.0 && box.bottom() <= bounds.bottom() - 2.0 &&
+               !(blocked && box.intersects(toolbar));
+    };
+    // Beside the region.  The top is pulled inside the surface when the
+    // selection starts at the very edge of the output.
+    QRectF pill(corner.x() - kInfoPillGap - size.width(),
+                std::max(corner.y(), bounds.top() + 2.0), size.width(), size.height());
+    if (!free(pill)) {
+        pill = QRectF(x, corner.y() - kInfoPillGap - size.height(), size.width(), size.height());
+        if (!free(pill)) {
+            pill = QRectF(x, region.bottom() + kInfoPillGap, size.width(), size.height());
+            if (!free(pill)) {
+                pill = QRectF(x, corner.y() + kInfoPillGap, size.width(), size.height());
+            }
+        }
+    }
+    drawPillBox(painter, pill, text, bounds);
 }
 
 // Mosaic strength levels: block size in device pixels for a given output
@@ -4821,6 +4880,21 @@ QString OverlayController::candidatePillText() const
     return QStringLiteral("%1  %2").arg(elided, dimensions);
 }
 
+/// The size pill's text for the selection as it stands: the dimensions, or the
+/// hovered window's label and the dimensions while the picker previews one.
+/// The paint and the damage rectangle both measure the pill from this, so the
+/// two can never disagree about how wide it is.
+QString OverlayController::selectionPillText() const
+{
+    if (pickMode_ && !editing_ && hoveredCandidate_ >= 0) {
+        return candidatePillText();
+    }
+    if (!selection_.has_value()) {
+        return QString();
+    }
+    return QStringLiteral("%1 × %2").arg(selection_->width).arg(selection_->height);
+}
+
 /// Moves the hover highlight to the candidate under the pointer.  Returns true
 /// when the highlight actually changed, so the caller can skip the repaint.
 bool OverlayController::applyCandidateHover(Point point, CaptureOverlay *overlay)
@@ -5709,10 +5783,10 @@ double waveReach(double amplitude, double width)
     return amplitude + width / 2.0 + 4.0;
 }
 
-// Room for the size pill the editor pins to the selection's top-left corner: it
-// is centred on that corner, so it reaches half its width to either side and a
-// line below.  Slack rather than the measured width, because the step has to
-// invalidate before the paint knows what the text will be.
+// Floor for the room the size pill needs, in the direction that matters least:
+// the pill is measured from its own text (see `selectionTouch`), and this only
+// keeps a short one from shrinking the step's rect below what the selection's
+// chrome -- the border and the eight handles -- already reaches.
 constexpr int kInfoPillSlack = 64;
 
 } // namespace
@@ -5734,7 +5808,14 @@ LogicalRect OverlayController::selectionTouch() const
     if (!selection_.has_value()) {
         return LogicalRect{};
     }
-    return uniteLogical(growBy(*selection_, kInfoPillSlack), pointerTouch());
+    // The size pill hangs off the selection and reaches half its own width to
+    // either side of the corner -- its whole width when it has to go beside the
+    // region -- so the step's rect is measured from the very text the paint
+    // will use rather than from a fixed slack a long size could outgrow.
+    const QSizeF pill = pillSize(selectionPillText());
+    const int reach = std::max(kInfoPillSlack,
+                               static_cast<int>(std::ceil(pill.width())) + kInfoPillGap);
+    return uniteLogical(growBy(*selection_, reach), pointerTouch());
 }
 
 LogicalRect OverlayController::annotationTouch() const
@@ -9877,20 +9958,39 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
     // Window picking previews a whole window before it is committed, so its
     // pill names the window instead of just measuring it.
     const bool pickPreview = pickMode_ && !editing_ && selection_.has_value();
-    if (selection_.has_value() && !pinEdit_ &&
+    // The pill belongs to the output the selection starts on.  Every overlay
+    // paints the whole chrome and clips what is not its own, but the pill is
+    // clamped into the surface rather than clipped, so without this the other
+    // outputs would each grow a copy of it at their own edge.
+    const bool ownsSelection = selection_.has_value() && selection_->x >= output.geometry.x &&
+        selection_->x < output.geometry.right() && selection_->y >= output.geometry.y &&
+        selection_->y < output.geometry.bottom();
+    if (ownsSelection && !pinEdit_ &&
         (pickPreview || gesture_->type == Gesture::Type::Selecting || editing_)) {
-        const QString text = pickPreview
-            ? candidatePillText()
-            : QStringLiteral("%1 × %2").arg(selection_->width).arg(selection_->height);
-        drawInfoPill(painter, localPoint(output, Point{selection_->x, selection_->y},
-                                         overlay->size()),
-                     text, target);
+        // The floating toolbar in this overlay's own coordinates: it is a child
+        // widget, so it paints over whatever this paint() puts under it.
+        QRectF toolbarBox;
+        if (toolbar_ != nullptr && toolbar_->isVisible() && toolbar_->parentWidget() != nullptr) {
+            QWidget *host = toolbar_->parentWidget();
+            const QPoint origin = overlay->mapToGlobal(QPoint(0, 0));
+            toolbarBox = QRectF(host->mapToGlobal(toolbar_->pos()) - origin,
+                                QSizeF(toolbar_->size()));
+        }
+        drawSelectionPill(painter,
+                          localPoint(output, Point{selection_->x, selection_->y}, overlay->size()),
+                          localRect(output, *selection_, overlay->size()), selectionPillText(),
+                          target, toolbarBox);
     }
 
-    const bool loupeActive = gesture_->type == Gesture::Type::Selecting ||
-        gesture_->type == Gesture::Type::Moving || gesture_->type == Gesture::Type::Resizing ||
-        gesture_->type == Gesture::Type::MovingAnnotation ||
-        gesture_->type == Gesture::Type::ResizingAnnotation;
+    // The pin editor drags the pinned image itself around the screen, and a
+    // magnifier there would follow the very picture it is magnifying: the loupe
+    // belongs to picking a region out of a frozen frame, not to placing a pin.
+    const bool pinDrag = pinEdit_ && gesture_->type == Gesture::Type::Moving;
+    const bool loupeActive = !pinDrag &&
+        (gesture_->type == Gesture::Type::Selecting || gesture_->type == Gesture::Type::Moving ||
+         gesture_->type == Gesture::Type::Resizing ||
+         gesture_->type == Gesture::Type::MovingAnnotation ||
+         gesture_->type == Gesture::Type::ResizingAnnotation);
     if (loupeActive && pointerOutput_ == overlay->outputIndex()) {
         drawLoupe(overlay, painter);
     }

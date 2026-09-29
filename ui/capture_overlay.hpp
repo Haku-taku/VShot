@@ -639,6 +639,7 @@ private:
     Point clampPoint(Point point) const;
     int candidateIndexAt(Point point) const;
     QString candidatePillText() const;
+    QString selectionPillText() const;
     bool applyCandidateHover(Point point, CaptureOverlay *overlay);
     // Replaces the candidate list with a fresh one and points the hover at
     // whatever the (unmoved) pointer is over now.
