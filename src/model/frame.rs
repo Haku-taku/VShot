@@ -81,6 +81,11 @@ impl Frame {
             encoder.set_color(png::ColorType::Rgba);
             encoder.set_depth(png::BitDepth::Eight);
             encoder.set_compression(compression.into());
+            // Say the pixels are sRGB.  Without it a file of sRGB bytes has no
+            // colour space at all, and a viewer on a wide-gamut display is free
+            // to read them as that display's own gamut -- which is exactly what
+            // a P3 or BT.2020 panel is, so an untagged capture came out tinted.
+            encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
             if let Some(density) = density {
                 let pixels_per_meter = density_to_pixels_per_meter(density);
                 encoder.set_pixel_dims(Some(png::PixelDimensions {
@@ -2039,6 +2044,21 @@ mod tests {
             u32::from_be_bytes(single[phys + 4..phys + 8].try_into().unwrap()),
             3780
         );
+    }
+
+    #[test]
+    fn png_declares_its_colour_space() {
+        // The pixels are sRGB, and without the chunk a viewer on a wide-gamut
+        // display is free to read them as that display's own gamut — a P3 or
+        // BT.2020 panel — so an untagged capture came out tinted.
+        let frame = Frame::solid(Size::new(2, 1), [10, 20, 30, 255]).unwrap();
+        let encoded = frame.to_png().unwrap();
+        assert_eq!(Frame::from_png(&encoded).unwrap(), frame);
+        let srgb = encoded
+            .windows(4)
+            .position(|chunk| chunk == &b"sRGB"[..])
+            .expect("the PNG declares its colour space");
+        assert_eq!(encoded[srgb + 4], 0); // the perceptual rendering intent
     }
 
     #[test]
