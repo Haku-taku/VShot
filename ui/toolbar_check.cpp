@@ -405,14 +405,19 @@ void checkThePinEditorOffersNoPinButton()
 }
 
 
-// The command bar is two rows: the drawing tools, then everything that acts on
-// the capture, steps it back or ends it.  One row of all of them came to about a
-// thousand logical pixels -- most of a 1080p output, and wider than the panels
-// it has to sit beside -- and a bar that long can only be clamped against the
-// screen edge, where it reads as a band across the capture rather than a panel
-// on it.  So the split is the fix, and what it has to keep is this: the tools in
-// the first row, the actions in the second, and the bar as wide as its wider row
-// rather than as wide as both.
+// The command bar is two rows: the drawing tools, the actions that act on the
+// capture, and the history pair beside them in the corner.  One row of all of
+// them came to about a thousand logical pixels -- most of a 1080p output, and
+// wider than the panels it has to sit beside -- and a bar that long can only be
+// clamped against the screen edge, where it reads as a band across the capture
+// rather than a panel on it.  So two rows are the fix.
+//
+// Which button goes in which row is what this checks.  The rows are filled in
+// order and split where the wider of them comes out narrowest, so what has to
+// hold is that no other split would be narrower: splitting by kind instead --
+// the tools on the first row, the actions on the second -- leaves one row three
+// times the length of its neighbour and makes the card as wide as the tools
+// alone, which is what it was before.
 void checkCommandBarIsTwoRows()
 {
     QScreen *screen = QGuiApplication::primaryScreen();
@@ -440,39 +445,98 @@ void checkCommandBarIsTwoRows()
     if (column == nullptr || column->count() != 2) {
         return;
     }
-    QLayout *tools = commandRow(parts.command, 0);
-    QLayout *actions = commandRow(parts.command, 1);
-    if (tools == nullptr || actions == nullptr) {
+    QLayout *first = commandRow(parts.command, 0);
+    QLayout *second = commandRow(parts.command, 1);
+    if (first == nullptr || second == nullptr) {
         expect(false, "both rows are laid out as rows");
         return;
     }
-    int inToolsRow = 0;
-    for (QToolButton *button : parts.command->findChildren<QToolButton *>()) {
-        if (tools->indexOf(button) >= 0) {
-            ++inToolsRow;
+    // The buttons of both rows in the order the rows carry them -- the first
+    // row's left to right, then the second's.  That is the order they were built
+    // in, which is the order the split is taken over, so any split of this list
+    // is a split the toolbar could have made instead.
+    QVector<QAbstractButton *> buttons;
+    int inFirstRow = 0;
+    for (QLayout *row : {first, second}) {
+        for (int i = 0; i < row->count(); ++i) {
+            if (auto *button = qobject_cast<QAbstractButton *>(row->itemAt(i)->widget())) {
+                buttons.append(button);
+                if (row == first) {
+                    ++inFirstRow;
+                }
+            }
         }
     }
-    expect(inToolsRow == 12, "the drawing tools keep its first row to themselves",
-           QStringLiteral("%1 of them in it").arg(inToolsRow));
+    expect(inFirstRow > 0 && inFirstRow < buttons.size(),
+           "and both of them carry buttons",
+           QStringLiteral("%1 and %2 of them")
+               .arg(inFirstRow)
+               .arg(buttons.size() - inFirstRow));
+    // The twelve tools are the buttons that say which tool they select; the
+    // rest are the actions.  Every one of them is in one of the two rows: the
+    // history pair is in the grid in the corner and is not counted here.
+    int tools = 0;
+    for (QAbstractButton *button : buttons) {
+        if (!button->property("tool").toString().isEmpty()) {
+            ++tools;
+        }
+    }
+    expect(tools == 12, "the drawing tools are among them",
+           QStringLiteral("%1 of them").arg(tools));
     auto *paste = parts.command->findChild<QToolButton *>(QStringLiteral("pasteButton"));
-    expect(paste != nullptr && actions->indexOf(paste) >= 0,
-           "the actions that act on the capture take the second");
+    expect(paste != nullptr && (first->indexOf(paste) >= 0 || second->indexOf(paste) >= 0),
+           "and so are the actions that act on the capture");
+    // The split is the balanced one: every other place the list could have been
+    // cut puts a longer row above the shorter one.
+    const auto rowWidth = [&buttons, spacing = first->spacing()](int from, int to) {
+        int width = 0;
+        for (int i = from; i < to; ++i) {
+            width += buttons.at(i)->sizeHint().width();
+        }
+        return to > from ? width + spacing * (to - from - 1) : 0;
+    };
+    const int count = buttons.size();
+    const int wider = std::max(rowWidth(0, inFirstRow), rowWidth(inFirstRow, count));
+    int best = -1;
+    for (int candidate = 1; candidate < count; ++candidate) {
+        const int other = std::max(rowWidth(0, candidate), rowWidth(candidate, count));
+        best = best < 0 ? other : std::min(best, other);
+    }
+    expect(best == wider, "and it is cut where the two rows come out closest to level",
+           QStringLiteral("rows %1 and %2, the best split %3")
+               .arg(rowWidth(0, inFirstRow))
+               .arg(rowWidth(inFirstRow, count))
+               .arg(best));
+    // Which is to say the two rows are about the same length, rather than one
+    // of them carrying the whole bar while the other sits empty.
+    const int widest = [&buttons] {
+        int width = 0;
+        for (QAbstractButton *button : buttons) {
+            width = std::max(width, button->sizeHint().width());
+        }
+        return width;
+    }();
+    expect(std::abs(rowWidth(0, inFirstRow) - rowWidth(inFirstRow, count)) <= widest,
+           "so neither row is a button wider than the other",
+           QStringLiteral("%1 against %2")
+               .arg(rowWidth(0, inFirstRow))
+               .arg(rowWidth(inFirstRow, count)));
     // The two rows are one column, so the card is as wide as the wider of them
     // plus the ends -- not as wide as both rows laid end to end, which is what
     // one row of all of them would have been.
-    const int bothRows = tools->sizeHint().width() + actions->sizeHint().width();
+    const int bothRows = first->sizeHint().width() + second->sizeHint().width();
     expect(parts.command->sizeHint().width() < bothRows,
            "and is no wider than its widest row",
            QStringLiteral("bar %1, both rows %2")
                .arg(parts.command->sizeHint().width())
                .arg(bothRows));
-    expect(column->sizeHint().width() == std::max(tools->sizeHint().width(),
-                                                  actions->sizeHint().width()),
+    expect(column->sizeHint().width() == std::max(first->sizeHint().width(),
+                                                  second->sizeHint().width()),
            "the column is as wide as its wider row",
            QStringLiteral("column %1, rows %2 and %3")
                .arg(column->sizeHint().width())
-               .arg(tools->sizeHint().width())
-               .arg(actions->sizeHint().width()));
+               .arg(first->sizeHint().width())
+               .arg(second->sizeHint().width()));
 }
 
 // The four ends -- undo, redo, OK, Cancel -- are pinned to the right-hand edge
@@ -818,19 +882,23 @@ void checkCommandBarButtonsShareOneSize()
     expect(squeezed == 0, "no button is smaller than its own size hint",
            QStringLiteral("%1 of %2").arg(squeezed).arg(buttons.size()));
 
-    // The tools are one column: the widest of their labels sets the width of all
-    // twelve, so the row reads across rather than stepping.  And the width it
-    // comes to is exactly the widest hint -- not more: a size measured before
-    // the buttons were polished is measured in the application's font, which
-    // leaves the row wider than any label in it needs.
+    // The tools are one column rather than one per row: the widest of their
+    // labels sets the width of all twelve, so a tool that lands in the lower row
+    // is the same size as one in the upper and the rows read across rather than
+    // stepping.  And the width it comes to is exactly the widest hint -- not
+    // more: a size measured before the buttons were polished is measured in the
+    // application's font, which leaves the rows wider than any label in them
+    // needs.
     int uniform = 0;
     int widest = 0;
     QString toolDetail;
     QSize toolSize;
+    int toolCount = 0;
     for (QAbstractButton *button : surface->findChildren<QToolButton *>()) {
-        if (tools->indexOf(button) < 0) {
+        if (button->property("tool").toString().isEmpty()) {
             continue;
         }
+        ++toolCount;
         widest = std::max(widest, button->sizeHint().width());
         if (toolSize.isEmpty()) {
             toolSize = button->size();
@@ -845,9 +913,11 @@ void checkCommandBarButtonsShareOneSize()
                              .arg(toolSize.height());
         }
     }
+    expect(toolCount == 12, "the twelve tools are on the bar",
+           QStringLiteral("%1 of them").arg(toolCount));
     expect(uniform == 0, "the drawing tools are all one size", toolDetail);
     expect(!toolSize.isEmpty() && toolSize.width() == widest,
-           "and exactly as wide as the widest label in the row",
+           "and exactly as wide as the widest tool label",
            QStringLiteral("%1 against a %2-wide label").arg(toolSize.width()).arg(widest));
 }
 
@@ -960,9 +1030,10 @@ void checkTheSizePillStaysOutsideTheCapture()
 
 // The tools' icons come from one switch with no default case, so a tool that is
 // added to the enum and not to that switch is a button with a hole in it: a
-// blank square sitting in the row, which is what the eyedropper was for one
-// build.  The two-row split already asserts how many buttons the row holds;
-// what this adds is that each of them actually draws something.
+// blank square sitting in a row, which is what the eyedropper was for one build.
+// The split already asserts how many buttons the two rows carry; what this adds
+// is that each of the tools among them actually draws something.  It walks both
+// rows, because which of them a tool lands in is the split's business.
 void checkEveryToolDrawsItsOwnIcon()
 {
     QScreen *screen = QGuiApplication::primaryScreen();
@@ -980,18 +1051,20 @@ void checkEveryToolDrawsItsOwnIcon()
     overlay->show();
     controller.beginPresetEdit();
     const ToolbarParts parts = toolbarParts(overlay);
-    QLayout *tools = parts.command != nullptr ? commandRow(parts.command, 0) : nullptr;
-    if (tools == nullptr) {
-        expect(false, "the tool row is laid out as a row");
+    if (parts.command == nullptr) {
+        expect(false, "the toolbar has a command bar");
         return;
     }
     int counted = 0;
     int blank = 0;
+    QStringList names;
     for (QToolButton *button : parts.command->findChildren<QToolButton *>()) {
-        if (tools->indexOf(button) < 0) {
+        const QString tool = button->property("tool").toString();
+        if (tool.isEmpty()) {
             continue;
         }
         ++counted;
+        names << tool;
         const QImage icon = button->icon().pixmap(20, 20).toImage();
         int inked = 0;
         for (int y = 0; y < icon.height() && inked == 0; ++y) {
@@ -1006,8 +1079,12 @@ void checkEveryToolDrawsItsOwnIcon()
             ++blank;
         }
     }
-    expect(counted == 12, "the tool row is twelve buttons",
+    expect(counted == 12, "the two rows carry the twelve tools",
            QStringLiteral("%1 of them").arg(counted));
+    // And the eyedropper is one of them, on a row of its own choosing: a tool
+    // that never made it out of the list would be counted here as a hole in the
+    // twelve.
+    expect(names.contains(QStringLiteral("picker")), "with the eyedropper among them");
     expect(blank == 0, "and every one of them draws an icon",
            QStringLiteral("%1 blank").arg(blank));
 }

@@ -2812,68 +2812,73 @@ public:
         // step back the capture pinned to its right-hand edge, one row each:
         // undo over redo, OK over Cancel.
         //
-        // It was one row until the tools filled it: twelve drawing tools, four
+        // It was one row until the buttons filled it: twelve drawing tools, the
         // one-shot actions, the history pair and the two ends of the capture came
         // to about a thousand logical pixels, which is most of a 1080p output and
         // wider than the panels it has to sit beside -- a bar that long can only
         // be clamped against the screen edge, and there it reads as a band across
-        // the capture rather than a panel on it.  So the tools took the first row
-        // and everything that acts on the picture took the second.
+        // the capture rather than a panel on it.  So the buttons took two rows.
         //
-        // The ends then had to be somewhere, and the second row was the wrong
+        // Which button goes in which row is not "the tools here, the actions
+        // there": the tools alone are about three times the width of the actions,
+        // so a split along that line leaves the first row setting the card's
+        // width while two thirds of the second sits empty -- and every tool added
+        // since makes the first row longer and the second no shorter.  The rows
+        // are filled in order and split where they come out closest to the same
+        // length instead, which is both what keeps the card as narrow as two rows
+        // can make it and what keeps the two rows from drifting apart as buttons
+        // are added.  See `placeCommandRows`.
+        //
+        // The ends had to be somewhere, and a row of the column was the wrong
         // place for them twice over: it made that row the height of whatever it
         // held while leaving a stretch of empty card beside the buttons, and the
         // buttons themselves were the four the eye goes to last, at the far end
         // of the longest row.  Pinned to the right they are always in the same
         // place -- the corner of the card, which is where a confirm and a cancel
         // are looked for -- and the two rows to their left are one column whose
-        // width no longer depends on how long the tool row happens to be.
+        // width no longer depends on how long the rows happen to be.
         auto *cardLayout = new QHBoxLayout(toolSurface);
         cardLayout->setContentsMargins(2, 2, 2, 2);
-        cardLayout->setSpacing(2);
+        cardLayout->setSpacing(kRowSpacing);
         auto *commandColumn = new QVBoxLayout();
-        commandColumn->setSpacing(2);
-        auto *toolRow = new QHBoxLayout();
-        toolRow->setSpacing(2);
-        auto *actionRow = new QHBoxLayout();
-        actionRow->setSpacing(2);
-        commandColumn->addLayout(toolRow);
-        commandColumn->addLayout(actionRow);
+        commandColumn->setSpacing(kRowSpacing);
+        auto *firstRow = new QHBoxLayout();
+        firstRow->setSpacing(kRowSpacing);
+        auto *secondRow = new QHBoxLayout();
+        secondRow->setSpacing(kRowSpacing);
+        commandColumn->addLayout(firstRow);
+        commandColumn->addLayout(secondRow);
         cardLayout->addLayout(commandColumn);
-        addTool(toolRow, Tool::Select);
-        addTool(toolRow, Tool::Rectangle);
-        addTool(toolRow, Tool::Ellipse);
-        addTool(toolRow, Tool::Arrow);
-        addTool(toolRow, Tool::Line);
-        addTool(toolRow, Tool::Wave);
-        addTool(toolRow, Tool::Bezier);
-        addTool(toolRow, Tool::Pen);
-        addTool(toolRow, Tool::Text);
-        addTool(toolRow, Tool::Number);
-        addTool(toolRow, Tool::Mosaic);
-        // The eyedropper closes the row: it draws nothing itself, it reads the
-        // pixel under the click and hands the colour to the tool it was armed
-        // from, which is where the pick leaves the session.
-        addTool(toolRow, Tool::Picker);
+        addTool(Tool::Select);
+        addTool(Tool::Rectangle);
+        addTool(Tool::Ellipse);
+        addTool(Tool::Arrow);
+        addTool(Tool::Line);
+        addTool(Tool::Wave);
+        addTool(Tool::Bezier);
+        addTool(Tool::Pen);
+        addTool(Tool::Text);
+        addTool(Tool::Number);
+        addTool(Tool::Mosaic);
+        // The eyedropper closes the list of tools: it draws nothing itself, it
+        // reads the pixel under the click and hands the colour to the tool it was
+        // armed from, which is where the pick leaves the session.
+        addTool(Tool::Picker);
         // The twelve are in, so their one size can be measured from their own
-        // labels; the row of actions below is built at it, which is why this
-        // stands between the two rows rather than at the end of both.
+        // labels; the actions that follow are built at it, which is why this
+        // stands between the last tool and the first action.
         sizeToolButtons();
-        // Both rows are packed to the left rather than spread across the panel:
-        // a row with room to spare would otherwise space its own buttons evenly
-        // apart, which slides them out from under the pointer as the style row
-        // above or below changes the panel's width.  The button positions are
-        // what the user aims at, so they stay put.
-        toolRow->addStretch(1);
-        // The one-shot actions open the second row, drawn the same way as the
-        // tools they follow: they are the same kind of thing to click, and they
-        // are not modes -- nothing stays selected -- so they are kept out of
-        // `toolButtons_`, which is what the active-state pass walks.
+        // The actions are the same kind of thing to click as the tools they
+        // follow -- same box, same label under the same icon -- and they are not
+        // modes: nothing stays selected, so they are kept out of `toolButtons_`,
+        // which is what the active-state pass walks.  They are placed in the same
+        // order they are built in, after the tools, by `placeCommandRows` once
+        // the last of them is in.
         //
         // Paste takes an image off disk through the file dialog; Ctrl+V takes
         // whatever is on the clipboard.  Both land in the same paste.
-        auto *paste = addToolAction(actionRow, uiTr("Image"), pasteIcon(QColor(230, 225, 229),
-                                                                       devicePixelRatioF()),
+        auto *paste = addToolAction(uiTr("Image"), pasteIcon(QColor(230, 225, 229),
+                                                             devicePixelRatioF()),
                                     uiTr("Paste an image onto the capture (Ctrl+V for the "
                                          "clipboard)"),
                                     QStringLiteral("pasteButton"));
@@ -2889,7 +2894,7 @@ public:
         // range is copied.  The mode lives in the controller -- the toolbar has
         // no selection to work on -- so the button only asks for it, and the
         // controller reports the result back through the callback below.
-        auto *text = addToolAction(actionRow, uiTr("Text+"),
+        auto *text = addToolAction(uiTr("Text+"),
                                    recognizeTextIcon(QColor(230, 225, 229), devicePixelRatioF()),
                                    uiTr("Select the text in the selection and copy what you "
                                         "select"),
@@ -2941,7 +2946,7 @@ public:
         // a mode and stays out of `toolButtons_`; the controller reports its
         // two-subprocess wait and its outcome through the callback below.
         auto *translate = addToolAction(
-            actionRow, uiTr("Translate"),
+            uiTr("Translate"),
             translateIcon(QColor(230, 225, 229), devicePixelRatioF()),
             uiTr("Translate the text in the selection and draw it in place"),
             QStringLiteral("translateButton"),
@@ -2986,7 +2991,7 @@ public:
         // `syncState`'s to say.
         if (controller_->longAllowed_) {
             longButton_ = addToolAction(
-                actionRow, uiTr("Scroll"),
+                uiTr("Scroll"),
                 scrollIcon(QColor(230, 225, 229), devicePixelRatioF()),
                 uiTr("Scroll the selection and stitch it into one tall image"),
                 QStringLiteral("longButton"));
@@ -2995,17 +3000,21 @@ public:
         }
         // Pinning finishes the session the way OK does, so it sits with the
         // capture's own actions rather than in the corner: it is a tool-shaped
-        // button like the four beside it, and the corner is the four
+        // button like the ones it is laid out among, and the corner is the four
         // text-shaped ends.  The pin editor hides it, being a pin already.
-        pinButton_ = addToolAction(actionRow, uiTr("Pin"),
+        pinButton_ = addToolAction(uiTr("Pin"),
                                    pinIcon(QColor(230, 225, 229), devicePixelRatioF()),
                                    uiTr("Pin the result on the screen"),
                                    QStringLiteral("pinButton"));
         connect(pinButton_, &QToolButton::clicked,
                 [controller = controller_] { controller->pin(); });
+        // The last button is in, so the two rows can be filled: this is the one
+        // place the split between them is decided, and it needs every button's
+        // own size to decide it.
+        placeCommandRows(firstRow, secondRow);
         // The slack of the card -- what the style row below is wider than the
         // two rows are -- is taken up here, between the column and the ends, so
-        // the tools stay where the pointer left them and the ends stay in the
+        // the buttons stay where the pointer left them and the ends stay in the
         // corner however wide the panel turns out to be.
         cardLayout->addStretch(1);
         // One divider for the whole height of the block rather than one per row:
@@ -3016,7 +3025,7 @@ public:
         endsDivider->setObjectName(QStringLiteral("toolbarDivider"));
         endsDivider->setFrameShape(QFrame::VLine);
         endsDivider->setFrameShadow(QFrame::Plain);
-        endsDivider->setFixedHeight(toolButtonHeight_ * 2 + 2);
+        endsDivider->setFixedHeight(toolButtonHeight_ * 2 + kRowSpacing);
         endsDivider->setCursor(Qt::ArrowCursor);
         cardLayout->addWidget(endsDivider);
         // The four ends, the history pair over the two ends of the capture:
@@ -3095,7 +3104,6 @@ public:
         for (QToolButton *button : toolSurface->findChildren<QToolButton *>()) {
             button->installEventFilter(toolSurface);
         }
-        actionRow->addStretch(1);
         rootLayout->addWidget(toolSurface);
 
         styleDivider_ = new QFrame(this);
@@ -4299,7 +4307,7 @@ private:
         return QString();
     }
 
-    void addTool(QHBoxLayout *layout, Tool tool)
+    void addTool(Tool tool)
     {
         const QString label = toolLabel(tool);
         auto *button = new QToolButton(this);
@@ -4316,7 +4324,15 @@ private:
         button->setFocusPolicy(Qt::NoFocus);
         button->setToolTip(toolTipForTool(tool));
         button->setAccessibleName(uiTr("Tool: %1").arg(label));
-        layout->addWidget(button);
+        // The tool it selects, so a check can tell the twelve drawing tools from
+        // the actions laid out among them -- the two kinds of button are drawn
+        // the same way and the rows no longer separate them.  Empty on every
+        // other button on the card.
+        button->setProperty("tool", toolName(tool));
+        // Not placed here: `placeCommandRows` fills the two rows from this list
+        // once every button is in, which is what lets the split between them be
+        // taken from the buttons' own widths.
+        commandButtons_.push_back(button);
         tools_.push_back(tool);
         toolButtons_.push_back(button);
         connect(button, &QToolButton::clicked, [controller = controller_, tool] {
@@ -4426,6 +4442,12 @@ private:
     static constexpr int kMinToolButtonWidth = 34;
     static constexpr int kMinToolButtonHeight = 34;
 
+    // The gap between two buttons of a row, and between the two rows themselves:
+    // the card's own spacing.  Written down once because `rowWidth` measures a
+    // row with it before the layout lays that row out with it, and the two have
+    // to be the same number.
+    static constexpr int kRowSpacing = 2;
+
     // How much room the two ends of the capture keep inside their own box: the
     // label and this much either side of it, rather than the style's own ten.
     // The constructor appends it as a stylesheet rule, and the block's width is
@@ -4443,28 +4465,83 @@ private:
     // layout's spacing already sits between the divider and this.
     static constexpr int kEndsGap = 6;
 
-    // The size the tool row came out at, which the row of one-shot actions below
-    // is built at so the two rows are one panel rather than two.  Set by
+    // The size the tools came out at, which the one-shot actions that follow are
+    // built at so the two rows are one panel rather than two.  Set by
     // `sizeToolButtons`, before the first action is added.
     int toolButtonWidth_ = kMinToolButtonWidth;
     int toolButtonHeight_ = kMinToolButtonHeight;
 
-    // A button in the tool row that does one thing instead of entering a mode,
-    // laid out exactly like the tool buttons: same size, same text-under-icon
+    // A button that does one thing instead of entering a mode, drawn exactly like
+    // the tool buttons it is laid out among: same size, same text-under-icon
     // shape, same hover and press painting from ToolCardFrame.  Kept out of
     // `toolButtons_` because nothing stays selected: a paste and a text read
-    // happen and are over.
+    // happen and are over.  It is placed with them, in the order it is built in,
+    // by `placeCommandRows`.
     //
     // `alsoShows` names every label the button will show after `label`, so the
     // box is wide enough for all of them from the start.  A button that changes
     // its text is the one case where the size cannot be a constant.
-    QToolButton *addToolAction(QHBoxLayout *layout, const QString &label, const QIcon &icon,
+    QToolButton *addToolAction(const QString &label, const QIcon &icon,
                                const QString &tooltip, const QString &objectName,
                                const QStringList &alsoShows = QStringList())
     {
         QToolButton *button = makeToolButton(label, icon, tooltip, objectName, alsoShows);
-        layout->addWidget(button);
+        commandButtons_.push_back(button);
         return button;
+    }
+
+    // What the buttons from `from` up to `to` come to in one row: their own fixed
+    // widths and the gaps between them.  It is the same spacing the layout is
+    // built at rather than a second copy of the number, so the width the split is
+    // chosen by is the width the row is laid out at.
+    int rowWidth(int from, int to) const
+    {
+        int width = 0;
+        for (int i = from; i < to; ++i) {
+            width += commandButtons_.at(i)->sizeHint().width();
+        }
+        if (to > from) {
+            width += kRowSpacing * (to - from - 1);
+        }
+        return width;
+    }
+
+    // Fills the two rows of the command bar from the one list of buttons, in the
+    // order they were built: the drawing tools first, then the actions.
+    //
+    // The split is taken where the wider of the two rows comes out narrowest,
+    // which is the same as taking it where the two are closest to the same
+    // length -- and that is the width the card ends up being, so it is the
+    // narrowest card two rows can make of these buttons.  Splitting by kind
+    // instead, tools on the first row and actions on the second, leaves a row
+    // three times the length of its neighbour: the first row sets the card's
+    // width while most of the second sits empty, and every tool added since makes
+    // that worse.  Taken this way the two stay level however many buttons are
+    // added.  A tie goes to the first row, so the split is stable as buttons are
+    // appended.
+    //
+    // Both rows are packed to the left rather than spread across the panel: a row
+    // with room to spare would otherwise space its own buttons evenly apart,
+    // which slides them out from under the pointer as the style row above or
+    // below changes the panel's width.  The button positions are what the user
+    // aims at, so they stay put.
+    void placeCommandRows(QHBoxLayout *first, QHBoxLayout *second)
+    {
+        const int count = commandButtons_.size();
+        int split = count;
+        int best = -1;
+        for (int candidate = 1; candidate < count; ++candidate) {
+            const int wider = std::max(rowWidth(0, candidate), rowWidth(candidate, count));
+            if (best < 0 || wider < best) {
+                best = wider;
+                split = candidate;
+            }
+        }
+        for (int i = 0; i < count; ++i) {
+            (i < split ? first : second)->addWidget(commandButtons_.at(i));
+        }
+        first->addStretch(1);
+        second->addStretch(1);
     }
 
     // The same button, built but not placed: the caller puts it in whatever
@@ -4498,6 +4575,10 @@ private:
     QWidget *styleRow_ = nullptr;
     QFrame *styleDivider_ = nullptr;
     QVector<QAbstractButton *> toolButtons_;
+    // Every button of the two command rows in the order they were built -- the
+    // tools, then the actions -- which is the order `placeCommandRows` fills the
+    // rows in and the list it measures the split by.
+    QVector<QAbstractButton *> commandButtons_;
     QVector<Tool> tools_;
     // The Text+ button, whose label reports what a text selection did.  The
     // result can come from a key the toolbar never sees, so it is stored rather
