@@ -354,7 +354,7 @@ vshot record window                             # one window's own pixels (not t
 vshot record window --pick                      # click the window to record, or name it by app id or title
 vshot record monitor --encoder hevc             # codec: h264 (default) / hevc / av1
 vshot record monitor --encoder-backend nvenc    # backend: auto (default) / vaapi / vulkan / nvenc (NVIDIA encode)
-vshot record monitor --fps 120                  # aim for 120 fps (1-240, default 60); `--duration 60` stops by itself after 60 seconds
+vshot record monitor --fps 120                  # aim for 120 fps (1 or more, no ceiling, default 60); `--duration 60` stops by itself after 60 seconds
 vshot record monitor --portal                   # through the desktop portal: its picker chooses (`record window --portal` offers windows)
 vshot record monitor --mic                      # record the microphone (session default source, or name one); `--no-mic` refuses it
 vshot record window --app-audio                 # record that window's own sound (may combine with --mic, summed into one track)
@@ -686,12 +686,12 @@ The save and open windows (a pin's **Save as…**, pasting a local image in the 
 
 | Key | Values | Default |
 | --- | --- | --- |
-| `radius` | 0–48, logical pixels | `12` |
-| `borderWidth` | 0–8, logical pixels; 0 draws no rim at all | `1` |
+| `radius` | 0–1000000, logical pixels | `12` |
+| `borderWidth` | 0–1000000, logical pixels; 0 draws no rim at all | `1` |
 | `borderColor` | `#rrggbb`; **leave it out** to derive one from the colour scheme | none |
 | `shadow` | `true` / `false` | `true` |
-| `shadowSize` | 0–64, logical pixels | `14` |
-| `shadowOffset` | -32–32, logical pixels | `3` |
+| `shadowSize` | 0–512, logical pixels | `14` |
+| `shadowOffset` | -512–512, logical pixels | `3` |
 | `shadowOpacity` | 0–255 | `120` |
 
 With no `borderColor` the rim is derived from the dialog's own colours — a stroke a little darker than the surface — so it reads as an edge under a light or a dark scheme, and one you write is used as it is. The shadow's four keys are **the same set the `pin` section has** (same meaning, same ranges and same defaults; see below). A layer surface can only be the size it asks the compositor for, so the shadow is painted in a ring the window keeps inside itself, and `shadowSize` is therefore also how much smaller the dialog is than its window — it is the ring's width, not something added outside it.
@@ -701,16 +701,16 @@ A pin is a layer surface with nothing but the image in it, so its corners, the s
 
 | Key | Values | Default |
 | --- | --- | --- |
-| `radius` | 0–512, logical pixels; 0 is a square corner | `0` |
+| `radius` | 0–1000000, logical pixels; 0 is a square corner | `0` |
 | `shadow` | `true` / `false` | `true` |
-| `shadowSize` | 0–64, logical pixels; 0 means no blur | `14` |
-| `shadowOffset` | -32–32, logical pixels; negative lifts the shadow above | `3` |
+| `shadowSize` | 0–512, logical pixels; 0 means no blur | `14` |
+| `shadowOffset` | -512–512, logical pixels; negative lifts the shadow above | `3` |
 | `shadowOpacity` | 0–255 | `120` |
-| `borderWidth` | 0–8, logical pixels; 0 draws no border at all | `2` |
+| `borderWidth` | 0–1000000, logical pixels; 0 draws no border at all | `2` |
 | `borderColor` | the border on an idle pin; the built-in light grey `#c0c0c0` when absent | none |
 | `activeBorderColor` | the border on the pin the pointer is over while that output holds the keyboard; the built-in black when absent | none |
 
-The default is **square corners with a shadow**: a screenshot is a picture of a window, and rounding it would cut into what it shows — while a screenshot pinned over a window of its own colour has no visible edge at all without one. The shadow's three numeric keys: `shadowSize` is how far the blur reaches past the edge, which is what its softness is; `shadowOffset` is how far the whole shadow is dropped — light comes from above, hence the default of 3, and a negative value puts it above the pin instead; `shadowOpacity` is the shadow's darkness, with the blur spreading it rather than adding to it; `shadow` is the master switch, and **turning it off keeps the numbers**, so it can be turned off for a moment and back on with the size still there. `radius` is a ceiling rather than a promise: what is actually painted is clamped to half the image's shorter side, past which a corner stops being a corner and becomes a lozenge — a pin's size changes with every wheel step, so that can only be decided at paint time. The border is **centred on the image edge**, half outside and half in, so changing its width leaves a rounded pin and a square one the same size. The shadow is built once and cached — a drag re-uses it, a zoom step or a config change rebuilds it. **A config change takes effect on the next `vshot pin`**: the daemon stays up while anything is pinned, but it re-reads the file every time a pin is added, so there is no need to restart it by hand.
+The default is **square corners with a shadow**: a screenshot is a picture of a window, and rounding it would cut into what it shows — while a screenshot pinned over a window of its own colour has no visible edge at all without one. The shadow's three numeric keys: `shadowSize` is how far the blur reaches past the edge, which is what its softness is; `shadowOffset` is how far the whole shadow is dropped — light comes from above, hence the default of 3, and a negative value puts it above the pin instead; `shadowOpacity` is the shadow's darkness, with the blur spreading it rather than adding to it; `shadow` is the master switch, and **turning it off keeps the numbers**, so it can be turned off for a moment and back on with the size still there. `radius` is a ceiling rather than a promise: what is actually painted is clamped to half the image's shorter side, past which a corner stops being a corner and becomes a lozenge — a pin's size changes with every wheel step, so that can only be decided at paint time. The border is **centred on the image edge**, half outside and half in, so changing its width leaves a rounded pin and a square one the same size. The corner radius and the border width have **no ceiling worth the name** — the million logical pixels in the table is a thousand screens, and neither of them costs an allocation — while the shadow's two numbers do, at 512: the blur is built over the shape grown by its reach, and the file dialog's own window grows by it too, so past that it is a hundred megabytes of haze for something off the screen. The shadow is built once and cached — a drag re-uses it, a zoom step or a config change rebuilds it. **A config change takes effect on the next `vshot pin`**: the daemon stays up while anything is pinned, but it re-reads the file every time a pin is added, so there is no need to restart it by hand.
 
 ## Environment variables
 

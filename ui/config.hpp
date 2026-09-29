@@ -152,24 +152,40 @@ struct DialogPreferences {
     ShadowStyle shadow;
 };
 
-/// The ceiling on a pin's corner radius and on its border width, in logical
-/// pixels.  They live here rather than in `config.cpp` because the settings
-/// window has to offer the same range the loader accepts: a value the file
-/// takes but the window cannot show would come back clamped the next time that
-/// page was saved.
-constexpr int kMaxPinRadius = 512;
-constexpr int kMaxPinBorderWidth = 8;
-/// The same ceilings for the file dialog's frame.  They live beside the pin's
-/// for the same reason: the settings window has to offer the range the loader
-/// accepts, and a hand-written value past what the window can show would come
-/// back clamped the next time that page was saved.
-constexpr int kMaxDialogRadius = 48;
-constexpr int kMaxDialogBorderWidth = 8;
-/// The same ceilings for a shadow's blur reach, its drop, and its alpha.  They
-/// are shared by the pin and the dialog, which is the point: one pair of
+/// How far a frame's numbers may go: a pin's corner radius, a pin's rim, the
+/// file dialog's corner radius and its rim, all in logical pixels.
+///
+/// There is no ceiling worth having on any of the four.  A radius is clamped to
+/// half the shape where it is drawn -- a corner cannot be rounder than the
+/// surface it is on -- and a rim is a pen width, so neither costs anything as it
+/// grows and neither stops meaning something at some size.  They used to be
+/// capped separately, at 512 and 8 for the pin and 48 and 8 for the dialog,
+/// which was us deciding how round the user's corners were allowed to be.
+///
+/// The number is not the whole of an `int` on purpose: the repaint region a rim
+/// is added to is a `QRect`, and a `QRect` grown by a billion on every side is
+/// arithmetic that overflows rather than a rectangle.  A million logical pixels
+/// is a thousand screens, so nothing a user can want is refused, and the sums
+/// stay in range.
+///
+/// It lives here rather than in `config.cpp` because the settings window has to
+/// offer the same range the loader accepts: a value the file takes but the
+/// window cannot show would come back clamped the next time that page was saved.
+constexpr int kMaxFrameValue = 1'000'000;
+
+/// The ceilings on a shadow's blur reach and on its drop, in logical pixels.
+/// They are shared by the pin and the dialog, which is the point: one pair of
 /// numbers describes both, and the settings window offers one range for each.
-constexpr int kMaxShadowSize = 64;
-constexpr int kMaxShadowOffset = 32;
+///
+/// These two are the only look values that do have a ceiling, because they are
+/// the only ones that cost anything as they grow: the blur is built over the
+/// shape grown by the reach on every side, so the mask is a square of that size,
+/// and the dialog's own surface is grown by the reach too -- a hundred
+/// megabytes of backing store for a haze nobody can see past.  Half a thousand
+/// logical pixels of reach is already further than a 4K screen is tall, so what
+/// is left out is a shadow that would be drawn mostly off screen.
+constexpr int kMaxShadowSize = 512;
+constexpr int kMaxShadowOffset = 512;
 constexpr int kMaxShadowOpacity = 255;
 
 /// The look of a pinned image.

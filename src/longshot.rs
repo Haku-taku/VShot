@@ -192,12 +192,15 @@ pub fn run(
     // from the compositor is scaled by the output.
     let pixel_width = region.size.width * density;
     let pixel_height = region.size.height * density;
-    let mut stitcher = Stitcher::new(
-        pixel_width,
-        pixel_height,
-        options.ignore_top * density,
-        options.max_height,
-    )?;
+    // The ignore-top is written in logical pixels like the region and is scaled
+    // the same way, but saturating rather than wrapping: nothing bounds it
+    // upstream -- the config takes any number and the settings window offers
+    // any number -- and a product that wrapped could come out below the frame
+    // height and quietly ignore fewer rows than were asked for.  Saturated it
+    // is at least the frame height, which is the one value the stitcher refuses
+    // with a message naming the two numbers.
+    let ignore_top = options.ignore_top.saturating_mul(density);
+    let mut stitcher = Stitcher::new(pixel_width, pixel_height, ignore_top, options.max_height)?;
     let mut hint = qt_overlay::start_hint_session(region, outputs)?;
 
     let started = Instant::now();

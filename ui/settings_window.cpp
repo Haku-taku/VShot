@@ -1305,32 +1305,32 @@ private:
                             "variable, always wins over these."));
 
         QWidget *scrolling = addCard(page, QString());
-        notchesSpin_ = optionalSpin(scrolling, kDefaultLongNotches, 1000, QString());
+        notchesSpin_ = optionalSpin(scrolling, kDefaultLongNotches, kMaxFrameValue, QString());
         notchesSpin_->setObjectName(QStringLiteral("longNotches"));
         notchesSpin_->setMinimumWidth(120);
         notchesSpin_->setValue(rememberedOr(config_.cli.longNotches, kDefaultLongNotches));
         addRow(scrolling, uiTr("Scroll notches"),
                uiTr("Wheel notches sent at a time"), notchesSpin_, true);
 
-        maxHeightSpin_ = optionalSpin(scrolling, kDefaultLongMaxHeight, 1'000'000, uiTr(" px"));
+        maxHeightSpin_ = optionalSpin(scrolling, kDefaultLongMaxHeight, kMaxFrameValue, uiTr(" px"));
         maxHeightSpin_->setObjectName(QStringLiteral("longMaxHeight"));
         maxHeightSpin_->setMinimumWidth(120);
         maxHeightSpin_->setValue(rememberedOr(config_.cli.longMaxHeight, kDefaultLongMaxHeight));
         addRow(scrolling, uiTr("Max height"), QString(), maxHeightSpin_, false);
 
-        maxFramesSpin_ = optionalSpin(scrolling, kDefaultLongMaxFrames, 1'000'000, QString());
+        maxFramesSpin_ = optionalSpin(scrolling, kDefaultLongMaxFrames, kMaxFrameValue, QString());
         maxFramesSpin_->setObjectName(QStringLiteral("longMaxFrames"));
         maxFramesSpin_->setMinimumWidth(120);
         maxFramesSpin_->setValue(rememberedOr(config_.cli.longMaxFrames, kDefaultLongMaxFrames));
         addRow(scrolling, uiTr("Max frames"), QString(), maxFramesSpin_, false);
 
-        timeoutSpin_ = optionalSpin(scrolling, kDefaultLongTimeout, 86'400, uiTr(" s"));
+        timeoutSpin_ = optionalSpin(scrolling, kDefaultLongTimeout, kMaxFrameValue, uiTr(" s"));
         timeoutSpin_->setObjectName(QStringLiteral("longTimeout"));
         timeoutSpin_->setMinimumWidth(120);
         timeoutSpin_->setValue(rememberedOr(config_.cli.longTimeout, kDefaultLongTimeout));
         addRow(scrolling, uiTr("Timeout"), QString(), timeoutSpin_, false);
 
-        ignoreTopSpin_ = optionalSpin(scrolling, kDefaultLongIgnoreTop, 100'000, uiTr(" px"));
+        ignoreTopSpin_ = optionalSpin(scrolling, kDefaultLongIgnoreTop, kMaxFrameValue, uiTr(" px"));
         ignoreTopSpin_->setObjectName(QStringLiteral("longIgnoreTop"));
         ignoreTopSpin_->setMinimumWidth(120);
         ignoreTopSpin_->setValue(rememberedOr(config_.cli.longIgnoreTop, kDefaultLongIgnoreTop));
@@ -1407,7 +1407,7 @@ private:
                     "(VAAPI and Vulkan import the dma-buf, NVENC copies frames via the CPU)"),
                recordEncoderBackendBox_, false);
 
-        recordFpsSpin_ = optionalSpin(recording, kDefaultRecordFps, 240, uiTr(" fps"));
+        recordFpsSpin_ = optionalSpin(recording, kDefaultRecordFps, kMaxFrameValue, uiTr(" fps"));
         recordFpsSpin_->setObjectName(QStringLiteral("recordFps"));
         recordFpsSpin_->setMinimumWidth(120);
         recordFpsSpin_->setValue(rememberedOr(config_.cli.recordFps, kDefaultRecordFps));
@@ -1480,6 +1480,10 @@ private:
     {
         QWidget *replay = addCard(page, uiTr("Replay"));
 
+        // The one numeric default that keeps a ceiling, and it is not ours to
+        // lift: the ring holds encoded packets in RAM, so the window is a memory
+        // budget -- an hour of a 30 Mbps capture is already gigabytes -- and the
+        // ceiling here is the same one `vshot replay --window` accepts.
         replayWindowSpin_ = optionalSpin(replay, kDefaultReplayWindow, 3600, uiTr(" s"));
         replayWindowSpin_->setObjectName(QStringLiteral("replayWindow"));
         replayWindowSpin_->setMinimumWidth(120);
@@ -1487,6 +1491,10 @@ private:
         addRow(replay, uiTr("History kept"),
                uiTr("Seconds of history the ring holds, 1-3600"), replayWindowSpin_, true);
 
+        // Capped for the same reason the window is: the ring keeps a whole GOP
+        // past the window, so the key-frame distance is memory too, and a GOP
+        // longer than the window would make the window itself the smaller half
+        // of the ring.
         replayGopSpin_ = optionalSpin(replay, kDefaultReplayGop, 10, uiTr(" s"));
         replayGopSpin_->setObjectName(QStringLiteral("replayGop"));
         replayGopSpin_->setMinimumWidth(120);
@@ -1515,7 +1523,7 @@ private:
                     "(VAAPI and Vulkan import the dma-buf, NVENC copies frames via the CPU)"),
                replayEncoderBackendBox_, false);
 
-        replayFpsSpin_ = optionalSpin(replay, kDefaultReplayFps, 240, uiTr(" fps"));
+        replayFpsSpin_ = optionalSpin(replay, kDefaultReplayFps, kMaxFrameValue, uiTr(" fps"));
         replayFpsSpin_->setObjectName(QStringLiteral("replayFps"));
         replayFpsSpin_->setMinimumWidth(120);
         replayFpsSpin_->setValue(rememberedOr(config_.cli.replayFps, kDefaultReplayFps));
@@ -1607,7 +1615,7 @@ private:
         // was saved.
         dialogRadiusSpin_ = new ModernSpinBox(shape);
         dialogRadiusSpin_->setObjectName(QStringLiteral("dialogRadius"));
-        dialogRadiusSpin_->setRange(0, static_cast<int>(kMaxDialogRadius));
+        dialogRadiusSpin_->setRange(0, static_cast<int>(kMaxFrameValue));
         dialogRadiusSpin_->setMinimumWidth(120);
         dialogRadiusSpin_->setValue(static_cast<int>(config_.dialog.radius));
         dialogRadiusSpin_->setSuffix(uiTr(" px"));
@@ -1619,7 +1627,7 @@ private:
         QWidget *frame = addCard(page, uiTr("Frame"));
         dialogBorderWidthSpin_ = new ModernSpinBox(frame);
         dialogBorderWidthSpin_->setObjectName(QStringLiteral("dialogBorderWidth"));
-        dialogBorderWidthSpin_->setRange(0, static_cast<int>(kMaxDialogBorderWidth));
+        dialogBorderWidthSpin_->setRange(0, static_cast<int>(kMaxFrameValue));
         dialogBorderWidthSpin_->setMinimumWidth(120);
         dialogBorderWidthSpin_->setValue(static_cast<int>(config_.dialog.borderWidth));
         dialogBorderWidthSpin_->setSuffix(uiTr(" px"));
@@ -1671,6 +1679,9 @@ private:
         // string, and `uiTr` looks up by the English text, so a second "Size"
         // would render as the text tool's 字号.
         QWidget *density = addCard(page, uiTr("Pin size"));
+        // Four is the renderer's own limit rather than a preference: a pin is
+        // drawn by scaling the captured image, and the renderer takes a density
+        // of 1 to 4 (see `pin.rs`).
         densitySpin_ = optionalSpin(density, kDefaultPinDensity, 4, QString(),
                                     uiTr("inferred"));
         densitySpin_->setObjectName(QStringLiteral("pinDensity"));
@@ -1693,7 +1704,7 @@ private:
         // was saved.
         pinRadiusSpin_ = new ModernSpinBox(shape);
         pinRadiusSpin_->setObjectName(QStringLiteral("pinRadius"));
-        pinRadiusSpin_->setRange(0, static_cast<int>(vshot::kMaxPinRadius));
+        pinRadiusSpin_->setRange(0, static_cast<int>(vshot::kMaxFrameValue));
         pinRadiusSpin_->setMinimumWidth(120);
         pinRadiusSpin_->setValue(static_cast<int>(config_.pin.radius));
         pinRadiusSpin_->setSuffix(uiTr(" px"));
@@ -1711,7 +1722,7 @@ private:
         QWidget *frame = addCard(page, uiTr("Border"));
         pinBorderWidthSpin_ = new ModernSpinBox(frame);
         pinBorderWidthSpin_->setObjectName(QStringLiteral("pinBorderWidth"));
-        pinBorderWidthSpin_->setRange(0, static_cast<int>(vshot::kMaxPinBorderWidth));
+        pinBorderWidthSpin_->setRange(0, static_cast<int>(vshot::kMaxFrameValue));
         pinBorderWidthSpin_->setMinimumWidth(120);
         pinBorderWidthSpin_->setValue(static_cast<int>(config_.pin.borderWidth));
         pinBorderWidthSpin_->setSuffix(uiTr(" px"));

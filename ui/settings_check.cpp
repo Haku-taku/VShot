@@ -314,6 +314,59 @@ void checkEveryFieldReachesTheFile()
            "the numeric rows did not write each other's values");
 }
 
+/// What each numeric box will let the user type.
+///
+/// Every one of these used to be capped at a size we picked -- a shadow's reach
+/// at 64, a pin's corner at 512, its rim at 8, the dialog's at 48 and 8, a
+/// frame rate at 240 -- and a ceiling is a decision the user cannot argue with
+/// from inside the window: the box simply refuses the number.  None of the
+/// four frame numbers has one now, and neither do the pixel counts the long
+/// capture takes; what is asserted here is that the box offers what the loader
+/// keeps, since a range the file takes but the window cannot show is the other
+/// half of the same problem.
+///
+/// The shadow's two numbers and the replay ring's three keep a ceiling, and
+/// those are asserted as ceilings: they are the values whose cost grows with
+/// them (a blur is built over the shape grown by its reach; the ring holds
+/// window and one GOP of encoded packets in RAM; a pin is drawn at its
+/// density).
+void checkTheBoxesOfferTheWholeRange()
+{
+    std::printf("--- what each numeric box will let the user type ----------------\n");
+    std::unique_ptr<QDialog> dialog(vshot::createSettingsDialog());
+    if (!dialog) {
+        return;
+    }
+    const auto offers = [](QDialog *window, const char *name, int maximum) {
+        QSpinBox *box = find<QSpinBox>(window, name);
+        if (box == nullptr) {
+            return;
+        }
+        expect(box->maximum() == maximum, "the box offers the range the loader keeps",
+               QStringLiteral("%1: %2 against %3").arg(name).arg(box->maximum()).arg(maximum));
+    };
+    for (const char *name : {"pinRadius", "pinBorderWidth", "dialogRadius", "dialogBorderWidth",
+                             "recordFps", "replayFps", "longNotches", "longMaxHeight",
+                             "longMaxFrames", "longTimeout", "longIgnoreTop"}) {
+        offers(dialog.get(), name, vshot::kMaxFrameValue);
+    }
+    // The look values whose cost grows with them: the blur's reach, the ring's
+    // window and key-frame distance, and the pin's density.
+    for (const char *name : {"pinShadowSize", "dialogShadowSize"}) {
+        offers(dialog.get(), name, vshot::kMaxShadowSize);
+    }
+    for (const char *name : {"pinShadowOffset", "dialogShadowOffset"}) {
+        offers(dialog.get(), name, vshot::kMaxShadowOffset);
+    }
+    for (const char *name : {"replayWindow", "replayGop", "pinDensity"}) {
+        QSpinBox *box = find<QSpinBox>(dialog.get(), name);
+        if (box != nullptr) {
+            expect(box->maximum() > 0, "and the ring's own boxes keep a ceiling",
+                   QStringLiteral("%1: %2").arg(name).arg(box->maximum()));
+        }
+    }
+}
+
 void checkTheWindowOpensOnTheStoredValues()
 {
     std::printf("--- the window opens on what the file says ----------------------\n");
@@ -973,6 +1026,7 @@ int main(int argc, char **argv)
     std::printf("config: %s\n", qPrintable(configPath()));
 
     checkEveryFieldReachesTheFile();
+    checkTheBoxesOfferTheWholeRange();
     checkTheWindowOpensOnTheStoredValues();
     checkClearingOneColorLeavesTheOther();
     checkCancelChangesNothing();

@@ -60,7 +60,9 @@ pub struct RecordDefaults {
     /// built-in default, VAAPI where it opens else Vulkan else NVENC),
     /// `vaapi`, `vulkan` or `nvenc`.
     pub encoder_backend: Option<String>,
-    /// The frame rate `--fps` falls back to, 1-240.
+    /// The frame rate `--fps` falls back to: any rate of 1 or more.  The loop
+    /// is paced by the capture source, so a rate above the output's refresh is
+    /// a rate it never reaches rather than an error.
     pub fps: Option<u32>,
     /// Whether a recording goes through the desktop portal without
     /// `--portal`.  `null` (the default) keeps the compositor's own
@@ -97,7 +99,9 @@ pub struct ReplayDefaults {
     /// The hardware encoder `--encoder-backend` falls back to for a replay:
     /// `auto` (the default), `vaapi`, `vulkan` or `nvenc`.
     pub encoder_backend: Option<String>,
-    /// The frame rate `--fps` falls back to, 1-240.
+    /// The frame rate `--fps` falls back to: any rate of 1 or more.  The loop
+    /// is paced by the capture source, so a rate above the output's refresh is
+    /// a rate it never reaches rather than an error.
     pub fps: Option<u32>,
     /// The key-frame distance in seconds (1-10): a smaller value makes a save
     /// start closer to the requested edge at the cost of a bigger ring.

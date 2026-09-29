@@ -356,6 +356,64 @@ void checkClearingAValueRemovesIt()
            "the cleared replay defaults read back as unset");
 }
 
+void checkTheLookNumbersKeepTheLargestValueTheyAreOffered()
+{
+    std::printf("--- the look numbers and the ranges the window offers --------------\n");
+    // Every look value used to be capped -- a pin's corner at 512, its rim at
+    // 8, the dialog's at 48 and 8, a shadow's reach at 64 -- and the reason the
+    // caps live in `config.hpp` is the one this asserts: a value the settings
+    // window cannot show comes back clamped the next time that page is saved,
+    // so the window's range and the loader's have to be one range.
+    //
+    // The four frame numbers have no ceiling left (see `kMaxFrameValue`), which
+    // in practice means the largest value the window offers is the largest the
+    // loader keeps.  The shadow's two still have one, because they are the only
+    // look values that cost an allocation as they grow -- so for those the
+    // assertion is both that the ceiling survives and that it is still a
+    // ceiling.
+    writeConfig(QStringLiteral(R"({
+        "pin": {"radius": %1, "borderWidth": %1,
+                "shadow": true, "shadowSize": %2, "shadowOffset": -%2},
+        "dialog": {"radius": %1, "borderWidth": %1,
+                   "shadow": true, "shadowSize": %2, "shadowOffset": -%2}
+    })")
+                    .arg(vshot::kMaxFrameValue)
+                    .arg(vshot::kMaxShadowSize));
+    const vshot::Config widest = vshot::loadConfig();
+    const auto frame = static_cast<std::uint32_t>(vshot::kMaxFrameValue);
+    expect(widest.pin.radius == frame && widest.pin.borderWidth == frame &&
+               widest.dialog.radius == frame && widest.dialog.borderWidth == frame,
+           "a corner and a rim keep the largest value the window offers",
+           QStringLiteral("pin %1/%2, dialog %3/%4")
+               .arg(widest.pin.radius)
+               .arg(widest.pin.borderWidth)
+               .arg(widest.dialog.radius)
+               .arg(widest.dialog.borderWidth));
+    expect(widest.pin.shadow.size == vshot::kMaxShadowSize &&
+               widest.pin.shadow.offset == -vshot::kMaxShadowSize &&
+               widest.dialog.shadow.size == vshot::kMaxShadowSize &&
+               widest.dialog.shadow.offset == -vshot::kMaxShadowSize,
+           "a shadow's reach and drop keep the largest value offered",
+           QStringLiteral("pin %1/%2, dialog %3/%4")
+               .arg(widest.pin.shadow.size)
+               .arg(widest.pin.shadow.offset)
+               .arg(widest.dialog.shadow.size)
+               .arg(widest.dialog.shadow.offset));
+
+    // And past it is clamped rather than kept: the ceiling is what keeps the
+    // blur's own allocation bounded, so a hand-written number over it has to
+    // come back as the ceiling and not as itself.
+    writeConfig(QStringLiteral(R"({"pin": {"shadowSize": %1, "shadowOffset": -%1}})")
+                    .arg(vshot::kMaxShadowSize + 1000));
+    const vshot::Config over = vshot::loadConfig();
+    expect(over.pin.shadow.size == vshot::kMaxShadowSize &&
+               over.pin.shadow.offset == -vshot::kMaxShadowSize,
+           "and a shadow past its ceiling comes back as the ceiling",
+           QStringLiteral("size %1, offset %2")
+               .arg(over.pin.shadow.size)
+               .arg(over.pin.shadow.offset));
+}
+
 void checkRoundTripOfEveryField()
 {
     std::printf("--- every field survives a write and a read ------------------------\n");
@@ -705,6 +763,7 @@ int main(int argc, char **argv)
     checkSettingsSaveKeepsWhatItDoesNotOwn();
     checkClearingOneSessionLeavesTheOther();
     checkClearingAValueRemovesIt();
+    checkTheLookNumbersKeepTheLargestValueTheyAreOffered();
     checkRoundTripOfEveryField();
 
     std::printf("--- result ---------------------------------------------------------\n");

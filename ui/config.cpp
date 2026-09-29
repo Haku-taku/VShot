@@ -796,9 +796,9 @@ DialogPreferences readDialog(const QJsonObject &dialog)
 {
     DialogPreferences preferences;
     preferences.radius = readBounded(dialog, QStringLiteral("radius"), preferences.radius,
-                                     kMaxDialogRadius);
+                                     kMaxFrameValue);
     preferences.borderWidth = readBounded(dialog, QStringLiteral("borderWidth"),
-                                          preferences.borderWidth, kMaxDialogBorderWidth);
+                                          preferences.borderWidth, kMaxFrameValue);
     // Absent, not merely unparseable, is what means "derive it": an invalid or
     // missing colour leaves the invalid QColor in place, and that is the
     // signal the dialog reads to pick a palette colour of its own.
@@ -835,10 +835,10 @@ PinPreferences readPin(const QJsonObject &pin)
     // its own size, which changes with every zoom step, so that clamp is
     // applied where the pin is drawn rather than here.
     preferences.radius =
-        readWhole(pin, QStringLiteral("radius"), preferences.radius, kMaxPinRadius);
+        readWhole(pin, QStringLiteral("radius"), preferences.radius, kMaxFrameValue);
     preferences.shadow = readShadow(pin, preferences.shadow);
     preferences.borderWidth = readWhole(pin, QStringLiteral("borderWidth"),
-                                        preferences.borderWidth, kMaxPinBorderWidth);
+                                        preferences.borderWidth, kMaxFrameValue);
     // Invalid means "use the built-in colour", exactly as in the dialog's rim:
     // the stroke has a good default and the file only has to say something when
     // the user wants a different one.

@@ -226,12 +226,15 @@ pub(crate) fn default_encoder() -> VideoCodec {
 
 /// The remembered frame rate: `--fps` overrides it, and the config's
 /// `record.fps` decides what "no flag" means.  The CLI's own default
-/// (60) unless the file says otherwise; a rate outside 1-240 is the
-/// built-in default rather than an error, for the same reason as the
-/// encoder above.
+/// (60) unless the file says otherwise; a rate of zero -- the one thing
+/// the loop cannot be asked for, since the interval it paces by is
+/// divided by it -- is the built-in default rather than an error, for
+/// the same reason as the encoder above.  There is no upper bound: the
+/// loop is paced by the source, so a rate above the output's refresh is
+/// simply a rate the source never reaches.
 pub(crate) fn default_fps() -> u32 {
     match crate::config::load().record.fps {
-        Some(fps) if (1..=240).contains(&fps) => fps,
+        Some(fps) if fps >= 1 => fps,
         _ => DEFAULT_FPS,
     }
 }
@@ -254,11 +257,12 @@ pub(crate) fn default_replay_window() -> u64 {
     }
 }
 
-/// The remembered replay frame rate: the config's `replay.fps` when it is in
-/// range, else the replay default (30).
+/// The remembered replay frame rate: the config's `replay.fps` when it is a
+/// rate at all, else the replay default (30).  Uncapped, like the recording
+/// loop's.
 pub(crate) fn default_replay_fps() -> u32 {
     match crate::config::load().replay.fps {
-        Some(fps) if (1..=240).contains(&fps) => fps,
+        Some(fps) if fps >= 1 => fps,
         _ => replay::DEFAULT_FPS,
     }
 }

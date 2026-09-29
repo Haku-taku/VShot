@@ -340,9 +340,12 @@ fallback composition instead of the GPU overlay."#
     Record {
         #[command(subcommand)]
         target: RecordTargetCommand,
-        /// Frame rate the loop aims for, 1-240; the config's `cli.record.fps`
-        /// when the flag is not given, else 60.
-        #[arg(long, global = true, value_parser = clap::value_parser!(u32).range(1..=240))]
+        /// Frame rate the loop aims for, at least 1; the config's
+        /// `cli.record.fps` when the flag is not given, else 60.  There is no
+        /// ceiling on it: the loop can only go as fast as the capture source
+        /// hands it frames, so a rate above the output's refresh costs nothing
+        /// and one below it is the only way to slow the capture down.
+        #[arg(long, global = true, value_parser = clap::value_parser!(u32).range(1..))]
         fps: Option<u32>,
         /// Stop on its own after this many seconds.
         #[arg(long, global = true)]
@@ -437,9 +440,10 @@ file `replay stop` reads, and VSHOT_RECORD_DEBUG=1 traces each frame."#
         /// `cli.replay.window` when the flag is not given, else 30.
         #[arg(long, global = true, value_parser = clap::value_parser!(u64).range(1..=3600))]
         window: Option<u64>,
-        /// Frame rate the loop aims for, 1-240; the config's `cli.replay.fps`
-        /// when the flag is not given, else 30.
-        #[arg(long, global = true, value_parser = clap::value_parser!(u32).range(1..=240))]
+        /// Frame rate the loop aims for, at least 1; the config's
+        /// `cli.replay.fps` when the flag is not given, else 30.  Uncapped for
+        /// the same reason the recording loop's rate is.
+        #[arg(long, global = true, value_parser = clap::value_parser!(u32).range(1..))]
         fps: Option<u32>,
         /// Key-frame distance in seconds (1-10); `cli.replay.gop` when the flag
         /// is not given, else 1. Smaller values start a save closer to the
@@ -720,9 +724,10 @@ pub enum ReplayCommandLine {
         /// `--save-dir`) when omitted.
         #[arg(value_name = "PATH")]
         path: Option<PathBuf>,
-        /// How many seconds to take from the ring, 1-3600; the whole window
-        /// when omitted.
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        /// How many seconds to take from the ring, at least 1; the whole
+        /// window when omitted, which is also what any value past the window
+        /// means -- there is no more history than the ring holds.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         seconds: Option<u64>,
     },
     /// Print how much history the running session holds.
