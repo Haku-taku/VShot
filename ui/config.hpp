@@ -26,6 +26,16 @@ struct EditorPreferences {
     /// Tool the toolbar opens with: select | rectangle | ellipse | arrow | pen
     /// | text | mosaic.
     QString tool = QStringLiteral("select");
+    /// How the Select tool starts a drag on an annotation that is already
+    /// selected: `precise` (the default) needs the press on the mark itself,
+    /// `loose` moves it from anywhere on screen.
+    ///
+    /// A mark that is hard to hit -- a hairline pen stroke, a run of small text
+    /// -- is what the second mode is for: once it is selected, the whole screen
+    /// is its handle.  The cost is that a press elsewhere no longer reaches the
+    /// capture selection, so a click (a press that does not move) drops the
+    /// mark instead, and the next drag starts from nothing selected.
+    QString selectMode = QStringLiteral("precise");
     QColor color{255, 64, 64, 255};
     QString font;
     std::uint32_t width = 2;
@@ -297,6 +307,11 @@ QColor resolveDialogBorderColor(const DialogPreferences &preferences, const QCol
 /// window should offer them.  The loaders use the same lists, so a value the
 /// window offers is always one the file will accept.
 const QStringList &toolNames();
+/// The two ways the Select tool may pick up an annotation: `precise` (the
+/// press has to land on the mark) and `loose` (once selected, the mark follows
+/// a drag that starts anywhere).  Offered by the settings window in this order,
+/// and read back by the loader from the same list.
+const QStringList &selectModeNames();
 const QStringList &dashNames();
 const QStringList &arrowStyleNames();
 const QStringList &mosaicShapeNames();

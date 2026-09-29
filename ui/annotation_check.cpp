@@ -27,6 +27,9 @@
 
 #include <QApplication>
 #include <QColor>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QImage>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -1545,11 +1548,136 @@ void checkBezierStepCoverage()
            "the pen path that lands is the closed one");
 }
 
+// Writes the one key the loose-mode check needs into the config file the
+// controller reads at construction.  Nothing else is written, so the built-in
+// defaults are what the rest of the run sees and the file cannot be the reason
+// a later assertion moves.
+void writeSelectMode(const QString &mode)
+{
+    const QString path =
+        qEnvironmentVariable("XDG_CONFIG_HOME") + QStringLiteral("/vshot/config.json");
+    if (!QDir().mkpath(QFileInfo(path).absolutePath())) {
+        expect(false, "the check has a config directory to write into", path);
+        return;
+    }
+    QJsonObject editor;
+    editor.insert(QStringLiteral("selectMode"), mode);
+    QJsonObject root;
+    root.insert(QStringLiteral("editor"), editor);
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        expect(false, "the check can write a config file", path);
+        return;
+    }
+    file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+    file.close();
+}
+
+// `editor.selectMode` decides what a press does once a mark is selected.
+// `precise` -- the default -- needs the press on the mark itself; `loose` moves
+// it from anywhere on screen, and a press that never travels is a click that
+// lets the mark go.  The stroke here is two pixels wide, so a second press
+// landing on it would be luck: that is what the mode is for.
+void checkSelectModeDecidesWhatAPressPicksUp()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    const QPointF strokeStart(200, 200);
+    const QPointF strokeMiddle(230, 205);
+    const QPointF strokeEnd(240, 210);
+    // Off the stroke, inside the capture selection and clear of its handles:
+    // the press is on nothing at all.
+    const QPointF nowhere(340, 330);
+    const QPointF travel(30, 10);
+
+    const auto run = [&](const QString &mode, bool loose) {
+        writeSelectMode(mode);
+        vshot::OverlayController controller(editingSession());
+        QString error;
+        vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+        if (overlay == nullptr) {
+            expect(false, "the controller accepts an overlay", error);
+            return;
+        }
+        overlay->show();
+        controller.beginPresetEdit();
+
+        controller.chooseTool(vshot::Tool::Pen);
+        controller.setWidth(2);
+        controller.press(overlay, strokeStart, Qt::LeftButton, Qt::NoModifier);
+        controller.move(overlay, strokeMiddle, Qt::LeftButton, Qt::NoModifier);
+        controller.release(overlay, strokeEnd, Qt::LeftButton, Qt::NoModifier);
+        expect(controller.annotations().size() == 1, "the stroke lands as one mark");
+        if (controller.annotations().size() != 1) {
+            return;
+        }
+        const vshot::Point before = controller.annotations().at(0).points.constFirst();
+
+        // A click on the stroke itself: the one press both modes act on.
+        controller.chooseTool(vshot::Tool::Select);
+        controller.press(overlay, strokeStart, Qt::LeftButton, Qt::NoModifier);
+        controller.release(overlay, strokeStart, Qt::LeftButton, Qt::NoModifier);
+
+        controller.press(overlay, nowhere, Qt::LeftButton, Qt::NoModifier);
+        controller.move(overlay, nowhere + travel, Qt::LeftButton, Qt::NoModifier);
+        controller.release(overlay, nowhere + travel, Qt::LeftButton, Qt::NoModifier);
+        const vshot::Point after = controller.annotations().at(0).points.constFirst();
+        const bool moved = after.x == before.x + static_cast<int>(travel.x()) &&
+            after.y == before.y + static_cast<int>(travel.y());
+        const QString detail = QStringLiteral("(%1,%2) -> (%3,%4)")
+                                   .arg(before.x)
+                                   .arg(before.y)
+                                   .arg(after.x)
+                                   .arg(after.y);
+        if (loose) {
+            expect(moved, "a loose drag moves the selected mark from anywhere", detail);
+        } else {
+            expect(!moved, "a precise drag from nothing leaves the mark where it is", detail);
+        }
+        if (!loose) {
+            return;
+        }
+
+        // A press that never travels is a click, and a click on nothing lets the
+        // mark go: the drag after it has nothing to pick up, so the mark stays
+        // where the first drag left it.
+        controller.press(overlay, nowhere, Qt::LeftButton, Qt::NoModifier);
+        controller.release(overlay, nowhere, Qt::LeftButton, Qt::NoModifier);
+        controller.press(overlay, nowhere, Qt::LeftButton, Qt::NoModifier);
+        controller.move(overlay, nowhere + QPointF(20, 20), Qt::LeftButton, Qt::NoModifier);
+        controller.release(overlay, nowhere + QPointF(20, 20), Qt::LeftButton, Qt::NoModifier);
+        const vshot::Point dropped = controller.annotations().at(0).points.constFirst();
+        expect(dropped.x == after.x && dropped.y == after.y,
+               "a click on nothing drops the mark, so the next drag leaves it alone",
+               QStringLiteral("(%1,%2) -> (%3,%4)")
+                   .arg(after.x)
+                   .arg(after.y)
+                   .arg(dropped.x)
+                   .arg(dropped.y));
+    };
+
+    run(QStringLiteral("loose"), true);
+    run(QStringLiteral("precise"), false);
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
+    // The controller reads the config at construction, so the run needs a
+    // config directory of its own: the check that switches `editor.selectMode`
+    // writes into it, and every other check reads the built-in defaults out of
+    // it rather than whatever the machine running it happens to have.
+    QTemporaryDir configHome;
+    if (!configHome.isValid()) {
+        std::printf("FAIL  no temporary directory to keep the config in\n");
+        return 1;
+    }
+    qputenv("XDG_CONFIG_HOME", configHome.path().toUtf8());
 
     checkRepaintsReuseTheRaster();
     checkEachMarkCachesOnItsOwn();
@@ -1568,6 +1696,7 @@ int main(int argc, char *argv[])
     checkClosedPathsCompareByTheirClosure();
     checkBezierFillsAtHalfAlpha();
     checkBezierStepCoverage();
+    checkSelectModeDecidesWhatAPressPicksUp();
 
     if (failures != 0) {
         std::printf("\n%d annotation cache checks failed\n", failures);

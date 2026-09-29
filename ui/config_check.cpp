@@ -132,6 +132,9 @@ void checkDefaultsWhenTheFileIsMissing()
     const vshot::Config config = vshot::loadConfig();
     expect(config.editor.tool == QStringLiteral("select"),
            "the editor tool falls back to select", config.editor.tool);
+    expect(config.editor.selectMode == QStringLiteral("precise"),
+           "the Select tool needs the press on the mark unless the file says otherwise",
+           config.editor.selectMode);
     expect(config.editor.color == QColor(255, 64, 64, 255), "the color falls back to #ff4040ff",
            config.editor.color.name(QColor::HexArgb));
     expect(config.editor.width == 2, "the width falls back to 2");
@@ -183,12 +186,15 @@ void checkBadValuesFallBackFieldByField()
 {
     std::printf("--- one bad value costs only its own field -------------------------\n");
     writeConfig(QStringLiteral(R"({
-        "editor": {"tool": "scribble", "width": 900, "dash": "dashed", "color": "not-a-color"},
+        "editor": {"tool": "scribble", "width": 900, "dash": "dashed", "color": "not-a-color",
+                   "selectMode": "sometimes"},
         "cli": {"png-compression": "slowest", "monitor": "DP-3"}
     })"));
     const vshot::Config config = vshot::loadConfig();
     expect(config.editor.tool == QStringLiteral("select"),
            "an unknown tool name falls back", config.editor.tool);
+    expect(config.editor.selectMode == QStringLiteral("precise"),
+           "an unknown select mode falls back", config.editor.selectMode);
     expect(config.editor.width == 64, "an out-of-range width is clamped", QString::number(config.editor.width));
     expect(config.editor.dash == QStringLiteral("dashed"), "a good value beside bad ones survives");
     expect(config.editor.color == QColor(255, 64, 64, 255), "an unparseable color falls back");
@@ -420,6 +426,7 @@ void checkRoundTripOfEveryField()
     QFile::remove(configPath());
     vshot::Config written;
     written.editor.tool = QStringLiteral("text");
+    written.editor.selectMode = QStringLiteral("loose");
     written.editor.color = QColor(12, 34, 56, 200);
     written.editor.font = QStringLiteral("Noto Sans");
     written.editor.width = 9;
@@ -476,6 +483,8 @@ void checkRoundTripOfEveryField()
     const vshot::Config read = vshot::loadConfig();
 
     expect(read.editor.tool == written.editor.tool, "editor.tool round-trips", read.editor.tool);
+    expect(read.editor.selectMode == written.editor.selectMode,
+           "editor.selectMode round-trips", read.editor.selectMode);
     expect(read.editor.color == written.editor.color, "editor.color round-trips",
            read.editor.color.name(QColor::HexArgb));
     expect(read.editor.font == written.editor.font, "editor.font round-trips");
@@ -634,6 +643,13 @@ void checkRoundTripOfEveryField()
         vshot::saveConfig(probe);
         expect(vshot::loadConfig().editor.tool == value,
                "the settings window's tool names all load back", value);
+    }
+    for (const QString &value : vshot::selectModeNames()) {
+        vshot::Config probe = written;
+        probe.editor.selectMode = value;
+        vshot::saveConfig(probe);
+        expect(vshot::loadConfig().editor.selectMode == value,
+               "the settings window's select modes all load back", value);
     }
     for (const QString &value : vshot::injectNames()) {
         vshot::Config probe = written;

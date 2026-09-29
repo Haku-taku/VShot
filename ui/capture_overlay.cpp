@@ -4270,6 +4270,7 @@ OverlayController::OverlayController(Session session)
     arrowSize_ = preferences.arrowSize;
     currentArrowStyle_ = preferences.arrowStyle;
     mosaicShape_ = preferences.mosaicShape;
+    looseSelect_ = preferences.selectMode == QStringLiteral("loose");
     mosaicStrength_ = preferences.mosaicStrength;
     // Every tool starts from the same remembered style and keeps its own copy
     // from there: a width moved on the rectangle must not follow the user to the
@@ -4781,6 +4782,26 @@ void OverlayController::applyCandidates(QVector<WindowCandidate> candidates)
         overlay->setCursor(hoveredCandidate_ >= 0 ? Qt::PointingHandCursor : Qt::ArrowCursor);
     }
     updateAll();
+}
+
+void OverlayController::beginSelectionGesture(Point point)
+{
+    const int handle = hitHandle(point);
+    if (selection_.has_value() && handle != 0 && handle != 9) {
+        gesture_->anchor = point;
+        gesture_->current = point;
+        gesture_->origin = *selection_;
+        gesture_->handle = handle;
+        gesture_->type = Gesture::Type::Resizing;
+    } else if (selection_.has_value() && handle == 9) {
+        gesture_->anchor = point;
+        gesture_->current = point;
+        gesture_->origin = *selection_;
+        gesture_->handle = handle;
+        gesture_->type = Gesture::Type::Moving;
+    } else {
+        startSelection(point);
+    }
 }
 
 void OverlayController::startSelection(Point point)
@@ -5685,6 +5706,9 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
     if (finished_ || cancelled_) {
         return;
     }
+    // A loose drag still held here belongs to a press whose release never
+    // arrived (a grab lost mid-drag); this press replaces it either way.
+    looseDrag_.reset();
     if (button == Qt::RightButton) {
         cancel();
         return;
@@ -5809,6 +5833,20 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
         } else if (annotationIndex >= 0) {
             selectAnnotation(annotationIndex);
             beginAnnotationDrag(point, false);
+        } else if (looseSelect_ && selectedAnnotation_ >= 0) {
+            // Loose mode: the selected mark follows a drag from anywhere, so
+            // this press is held back rather than acted on -- until it moves it
+            // is still a click, and a click that lands on nothing lets the mark
+            // go.  A capture handle is the one exception: it is a small,
+            // deliberate target, and dropping the mark is the price of using
+            // it.
+            const int handle = pinEdit_ ? 0 : hitHandle(point);
+            if (handle != 0 && handle != 9) {
+                selectAnnotation(-1);
+                beginSelectionGesture(point);
+            } else {
+                looseDrag_ = point;
+            }
         } else if (pinEdit_) {
             // Empty image surface: drop the current annotation selection and
             // start dragging the image itself (which carries its annotations).
@@ -5821,22 +5859,7 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
                 gesture_->type = Gesture::Type::Moving;
             }
         } else {
-            const int handle = hitHandle(point);
-            if (selection_.has_value() && handle != 0 && handle != 9) {
-                gesture_->anchor = point;
-                gesture_->current = point;
-                gesture_->origin = *selection_;
-                gesture_->handle = handle;
-                gesture_->type = Gesture::Type::Resizing;
-            } else if (selection_.has_value() && handle == 9) {
-                gesture_->anchor = point;
-                gesture_->current = point;
-                gesture_->origin = *selection_;
-                gesture_->handle = handle;
-                gesture_->type = Gesture::Type::Moving;
-            } else {
-                startSelection(point);
-            }
+            beginSelectionGesture(point);
         }
     } else {
         if (!canDrawAt(point)) {
@@ -5875,6 +5898,30 @@ void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::
             overlay->setCursor(Qt::IBeamCursor);
         }
         return;
+    }
+    if (looseDrag_.has_value()) {
+        // A loose drag is held back until it actually moves, so a press that
+        // never travels is still a click.  Past the threshold the mark picks up
+        // the drag from where the button went down, which is what lets the
+        // pointer be nowhere near the mark it is moving.
+        if (buttons == Qt::NoButton) {
+            // The button went up without a release event reaching us (a widget
+            // change, a grab lost): treat it as the click it was.
+            looseDrag_.reset();
+        } else {
+            const std::int64_t dx = static_cast<std::int64_t>(point.x) - looseDrag_->x;
+            const std::int64_t dy = static_cast<std::int64_t>(point.y) - looseDrag_->y;
+            if (dx * dx + dy * dy <= 16) {
+                overlay->setCursor(Qt::SizeAllCursor);
+                return;
+            }
+            const Point anchor = *looseDrag_;
+            looseDrag_.reset();
+            beginAnnotationDrag(anchor, false);
+            updateAnnotationDrag(point);
+            updateTouch(annotationTouch());
+            return;
+        }
     }
     if (pickMode_ && !editing_ && buttons == Qt::NoButton &&
         gesture_->type == Gesture::Type::None) {
@@ -5959,6 +6006,16 @@ void OverlayController::release(CaptureOverlay *overlay, const QPointF &local,
     }
     if (textMode_) {
         textDragging_ = false;
+        return;
+    }
+    if (looseDrag_.has_value()) {
+        // The press never travelled, so it was a click on nothing: the mark is
+        // let go, and with nothing selected the next drag reaches the capture
+        // selection again.  The selection itself is left as it was -- a click
+        // is not how one is drawn.
+        looseDrag_.reset();
+        selectAnnotation(-1);
+        updateAll();
         return;
     }
     const Point point = globalPoint(overlay, local);

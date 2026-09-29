@@ -32,6 +32,7 @@ const QStringList kToolNames = {QStringLiteral("select"), QStringLiteral("rectan
                                 QStringLiteral("line"), QStringLiteral("wave"),
                                 QStringLiteral("bezier"), QStringLiteral("pen"),
                                 QStringLiteral("text"), QStringLiteral("mosaic")};
+const QStringList kSelectModeNames = {QStringLiteral("precise"), QStringLiteral("loose")};
 const QStringList kDashNames = {QStringLiteral("solid"), QStringLiteral("dashed"),
                                 QStringLiteral("dotted")};
 const QStringList kArrowStyleNames = {QStringLiteral("open"), QStringLiteral("filled")};
@@ -404,6 +405,9 @@ EditorPreferences readEditor(const QJsonObject &editor)
     EditorPreferences preferences;
     preferences.tool =
         readChoice(editor, QStringLiteral("tool"), preferences.tool, kToolNames);
+    preferences.selectMode =
+        readChoice(editor, QStringLiteral("selectMode"), preferences.selectMode,
+                   kSelectModeNames);
     preferences.color = readColor(editor, QStringLiteral("color"), preferences.color);
     preferences.font = readString(editor, QStringLiteral("font"), preferences.font);
     preferences.width =
@@ -520,6 +524,7 @@ QJsonObject editorJson(const EditorPreferences &preferences)
 {
     QJsonObject editor;
     editor.insert(QStringLiteral("tool"), preferences.tool);
+    editor.insert(QStringLiteral("selectMode"), preferences.selectMode);
     editor.insert(QStringLiteral("color"), colorText(preferences.color));
     editor.insert(QStringLiteral("font"), preferences.font);
     editor.insert(QStringLiteral("width"), static_cast<double>(preferences.width));
@@ -969,6 +974,11 @@ QColor resolveDialogBorderColor(const DialogPreferences &preferences, const QCol
 const QStringList &toolNames()
 {
     return kToolNames;
+}
+
+const QStringList &selectModeNames()
+{
+    return kSelectModeNames;
 }
 
 const QStringList &dashNames()

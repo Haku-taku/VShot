@@ -1148,6 +1148,17 @@ private:
                uiTr("The tool editing starts with; session changes are not saved here"),
                toolBox_, true);
 
+        selectModeBox_ = new ModernComboBox(shape);
+        selectModeBox_->setObjectName(QStringLiteral("selectMode"));
+        selectModeBox_->setMinimumWidth(180);
+        for (const QString &value : selectModeNames()) {
+            selectModeBox_->addItem(value, value);
+        }
+        selectChoice(selectModeBox_, config_.editor.selectMode);
+        addRow(shape, uiTr("Select tool drags"),
+               uiTr("precise presses the mark itself; loose drags a selected mark from anywhere"),
+               selectModeBox_, false);
+
         colorButton_ = new ColorButton(shape);
         colorButton_->setColor(config_.editor.color);
         addRow(shape, uiTr("Color"), uiTr("Hex, with alpha last when it is not opaque"),
@@ -1827,6 +1838,7 @@ private:
         Config config = config_;
         EditorPreferences &editor = config.editor;
         editor.tool = toolBox_->currentData().toString();
+        editor.selectMode = selectModeBox_->currentData().toString();
         editor.color = colorButton_->color();
         editor.width = static_cast<std::uint32_t>(std::max(1, widthSpin_->value()));
         editor.dash = dashBox_->currentData().toString();
@@ -1923,6 +1935,7 @@ private:
     QListWidget *sidebar_ = nullptr;
     QStackedWidget *pages_ = nullptr;
     QComboBox *toolBox_ = nullptr;
+    QComboBox *selectModeBox_ = nullptr;
     ColorButton *colorButton_ = nullptr;
     QSpinBox *widthSpin_ = nullptr;
     QComboBox *dashBox_ = nullptr;

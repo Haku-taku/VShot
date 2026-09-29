@@ -585,7 +585,8 @@ The window is an ordinary window: it captures nothing and needs no compositor pr
   "editor": {
     "tool": "arrow", "color": "#ff8800ff", "width": 4, "textPixels": 28,
     "dash": "dotted", "arrowSize": 3, "arrowStyle": "filled",
-    "mosaicShape": "brush", "mosaicStrength": 3, "font": "Noto Sans"
+    "mosaicShape": "brush", "mosaicStrength": 3, "font": "Noto Sans",
+    "selectMode": "loose"
   },
   "cli": {
     "png-compression": "high",
@@ -611,6 +612,7 @@ This section is the style **every session starts from**. Nothing a session does 
 | Key | Values | Default |
 | --- | --- | --- |
 | `tool` | `select` / `rectangle` / `ellipse` / `arrow` / `pen` / `text` / `mosaic` | `select` |
+| `selectMode` | `precise` / `loose` | `precise` |
 | `color` | `#rrggbb` or `#rrggbbaa` | `#ff4040ff` |
 | `width` | 1–64 | `2` |
 | `textPixels` | 7–448 (a pixel height) | `14` |
@@ -622,6 +624,8 @@ This section is the style **every session starts from**. Nothing a session does 
 | `font` | font family; an empty string uses the system default | `""` |
 
 `tool` is the tool an **editing** session starts with and, like every style here, it lives **only in the config**. A fresh region capture always opens on Select — its first step is dragging the rectangle, and opening straight onto a drawing tool (say Text) makes the first click place a label; `window pick` and scrolling capture stay on Select for the same reason. Out-of-range integers are clamped, and an unrecognized name falls back to the default, so a typo in a hand-edited file costs you that one setting. **`textPixels` is a pixel height**: type 14 and the label is 14 pixels tall, exactly matching the number in the editor's size box; the legacy "glyph multiple" scale the JSON protocol still carries (1–64, one cell being 7 pixels) is derived once, on the way out. Earlier versions called this key `textSize` and stored that multiple, and **an old file is migrated automatically** (`2` → 14 px, `3` → 21 px): the next save writes it as `textPixels` and drops the old key, and when both are present `textPixels` wins.
+
+`selectMode` decides **what a press picks up once a mark is already selected**. `precise` (the default) needs the pointer on the mark itself; `loose` is "select first, then drag from anywhere" — with a mark selected, a press anywhere on screen moves it, so a one-pixel stroke never has to be aimed at twice. The cost is that the capture selection gives way to the mark while one is selected (its handles still win, being small deliberate targets): to drag the selection again, **click once on empty space** to let the mark go — a click only drops the selection, it never moves the frame, and everything is as it was after that.
 
 ### `cli` — command-line defaults
 Supplies values for flags **not given on the command line**. The order is:

@@ -560,6 +560,12 @@ private:
     bool toolbarAnchorValid_ = false;
     // Selected annotation adjustment (move/resize under the Select tool).
     int selectedAnnotation_ = -1;
+    /// `editor.selectMode == "loose"`: a press that is not on a handle or
+    /// another mark is held back until it moves, and then moves the selected
+    /// mark from wherever it started.  The point is the one the button went
+    /// down at, which is the anchor the move is measured from.
+    bool looseSelect_ = false;
+    std::optional<Point> looseDrag_;
     Annotation dragAnnotation_;
     QVector<Annotation> dragSnapshot_;
     bool dragMoved_ = false;
@@ -634,6 +640,11 @@ private:
     LogicalRect moveSelection(LogicalRect origin, Point anchor, Point current) const;
     LogicalRect resizeSelection(LogicalRect origin, int handle, Point current) const;
     int hitHandle(Point point) const;
+    // What a press on the Select tool does when it is not aimed at an
+    // annotation: resize the selection by its handle, move it from inside, or
+    // start a new one.  Shared with the loose drag's click path, which has to
+    // reach the same selection logic once it has let go of the mark.
+    void beginSelectionGesture(Point point);
     void startSelection(Point point);
     void updateSelection(Point point);
     void finishSelection(Point point);

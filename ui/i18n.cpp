@@ -269,6 +269,10 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("Opening tool"), QString::fromUtf8("默认工具")},
         {QStringLiteral("The tool editing starts with; session changes are not saved here"),
          QString::fromUtf8("编辑状态的起始工具；会话中的切换不写回这里")},
+        {QStringLiteral("Select tool drags"), QString::fromUtf8("选择工具拖动方式")},
+        {QStringLiteral("precise presses the mark itself; loose drags a selected mark from "
+                        "anywhere"),
+         QString::fromUtf8("precise：按在标注上；loose：已选中的标注可从任意位置拖动")},
         {QStringLiteral("Color"), QString::fromUtf8("颜色")},
         {QStringLiteral("Hex, with alpha last when it is not opaque"),
          QString::fromUtf8("十六进制，不透明时省略 alpha，否则写在最后")},

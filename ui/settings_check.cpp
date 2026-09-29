@@ -130,6 +130,8 @@ void checkEveryFieldReachesTheFile()
     // wired to the wrong member (or to nothing) is caught by the read-back.
     expect(choose(find<QComboBox>(dialog.get(), "tool"), QStringLiteral("mosaic")),
            "the tool list offers mosaic");
+    expect(choose(find<QComboBox>(dialog.get(), "selectMode"), QStringLiteral("loose")),
+           "the select-mode list offers loose");
     find<QSpinBox>(dialog.get(), "width")->setValue(23);
     expect(choose(find<QComboBox>(dialog.get(), "dash"), QStringLiteral("dotted")),
            "the line-style list offers dotted");
@@ -234,6 +236,8 @@ void checkEveryFieldReachesTheFile()
 
     const vshot::Config saved = vshot::loadConfig();
     expect(saved.editor.tool == QStringLiteral("mosaic"), "the tool reached the file", saved.editor.tool);
+    expect(saved.editor.selectMode == QStringLiteral("loose"),
+           "the select mode reached the file", saved.editor.selectMode);
     expect(saved.editor.width == 23, "the width reached the file", QString::number(saved.editor.width));
     expect(saved.editor.dash == QStringLiteral("dotted"), "the line style reached the file");
     expect(saved.editor.arrowSize == 6, "the arrow head size reached the file");
@@ -373,7 +377,8 @@ void checkTheWindowOpensOnTheStoredValues()
     // The size is written under the pixel key, which is what this build
     // produces; the legacy `textSize` (a glyph multiple) is checked separately.
     writeConfig(QStringLiteral(R"({
-        "editor": {"tool": "ellipse", "width": 12, "dash": "dashed", "arrowStyle": "filled",
+        "editor": {"tool": "ellipse", "selectMode": "loose", "width": 12, "dash": "dashed",
+                   "arrowStyle": "filled",
                    "mosaicShape": "ellipse", "mosaicStrength": 1, "arrowSize": 2, "textPixels": 28},
         "cli": {"png-compression": "fastest", "monitor": "DP-3",
                 "long": {"notches": 3, "inject": "portal", "timeout": 45},
@@ -395,6 +400,9 @@ void checkTheWindowOpensOnTheStoredValues()
     }
     expect(find<QComboBox>(dialog.get(), "tool")->currentData().toString() == QStringLiteral("ellipse"),
            "the tool box shows the stored tool");
+    expect(find<QComboBox>(dialog.get(), "selectMode")->currentData().toString() ==
+               QStringLiteral("loose"),
+           "the select-mode box shows the stored mode");
     expect(find<QSpinBox>(dialog.get(), "width")->value() == 12, "the width box shows the stored width");
     expect(find<QComboBox>(dialog.get(), "dash")->currentData().toString() == QStringLiteral("dashed"),
            "the line-style box shows the stored style");
@@ -728,6 +736,7 @@ void checkEverySettingIsOnThePageTheSidebarNames()
         {"pinRadius", "Pin appearance"},
         {"dialogRadius", "File dialogs"},
         {"width", "Annotation editor"},
+        {"selectMode", "Annotation editor"},
     };
     for (const auto &row : expected) {
         QWidget *widget = dialog->findChild<QWidget *>(QString::fromLatin1(row.widget));
