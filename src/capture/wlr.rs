@@ -397,10 +397,10 @@ impl Drop for CaptureBuffer {
 /// reading of a buffer the compositor filled with the pixels it is showing.
 ///
 /// The format is the contract, and the output's description names the transfer
-/// function and primaries; the pixels are never inspected to decide.  Only
-/// [`WlrCapture::capture_output_hdr`], on the colour-managed connection, reads a
-/// ten-bit buffer this way: the plain connection never receives the output's own
-/// pixels (see [`WlrCapture::capture`]).
+/// function and primaries; the pixels are never inspected to decide.  Both
+/// [`WlrCapture::capture`] and [`WlrCapture::capture_output_hdr`] read a ten-bit
+/// buffer through here and differ only in what they do with the frame (one
+/// tone-maps it for the SDR scene, the other keeps the HDR light).
 fn decode_output_rgb10(
     name: &str,
     buffer: &CaptureBuffer,
@@ -565,17 +565,10 @@ struct CaptureState {
     manager_version: u32,
     dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
     dmabuf_version: u32,
-    /// Whether this connection asked to be a `wp_color_manager_v1` client.  A
-    /// compositor that keys HDR capture on that binding hands such a client the
-    /// output's own pixels, and everyone else the SDR rendition it prepared; a
-    /// capture therefore reads its two halves over two connections.
-    bind_color_management: bool,
     /// The colour-management global, bound so this client counts as
     /// colour-management aware.  A compositor that hands HDR over through a
     /// capture only does so for such a client, and the output descriptions read
-    /// through it are what say whether a 10-bit buffer holds HDR.  Only a
-    /// connection that asked for it binds it at all (see
-    /// `CaptureState::bind_color_management`).
+    /// through it are what say whether a 10-bit buffer holds HDR.
     color_manager: Option<wp_color_manager_v1::WpColorManagerV1>,
     /// The colour description of each output, read once and kept for the run:
     /// a compositor that never answers a query would otherwise cost its timeout
@@ -615,40 +608,12 @@ pub struct WlrCapture {
 }
 
 impl WlrCapture {
-    /// A connection that is an ordinary capture client: the compositor hands it
-    /// the SDR rendition it prepared, which is what [`WlrCapture::capture`]
-    /// wants.
-    ///
-    /// Deliberately *not* a `wp_color_manager_v1` client.  A compositor keys HDR
-    /// capture on that binding — Hyprland's `CMonitor::getPreferredReadFormat`
-    /// only offers a ten-bit buffer on an HDR output to a client that has it —
-    /// so binding it here would replace the compositor's own tone map with the
-    /// output's HDR pixels, leaving VShot to tone-map them itself.
     pub fn connect() -> Result<Self> {
-        Self::connect_with(false)
-    }
-
-    /// The same connection, but a client of `wp_color_manager_v1`.
-    ///
-    /// That binding is what a compositor keys HDR capture on, so this is the
-    /// connection handed the output's *own* pixels instead of the SDR rendition
-    /// it prepares for everyone else.  Only the HDR half of a capture wants
-    /// those; the SDR half is the compositor's own picture (see
-    /// [`WlrCapture::capture`]), so a capture reads its two halves over two
-    /// connections.
-    pub fn connect_colour_managed() -> Result<Self> {
-        Self::connect_with(true)
-    }
-
-    fn connect_with(bind_color_management: bool) -> Result<Self> {
         let connection = Connection::connect_to_env()
             .map_err(|error| VshotError::WaylandConnection(error.to_string()))?;
         let mut event_queue = connection.new_event_queue::<CaptureState>();
         let qh = event_queue.handle();
-        let state = CaptureState {
-            bind_color_management,
-            ..CaptureState::default()
-        };
+        let state = CaptureState::default();
         connection.display().get_registry(&qh, ());
         let mut state = state;
         event_queue
@@ -690,28 +655,21 @@ impl WlrCapture {
         self.capture(name, Some(region), cursor)
     }
 
-    /// One output's SDR picture: what the compositor itself prepared for an
-    /// ordinary client.
-    ///
-    /// This connection is deliberately *not* a `wp_color_manager_v1` client (see
-    /// [`WlrCapture::connect`]), and that is what makes the pixels here the right
-    /// SDR half of a capture: a compositor keys HDR capture on that binding, so
-    /// an ordinary client is handed the SDR rendition it already produced —
-    /// tone-mapped by the component that owns the display's colour management,
-    /// against that display's own peak — rather than the output's own HDR
-    /// pixels.  VShot therefore never tone-maps a capture itself on this path;
-    /// its own map could only be an approximation of the compositor's.
-    ///
-    /// The depth is read, not guessed: an 8-bit offer is sRGB, and a 10-bit one
-    /// is the same sRGB in ten bits (a ten-bit SDR output keeps its own depth).
-    /// A compositor that handed *this* client the output's HDR pixels would be
-    /// handing them to a client that cannot interpret them, which the protocol
-    /// conventions do not allow — HDR arrives on the colour-managed connection
-    /// instead, through [`WlrCapture::capture_output_hdr`].
     fn capture(&mut self, name: &str, region: Option<Rect>, cursor: bool) -> Result<Frame> {
         let (buffer, y_invert) = self.capture_buffer(name, region, cursor)?;
         let convert_started = Instant::now();
-        let frame = buffer.into_frame(y_invert)?;
+        // A 10-bit buffer on an output the compositor describes as HDR *is* the
+        // output's own HDR pixels: the format is the contract, and the pixels
+        // are never inspected to decide (see the note in `model::hdr`).  An HDR
+        // buffer is tone-mapped down, so the SDR scene, and the annotation
+        // overlay drawn from it, show the content as light rather than HDR read
+        // as sRGB.
+        let frame = match self.hdr_output_color(name)? {
+            Some(color) if is_10bit_shm(buffer.format) => {
+                decode_output_rgb10(name, &buffer, y_invert, color)?.tone_map_to_srgb()?
+            }
+            _ => buffer.into_frame(y_invert)?,
+        };
         if std::env::var_os("VSHOT_RECORD_DEBUG").is_some() {
             eprintln!(
                 "vshot:   capture: pixel-convert {:.1}ms",
@@ -917,6 +875,14 @@ impl WlrCapture {
             );
         }
         Ok(Some(hdr))
+    }
+
+    /// The colour description of an output, but only when the compositor calls
+    /// it HDR — a PQ or HLG transfer.  `None` means the output is SDR, or the
+    /// compositor does not describe it, so a 10-bit buffer of its pixels is not
+    /// HDR content and must not be read as if it were.
+    fn hdr_output_color(&mut self, name: &str) -> Result<Option<OutputColor>> {
+        Ok(self.output_color(name)?.filter(OutputColor::is_hdr))
     }
 
     /// The colour properties the compositor describes for one output, over
@@ -1344,12 +1310,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for CaptureState {
                     state.dmabuf_version = bind_version;
                     state.dmabuf = Some(registry.bind(name, bind_version, qh, ()));
                 }
-                "wp_color_manager_v1" if state.bind_color_management && state.color_manager.is_none() => {
+                "wp_color_manager_v1" if state.color_manager.is_none() => {
                     // Bound for its side effect on a compositor that keys HDR
                     // capture on it, not for its events (see
-                    // `CaptureState::color_manager`).  A connection that does
-                    // not bind it is a plain client, which is what the SDR half
-                    // of a capture wants to be.
+                    // `CaptureState::color_manager`).
                     state.color_manager = Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 "wl_output" => {

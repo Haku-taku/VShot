@@ -175,14 +175,7 @@ fn run() -> Result<()> {
     // held back here and only raised by a route that really needs the topology.
     let topology = wayland.output_infos();
     let known_outputs: &[OutputInfo] = topology.as_deref().unwrap_or(&[]);
-    // Two connections on purpose.  The plain one is handed the SDR rendition a
-    // compositor prepares for ordinary clients — which is the SDR half of a
-    // capture, tone-mapped by the compositor that knows its own display — while
-    // the colour-management one is handed the output's own HDR pixels, which is
-    // what the HDR half is.  A compositor without `wp_color_manager_v1` answers
-    // both the same way.
     let mut capture = Capturer::connect()?;
-    let mut hdr_capture = Capturer::connect_colour_managed()?;
 
     // Everything below freezes the desktop, and the annotation overlay is a
     // window like any other: left alone, its toolbar would be baked into the
@@ -314,7 +307,7 @@ fn run() -> Result<()> {
         // HDR halves describe the same instant.  Targets that reconstruct a
         // window or compose every output never keep an HDR half.
         let hdr_outputs = if target_wants_hdr(&request.target) {
-            capture_hdr_outputs(&mut hdr_capture, &scene, request.cursor)
+            capture_hdr_outputs(&mut capture, &scene, request.cursor)
         } else {
             Vec::new()
         };
@@ -519,7 +512,7 @@ fn run() -> Result<()> {
                 // A picked window is captured as the SDR/HDR pair like any
                 // other, and its frozen frame gets the same backdrop treatment
                 // as a dragged selection.
-                let hdr_outputs = capture_hdr_outputs(&mut hdr_capture, &scene, request.cursor);
+                let hdr_outputs = capture_hdr_outputs(&mut capture, &scene, request.cursor);
                 let backdrop = show_hdr_backdrop(&mut wayland, &scene, &hdr_outputs);
                 let geometry = picked
                     .point
@@ -1114,19 +1107,12 @@ fn finish_capture(
 /// The two images of one capture: the SDR PNG and, when the content is really
 /// HDR, the HDR frame written beside it.
 ///
-/// The two halves come from the two connections the capture holds, one each:
-/// the SDR half is the compositor's own picture of the scene — the rendition it
-/// prepares for an ordinary client, tone-mapped by the component that owns the
-/// display's colour management — and the HDR half is the output's own pixels
-/// from the colour-managed connection.  Neither is derived from the other, so
-/// the SDR file is exactly what an SDR client sees of this screen, not an
-/// approximation VShot computed.  The annotations are rendered into each half
-/// in that half's own space: the SDR marks composite in sRGB over the SDR
-/// picture, the HDR marks in linear light over the HDR one, which is what each
-/// is drawn as on screen.
-///
-/// A 10-bit buffer that carries no light beyond SDR white is not HDR content at
-/// all: it keeps the ordinary path and no HDR file is written beside the PNG.
+/// Annotations render in HDR mode over the HDR frame — mosaics pixelate in
+/// linear light and every other mark composites in linear light — and the SDR
+/// half is vshot's own tone map of that same content, so both files describe
+/// one set of marks over one set of light.  A 10-bit buffer that carries no
+/// light beyond SDR white is not HDR content at all: it keeps the ordinary path
+/// and no HDR file is written beside the PNG.
 fn sdr_and_hdr(
     edits: &EditPipeline,
     frame: Frame,
@@ -1145,8 +1131,18 @@ fn sdr_and_hdr(
         }
         None => None,
     };
-    let sdr = edits.apply(ImageDocument::new(frame))?.into_frame();
-    Ok((sdr, hdr))
+    // The SDR half is vshot's own tone map of the annotated HDR frame rather
+    // than a second capture.  The compositor's own SDR rendition of an HDR
+    // output cannot be used: Hyprland writes it against
+    // `DEFAULT_SRGB_IMAGE_DESCRIPTION`, whose peak is 80 cd/m2, while the SDR
+    // white an SDR image means is the output's own reference — 203 here — so it
+    // puts ordinary SDR content well below white instead of on it (measured:
+    // SDR white at sRGB 220 of 255, 145 of 203 cd/m2).  Taking it would dim the
+    // whole capture, not just the highlights.
+    match hdr {
+        Some(half) => Ok((half.frame.tone_map_to_srgb()?, Some(half))),
+        None => Ok((edits.apply(ImageDocument::new(frame))?.into_frame(), None)),
+    }
 }
 
 /// Whether a target keeps an HDR half **from the first capture**.  Only the
@@ -1840,12 +1836,16 @@ mod tests {
     }
 
     #[test]
-    fn an_hdr_capture_keeps_the_compositors_own_sdr_half() {
-        // The SDR PNG is the compositor's own picture of the scene — the
-        // rendition it prepares for an ordinary client and tone-maps itself —
-        // not a map VShot computed from the HDR half, which could only
-        // approximate it.  The HDR half is handed over unchanged for the HDR
-        // file.
+    fn an_hdr_capture_tone_maps_its_own_sdr_half() {
+        // The SDR PNG is vshot's own tone map of the HDR half, not a second
+        // capture.  It cannot be the compositor's own rendition: that is written
+        // against a peak of 80 cd/m2 while SDR white is the output's own
+        // reference (203 here), so it puts ordinary SDR content below white —
+        // taking it would dim the whole capture, not just the highlights.
+        //
+        // The peak lands on white; the mid channel is rolled off well below it,
+        // and red stays the dominant channel — a real tone map, not the second
+        // capture.
         let hdr = HdrFrame::new(
             Size::new(2, 1),
             vec![[4.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]],
@@ -1860,7 +1860,10 @@ mod tests {
             }),
         )
         .unwrap();
-        assert_eq!(sdr.pixel(Point::new(0, 0)), Some([0, 255, 0, 255]));
+        let pixel = sdr.pixel(Point::new(0, 0)).unwrap();
+        assert!(pixel[0] > 240, "the brightest channel did not near white");
+        assert_eq!(pixel[1], pixel[2]);
+        assert!((128..=200).contains(&pixel[1]), "green = {}", pixel[1]);
         let kept = kept.expect("the HDR half is kept");
         assert_eq!(kept.frame.pixel(0, 0), Some([4.0, 1.0, 1.0, 1.0]));
     }

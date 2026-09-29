@@ -12,16 +12,9 @@
 //! primaries, PQ (ST 2084) transfer — is decoded into that space, the editor's
 //! marks are composited there in linear light, and two images come out:
 //!
-//! * `<name>.png`, 8-bit sRGB, the SDR view of the same content;
-//! * `<name>.hdr`, Radiance RGBE, the HDR content itself.
-//!
-//! The SDR view is **the compositor's own**, not one computed here: a capture
-//! reads its SDR half over a connection that is not a `wp_color_manager_v1`
-//! client, and the compositor answers that with the rendition it already
-//! produced for ordinary clients — tone-mapped by the component that owns the
-//! display's colour management.  [`HdrFrame::tone_map_to_srgb`] is this module's
-//! own conversion, kept for a frame with no compositor rendition behind it, and
-//! is deliberately not what a capture saves.
+//! * `<name>.png`, 8-bit sRGB, the tone-mapped SDR view of the same content;
+//! * `<name>.avif` (ten-bit BT.2020/PQ) or `<name>.hdr` (Radiance RGBE), the HDR
+//!   content itself.
 //!
 //! Both the PQ curve and the BT.2020↔BT.709 matrices are the ones a colour
 //! pipeline is expected to use; the same constants appear in the reference
@@ -495,7 +488,7 @@ fn solve3(matrix: [[f32; 3]; 3], target: [f32; 3]) -> [f32; 3] {
 /// looked like after the conversion to BT.709.  Moving along the line to the
 /// achromatic axis gives up only the chroma that does not fit and keeps the
 /// hue, which is what a gamut map is for.
-fn map_into_gamut(rgb: [f32; 3]) -> [f32; 3] {
+fn map_into_709(rgb: [f32; 3]) -> [f32; 3] {
     let smallest = rgb[0].min(rgb[1]).min(rgb[2]);
     if smallest >= 0.0 {
         return rgb;
@@ -512,6 +505,91 @@ fn map_into_gamut(rgb: [f32; 3]) -> [f32; 3] {
         (rgb[1] + toward * (luma - rgb[1])).max(0.0),
         (rgb[2] + toward * (luma - rgb[2])).max(0.0),
     ]
+}
+
+// --- the HDR -> SDR roll-off ---------------------------------------------
+
+/// Where SDR white lands, as a fraction of the sRGB range.
+///
+/// This is the one real choice in an HDR → SDR map, and it is forced: an 8-bit
+/// SDR image's ceiling *is* white, so light brighter than SDR white can only be
+/// shown by putting white below the ceiling and spending the codes above it on
+/// the highlights.  White at 1.0 leaves nothing for them, which is the bug —
+/// every pixel above white collapsed onto the same code.
+///
+/// 0.8 spends the top fifth of the range on light above SDR white: white lands
+/// on sRGB 231 and an 8× highlight on 252, so the two are 21 codes apart and a
+/// bright patch reads as a patch.  The cost is that SDR content sits 10 % lower
+/// than it would — which is the same cost the compositor's own rendition pays
+/// (it puts white at 220) and far less of it.
+const SDR_WHITE_LEVEL: f32 = 0.8;
+
+/// The light, as a multiple of SDR white, that reaches the top of the range.
+///
+/// Ten comfortably covers desktop HDR: a 1000 cd/m² highlight on a 203 cd/m²
+/// SDR white is about five.  PQ's own peak is 10 000, so most of what a really
+/// bright frame holds still lands on the last code; the HDR half is what carries
+/// that light exactly.
+const ROLL_OFF_PEAK: f32 = 10.0;
+
+/// Rolls a BT.709 linear triple whose light may exceed SDR white off into the
+/// 0..=1 range an 8-bit SDR image can hold.
+///
+/// Two things have to hold at once, and the map before this one held only the
+/// first:
+///
+/// * **SDR light must keep its own shape.**  The map is one straight scale up to
+///   SDR white, so the ratios inside the SDR range — and so the whole look of an
+///   SDR image — are exactly what they were.
+/// * **Light above white must stay ordered.**  Scaling the whole triple by one
+///   factor until its brightest channel lands on white — what this did — makes
+///   the peak *always* 1.0, so `(4, 2, 1)` and `(8, 4, 2)` come out as the same
+///   pixel.  An HDR gradient is then one flat code, which is exactly the bug:
+///   the bright patches of an HDR test page became indistinguishable from the
+///   SDR around them.
+///
+/// Those two pull against each other, because an 8-bit SDR image's ceiling *is*
+/// white.  The only way to show light brighter than white is to put white below
+/// the ceiling and spend the codes above it on the highlights — which is what
+/// [`SDR_WHITE_LEVEL`] is, and what the compositor's own rendition does too.
+///
+/// Hue is preserved throughout: one factor applies to the whole triple, and
+/// only that factor is a curve of the peak rather than its reciprocal.
+fn roll_off(rgb: [f32; 3]) -> [f32; 3] {
+    let below = [rgb[0].max(0.0), rgb[1].max(0.0), rgb[2].max(0.0)];
+    let peak = rgb[0].max(rgb[1]).max(rgb[2]);
+    // A pixel with no light has no scale that applies to it: `0/0` is NaN, and
+    // NaN propagates through the clamp to 255 — a black pixel would come out
+    // white.  Black is black.
+    if peak <= 0.0 {
+        return [0.0, 0.0, 0.0];
+    }
+    let scale = roll_off_peak(peak) / peak;
+    [
+        (below[0] * scale).min(1.0),
+        (below[1] * scale).min(1.0),
+        (below[2] * scale).min(1.0),
+    ]
+}
+
+/// Where a pixel's brightest channel lands, given the light it carries.
+///
+/// Up to SDR white the map is a straight scale by [`SDR_WHITE_LEVEL`], so the
+/// *ratios* inside the SDR range — and so the whole shape of an SDR image — are
+/// exactly what they were, and white is where white is defined to be.  Above it,
+/// a Reinhard curve spends what is left of the range, monotonically, so a
+/// brighter pixel always lands on a brighter code and a highlight never
+/// collapses onto white.
+fn roll_off_peak(peak: f32) -> f32 {
+    if peak <= 1.0 {
+        return peak * SDR_WHITE_LEVEL;
+    }
+    // How far into the range above white this light is, 0..1 at the peak.
+    let at = (peak - 1.0) / (ROLL_OFF_PEAK - 1.0);
+    // Reinhard, scaled so `at == 1` (the peak) reaches the top of the range.
+    let headroom = 1.0 - SDR_WHITE_LEVEL;
+    let spent = (at / (1.0 + at)) / 0.5;
+    (SDR_WHITE_LEVEL + headroom * spent.min(1.0)).min(1.0)
 }
 
 // --- the frame ------------------------------------------------------------
@@ -690,30 +768,28 @@ impl HdrFrame {
     /// Tone-maps the whole frame to an 8-bit sRGB frame, the SDR half of the
     /// pair.
     ///
-    /// **The capture path does not use this.**  A capture takes its SDR half from
-    /// the compositor, which hands an ordinary client the SDR rendition it
-    /// produced itself — tone-mapped against that display's own peak by the
-    /// component that owns its colour management — and this map cannot match
-    /// that (see `capture::wlr::WlrCapture::capture` and `main::sdr_and_hdr`).
-    /// It is kept as the model's own conversion, for a caller that holds an HDR
-    /// frame with no compositor rendition behind it; the SDR half of a capture is
-    /// never such a frame.
-    ///
     /// The map is **display-referred**: linear 1.0 is the output's own SDR white
-    /// (see [`OutputColor::reference_nits`]) and it lands on sRGB white, so a
-    /// sample inside the SDR range keeps exactly the code its light deserves.
-    /// The frame's own peak deliberately does **not** set the white point: with
-    /// that, one capture of a window would come out at a different brightness
-    /// from the next depending on what else shared the frame, and a pinned copy
-    /// of a capture would not match the content it was taken from.
+    /// (see [`OutputColor::reference_nits`]) and it lands on [`SDR_WHITE_LEVEL`]
+    /// — below sRGB white on purpose, so the codes above it can carry light
+    /// brighter than white, and so a sample inside the SDR range keeps the ratio
+    /// its light had.  The frame's own peak deliberately does **not** set the
+    /// white point: with that, one capture of a window would come out at a
+    /// different brightness from the next depending on what else shared the
+    /// frame, and a pinned copy of a capture would not match the content it was
+    /// taken from.
     ///
-    /// Light beyond SDR white has nowhere to go in an 8-bit SDR image — the
-    /// format ends at white — so it is rolled off: the whole triple is scaled by
-    /// one factor until its brightest channel lands on white, which keeps hue
-    /// and clips only what the format cannot hold.  That is a blunt roll-off
-    /// beside a real tone map's knee, which is the other reason the compositor's
-    /// own rendition is what a capture saves.  Alpha is quantised to a byte like
-    /// every other channel (a capture is opaque).
+    /// Light above SDR white has nowhere to go in an 8-bit SDR image — the
+    /// format ends at white — so it is rolled off by [`roll_off`]: up to white
+    /// the map is one straight scale, so the ratios inside the SDR range are
+    /// exactly what they were, and above it the curve rises monotonically to the
+    /// top of the range, so a brighter pixel always lands on a brighter code.
+    /// A roll-off that scales the whole triple by one factor until its peak
+    /// reaches white — what this did — makes the peak *always* white, so
+    /// `(4, 2, 1)` and `(8, 4, 2)` become the same pixel and the HDR marks of a
+    /// test page come out indistinguishable from the SDR around them.
+    ///
+    /// Alpha is quantised to a byte like every other channel (a capture is
+    /// opaque).
     pub fn tone_map_to_srgb(&self) -> Result<Frame> {
         let mut bytes = vec![0u8; self.pixels.len() * 4];
         map_rows(&mut bytes, self.size.width as usize * 4, |offset, row| {
@@ -723,17 +799,14 @@ impl HdrFrame {
                 // than by clipping: clamping a negative component moves a
                 // saturated colour's hue, which is the inaccurate colour a
                 // wide-gamut capture used to come out with.
-                let rgb = map_into_gamut(multiply(
+                let rgb = map_into_709(multiply(
                     self.primaries.to_bt709(),
                     [pixel[0], pixel[1], pixel[2]],
                 ));
-                // One factor for the whole triple, so hue survives the roll-off
-                // of anything brighter than white.
-                let peak = rgb[0].max(rgb[1]).max(rgb[2]);
-                let scale = if peak > 1.0 { 1.0 / peak } else { 1.0 };
-                destination[0] = to_u8(srgb_oetf(rgb[0] * scale));
-                destination[1] = to_u8(srgb_oetf(rgb[1] * scale));
-                destination[2] = to_u8(srgb_oetf(rgb[2] * scale));
+                let rgb = roll_off(rgb);
+                destination[0] = to_u8(srgb_oetf(rgb[0]));
+                destination[1] = to_u8(srgb_oetf(rgb[1]));
+                destination[2] = to_u8(srgb_oetf(rgb[2]));
                 destination[3] = to_u8(pixel[3]);
             }
         });
@@ -1375,9 +1448,16 @@ mod tests {
         .unwrap();
         assert_eq!(frame.primaries(), Primaries::Bt2020);
         let pixel = frame.tone_map_to_srgb().unwrap().pixel(Point::new(0, 0)).unwrap();
-        for channel in &pixel[..3] {
-            assert!((i32::from(*channel) - 255).abs() <= 1, "{pixel:?}");
-        }
+        // White is neutral, and it lands where the map puts SDR white — which is
+        // *not* the last code, because the codes above it are what light
+        // brighter than white is shown with (see `SDR_WHITE_LEVEL`).
+        assert_eq!(pixel[0], pixel[1]);
+        assert_eq!(pixel[1], pixel[2]);
+        assert!(
+            (215..=245).contains(&pixel[0]),
+            "white landed on {}, which leaves the highlights nowhere to go",
+            pixel[0]
+        );
     }
 
     #[test]
@@ -1605,15 +1685,17 @@ mod tests {
                 "channel {channel} moved with the frame's peak"
             );
         }
-        // SDR white is sRGB white, exactly.
+        // SDR white lands where the map puts it — a fixed level, not
+        // the last code, so that light above white has somewhere to go.
         let white = one_pixel([1.0, 1.0, 1.0, 1.0]);
-        assert_eq!(
-            white
-                .tone_map_to_srgb()
-                .unwrap()
-                .pixel(Point::new(0, 0))
-                .unwrap()[0],
-            255
+        let white_code = white
+            .tone_map_to_srgb()
+            .unwrap()
+            .pixel(Point::new(0, 0))
+            .unwrap()[0];
+        assert!(
+            (215..=245).contains(&white_code),
+            "white landed on {white_code}"
         );
         // And a value with no light of its own stays black.
         let black = one_pixel([0.0, 0.0, 0.0, 1.0]);
@@ -1629,17 +1711,68 @@ mod tests {
 
     #[test]
     fn tone_mapping_rolls_light_over_white_off_and_keeps_hue() {
-        // Light beyond SDR white cannot be shown by an 8-bit SDR image: the
-        // brightest channel lands on white and the rest of the triple is scaled
-        // with it, which clips only that light and leaves the hue alone.
+        // Light beyond SDR white cannot be shown by an 8-bit SDR image, so it is
+        // compressed toward white by one factor for the whole triple — which
+        // leaves the ratios between the channels, and so the hue, alone.
         let frame = one_pixel([4.0, 2.0, 1.0, 1.0]);
         let sdr = frame.tone_map_to_srgb().unwrap();
         let pixel = sdr.pixel(Point::new(0, 0)).unwrap();
-        assert_eq!(pixel[0], 255, "the brightest channel did not reach white");
+        // The compression is a curve, not a clip: the brightest channel lands
+        // *near* white but below it, so a brighter pixel still has somewhere to
+        // go.  Reaching exactly white here is the bug — see the test below.
+        assert!(pixel[0] > 240 && pixel[0] < 255, "green = {}", pixel[0]);
         // The ratio between the channels is what the light had, so the mark on
         // the image keeps its colour instead of washing out towards white.
-        assert_eq!(pixel[1], to_u8(srgb_oetf(0.5)));
-        assert_eq!(pixel[2], to_u8(srgb_oetf(0.25)));
+        let expected = to_u8(srgb_oetf(srgb_eotf(f32::from(pixel[0]) / 255.0) * 0.5));
+        assert!((i32::from(pixel[1]) - i32::from(expected)).abs() <= 1, "{pixel:?}");
+        let expected = to_u8(srgb_oetf(srgb_eotf(f32::from(pixel[0]) / 255.0) * 0.25));
+        assert!((i32::from(pixel[2]) - i32::from(expected)).abs() <= 1, "{pixel:?}");
+    }
+
+    #[test]
+    fn tone_mapping_keeps_brighter_light_brighter() {
+        // The whole point of the map, and what the reciprocal-of-the-peak one
+        // got wrong: it made every pixel above white land on the same code, so
+        // an HDR gradient collapsed to one flat patch.  A brighter pixel must
+        // come out at least as bright, and a strictly brighter one strictly so
+        // for as long as the range allows.
+        let codes = |light: f32| -> u8 {
+            one_pixel([light, light, light, 1.0])
+                .tone_map_to_srgb()
+                .unwrap()
+                .pixel(Point::new(0, 0))
+                .unwrap()[0]
+        };
+        // SDR light keeps its own shape: the map is one straight scale below
+        // white, so the ratios inside the SDR range are exactly what they were.
+        // (White itself sits below the last code — that is what leaves room for
+        // the highlights.)
+        assert_eq!(
+            codes(0.5),
+            to_u8(srgb_oetf(0.5 * SDR_WHITE_LEVEL)),
+            "SDR light is not a straight scale"
+        );
+        // SDR white leaves headroom for the highlights, which is the only way an
+        // 8-bit image can show light brighter than white at all.
+        let white = codes(1.0);
+        assert!((215..=245).contains(&white), "white = {white}");
+        // Above white the map stays monotonic — never decreasing — and is still
+        // strictly increasing for as long as 8-bit codes are left to spend.
+        let mut previous = white;
+        for light in [1.5f32, 2.0, 3.0, 5.0, 8.0, 16.0, 64.0] {
+            let now = codes(light);
+            assert!(
+                now >= previous,
+                "light {light} came out darker ({now}) than less light ({previous})"
+            );
+            previous = now;
+        }
+        // And separated: a bright patch is codes away from white, not on it.
+        let separation = i32::from(codes(8.0)) - i32::from(white);
+        assert!(
+            separation >= 15,
+            "the highlights are only {separation} codes above white"
+        );
     }
 
     #[test]
