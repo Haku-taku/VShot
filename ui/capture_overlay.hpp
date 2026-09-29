@@ -621,6 +621,11 @@ private:
     // Moves are coalesced: while one request is in flight the newest position
     // waits here, since a drag produces far more motion than the daemon needs.
     std::optional<Point> pendingPinOrigin_;
+    // The position the marks are anchored to in pin-edit mode: the last
+    // confirmed reply from the daemon, not the optimistic cursor position.  The
+    // FP16 helper surface shows the image at this same position, so clipping
+    // marks to it keeps them in sync with the image rather than ahead of it.
+    std::optional<LogicalRect> marksOrigin_;
 
     Point globalPoint(CaptureOverlay *overlay, const QPointF &local) const;
     Point unclampedGlobalPoint(CaptureOverlay *overlay, const QPointF &local) const;

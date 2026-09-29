@@ -4588,6 +4588,11 @@ Point OverlayController::clampPoint(Point point) const
 // around the surrounding canvas.
 const LogicalRect &OverlayController::annotationLimits() const
 {
+    if (pinEdit_ && marksOrigin_.has_value()) {
+        // Use the confirmed position: marks are constrained to where the FP16
+        // image actually is, not where the cursor is asking it to go next.
+        return *marksOrigin_;
+    }
     if (pinEdit_ && selection_.has_value()) {
         return *selection_;
     }
@@ -6441,24 +6446,23 @@ void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifi
 }
 
 // Moves the selection — the pinned image, in pin-edit mode — to follow the
-// pointer, carrying its annotations along. Annotations are stored in global
-// coordinates and the renderer anchors them to the returned selection, so
-// translating them keeps the preview and the rendered result in step.
+// pointer.
 //
-// In pin-edit mode the moving is delegated outright: the daemon repositions
-// the real pin window with its own clamp, and the reply lands back here as the
-// authoritative rect. The editor never paints the image itself, so there is
-// nothing to keep in sync but the annotations.
+// Marks are stored in global coordinates and must remain aligned to the FP16
+// helper surface, which shows the image at the *daemon-confirmed* position.
+// Translating marks here (the optimistic position) races the daemon: by the
+// time the reply arrives, the cursor has often moved on, and applyPinRect then
+// corrects against an already-moved selection_, shifting marks the wrong way
+// and making them appear to fragment.  The marks are only moved in
+// applyPinRect, when the daemon says where the image actually is.
 void OverlayController::applySelectionMove(LogicalRect origin, Point anchor, Point current)
 {
     const LogicalRect moved = moveSelection(origin, anchor, current);
     if (pinEdit_ && selection_.has_value()) {
-        // Image and marks travel together: shifting both by the same delta
-        // keeps every mark on the image pixel it was drawn on.
-        translateAnnotations(moved.x - selection_->x, moved.y - selection_->y);
-        // The daemon does the actual moving (its pin window is the one on
-        // screen) and answers with the rect it clamped to; applyPinRect
-        // corrects this optimistic position when the two disagree.
+        // Optimistically track where the cursor would like the image to be,
+        // for the daemon request and for computing the next incremental delta.
+        // Do NOT translate annotations: they stay at marksOrigin_ (the last
+        // confirmed daemon position) until applyPinRect updates them.
         requestPinMove(Point{moved.x, moved.y});
     }
     selection_ = moved;
@@ -6578,20 +6582,24 @@ void OverlayController::applyPinReply(QByteArray line)
     }
 }
 
-// Adopts the rect the daemon clamped the pin to. The pin stays the same size,
-// so only a positional correction can come back; the marks were already moved
-// to the requested spot, so they get the same correction.
+// The daemon confirmed where it placed the pin.  Marks are anchored to
+// marksOrigin_ (the previous confirmed position); translate them by the delta
+// from there to the new confirmed position, then update both marksOrigin_ and
+// selection_ so the next confirmation is computed correctly.
 void OverlayController::applyPinRect(const LogicalRect &rect)
 {
-    if (!selection_.has_value()) {
+    if (!marksOrigin_.has_value()) {
         return;
     }
-    const std::int32_t dx = rect.x - selection_->x;
-    const std::int32_t dy = rect.y - selection_->y;
+    const std::int32_t dx = rect.x - marksOrigin_->x;
+    const std::int32_t dy = rect.y - marksOrigin_->y;
+    marksOrigin_ = LogicalRect{rect.x, rect.y, marksOrigin_->width, marksOrigin_->height};
+    // Keep the optimistic selection in step with the latest confirmed position
+    // so that the next drag's incremental delta is computed from here.
+    selection_ = *marksOrigin_;
     if (dx == 0 && dy == 0) {
         return;
     }
-    selection_ = LogicalRect{rect.x, rect.y, selection_->width, selection_->height};
     translateAnnotations(dx, dy);
     updateAll();
 }
@@ -8291,6 +8299,9 @@ void OverlayController::beginPinEdit()
     // the toolbar can sit beside the image like a region-capture toolbar.
     selection_ = LogicalRect{session_.bounds.x, session_.bounds.y, session_.bounds.width,
                              session_.bounds.height};
+    // The marks origin starts at the same place: the image is where the
+    // session placed it, and the FP16 surface is already showing it there.
+    marksOrigin_ = *selection_;
     editing_ = true;
     toolbarOutput_ = 0;
     showToolbar();
@@ -9444,8 +9455,14 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
     // The editor shows the session bounds (the image) at the selection, which
     // the pin editor lets the user drag around; region capture pins the
     // selection onto the frozen output, so the two coincide there.
+    //
+    // In pin-edit mode the marks clip rect uses marksOrigin_ (the confirmed
+    // daemon position), not the optimistic selection_: the FP16 helper surface
+    // shows the image at the confirmed position, so clipping to the same rect
+    // keeps marks and image in sync.  The optimistic selection_ is only for
+    // computing the next incremental move request.
     const LogicalRect imageArea =
-        pinEdit_ && selection_.has_value() ? *selection_ : output.geometry;
+        pinEdit_ && marksOrigin_.has_value() ? *marksOrigin_ : output.geometry;
     const QRectF imageRect = localRect(output, imageArea, overlay->size());
     painter->save();
     painter->setRenderHint(QPainter::SmoothPixmapTransform, false);
