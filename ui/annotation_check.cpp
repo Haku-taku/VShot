@@ -170,6 +170,15 @@ vshot::Session coordinateSession()
 
 // A one-output session whose frame is solid black, so a green label's ink can be
 // read back with a low threshold and compared between two renderings of it.
+vshot::Session blackSession()
+{
+    vshot::Session session = editingSession();
+    session.outputs[0].image.fill(QColor(0, 0, 0));
+    return session;
+}
+
+// The same frame at twice the density: the magnifier reads device pixels, so a
+// scaled output exercises a different crop from the logical one.
 vshot::Session scaledCoordinateSession()
 {
     vshot::Session session = editingSession();
@@ -1890,6 +1899,82 @@ void checkLoupeShowsTheCursorPixelEverywhere()
 // glyphs away from the origin the committed label is drawn at, so the label
 // visibly jumps the moment the editor is accepted.  This measures the ink of
 // the typed text and of the committed label and requires them to agree.
+void checkTextEditorMatchesTheCommittedLabel()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(blackSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+    controller.chooseTool(vshot::Tool::Text);
+    controller.setCurrentColor(QColor(0, 255, 0));
+
+    const QPoint origin(60, 60);
+    controller.press(overlay, QPointF(origin), Qt::LeftButton, Qt::NoModifier);
+    QLineEdit *editor = overlay->findChild<QLineEdit *>();
+    expect(editor != nullptr, "the text tool opens its inline editor");
+    if (editor == nullptr) {
+        return;
+    }
+    editor->setText(QStringLiteral("Hi"));
+
+    const auto inkBounds = [](const QImage &image) {
+        QRect box;
+        for (int y = 0; y < 120 && y < image.height(); ++y) {
+            for (int x = 0; x < 240 && x < image.width(); ++x) {
+                const QColor c = image.pixelColor(x, y);
+                if (c.green() > 60 && c.green() > c.red() * 2 && c.green() > c.blue() * 2) {
+                    box = box.isNull() ? QRect(x, y, 1, 1) : box.united(QRect(x, y, 1, 1));
+                }
+            }
+        }
+        return box;
+    };
+
+    QImage whileEditing(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &whileEditing);
+    const QRect editingInk = inkBounds(whileEditing);
+
+    controller.key(overlay, Qt::Key_Return, Qt::NoModifier);
+    expect(controller.annotations().size() == 1, "the label lands as one annotation");
+    QImage committed(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &committed);
+    const QRect committedInk = inkBounds(committed);
+
+    expect(!editingInk.isNull() && !committedInk.isNull(), "the typed and committed labels both paint");
+    if (!editingInk.isNull() && !committedInk.isNull()) {
+        // A pixel of slack for the antialiased edge, which the two renderings
+        // need not sample identically; the frame and clamp that used to push
+        // the editor's text twenty-odd pixels off are what this pins down.
+        const auto near = [](int a, int b) { return std::abs(a - b) <= 1; };
+        const bool same = near(editingInk.x(), committedInk.x()) &&
+                          near(editingInk.y(), committedInk.y()) &&
+                          near(editingInk.width(), committedInk.width()) &&
+                          near(editingInk.height(), committedInk.height());
+        expect(same, "the typed label sits where the committed one lands",
+               QStringLiteral("editing ink %1,%2 %3x%4 vs committed %5,%6 %7x%8")
+                   .arg(editingInk.x())
+                   .arg(editingInk.y())
+                   .arg(editingInk.width())
+                   .arg(editingInk.height())
+                   .arg(committedInk.x())
+                   .arg(committedInk.y())
+                   .arg(committedInk.width())
+                   .arg(committedInk.height()));
+    }
+}
+
+// A pin-edit session whose image has been dragged: the session's recorded
+// geometry is still the rect the editor opened on, while the image (the
 // session bounds) has moved.  That is exactly the state the editor is in after
 // the daemon confirms a move, and it is where an overlay's surface, the image
 // rect and the stale output geometry all disagree.
@@ -2055,6 +2140,7 @@ int main(int argc, char *argv[])
     checkEachOutputKeepsItsOwnRaster();
     checkEdgeOfCanvasKeepsTheRaster();
     checkLiveStrokeMatchesTheCommittedMark();
+    checkTextEditorMatchesTheCommittedLabel();
     checkLoupeShowsTheCursorPixelEverywhere();
     checkPinEditStepsCoverTheirChange();
     checkMovedPinLoupeFollowsTheImage();

@@ -191,6 +191,53 @@ LogicalRect logicalFromSource(const OutputSession &output, const QRect &rect)
     return result;
 }
 
+// The top-left pixel of anything actually drawn in `image`.
+QPoint firstInk(const QImage &image)
+{
+    for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+            if (qAlpha(image.pixel(x, y)) != 0) {
+                return QPoint(x, y);
+            }
+        }
+    }
+    return QPoint();
+}
+
+// How far inside a line edit its own glyphs start, measured against where the
+// overlay draws the very same glyphs for the committed label.  The editor is a
+// QLineEdit and whatever its style bakes into the content rect shifts the text
+// a pixel or two; the committed label is drawn at the mark's origin with
+// AlignLeft|AlignTop.  The difference is a constant for a given font and style,
+// so a one-glyph probe in both places measures it exactly -- subtracting the
+// two puts the editor's text where the label will land instead of where the
+// style happens to put it.
+QPoint lineEditGlyphInset(QLineEdit *editor)
+{
+    const QFont font = editor->font();
+    const QSize size = editor->size();
+    const qreal ratio = editor->devicePixelRatioF() > 0 ? editor->devicePixelRatioF() : 1.0;
+
+    QImage reference(size, QImage::Format_ARGB32_Premultiplied);
+    reference.fill(Qt::transparent);
+    {
+        QPainter painter(&reference);
+        painter.setFont(font);
+        painter.setPen(Qt::white);
+        painter.drawText(QRect(QPoint(0, 0), size), Qt::AlignLeft | Qt::AlignTop,
+                         QStringLiteral("H"));
+    }
+
+    QImage probe(size, QImage::Format_ARGB32_Premultiplied);
+    probe.fill(Qt::transparent);
+    editor->render(&probe);
+
+    const QPoint want = firstInk(reference);
+    const QPoint got = firstInk(probe);
+    return QPoint(static_cast<int>(std::lround((got.x() - want.x()) / ratio)),
+                  static_cast<int>(std::lround((got.y() - want.y()) / ratio)));
+}
+
 QPointF localPoint(const OutputSession &output, const Point &point, const QSize &size)
 {
     const LogicalRect &surface = surfaceOf(output);
@@ -5391,21 +5438,42 @@ void OverlayController::startTextEditor(CaptureOverlay *overlay, int index, Poin
     textEdit_->setText(initial);
     QFont editorFont = textFont(textEditFont_, std::max(1, static_cast<int>(textEditPixels_)));
     textEdit_->setFont(editorFont);
-    textEdit_->setStyleSheet(
-        QStringLiteral("QLineEdit { color: %1; background: rgba(0, 0, 0, 140); "
-                       "border: 1px solid #888; padding: 0 3px; }")
-            .arg(editColor.name()));
+    // The editor carries no frame and no padding, so its glyphs start exactly at
+    // its own top-left.  A framed, padded box would draw the text a few pixels
+    // in from the corner and the label would jump the moment the editor was
+    // accepted; this way the corner is the label's origin and nothing moves.
+    textEdit_->setFrame(false);
+    textEdit_->setTextMargins(0, 0, 0, 0);
+    const QString editorSheet =
+        QStringLiteral("QLineEdit { color: %1; border: none; padding: 0; background: %2; }")
+            .arg(editColor.name(), QStringLiteral("rgba(0, 0, 0, 140)"));
+    const QString probeSheet =
+        QStringLiteral("QLineEdit { color: %1; border: none; padding: 0; background: transparent; }")
+            .arg(editColor.name());
+    textEdit_->setStyleSheet(editorSheet);
     const QPointF local = owner->localFromGlobal(origin);
-    const int width = std::min(360, std::max(160, owner->width() - 16));
-    // Hug the mirrored glyph height instead of QLineEdit's roomy default
-    // frame: the box only needs the text plus a small breathing margin.
-    const int height = std::max(20, QFontMetrics(editorFont).height() + 6);
-    const int x = std::clamp(static_cast<int>(std::round(local.x())), 4, std::max(4, owner->width() - width - 4));
-    const int y = std::clamp(static_cast<int>(std::round(local.y())), 4, std::max(4, owner->height() - height - 4));
+    const QFontMetrics editorMetrics(editorFont);
+    // As tall as its own glyphs, so the vertical centring QLineEdit applies is
+    // a no-op and the text's ascent sits on the widget's top edge; as wide as
+    // the room left of the origin, so the corner stays where the label is drawn
+    // rather than being clamped away from it.
+    const int x = static_cast<int>(std::round(local.x()));
+    const int y = static_cast<int>(std::round(local.y()));
+    const int height = std::max(1, editorMetrics.height());
+    const int width = std::clamp(owner->width() - x - 4, 40, 360);
     textEdit_->setGeometry(x, y, width, height);
     textEdit_->show();
     textEdit_->raise();
     textEdit_->setFocus(Qt::OtherFocusReason);
+    // Measure where the style actually puts the glyphs (a frame, a margin) and
+    // pull the box back by exactly that, so the label lands where it was typed.
+    // The probe is painted on a transparent background so only its ink is read.
+    textEdit_->setStyleSheet(probeSheet);
+    textEdit_->setText(QStringLiteral("H"));
+    const QPoint inset = lineEditGlyphInset(textEdit_);
+    textEdit_->setStyleSheet(editorSheet);
+    textEdit_->setText(initial);
+    textEdit_->setGeometry(x - inset.x(), y - inset.y(), width, height);
     if (!initial.isEmpty()) {
         textEdit_->selectAll();
     }
