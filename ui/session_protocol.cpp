@@ -182,10 +182,10 @@ bool loadSession(const QString &sessionPath, Session *session, QString *error)
     parsed.mode = root.value(QStringLiteral("mode")).toString();
     if (parsed.mode != QStringLiteral("region") && parsed.mode != QStringLiteral("region-only") &&
         parsed.mode != QStringLiteral("pin-edit") && parsed.mode != QStringLiteral("window-pick") &&
-        parsed.mode != QStringLiteral("long-shot")) {
+        parsed.mode != QStringLiteral("long-shot") && parsed.mode != QStringLiteral("translate")) {
         return fail(error,
                     QStringLiteral("session mode must be `region`, `region-only`, `pin-edit`, "
-                                   "`window-pick` or `long-shot`"));
+                                   "`window-pick`, `long-shot` or `translate`"));
     }
     // A hint session is the small overlay a scrolling capture keeps on screen;
     // it draws no image at all, so its outputs carry geometry only.
@@ -290,6 +290,49 @@ bool loadSession(const QString &sessionPath, Session *session, QString *error)
                 return fail(error, QStringLiteral("session `long_allowed` must be a boolean"));
             }
             parsed.longAllowed = longValue.toBool();
+        }
+    }
+
+    // A translate session may name how the translation is asked for and where
+    // the composited PNG goes.  Both are optional: an absent key leaves the
+    // choice to the CLI's own config, the same thing an empty object means.
+    if (parsed.mode == QStringLiteral("translate")) {
+        const QJsonValue translateValue = root.value(QStringLiteral("translate"));
+        if (!translateValue.isUndefined() && !translateValue.isNull()) {
+            if (!translateValue.isObject()) {
+                return fail(error, QStringLiteral("session `translate` must be an object"));
+            }
+            const QJsonObject object = translateValue.toObject();
+            TranslateOptions options;
+            const auto readOption = [&error, &object](const char *key, QString *out) {
+                const QJsonValue value = object.value(QLatin1String(key));
+                if (value.isUndefined() || value.isNull()) {
+                    return true;
+                }
+                if (!value.isString() || value.toString().isEmpty()) {
+                    return fail(error, QStringLiteral("session `translate.%1` must be a "
+                                                      "non-empty string")
+                                           .arg(QLatin1String(key)));
+                }
+                *out = value.toString();
+                return true;
+            };
+            if (!readOption("from", &options.from) || !readOption("to", &options.to) ||
+                !readOption("provider", &options.provider)) {
+                return false;
+            }
+            parsed.translate = options;
+        }
+        const QJsonValue resultValue = root.value(QStringLiteral("result_path"));
+        if (!resultValue.isUndefined() && !resultValue.isNull()) {
+            if (!resultValue.isString() || resultValue.toString().isEmpty()) {
+                return fail(error,
+                            QStringLiteral("session `result_path` must be a non-empty string"));
+            }
+            parsed.resultPath = resultValue.toString();
+            if (!parsed.resultPath.startsWith(QLatin1Char('/'))) {
+                return fail(error, QStringLiteral("session `result_path` must be an absolute path"));
+            }
         }
     }
 

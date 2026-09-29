@@ -367,6 +367,37 @@ Qt overlay 拖出矩形，确认之前不打开任何设备、不创建任何文
 一张 PNG，它把文字写到 stdout。见 README 的 OCR 一节。"#,
     ),
     (
+        "translate",
+        "把区域里、图片文件里、或 stdin 上 OCR 信封里的文字翻译出来",
+        r#"不给 --geometry、--input、--stdin-ocr 时，冻结场景交给 Qt overlay 的翻译模式：框完这块
+区域，译文立刻画在原文上；Enter 是确认（也是 Esc 撤下译文后重新翻译这块框）。--output 写出那张
+合成好的 PNG，--clipboard 把它复制走，两个都不给则把译文打印到 stdout。--input 读一个文件、
+翻译它识别出的文字；--geometry 翻译一块固定区域，不开 overlay；--stdin-ocr 读
+`vshot ocr --json` 打印的 JSON 信封、只翻译其中的行，完全不碰屏幕。
+
+--json 把 OCR 信封原样写回，只是每行的 text 换成了译文、原文留在 source 里，程序于是能把译文
+摆在原文所在的位置；它就是编辑器文字层已经在解析的那个形状，也是编辑器调用的那一路。那一路
+（--stdin-ocr）无论加不加 --json 都输出信封，所以 --json 在那儿是隐含的。
+
+九个 provider 由 --provider 或 `cli.translate.provider` 选：其中五个不用账号、不用你自己的
+密钥——`google`（默认）、`microsoft`、`volcengine`、`transmart` 与 `lingocloud`；其余是
+`bing`（Azure Translator）、`baidu`（百度翻译）、`ai`（任意 OpenAI 兼容的 chat 接口）与
+`external`（你自己的程序，从 stdin 读原文、按行把译文写到 stdout）。`lingocloud` 用的是从
+彩云 web 应用借来的 token；配置里 `cli.translate.lingocloud.token` 可以换成你自己的。要密钥的
+那几个，密钥同样放在 $XDG_CONFIG_HOME/vshot/config.json 的 `cli.translate` 段；见 README 的
+翻译一节。
+
+`--provider auto` 不是它自己的服务：它按 google、microsoft、volcengine、transmart、
+lingocloud、bing、baidu、ai、external 的顺序挑能用的那些来试——不用凭据的五个排在前面，而
+`lingocloud` 排在这五个的最后，因为它借的是别人的凭据。一个 provider 配齐了能跑就算可用
+（bing、baidu、ai 要各自的密钥，external 要命令），不用凭据的五个永远可用。
+`cli.translate.fallback` 是一个可选的数组，列出当前这个一行都没翻出来时接着试的 provider；
+默认是空的，不会偷偷多跑你没要的东西。
+
+语种按 vshot 自己的写法（`zh-Hans`、`zh-Hant`、`en`、`ja`、`ko`……），`auto`（默认源语言）
+表示自动识别。每个 provider 会拿到它自己的代码；它不认识的标签原样传下去，不会被丢掉。"#,
+    ),
+    (
         "window active",
         "截取当前焦点窗口：合成器能自己画就画，否则用合成器元数据，再否则在捕获帧上做像素识别",
         r#"窗口像素能由合成器自己画就由它画：KWin 的 ScreenShot2 与 niri 的 `screenshot-window` 都
@@ -405,7 +436,7 @@ const ARGS: &[(&str, &str)] = &[
         "output",
         "把结果写到 PATH，展开 strftime（`-` 写到 stdout）：截图是 PNG 字节，写完后把文件 URI 复制进剪贴板。对 `record` 则是视频文件：`-` 被拒，没有 `.mp4` 后缀时补上。",
     ),
-    ("clipboard", "把结果复制进剪贴板：截图是 PNG 字节，`vshot ocr` 是识别出的文字。"),
+    ("clipboard", "把结果复制进剪贴板：截图是 PNG 字节，`vshot ocr` 是识别出的文字，`vshot translate` 是合成好的图片或译文。"),
     ("pin", "把截到的图像 pin 到屏幕上，而不是写到任何地方。"),
     (
         "png_compression",
@@ -413,8 +444,21 @@ const ARGS: &[(&str, &str)] = &[
     ),
     ("geometry", "固定的全局矩形，格式为 `x,y 宽x高`。"),
     ("interactive", "明确要求用指针选区；不给 --geometry 时这就是默认行为。"),
-    ("input", "改为读这个文件里的图片，而不是截屏；标注编辑器的取字按钮走的也是这条路。"),
-    ("json", "把识别出的每一行以及每个字的位置写成 JSON，而不是纯文本。"),
+    ("input", "改为读这个文件里的图片，而不是截屏。"),
+    (
+        "stdin_ocr",
+        "读 stdin 上 `vshot ocr --json` 打印的 OCR JSON 信封并翻译其中的行：不截图、不跑 OCR、不弹通知。",
+    ),
+    ("from", "源语言（内置默认 `auto`，即自动识别）；否则用配置里的 `cli.translate.from`。"),
+    ("to", "目标语言（内置默认 `zh-Hans`）；否则用配置里的 `cli.translate.to`。"),
+    (
+        "provider",
+        "用哪个 provider：google（默认）、microsoft、volcengine、transmart、lingocloud、bing、baidu、ai 或 external，或 `auto`（按这个顺序挑可用的那个）；否则用配置里的 `cli.translate.provider`。`cli.translate.fallback` 会在它之后接着试。",
+    ),
+    (
+        "json",
+        "把结果写成 JSON 而不是纯文本：OCR 是每行和每个字的位置，翻译是翻译后的信封；`--stdin-ocr` 这一路无论是否加 --json 都输出信封。",
+    ),
     (
         "name",
         "输出名（`current` 是合成器说你在的那块，也是缺省值）；`record window` / `replay start window` 下是窗口的 app id 或标题，省略即焦点窗口。",

@@ -103,6 +103,16 @@ const char *const kUnseparatedLine = R"json(
  {"text":"whole","rect":{"x":5,"y":6,"width":7,"height":8},"chars":[]}]}
 )json";
 
+// A translated envelope: the translate step drops the per-character boxes
+// outright and keeps only the line rect and the source, so a line can arrive
+// with no `chars` key at all.  It has to place just as a line with `[]` does.
+const char *const kNoCharacterList = R"json(
+{"version":1,"geometry":true,"provider":"external","from":"en","to":"zh","lines":[
+ {"text":"你好","source":"whole","rect":{"x":5,"y":6,"width":7,"height":8}},
+ {"text":"whole","source":"whole","error":"the provider timed out",
+  "rect":{"x":5,"y":20,"width":7,"height":8}}]}
+)json";
+
 const char *const kIdeographs = R"json(
 {"version":1,"geometry":true,"lines":[
  {"text":"中文测试","rect":{"x":0,"y":0,"width":80,"height":20},
@@ -330,6 +340,29 @@ void checkDegenerateDocuments()
                rectText(whole->unit(0).rect));
     }
 
+    // The shape the translation step actually prints: the per-character boxes
+    // are gone, not empty, and the line's `text` is the translation while
+    // `source` keeps what the engine read.  The line lands on its own rect all
+    // the same -- that is the whole reason the translated envelope reuses this
+    // parser -- and a line that failed keeps its source text in place.
+    std::optional<vshot::TextLayer> translated = parse(
+        kNoCharacterList, vshot::TextLayerPlacement{}, "a translated envelope parses");
+    if (translated.has_value()) {
+        expect(translated->hasGeometry(), "a translated line still has geometry");
+        expect(translated->count() == 2, "one unit per line with no character boxes",
+               QString::number(translated->count()));
+        expect(translated->lineText(0) == QStringLiteral("你好"),
+               "the line's text is the translation", translated->lineText(0));
+        expect(translated->lineText(1) == QStringLiteral("whole"),
+               "a failed line keeps the source the engine left in place",
+               translated->lineText(1));
+        expect(sameRect(translated->unit(0).rect, 5, 6, 7, 8),
+               "which lands on the original line's rect", rectText(translated->unit(0).rect));
+        expect(sameRect(translated->unit(1).rect, 5, 20, 7, 8),
+               "and so does the line that failed",
+               rectText(translated->unit(1).rect));
+    }
+
     // Every way the document can be wrong, and none of them may crash or be
     // quietly accepted: the caller has to be able to tell a rejection from a
     // document that simply has no positions.
@@ -346,7 +379,7 @@ void checkDegenerateDocuments()
         {"a line that is not an object", R"({"version":1,"geometry":true,"lines":[7]})"},
         {"a line with no text", R"({"version":1,"geometry":true,"lines":[{"rect":{"x":0,"y":0,"width":1,"height":1},"chars":[]}]})"},
         {"a line with no rectangle", R"({"version":1,"geometry":true,"lines":[{"text":"a","chars":[]}]})"},
-        {"a line with no characters list", R"({"version":1,"geometry":true,"lines":[{"text":"a","rect":{"x":0,"y":0,"width":1,"height":1}}]})"},
+        {"a line whose characters are not a list", R"({"version":1,"geometry":true,"lines":[{"text":"a","rect":{"x":0,"y":0,"width":1,"height":1},"chars":"nope"}]})"},
         {"a character with no glyph", R"({"version":1,"geometry":true,"lines":[{"text":"a","rect":{"x":0,"y":0,"width":1,"height":1},"chars":[{"rect":{"x":0,"y":0,"width":1,"height":1}}]}]})"},
         {"a character with no rectangle", R"({"version":1,"geometry":true,"lines":[{"text":"a","rect":{"x":0,"y":0,"width":1,"height":1},"chars":[{"ch":"a"}]}]})"},
     };

@@ -172,8 +172,15 @@ std::optional<TextLayer> TextLayer::fromJson(const QByteArray &document,
             return reject(QStringLiteral("a text layer line has no rectangle"));
         }
         const QJsonValue characters = line.value(QStringLiteral("chars"));
-        if (!characters.isArray()) {
-            return reject(QStringLiteral("a text layer line has no characters"));
+        // A missing list means the same thing an empty one does: no
+        // per-character boxes.  The recognition engine sends `[]` when its
+        // boxes disagreed with its text; the translation step drops the list
+        // altogether, because the boxes exist to select the source and a
+        // translation is not selected.  Both leave the line placeable as one
+        // unit over its own rect, which is exactly what a translated line
+        // needs.  A list that is there but is not a list is still malformed.
+        if (!characters.isUndefined() && !characters.isNull() && !characters.isArray()) {
+            return reject(QStringLiteral("a text layer line's characters are not a list"));
         }
         const QJsonArray charactersArray = characters.toArray();
         if (charactersArray.isEmpty()) {

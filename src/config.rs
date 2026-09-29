@@ -39,6 +39,7 @@ pub struct CliDefaults {
     pub long: LongDefaults,
     pub pin: PinDefaults,
     pub ocr: OcrDefaults,
+    pub translate: TranslateDefaults,
     pub record: RecordDefaults,
     pub replay: ReplayDefaults,
 }
@@ -147,6 +148,126 @@ pub struct OcrExternalDefaults {
     pub command: Option<Vec<String>>,
     /// Send the PNG on stdin instead of naming a file on the command line.
     pub stdin: Option<bool>,
+    /// Seconds to wait before giving up.  Defaults to 30.
+    pub timeout: Option<u64>,
+}
+
+/// Text translation, used by `vshot translate` and the editor's translate
+/// mode.  Absent keys mean the built-in defaults; the section is entirely
+/// optional and `google` needs no account at all.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct TranslateDefaults {
+    /// Which service: `google` (the default), `microsoft`, `volcengine`,
+    /// `transmart`, `lingocloud`, `bing`, `baidu`, `ai` or `external`, or
+    /// `auto` to try the usable ones in that order.  The keyless-by-config ones
+    /// need no settings; `lingocloud` borrows a token unless one is given below.
+    pub provider: Option<String>,
+    /// Source language, in vshot's own BCP-47-ish spelling (`zh-Hans`,
+    /// `zh-Hant`, `en`, `ja`, `ko`, ...); `auto` (the default) detects it.
+    /// Each provider is handed its own code for the tag (see `translate.rs`).
+    pub from: Option<String>,
+    /// Target language, written the same way.  `zh-Hans` by default.
+    pub to: Option<String>,
+    /// Seconds before a provider's HTTP request is given up on.  Defaults to
+    /// 20; `external` has its own timeout below.
+    pub timeout: Option<u64>,
+    /// Whether a finished translation raises a desktop notification.  Absent
+    /// means no — unlike `ocr.notify`, the Qt editor drives translation while
+    /// its window is on screen, so a note is noise more often than a receipt.
+    /// The `--stdin-ocr` route never notifies at all.
+    pub notify: Option<bool>,
+    /// More providers to try, in order, when the one that ran produced no
+    /// usable result — a name from the same set as `provider`.  Empty by
+    /// default, so nothing runs that was not asked for; a name that repeats
+    /// one already in the chain is skipped, and an unknown name is an error.
+    pub fallback: Option<Vec<String>>,
+    /// The tokenless Google endpoint takes no settings.  The key exists only so
+    /// the default provider has a named place in the file; it is an empty
+    /// object.
+    pub google: Option<TranslateGoogleDefaults>,
+    /// Caiyun's endpoint (the `lingocloud` provider).  Optional: the built-in
+    /// borrowed token is used when no token is given here.
+    pub lingocloud: Option<TranslateLingocloudDefaults>,
+    /// Azure Translator (the `bing` provider).
+    pub bing: Option<TranslateBingDefaults>,
+    /// Baidu's fanyi API.
+    pub baidu: Option<TranslateBaiduDefaults>,
+    /// Any OpenAI-compatible chat-completions endpoint.
+    pub ai: Option<TranslateAiDefaults>,
+    /// A program of the user's own, run the way the external OCR engine is.
+    pub external: Option<TranslateExternalDefaults>,
+}
+
+/// Google needs nothing; the struct is here so the default provider has a named
+/// place in the file, next to the ones that do take settings.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct TranslateGoogleDefaults {}
+
+/// Caiyun's `lingocloud` endpoint.  It needs nothing to run — a token is built
+/// in — and this key exists so it does not have to keep borrowing that one: the
+/// built-in is lifted from Caiyun's web app and passed between third-party
+/// forks, and Caiyun can revoke it at any time.  A user with a Caiyun account
+/// of their own puts their token here and stops borrowing (see the README's
+/// Translation section); the request's `X-Authorization` header is built as
+/// `token <value>`, so the value is the token itself.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct TranslateLingocloudDefaults {
+    /// The token, without the `token ` scheme the header carries.  Absent or
+    /// blank leaves the built-in borrowed token in place.
+    pub token: Option<String>,
+}
+
+/// Azure Translator's credentials and endpoint.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct TranslateBingDefaults {
+    /// The resource endpoint; the default is the global
+    /// `https://api.cognitive.microsofttranslator.com`.
+    pub endpoint: Option<String>,
+    /// The subscription key, sent as `Ocp-Apim-Subscription-Key`.  Required.
+    pub api_key: Option<String>,
+    /// A single-region resource's region, sent as
+    /// `Ocp-Apim-Subscription-Region`.  Optional.
+    pub region: Option<String>,
+}
+
+/// Baidu's fanyi credentials.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct TranslateBaiduDefaults {
+    /// The developer app's app id.  Required.
+    pub app_id: Option<String>,
+    /// The app's secret, used only to sign the request.  Required.
+    pub secret_key: Option<String>,
+}
+
+/// An OpenAI-compatible chat endpoint.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct TranslateAiDefaults {
+    /// The base URL, or the full `/chat/completions` URL.  Required.
+    pub endpoint: Option<String>,
+    /// The bearer token.  Required.
+    pub api_key: Option<String>,
+    /// The model name.  Required.
+    pub model: Option<String>,
+    /// Replaces the built-in system prompt when non-empty.
+    pub prompt: Option<String>,
+}
+
+/// How to reach a translation program the user runs themselves.
+///
+/// The same escape hatch the OCR side has: the program reads the source lines
+/// on stdin and writes the translations on stdout, one per line, and vshot
+/// only starts it and checks that one line came back for each one sent.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct TranslateExternalDefaults {
+    /// The program and its arguments, as an array.
+    pub command: Option<Vec<String>>,
     /// Seconds to wait before giving up.  Defaults to 30.
     pub timeout: Option<u64>,
 }
@@ -344,6 +465,61 @@ mod tests {
         // The recording side's follow is its own field: a replay list must not
         // appear as one.
         assert!(file.cli.record.follow.is_none());
+    }
+
+    #[test]
+    fn the_translate_section_carries_the_provider_settings() {
+        let file: ConfigFile = serde_json::from_str(
+            r#"{"cli":{"translate":{
+                "provider":"baidu","from":"ja","to":"zh-Hans","timeout":40,"notify":true,
+                "fallback":["bing","google"],
+                "google":{},
+                "lingocloud":{"token":"mine"},
+                "bing":{"endpoint":"https://x","api-key":"k","region":"westus"},
+                "baidu":{"app-id":"a","secret-key":"s"},
+                "ai":{"endpoint":"https://y","api-key":"k","model":"m","prompt":"p"},
+                "external":{"command":["/bin/tr"],"timeout":5}
+            }}}"#,
+        )
+        .expect("a translate section parses");
+        let translate = &file.cli.translate;
+        assert_eq!(translate.provider.as_deref(), Some("baidu"));
+        assert_eq!(translate.from.as_deref(), Some("ja"));
+        assert_eq!(translate.to.as_deref(), Some("zh-Hans"));
+        assert_eq!(translate.timeout, Some(40));
+        assert_eq!(translate.notify, Some(true));
+        assert_eq!(
+            translate.fallback.as_deref(),
+            Some(["bing".to_owned(), "google".to_owned()].as_slice())
+        );
+        // `google` is the empty object that gives the default provider a named
+        // place next to the ones that take settings.
+        assert!(translate.google.is_some());
+        // `lingocloud` is optional and carries only a token override.
+        let lingocloud = translate.lingocloud.as_ref().unwrap();
+        assert_eq!(lingocloud.token.as_deref(), Some("mine"));
+        let bing = translate.bing.as_ref().unwrap();
+        assert_eq!(bing.endpoint.as_deref(), Some("https://x"));
+        assert_eq!(bing.api_key.as_deref(), Some("k"));
+        assert_eq!(bing.region.as_deref(), Some("westus"));
+        let baidu = translate.baidu.as_ref().unwrap();
+        assert_eq!(baidu.app_id.as_deref(), Some("a"));
+        assert_eq!(baidu.secret_key.as_deref(), Some("s"));
+        let ai = translate.ai.as_ref().unwrap();
+        assert_eq!(ai.endpoint.as_deref(), Some("https://y"));
+        assert_eq!(ai.model.as_deref(), Some("m"));
+        assert_eq!(ai.prompt.as_deref(), Some("p"));
+        let external = translate.external.as_ref().unwrap();
+        assert_eq!(
+            external.command.as_deref(),
+            Some(["/bin/tr".to_owned()].as_slice())
+        );
+        assert_eq!(external.timeout, Some(5));
+
+        // An absent section is the built-in defaults, not a failure.
+        let bare: ConfigFile = serde_json::from_str(r#"{"cli":{}}"#).unwrap();
+        assert!(bare.cli.translate.provider.is_none());
+        assert!(bare.cli.translate.bing.is_none());
     }
 }
 

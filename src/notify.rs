@@ -4,10 +4,13 @@
 //! Desktop notifications, for the one result that arrives with nothing on
 //! screen to show for it.
 //!
-//! The text recognizer is the only caller.  `vshot ocr` puts its answer on the
-//! clipboard or on stdout, and a keybinding shows neither, so a recognition
-//! that finished, one that failed, and one that never ran all look the same
-//! until the user pastes.  A notification is what tells them apart.
+//! The text recognizer and the translator are the callers.  `vshot ocr` puts
+//! its answer on the clipboard or on stdout, and a keybinding shows neither,
+//! so a recognition that finished, one that failed, and one that never ran all
+//! look the same until the user pastes.  A notification is what tells them
+//! apart.  `vshot translate` is the same shape when it captures, but its
+//! `--stdin-ocr` route is driven by the editor's own window and never
+//! notifies: there, the thing on screen already says what happened.
 //!
 //! It goes over the session bus to whatever daemon owns
 //! `org.freedesktop.Notifications` — the desktop's own, not ours — which is why
@@ -48,13 +51,14 @@ const EXPIRE_MS: i32 = 4000;
 const BODY_LIMIT: usize = 160;
 
 /// The kind of result a notification reports.  Each one has its own switch in
-/// the config file (`ocr.notify`, `record.notify`, `replay.notify`), because a
-/// user may want a recording's receipt but not a stream of text-recognition
-/// notes, or the other way round -- reading one key for all of them would make
-/// one preference silence the other's report.
+/// the config file (`ocr.notify`, `translate.notify`, `record.notify`,
+/// `replay.notify`), because a user may want a recording's receipt but not a
+/// stream of text-recognition notes, or the other way round -- reading one key
+/// for all of them would make one preference silence the other's report.
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Ocr,
+    Translate,
     Recording,
     Replay,
 }
@@ -97,6 +101,50 @@ pub fn ocr_failed(reason: &str) {
             "取字失败"
         } else {
             "Text recognition failed"
+        },
+        &preview(reason),
+    );
+}
+
+/// Says that a translation is ready, having just been sent to `destination`.
+///
+/// The shape is `ocr_finished`'s: the summary states where the text went and
+/// the body is a preview of it, so the half that survives a long result is the
+/// interesting one.  The switch is `cli.translate.notify`, which is off by
+/// default — translation here is driven from the editor's window, which
+/// already shows the result, so a note is a receipt less often wanted.
+pub fn translate_finished(text: &str, to_clipboard: bool) {
+    let chinese = crate::cli_i18n::prefers_chinese();
+    if text.trim().is_empty() {
+        send(
+            Kind::Translate,
+            if chinese {
+                "没有可翻译的文字"
+            } else {
+                "Nothing to translate"
+            },
+            "",
+        );
+        return;
+    }
+    let summary = match (chinese, to_clipboard) {
+        (true, true) => "译文已复制到剪贴板",
+        (true, false) => "翻译完成",
+        (false, true) => "Translation copied to the clipboard",
+        (false, false) => "Translated",
+    };
+    send(Kind::Translate, summary, &preview(text));
+}
+
+/// Says that the translation itself failed, with the reason it gives.
+pub fn translate_failed(reason: &str) {
+    let chinese = crate::cli_i18n::prefers_chinese();
+    send(
+        Kind::Translate,
+        if chinese {
+            "翻译失败"
+        } else {
+            "Translation failed"
         },
         &preview(reason),
     );
@@ -165,6 +213,9 @@ fn enabled(kind: Kind) -> bool {
     let cli = config::load();
     match kind {
         Kind::Ocr => cli.ocr.notify.unwrap_or(true),
+        // Translation is off unless asked for: its usual caller shows the
+        // result in its own window.
+        Kind::Translate => cli.translate.notify.unwrap_or(false),
         Kind::Recording => cli.record.notify.unwrap_or(true),
         Kind::Replay => cli.replay.notify.unwrap_or(true),
     }

@@ -26,6 +26,8 @@ add_executable(vshot-qt-ui
     ui/capture_overlay.hpp
     ui/text_layer.cpp
     ui/text_layer.hpp
+    ui/translation_layer.cpp
+    ui/translation_layer.hpp
     ui/color_card.cpp
     ui/color_card.hpp
     ui/i18n.cpp
@@ -235,6 +237,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/capture_overlay.hpp
         ui/text_layer.cpp
         ui/text_layer.hpp
+        ui/translation_layer.cpp
+        ui/translation_layer.hpp
         ui/session_protocol.cpp
         ui/session_protocol.hpp
         ui/config.cpp
@@ -267,6 +271,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/capture_overlay.hpp
         ui/text_layer.cpp
         ui/text_layer.hpp
+        ui/translation_layer.cpp
+        ui/translation_layer.hpp
         ui/session_protocol.cpp
         ui/session_protocol.hpp
         ui/config.cpp
@@ -298,6 +304,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/capture_overlay.hpp
         ui/text_layer.cpp
         ui/text_layer.hpp
+        ui/translation_layer.cpp
+        ui/translation_layer.hpp
         ui/session_protocol.cpp
         ui/session_protocol.hpp
         ui/config.cpp
@@ -330,6 +338,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/capture_overlay.hpp
         ui/text_layer.cpp
         ui/text_layer.hpp
+        ui/translation_layer.cpp
+        ui/translation_layer.hpp
         ui/session_protocol.cpp
         ui/session_protocol.hpp
         ui/config.cpp
@@ -424,5 +434,41 @@ if(VSHOT_BUILD_CHECKS)
     target_compile_features(vshot-text-layer-check PRIVATE cxx_std_17)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(vshot-text-layer-check PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    # The translation check: the placed lines a translated envelope becomes, the
+    # background sampler that keeps a flat background's own colour instead of a
+    # mean pulled toward the glyphs, the font fitter that shrinks a line rather
+    # than clipping it, and the session keys the standalone overlay reads.  It
+    # also drives the editor's Translate button against a `vshot` stub, so the
+    # two subprocesses and the annotation the button lands are checked end to
+    # end through the same discovery the OCR path uses.  Needs Widgets and the
+    # offscreen platform plugin, no compositor.
+    add_executable(vshot-translate-check
+        ui/translation_check.cpp
+        ui/translation_layer.cpp
+        ui/translation_layer.hpp
+        ui/capture_overlay.cpp
+        ui/capture_overlay.hpp
+        ui/text_layer.cpp
+        ui/text_layer.hpp
+        ui/session_protocol.cpp
+        ui/session_protocol.hpp
+        ui/config.cpp
+        ui/config.hpp
+        ui/text_size.hpp
+        ui/i18n.cpp
+        ui/i18n.hpp
+    )
+    target_link_libraries(vshot-translate-check PRIVATE
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+        Qt6::Network
+        LayerShellQt::Interface
+    )
+    target_compile_features(vshot-translate-check PRIVATE cxx_std_17)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(vshot-translate-check PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 endif()

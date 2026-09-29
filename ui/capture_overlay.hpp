@@ -5,6 +5,7 @@
 
 #include "session_protocol.hpp"
 #include "text_layer.hpp"
+#include "translation_layer.hpp"
 
 #include <QByteArray>
 #include <QColor>
@@ -75,6 +76,13 @@ struct Annotation {
         // then resize it with the handles. The pixels travel to the renderer as
         // a raw RGBA8888 file, the same way a text label's bitmap does.
         Image,
+        // A translated capture: one placed line per recognized line, drawn over
+        // the text it replaces. `translation` holds the geometry, the text and
+        // the colours, all settled when the translation came back, and `rect`
+        // is the union of the filled boxes -- what the hit test and the drag
+        // clamp read. It travels to the renderer as an image bitmap, so the
+        // Rust side needs no knowledge of it at all.
+        Translation,
     };
 
     Kind kind = Kind::Stroke;
@@ -133,6 +141,11 @@ struct Annotation {
     std::uint32_t deviceRatio = 1;
     // The pasted image itself, at its own resolution (`Kind::Image` only).
     QImage pixels;
+    // The placed translation (`Kind::Translation` only): one entry per
+    // recognized line, holding the rectangle it replaces, the fill and the text
+    // drawn in it.  Everything the paint needs is here, so the preview and the
+    // committed bitmap are drawn from the same numbers.
+    QVector<TranslatedLine> translation;
     // The last rasterized form of this annotation, kept so a repaint can blit
     // it instead of drawing the mark again.  A mosaic preview averages the
     // source image block by block, so redrawing every mark on every pointer
@@ -177,7 +190,10 @@ inline bool annotationEquals(const Annotation &first, const Annotation &second)
         // Likewise for a bezier path's closure: an open curve and the closed
         // one that fills it are different marks, and leaving this out would let
         // an undo step that only closes a path look like no change at all.
-        first.closed != second.closed) {
+        first.closed != second.closed ||
+        // A translation's placed lines are its whole content: two of them that
+        // differ in a background, a font or a box are different pictures.
+        first.translation != second.translation) {
         return false;
     }
     if (first.rect.x != second.rect.x || first.rect.y != second.rect.y ||
@@ -345,12 +361,26 @@ public:
     bool enterTextSelection(const QByteArray &document, QString *error);
     void leaveTextMode();
     bool textMode() const { return textMode_; }
+    /// Runs OCR then translation over the selection and adds the result as one
+    /// annotation, in place.  Returns false and fills `error` when there is
+    /// nothing to read; reports its progress through
+    /// `setTranslateResultCallback`, the way the text button does.
+    bool translateSelection(QString *error);
+    /// Whether the session is the standalone `translate` overlay: a region-only
+    /// frame, the translation drawn over the frozen scene as soon as that frame
+    /// is finished, and an Enter that accepts, writing the composited PNG.
+    bool translateMode() const { return translateMode_; }
+    /// The text the last translation produced, empty before one has run.
+    QString translatedText() const { return translatedText_; }
     /// The text the current range would copy, empty when nothing is selected.
     QString selectedText() const;
     /// Told what the text button should show.  Called with `Busy` before the
     /// recognition run starts -- the wait for the engine is long enough that
     /// the button has to say so -- and once more with the outcome.
     void setTextResultCallback(std::function<void(TextOutcome, const QString &)> callback);
+    /// The same for the translate button: `Busy` while the two subprocesses
+    /// run, then the outcome.
+    void setTranslateResultCallback(std::function<void(TextOutcome, const QString &)> callback);
     /// Replaces the clipboard write the text paths use.  It exists so a check
     /// can verify what would be copied without a clipboard; the default writes
     /// through `wl-copy`.
@@ -459,6 +489,22 @@ private:
     /// Writes the text the mode copies.  The default is `wl-copy`; a check
     /// replaces it so the copy can be verified without a clipboard.
     std::function<bool(const QString &)> clipboardWriter_;
+    /// The standalone `translate` overlay: a region-only frame, a translation
+    /// drawn over the frozen scene, then an accept that writes the PNG.  It is
+    /// a mode of its own rather than the editor because it never shows a
+    /// toolbar and its Enter key means two different things in turn.
+    bool translateMode_ = false;
+    /// Whether a translation is up over the framing, and what it holds.
+    bool translated_ = false;
+    QVector<TranslatedLine> translatedLines_;
+    QString translatedText_;
+    /// Where the accepted translation was written, for the result document.
+    QString resultImagePath_;
+    /// The absolute path the session named for it, from `result_path`.
+    QString resultPath_;
+    /// Told when a translation starts and how it ended, so the button the user
+    /// pressed can say so.
+    std::function<void(TextOutcome outcome, const QString &error)> translateResultCallback_;
     QVector<WindowCandidate> candidates_;
     int hoveredCandidate_ = -1;
     // Live candidate refresh: the picker's stdin carries fresh lists from the
@@ -670,6 +716,15 @@ private:
     // The one place the mode's text reaches the clipboard: the injected writer
     // when there is one, `wl-copy` otherwise.
     bool writeClipboard(const QString &text);
+    // The translation path, shared by the editor's button and the standalone
+    // overlay: read the selection, run it through the CLI's two steps, and
+    // place the result.  `computeTranslation` does the subprocesses and the
+    // parse; the two callers differ only in what they keep afterwards.
+    bool computeTranslation(QVector<TranslatedLine> *lines, QString *text, QString *error);
+    bool runTranslationPipeline(const QImage &pixels, QByteArray *document,
+                                QString *error) const;
+    bool runTranslateStage(QString *error);
+    bool acceptTranslation(QString *error);
     void mutateAnnotations(QVector<Annotation> next);
     void drawLoupe(CaptureOverlay *overlay, QPainter *painter);
     // Draws the in-progress freehand stroke from a raster that only grows by the

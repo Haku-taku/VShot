@@ -77,6 +77,20 @@ pub fn copy_text_to_clipboard(text: &str) -> Result<()> {
     copy_bytes_to_clipboard(text.as_bytes(), "text/plain")
 }
 
+/// Puts a PNG that is already encoded on the clipboard, for a caller whose
+/// result arrived as bytes rather than as a `Frame` (the translate overlay's
+/// composited image, which the Qt helper wrote to a file).
+pub fn copy_png_to_clipboard(bytes: &[u8]) -> Result<()> {
+    copy_to_clipboard(bytes)
+}
+
+/// Expands a `--output` path's strftime pattern with the current time, the way
+/// `write_frame` does.  It exists for the translate overlay, which has to hand
+/// the helper an absolute path to write to before any `Frame` exists.
+pub fn expanded_output_path(path: &Path) -> PathBuf {
+    expand_output_path(path, Local::now())
+}
+
 fn copy_file_to_clipboard(path: &Path) -> Result<()> {
     let absolute = path.canonicalize().map_err(|source| {
         VshotError::Clipboard(format!(

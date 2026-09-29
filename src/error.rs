@@ -84,6 +84,12 @@ pub enum VshotError {
     Annotate(String),
     #[error("text recognition failed: {0}")]
     Ocr(String),
+    /// Screenshot translation: the provider's request failed, answered with
+    /// something unusable, or came back with a different number of lines than
+    /// were sent.  The message is a complete sentence because the causes span
+    /// several services and a command of the user's own.
+    #[error("translation failed: {0}")]
+    Translate(String),
     /// Scrolling capture: the frames could not be stitched, or what was asked
     /// of the stitcher makes no sense (a region too small, an ignore-top that
     /// covers the whole frame).

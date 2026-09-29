@@ -37,6 +37,7 @@
 #include "i18n.hpp"
 
 #include <QApplication>
+#include <QBoxLayout>
 #include <QByteArray>
 #include <QColor>
 #include <QDir>
@@ -424,24 +425,56 @@ void checkToolbarButton()
            "the paste button is drawn like the tool buttons");
     expect(paste->property("toolButton").toBool(),
            "the paste button carries the tool-button property the frame paints by");
-    // It sits in the tool row beside the tools: it is the same kind of thing to
-    // click, and a second row of text buttons only made the bar taller.
+    // It sits on the command bar beside the tools: it is the same kind of thing
+    // to click, and a second row of text buttons only made the bar taller.
     auto *confirm = surface->findChild<QPushButton *>(QStringLiteral("confirmButton"));
     expect(confirm != nullptr && paste->parentWidget() == confirm->parentWidget(),
-           "the paste button shares the command row with OK");
+           "the paste button shares the command bar with OK");
     if (confirm == nullptr) {
         return;
     }
-    // Before OK in that row: the row reads tools, Image, Text+, undo/redo, OK,
-    // Cancel.
-    QLayout *row = confirm->parentWidget() != nullptr ? confirm->parentWidget()->layout() : nullptr;
-    expect(row != nullptr && row->indexOf(paste) >= 0 && row->indexOf(confirm) > row->indexOf(paste),
-           "the paste button sits before OK in that row");
-    // And in the tools' own stretch of the row: ahead of the first divider,
-    // which is what separates the tools from undo/redo.
+    // The command bar is two rows of buttons in a column with the four ends --
+    // undo, redo, OK, Cancel -- pinned to its right, so "before OK" is the
+    // reading order across two layouts rather than one layout's index.  Where a
+    // button was laid out is read off the layouts themselves: the bar is placed
+    // before an off-screen overlay ever runs an event loop, so nothing has been
+    // positioned yet and only the layout knows where a button sits.  The bar
+    // reads Image, Text+, Translate, Scroll on the second row, then the ends.
+    const auto rowOf = [surface](QWidget *widget) -> QLayout * {
+        for (QLayout *row : surface->findChildren<QLayout *>()) {
+            if (row->indexOf(widget) >= 0) {
+                return row;
+            }
+        }
+        return nullptr;
+    };
+    const auto indexOfLayout = [](QLayout *parent, QLayout *child) {
+        for (int i = 0; parent != nullptr && i < parent->count(); ++i) {
+            if (parent->itemAt(i)->layout() == child) {
+                return i;
+            }
+        }
+        return -1;
+    };
+    QLayout *pasteRow = rowOf(paste);
+    QLayout *endsBlock = rowOf(confirm);
+    auto *card = qobject_cast<QBoxLayout *>(surface->layout());
+    QLayout *column = card != nullptr && card->count() > 0 ? card->itemAt(0)->layout() : nullptr;
+    expect(pasteRow != nullptr && pasteRow != endsBlock && column != nullptr &&
+               indexOfLayout(column, pasteRow) == 1,
+           "the paste button sits in the actions row, under the tools");
+    expect(endsBlock != nullptr && card != nullptr &&
+               indexOfLayout(card, endsBlock) == card->count() - 1,
+           "and OK sits in the ends pinned to the right of that column");
+    // And to the left of the divider, which is what separates the two rows from
+    // the four ends.
     auto *divider = surface->findChild<QFrame *>(QStringLiteral("toolbarDivider"));
-    expect(divider != nullptr && row->indexOf(paste) < row->indexOf(divider),
-           "the paste button sits with the tools, before the first divider");
+    const int dividerAt = card != nullptr && divider != nullptr ? card->indexOf(divider) : -1;
+    expect(dividerAt > 0 && dividerAt < card->count() - 1,
+           "the paste button sits left of the divider that separates it from the ends",
+           QStringLiteral("divider at %1 of %2")
+               .arg(dividerAt)
+               .arg(card != nullptr ? card->count() : -1));
 }
 
 // The text tool's entry point: the button has to be on the command bar next to

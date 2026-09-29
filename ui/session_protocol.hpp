@@ -48,6 +48,15 @@ struct WindowCandidate {
     QString label;
 };
 
+// The `translate` session object: how a `vshot translate` call is to be made.
+// Every field is optional, and an absent one means "use the CLI's own config
+// default", which is exactly what an absent whole object means too.
+struct TranslateOptions {
+    QString from;
+    QString to;
+    QString provider;
+};
+
 struct Session {
     QString mode;
     LogicalRect bounds;
@@ -72,6 +81,13 @@ struct Session {
     // nothing to scroll, so the CLI leaves this false there and the action
     // never appears.
     bool longAllowed = false;
+    // `translate` only, optional: how the translation is asked for. Absent
+    // leaves every choice to the CLI's own config, exactly as an object with
+    // no fields does.
+    std::optional<TranslateOptions> translate;
+    // `translate` only, optional: the absolute path the composited PNG is
+    // written to once the user accepts.
+    QString resultPath;
 };
 
 bool loadSession(const QString &sessionPath, Session *session, QString *error);

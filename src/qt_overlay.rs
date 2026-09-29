@@ -325,7 +325,26 @@ struct QtSession<'a> {
     // nothing to scroll, so it leaves this out and the action stays away.
     #[serde(skip_serializing_if = "Option::is_none")]
     long_allowed: Option<bool>,
+    // Translate mode only: the language pair and provider the helper hands to
+    // `vshot translate --stdin-ocr` while it works, so the overlay and the CLI
+    // translate the same way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    translate: Option<QtTranslate<'a>>,
+    // Translate mode only: absolute path the helper writes its composited PNG
+    // to.  Optional like every other added field, so an older helper ignores
+    // it and a newer one without it falls back to a temp file of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_path: Option<String>,
     outputs: Vec<QtOutput<'a>>,
+}
+
+/// The language pair and provider a translate session runs with, exactly the
+/// three knobs the CLI takes.
+#[derive(Debug, Serialize)]
+struct QtTranslate<'a> {
+    from: &'a str,
+    to: &'a str,
+    provider: &'a str,
 }
 
 /// One pickable window: the helper highlights the candidate on top at the
@@ -392,6 +411,11 @@ struct QtResult {
     // than a still to keep.
     #[serde(default)]
     long: bool,
+    // Translate mode only: the finished translation, and the PNG the helper
+    // composited it into.  Both optional, so an older helper that does not
+    // send them still parses here and a newer one always does.
+    translated_text: Option<String>,
+    image_path: Option<String>,
 }
 
 /// What an editing session reported: the region to keep, the marks drawn
@@ -498,6 +522,66 @@ pub fn select_region(scene: &SceneSnapshot) -> Result<Rect> {
     let output = run_helper(&helper, &session_path)?;
     let (selection, _annotations) = parse_result(output, scene.bounds())?;
     Ok(selection)
+}
+
+/// What a translate session reported: the finished translation, which the
+/// caller prints or copies, and where the helper says it wrote the composited
+/// PNG (normally the `result_path` it was handed).
+pub(crate) struct TranslateOutcome {
+    pub(crate) text: String,
+    pub(crate) image_path: Option<PathBuf>,
+}
+
+/// Opens the Qt overlay in its translate mode and waits for it to finish.
+///
+/// The whole interaction lives on the helper's side: it frames a region,
+/// recognizes it (`vshot ocr`), translates it (`vshot translate --stdin-ocr`)
+/// and draws the translation over the original, then writes the composited PNG
+/// to `result_path`.  This side only builds the session and reads the answer —
+/// the same shape `select_region` has, one mode over.
+pub(crate) fn translate_overlay(
+    scene: &SceneSnapshot,
+    from: &str,
+    to: &str,
+    provider: &str,
+    result_path: &Path,
+) -> Result<TranslateOutcome> {
+    let translate = QtTranslate { from, to, provider };
+    let (_directory, session_path) = write_session_full(
+        scene,
+        "translate",
+        &[],
+        None,
+        false,
+        Some(translate),
+        Some(result_path.to_string_lossy().into_owned()),
+    )?;
+    let helper = helper_program()?;
+    let output = run_helper(&helper, &session_path)?;
+    parse_translate_result(output)
+}
+
+/// Reads a translate session's answer: the translated text a `status: "ok"`
+/// result carries.  A cancel is the same error every other overlay returns.
+fn parse_translate_result(bytes: Vec<u8>) -> Result<TranslateOutcome> {
+    let result: QtResult = serde_json::from_slice(&bytes).map_err(|error| {
+        VshotError::Translate(format!("Qt helper returned invalid result JSON: {error}"))
+    })?;
+    match result.status.as_str() {
+        "cancelled" => Err(VshotError::SelectionCancelled),
+        "ok" => {
+            let text = result.translated_text.ok_or_else(|| {
+                VshotError::Translate("the Qt helper returned no translated text".into())
+            })?;
+            Ok(TranslateOutcome {
+                text,
+                image_path: result.image_path.map(PathBuf::from),
+            })
+        }
+        status => Err(VshotError::Translate(format!(
+            "Qt helper returned unknown status `{status}`"
+        ))),
+    }
 }
 
 /// What the hint overlay of a scrolling capture said.
@@ -747,6 +831,8 @@ pub(crate) fn write_pin_edit_session(spec: &PinEditSpec<'_>) -> Result<(TempDir,
         candidates: None,
         selection: None,
         long_allowed: None,
+        translate: None,
+        result_path: None,
         outputs: vec![QtOutput {
             id: 0,
             name: spec.output_name,
@@ -853,12 +939,19 @@ pub(crate) fn parse_edit_result(
     }
 }
 
-fn write_session(
+/// Serializes a Qt editing session and writes it to a private directory,
+/// returning the directory (kept alive by the caller) and the JSON's path.
+///
+/// `translate` and `result_path` are the translate mode's two additions; every
+/// other mode passes `None` and the fields stay out of its document.
+fn write_session_full(
     scene: &SceneSnapshot,
     mode: &str,
     candidates: &[WindowCandidate],
     selection: Option<WireRect>,
     long_allowed: bool,
+    translate: Option<QtTranslate<'_>>,
+    result_path: Option<String>,
 ) -> Result<(TempDir, PathBuf)> {
     let directory = tempfile::Builder::new()
         .prefix("vshot-qt-")
@@ -903,6 +996,8 @@ fn write_session(
             .then(|| candidates.iter().map(QtCandidate::from).collect()),
         selection,
         long_allowed: long_allowed.then_some(true),
+        translate,
+        result_path,
         outputs,
     };
     let session_path = directory.path().join("session.json");
@@ -911,6 +1006,16 @@ fn write_session(
     })?;
     write_private_file(&session_path, &encoded)?;
     Ok((directory, session_path))
+}
+
+fn write_session(
+    scene: &SceneSnapshot,
+    mode: &str,
+    candidates: &[WindowCandidate],
+    selection: Option<WireRect>,
+    long_allowed: bool,
+) -> Result<(TempDir, PathBuf)> {
+    write_session_full(scene, mode, candidates, selection, long_allowed, None, None)
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -1715,5 +1820,74 @@ mod tests {
         let compacted = compact_error(text.as_bytes());
         assert!(compacted.len() <= MAX_HELPER_ERROR_BYTES);
         assert!(std::str::from_utf8(compacted.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn parses_a_translate_result() {
+        let bytes =
+            r#"{"status":"ok","action":"","translated_text":"你好","image_path":"/tmp/t.png"}"#
+                .as_bytes()
+                .to_vec();
+        let outcome = parse_translate_result(bytes).unwrap();
+        assert_eq!(outcome.text, "你好");
+        assert_eq!(outcome.image_path.as_deref(), Some(Path::new("/tmp/t.png")));
+        // A cancel is the same error every other overlay returns.
+        assert!(matches!(
+            parse_translate_result(br#"{"status":"cancelled"}"#.to_vec()),
+            Err(VshotError::SelectionCancelled)
+        ));
+        // An `ok` without the text is an error, not an empty translation.
+        assert!(matches!(
+            parse_translate_result(br#"{"status":"ok"}"#.to_vec()),
+            Err(VshotError::Translate(_))
+        ));
+    }
+
+    #[test]
+    fn a_translate_session_carries_its_languages_and_result_path() {
+        // The wire shape the Qt helper parses: the language pair, provider and
+        // destination path, under the new `translate` mode.
+        fn session<'a>(
+            translate: Option<QtTranslate<'a>>,
+            result_path: Option<String>,
+        ) -> QtSession<'a> {
+            QtSession {
+                version: 1,
+                mode: "translate",
+                bounds: Rect::new(0, 0, 10, 10).into(),
+                window: None,
+                socket: None,
+                id: None,
+                action: None,
+                candidates: None,
+                selection: None,
+                long_allowed: None,
+                translate,
+                result_path,
+                outputs: Vec::new(),
+            }
+        }
+        let with = session(
+            Some(QtTranslate {
+                from: "auto",
+                to: "zh-Hans",
+                provider: "google",
+            }),
+            Some("/tmp/translated.png".to_owned()),
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(parsed["mode"], "translate");
+        assert_eq!(parsed["translate"]["from"], "auto");
+        assert_eq!(parsed["translate"]["to"], "zh-Hans");
+        assert_eq!(parsed["translate"]["provider"], "google");
+        assert_eq!(parsed["result_path"], "/tmp/translated.png");
+        // A mode that does not translate leaves both fields out, so an older
+        // helper sees exactly the session it always saw.
+        let without = session(None, None);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&without).unwrap()).unwrap();
+        assert!(parsed.get("translate").is_none());
+        assert!(parsed.get("result_path").is_none());
     }
 }

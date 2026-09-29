@@ -85,7 +85,9 @@ pub struct Cli {
         conflicts_with_all = ["clipboard", "pin"]
     )]
     pub output: Option<PathBuf>,
-    /// Copy the result to the clipboard: PNG bytes, or `vshot ocr`'s text.
+    /// Copy the result to the clipboard: PNG bytes, or the text `vshot ocr`
+    /// produces. `vshot translate` copies its composited image, or its text
+    /// when the route has none.
     #[arg(long, global = true, conflicts_with = "output")]
     pub clipboard: bool,
     /// Pin the captured image on screen instead of writing it anywhere.
@@ -525,6 +527,83 @@ stdout. See the README's OCR section."#
         #[arg(long, conflicts_with = "clipboard")]
         json: bool,
     },
+    /// Translate the text of a region, an image file, or an OCR envelope
+    /// already on stdin.
+    #[command(
+        after_help = r#"Without --geometry, --input or --stdin-ocr the frozen scene is handed to the
+Qt overlay in its translate mode: frame a region and the translation is drawn
+over the original as soon as the frame is finished. Enter accepts it from
+there (and translates the frame again after an Escape), --output writes that
+composited PNG, --clipboard copies it, and with neither the translated text
+goes to stdout. --input reads a file and translates its recognized text;
+--geometry translates one fixed region without opening the overlay; and
+--stdin-ocr reads the JSON envelope `vshot ocr --json` prints and translates
+its lines without touching the screen at all.
+
+--json writes the OCR envelope back with each line's text translated and the
+original kept as `source`, so a program can place the translation exactly where
+the original was. It is the shape the editor's text layer already parses, and
+the `--stdin-ocr` route is the primitive the editor calls; that route always
+emits the envelope, with or without --json, so --json is implied there.
+
+Nine providers answer, chosen by --provider or `cli.translate.provider`: five
+need no account and no key of your own — `google` (the default), `microsoft`,
+`volcengine`, `transmart` and `lingocloud` — and the rest are `bing` (Azure
+Translator), `baidu` (Baidu's fanyi), `ai` (any OpenAI-compatible chat endpoint)
+and `external` (a program of your own, which reads the source lines on stdin and
+writes one translated line per line on stdout). `lingocloud` runs on a token
+borrowed from Caiyun's web app; `cli.translate.lingocloud.token` in
+$XDG_CONFIG_HOME/vshot/config.json replaces it with one of your own, and the
+keys the keyed ones need are in the same `cli.translate` section — see the
+README's Translation section.
+
+`--provider auto` is not a service of its own: it tries the usable ones in the
+order google, microsoft, volcengine, transmart, lingocloud, bing, baidu, ai,
+external — the credential-free five first, lingocloud last of them because it
+borrows somebody else's credential. A provider is usable once it has what it
+needs to run (bing, baidu and ai their keys, external its command); the
+credential-free five always are. `cli.translate.fallback` is an optional array
+naming more providers to try, in order, when the one that ran translated no line
+at all; it is empty by default, so nothing runs that you did not ask for.
+
+Languages are written the way vshot writes them (`zh-Hans`, `zh-Hant`, `en`,
+`ja`, `ko`, ...) and `auto` (the default source) detects one. Each provider is
+handed its own code for the tag; a tag it does not know passes through
+unchanged rather than being dropped."#
+    )]
+    Translate {
+        /// Fixed global geometry in `x,y widthxheight` form.
+        #[arg(long, conflicts_with = "interactive", allow_hyphen_values = true)]
+        geometry: Option<String>,
+        /// Explicitly request the Qt overlay; the default when no input is given.
+        #[arg(long, conflicts_with = "geometry")]
+        interactive: bool,
+        /// Read an image from this file instead of capturing the screen.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["geometry", "interactive", "stdin_ocr"])]
+        input: Option<PathBuf>,
+        /// Read the OCR JSON envelope `vshot ocr --json` prints from stdin and
+        /// translate its lines: no capture, no OCR run, no notification.
+        #[arg(long = "stdin-ocr", conflicts_with_all = ["geometry", "interactive", "input"])]
+        stdin_ocr: bool,
+        /// Target language (built-in default `zh-Hans`); `cli.translate.to`
+        /// otherwise.
+        #[arg(long, value_name = "LANG")]
+        to: Option<String>,
+        /// Source language (built-in default `auto`, which detects it);
+        /// `cli.translate.from` otherwise.
+        #[arg(long, value_name = "LANG")]
+        from: Option<String>,
+        /// Which provider answers: google (the default), microsoft, volcengine,
+        /// transmart, lingocloud, bing, baidu, ai or external, or `auto` to try
+        /// the usable ones in that order; `cli.translate.provider` otherwise.
+        /// `cli.translate.fallback` names more to try after it.
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<String>,
+        /// Write the translated envelope as JSON instead of plain text; the
+        /// `--stdin-ocr` route always emits the envelope either way.
+        #[arg(long, conflicts_with = "clipboard")]
+        json: bool,
+    },
 }
 
 /// What `vshot annotate` was asked of the resident overlay daemon.  The
@@ -844,6 +923,19 @@ pub enum Action {
         /// instead of plain text.
         json: bool,
     },
+    /// Translate the text of a region, a file, or an OCR envelope on stdin.
+    Translate {
+        /// Where the source lines come from.
+        source: TranslateSource,
+        /// Where the result goes: stdout, the clipboard, or a composited PNG.
+        destination: TranslateDestination,
+        /// The provider name, already validated against the provider set.
+        provider: String,
+        from: String,
+        to: String,
+        /// Write the translated OCR envelope as JSON instead of plain text.
+        json: bool,
+    },
     /// Record the screen to a file; `Stop` ends a running recording.
     Record(RecordAction),
     /// Keep a rolling window of the screen in memory; `Save` writes it out.
@@ -892,6 +984,34 @@ pub enum OcrSource {
     Geometry(Rect),
     /// An image file on disk.
     File(PathBuf),
+}
+
+/// Where `vshot translate` gets its source lines.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TranslateSource {
+    /// The OCR JSON envelope on stdin, `vshot ocr --json`'s own shape.  The
+    /// editor's primitive: no compositor, no capture, no OCR run.
+    StdinOcr,
+    /// A region of the frozen screen, framed in the Qt overlay's translate
+    /// mode, which also composites the translation for `--output`.
+    Screen,
+    /// A fixed region of the frozen screen, translated without the overlay.
+    Geometry(Rect),
+    /// An image file on disk, recognized and then translated.
+    File(PathBuf),
+}
+
+/// Where `vshot translate` puts its result.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TranslateDestination {
+    /// The translated text (or the envelope, when JSON was asked for) on
+    /// stdout.
+    Stdout,
+    /// On the clipboard: the translated text for the plain routes, or the
+    /// composited PNG for the overlay route.
+    Clipboard,
+    /// The composited PNG the overlay wrote, at this path.
+    Png(PathBuf),
 }
 
 /// Where recognized text goes.
@@ -1511,6 +1631,81 @@ impl Cli {
                 json: *json,
             });
         }
+        if let Command::Translate {
+            geometry,
+            interactive: _,
+            input,
+            stdin_ocr,
+            to,
+            from,
+            provider,
+            json,
+        } = &self.command
+        {
+            let defaults = crate::config::load().translate;
+            let provider = provider
+                .clone()
+                .or(defaults.provider)
+                .unwrap_or_else(|| "google".to_owned());
+            // Validate the name here, whatever the route: a typo should be
+            // reported before a capture opens an overlay on the desktop.  This
+            // accepts `auto` as well as the provider names.
+            crate::translate::validate_provider(&provider)?;
+            let from = from
+                .clone()
+                .or(defaults.from)
+                .unwrap_or_else(|| "auto".to_owned());
+            let to = to
+                .clone()
+                .or(defaults.to)
+                .unwrap_or_else(|| "zh-Hans".to_owned());
+
+            let source = match (stdin_ocr, input, geometry) {
+                (true, _, _) => TranslateSource::StdinOcr,
+                (_, Some(path), _) => TranslateSource::File(path.clone()),
+                (_, None, Some(geometry)) => TranslateSource::Geometry(parse_geometry(geometry)?),
+                (_, None, None) => TranslateSource::Screen,
+            };
+            let overlay = matches!(source, TranslateSource::Screen);
+            // The overlay hands back a composited PNG, so `--output` writes it
+            // and `--clipboard` copies it; every other route produces text, so
+            // `--output` would write an image it does not have.  `--json` is
+            // the envelope, which the overlay does not carry (the helper
+            // reports the finished translation, not the per-line one).
+            if !overlay && self.output.is_some() {
+                return Err(VshotError::InvalidDestination(
+                    "--output only applies to the interactive translate overlay, which composites \
+                     the translation into a PNG; every other translate route produces text, so it \
+                     goes to stdout or to the clipboard with --clipboard"
+                        .into(),
+                ));
+            }
+            if overlay && *json {
+                return Err(VshotError::InvalidDestination(
+                    "--json is not available on the interactive translate overlay; it reports the \
+                     composited image, not the per-line envelope (`--stdin-ocr` carries that)"
+                        .into(),
+                ));
+            }
+            if self.pin {
+                return Err(VshotError::InvalidDestination(
+                    "--pin does not apply to the translate subcommand".into(),
+                ));
+            }
+            let destination = match (&self.output, self.clipboard, overlay) {
+                (Some(path), _, true) => TranslateDestination::Png(path.clone()),
+                (_, true, _) => TranslateDestination::Clipboard,
+                _ => TranslateDestination::Stdout,
+            };
+            return Ok(Action::Translate {
+                source,
+                destination,
+                provider,
+                from,
+                to,
+                json: *json,
+            });
+        }
         if let Command::Pin {
             files,
             toggle,
@@ -1650,6 +1845,11 @@ impl Cli {
             Command::Ocr { .. } => {
                 return Err(VshotError::InvalidDestination(
                     "the ocr subcommand is not a capture target".into(),
+                ))
+            }
+            Command::Translate { .. } => {
+                return Err(VshotError::InvalidDestination(
+                    "the translate subcommand is not a capture target".into(),
                 ))
             }
             Command::Record { .. } => {
@@ -2443,5 +2643,121 @@ mod tests {
             error.to_string().contains("auto, wlr, portal, uinput"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn translate_routes_its_four_inputs_and_keeps_the_language_defaults() {
+        // `--stdin-ocr` is the editor's primitive: no capture, envelope out.
+        let action = Cli::try_parse_action_from(["vshot", "translate", "--stdin-ocr"]).unwrap();
+        match action {
+            Action::Translate {
+                source,
+                destination,
+                provider,
+                from,
+                to,
+                json,
+            } => {
+                assert_eq!(source, TranslateSource::StdinOcr);
+                assert_eq!(destination, TranslateDestination::Stdout);
+                assert_eq!(provider, "google");
+                assert_eq!(from, "auto");
+                assert_eq!(to, "zh-Hans");
+                assert!(!json);
+            }
+            other => panic!("expected a translate action, got {other:?}"),
+        }
+
+        // `--input` reads a file, and the flags override the language pair.
+        let action = Cli::try_parse_action_from([
+            "vshot",
+            "translate",
+            "--input",
+            "shot.png",
+            "--from",
+            "ja",
+            "--to",
+            "en",
+            "--provider",
+            "bing",
+            "--json",
+        ])
+        .unwrap();
+        match action {
+            Action::Translate {
+                source,
+                provider,
+                from,
+                to,
+                json,
+                ..
+            } => {
+                assert_eq!(source, TranslateSource::File("shot.png".into()));
+                assert_eq!(provider, "bing");
+                assert_eq!(from, "ja");
+                assert_eq!(to, "en");
+                assert!(json);
+            }
+            other => panic!("expected a translate action, got {other:?}"),
+        }
+
+        // A fixed region is translated without opening the overlay.
+        let action = Cli::try_parse_action_from([
+            "vshot",
+            "translate",
+            "--geometry",
+            "1,2 3x4",
+            "--clipboard",
+        ])
+        .unwrap();
+        match action {
+            Action::Translate {
+                source,
+                destination,
+                ..
+            } => {
+                assert_eq!(source, TranslateSource::Geometry(Rect::new(1, 2, 3, 4)));
+                assert_eq!(destination, TranslateDestination::Clipboard);
+            }
+            other => panic!("expected a translate action, got {other:?}"),
+        }
+
+        // Nothing named opens the overlay, where `--output` writes the PNG.
+        let action =
+            Cli::try_parse_action_from(["vshot", "translate", "--output", "out.png"]).unwrap();
+        match action {
+            Action::Translate {
+                source,
+                destination,
+                ..
+            } => {
+                assert_eq!(source, TranslateSource::Screen);
+                assert_eq!(destination, TranslateDestination::Png("out.png".into()));
+            }
+            other => panic!("expected a translate action, got {other:?}"),
+        }
+
+        // An unknown provider is refused before anything runs.
+        let error = Cli::try_parse_action_from([
+            "vshot",
+            "translate",
+            "--stdin-ocr",
+            "--provider",
+            "deepl",
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("deepl"), "{error}");
+        // `--output` is not available on the text routes, and `--json` is not
+        // available on the overlay.
+        assert!(Cli::try_parse_action_from([
+            "vshot",
+            "translate",
+            "--input",
+            "a.png",
+            "--output",
+            "b.png"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_action_from(["vshot", "translate", "--json"]).is_err());
     }
 }

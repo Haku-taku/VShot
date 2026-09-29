@@ -19,6 +19,7 @@ Rust 写的 Wayland 截图工具，带 Qt 交互界面与常驻 pin 浮层。捕
 - **pin 浮层**——把图片或剪贴板内容钉在屏幕上：拖动、滚轮缩放、双击关闭、一键显隐、Space 进标注编辑
 - **剪贴板贴图**——颜色、图片、复制的图片文件、纯文本（按 HTML / markdown / 代码 / 普通文本渲染成卡片）
 - **OCR 取字**——框选一块区域把文字读出来（中英日），走 `vshot ocr`，编辑器工具栏里也有「取字」按钮——它把识别到的文字就地选出来，而不是整段复制走；识别完弹一条桌面通知
+- **翻译**——把识别到的文字翻译成别的语种，走 `vshot translate`：交互时译文直接画在原文上，也可输出「译文信封」给程序按原位置摆放；九个 provider，其中五个（Google / Microsoft / 火山 / 腾讯 Transmart / 彩云 Lingocloud——最后一个借用彩云的 token）不用你自己的密钥，其余是 Bing / 百度 / OpenAI 兼容接口 / 自己的程序
 - **输出目标**——文件（支持 strftime 路径）、stdout、剪贴板、屏幕 pin，四选一
 - **中英双语**——界面与 `--help` 都跟随系统语言
 
@@ -102,6 +103,15 @@ vshot ocr --json                            # OCR：框选，文字与每个字�
 vshot ocr --clipboard                       # 同上，进剪贴板
 vshot ocr --input shot.png                  # 读一个已有的图片文件
 
+vshot translate                             # 翻译：框完松手就翻，译文画在原文上；Enter 确认后译文到 stdout
+vshot translate --output out.png            # 把合成好的译文 PNG 写到文件
+vshot translate --clipboard                 # 把合成好的译文 PNG 复制进剪贴板
+vshot translate --input shot.png            # 读一个图片文件，翻译它的文字
+vshot translate --to en --from ja           # 指定目标 / 源语言
+vshot translate --provider bing             # 换一个翻译服务
+vshot translate --provider auto             # 按顺序挑可用的翻译服务
+vshot ocr --json | vshot translate --stdin-ocr --json   # 翻译一个 OCR 信封
+
 vshot record monitor eDP-1 --output clip.mp4    # 录屏：录一块屏
 vshot record monitor --fps 30                   # 你当前所在的那块（NAME 省略即 current），30fps
 vshot record all                                # 整个桌面，默认存视频目录
@@ -141,7 +151,7 @@ vshot all --output 'shots/capture-%Y%m%d-%H%M%S.final.png'
 
 - 拖拽画矩形，四周 8 个手柄调整大小，拖选区内部移动位置，方向键微调（Shift 加速为 10 逻辑像素）；拖拽或调整时，光标旁显示 8x 放大镜与原生像素坐标，选区左上角显示 `宽 × 高`
 - **Enter**、选区内双击或工具栏 OK 确认；**Esc** 或右键取消整次截图（文本框内的 Esc 只关闭文本框）
-- 工具栏第一行为 Select、Rect、Ellipse、Arrow、Draw、Text、Mosaic、长截图 与 Undo、Redo、OK、Cancel；样式子面板按当前工具显隐，跟随选区移动。「长截图」把这块选区交给滚动长截图（`vshot long`）而不是保留它；选区横跨两块屏幕时该按钮置灰
+- 工具栏是两行按钮加右侧固定的一角：第一行是绘图工具 Select、Rect、Ellipse、Arrow、Line、Wave、Bezier、Draw、Text、Number、Mosaic，第二行是作用在截图上的动作——图片、取字、翻译、长截图；右下角是两行两列的 Undo/Redo 与 OK/Cancel（上排撤销/重做，下排确定/取消），贴着面板右边而不是跟在最长那行的末尾（面板宽度取命令条与样式子面板里更宽的那个）；样式子面板按当前工具显隐，跟随选区移动。「长截图」把这块选区交给滚动长截图（`vshot long`）而不是保留它；选区横跨两块屏幕时该按钮置灰
 - 样式项：颜色色板（含自定义取色器：HSV 渐变 + 十六进制输入）、线型 Solid/Dash/Dot、箭头头型 Open V/Filled、粗细 1-64、箭头大小 1-8、字号 7-448（直接就是像素高）、马赛克形状 Rect/Ellip/Brush、马赛克程度 1-3、系统字体列表（每项按自身字形预览）。Arrow 是按下点到释放点的直线箭头；Draw 是自由绘制；Mosaic 的马赛克程度控制像素块大小与涂抹半径
 - **Select** 工具可点选任意标注：单击选中，拖动移动（文本同样），形状/线条/马赛克可拖把手缩放，Delete/Backspace 删除；样式修改即时应用到选中标注；**Ctrl+Z / Ctrl+Y**（或 Ctrl+Shift+Z）撤销/重做。标注以全局逻辑坐标传回 Rust，最终 PNG 由内置软件渲染重绘，与预览一致
 - **贴图 / 取字**：工具栏的「图片」按钮从磁盘挑一张，或 **Ctrl+V** 直接把剪贴板里的图贴进来——原尺寸落在选区正中，比选区大时等比缩小塞进去，贴完自动切到 Select 并选中它；「取字」按钮把选区里的文字识别成一层可就地选取的文字层，而不是整段复制走（见[「OCR 取字」](#ocr-取字)，`cli.ocr.notify` 可关）
@@ -224,6 +234,80 @@ for text in (result.txts or []):
 ```
 
 **配置错了会直接报错，不会静默退回 CPU**：写了 `engine: "external"` 却没给 `command`、或者命令跑不起来、或者程序非零退出，都是明确的错误信息（外部程序写到 stderr 的内容会一并带上）。
+
+## 翻译
+`vshot translate` 把屏幕上某块区域的文字翻译成另一个语种。不给参数时走 Qt overlay 的翻译模式：框一块区域，松手就识别、翻译，译文画在原文上；Enter 确认（Esc 撤下译文后可再 Enter 重翻这块框）：
+
+译文是**就地盖在原文上**的：每行的底色取该行上下各 2 像素里最常见的颜色，所有底色先铺完再写文字——后一行的底色不会盖掉上一行的字；字用**桌面自己的字体**（Qt 应用字体，也就是系统字体），只有当它画不出译文里的字时才回退到内置的 CJK 字体表。译文放不下时先缩小字号（下限为行高的一半），再放不下就把底色块横向加宽，而不是溢出画面。
+
+```sh
+vshot translate                    # 框选，译文上屏；Enter 后译文到 stdout
+vshot translate --output out.png   # 把合成好的译文 PNG 写到文件
+vshot translate --clipboard        # 把合成好的译文 PNG 复制进剪贴板
+vshot translate --input shot.png   # 读一个图片文件，翻译它识别出的文字
+vshot translate --geometry '0,0 800x200'
+vshot translate --to en --from ja  # 指定目标 / 源语言
+vshot translate --provider bing    # 换一个翻译服务
+vshot translate --provider auto    # 按顺序挑可用的翻译服务
+```
+
+`--stdin-ocr` 是编辑器用的原语：它从 stdin 读 `vshot ocr --json` 打印的 **OCR JSON 信封**，只翻译其中的 `lines[].text`，再把一个**翻译后的信封**写到 stdout——不截图、不跑 OCR、不碰合成器，也**不弹通知**。编辑器就是这么调它的：
+
+```sh
+vshot ocr --json | vshot translate --stdin-ocr --json
+```
+
+`--json` 把信封原样写回：`lines[].text` 换成译文，原文留在同一条的 `source` 里；`geometry` 与每行的 `rect` 都保留，`chars` 丢掉（逐字框只用来**选取原文**，翻译浮层不选原文，所以不需要）——`geometry` 仍为 `true`，因为每行的 `rect` 是真的、也是 Qt 文字层摆放译文要用的。这正好是编辑器文字层已经在解析的形状，译文因此落在原文的位置上。某一行翻译失败时，这一行仍在：`text` 保持原文，另加一个 `error` 字段——**一行坏掉不会丢掉整批**。`--stdin-ocr` 这一路**总是**输出信封，`--json` 加不加都一样——它本来就隐含 `--json`。
+
+不带 `--json` 时打印译文，一行一行，和 `vshot ocr` 打印识别结果的方式一样。`cli.translate.notify`（默认 `false`）控制翻译结束时那条桌面通知；`--stdin-ocr` 这一路永远不弹。
+
+### provider
+九个服务由 `--provider` 或配置里的 `cli.translate.provider` 选，其中**五个不用你自己的密钥**：
+
+| provider | 需要的凭据 | 说明 |
+| --- | --- | --- |
+| `google` | 无 | 官方 Android 应用用的免密钥接口；每行一次请求（4 路并发）再按序拼回 |
+| `microsoft` | 无 | 微软 edge 的免密钥接口；一次请求可带多行（JSON 数组），`from` 留空即自动识别 |
+| `volcengine` | 无 | 火山翻译；发出伪装成厂商自家 Chrome 扩展的请求，一次只翻一行 |
+| `transmart` | 无 | 腾讯 Transmart；一次请求可带多行（`text_list`） |
+| `lingocloud` | 无（借用彩云的 token，可用 `token` 覆盖） | 彩云小译；一次请求可带多行，`trans_type` 是 `<from>2<to>`；简体中文要写 `zh`，繁体 `zh-Hant` 照收 |
+| `bing` | `api-key`（可选 `region`） | Azure Translator，一次请求可带多行 |
+| `baidu` | `app-id` + `secret-key` | 百度翻译，多行用 `\n` 拼成一个 `q` 一次发，`sign` 是 `md5(appid + q + salt + secret_key)` |
+| `ai` | `endpoint` + `api-key` + `model` | 任意 OpenAI 兼容的 chat 接口；`prompt` 可覆盖内置的系统提示词 |
+| `external` | 无（用你自己的程序） | 从 stdin 读原文、按行把译文写到 stdout |
+
+`google`、`microsoft`、`volcengine`、`transmart` 这四个都免密钥：不要账号、不要密钥，配置里什么都不用填。`lingocloud` 也不用你配任何东西，但它跑在**从彩云 web 应用借来的 token**（`9sdftiq37bnv410eon2l`）上——这个常量出现在几十个第三方客户端 fork 里，彩云随时可能吊销它。要停止借用，就在配置里写 `cli.translate.lingocloud.token` 放一个你自己的彩云 token；真被吊销时改配置即可，不用改代码。
+
+`bing` 的 `endpoint` 默认 `https://api.cognitive.microsofttranslator.com`；`ai` 的 `endpoint` 以 `/chat/completions` 结尾时直接用，否则拼上 `/chat/completions`。密钥配错了会**明确报错**并指名缺哪一项，而不是悄悄换一个 provider。
+
+`--provider auto`（或配置里的 `"provider": "auto"`）不指名任何服务：它按内置顺序 **google、microsoft、volcengine、transmart、lingocloud、bing、baidu、ai、external** 依次试，先试不用凭据的五个——`lingocloud` 排在这五个的最后，因为它借的是别人的凭据；跳过没有东西可跑的——`bing`、`baidu`、`ai` 要各自的密钥，`external` 要命令，而那五个永远能跑。谁先给出结果就用谁，信封里的 `provider` 报的是真正跑的那个。
+
+`cli.translate.fallback` 是一个可选的数组，列出主 provider 之后要接着试的 provider（主 provider 是 `auto` 时，就排在整条 auto 顺序之后）。它**默认是空的**，不会跑任何你没写的东西。一个 provider 只要**至少翻出一行**就算给出了结果；每一行都失败时——就是被限流的 Google 那种情况，每行各自带着 `error` 而命令仍然退出 0——就换链上的下一个；一旦有一行成功，整份结果就原样采用，包括其中失败的行。两个及以上 provider 的链整条都失败时，报错会指名每一个试过的 provider 及它最后给的原因。和链上已有的重名会被跳过，不认识的写法会报错。
+
+**没有 `fallback`** 时链上只有一个 provider，它就不算一条链：结果照旧返回，包括逐行的 `error` 字段，所以单跑 `--provider google` 的行为一点没变。链和它那条「全都失败」的报错，只有在你写了第二个 provider 之后才存在。
+
+`external` 是唯一的万能逃生口——只要一个 shell 脚本就能用：
+
+```json
+{"cli": {"translate": {"provider": "external",
+                       "external": {"command": ["/usr/local/bin/my-translate"], "timeout": 30}}}}
+```
+
+它把原文按行写到子进程的 stdin，从 stdout 读回译文；**行数必须和输入一致**，多一行少一行都会报错并说明期望与实际的行数，同时带上程序写到 stderr 的内容。超时默认 30 秒，到点杀掉子进程。
+
+### 语种代码
+语种用 vshot 自己的 BCP-47 风格写法：`zh-Hans`、`zh-Hant`、`en`、`ja`、`ko`……`auto` 表示自动识别。每个 provider 有自己的代码，vshot 在发请求前换算：
+
+- **Google** 用 `zh-CN`/`zh-TW`，识别写作 `auto`；
+- **Microsoft** 用 vshot 原样的标签（`zh-Hans`/`zh-Hant` 都照收），识别是 `from` 留空；
+- **火山（volcengine）** 多数标签原样透传，但**简体中文要写 `zh`**（实测 `zh-Hans`/`zh-CN`/`zh-TW` 会让它回英文），繁体 `zh-Hant` 照收；请求根本不带源语言字段，识别始终是隐式的；
+- **腾讯 Transmart** 把 `zh-Hans`/`zh-Hant` 都并成 `zh`；源语言按调用方给的原样下发，**`auto` 也一样**（实测该接口接受 `auto` 并自动识别；反倒是按某些客户端那样发 `en`，遇到非英文原文会原样返回、不翻译）；
+- **彩云（lingocloud）** 把两个标签拼成 `<from>2<to>`：**只有 `zh-Hans` 会被改写成 `zh`**（该接口把 `zh-Hans` 当作源和目的都拒收），`zh-Hant` 原样下发且**确实回繁体**（实测 `ja2zh-Hant` 给的是「今天天氣真好啊。」，不是简体；`zh-Hant2ja` 则被服务内部归一成 `zh2ja`）；其余标签——包括旧客户端只认的六种之外的 `de`、`ko`——全部原样传下去，由服务自己的 `rc=-1` 报错；
+- **Bing** 用 vshot 原样的标签，识别就是**不带** `from` 参数；
+- **百度** 用 `zh`/`cht`/`jp`/`kor`/`fra`，识别写作 `auto`；
+- **`ai` 与 `external`** 原样透传。
+
+**表里没有的标签原样传下去**，绝不悄悄丢掉——不认识的语种宁可让服务自己报错，也好过用错误的语言翻译。
 
 ## 截取窗口
 ### window active
@@ -579,8 +663,21 @@ vshot settings
 | `ocr.external.stdin` | 把 PNG 走 stdin 而不是给路径 | `false` |
 | `ocr.external.timeout` | 外部程序的超时（秒） | `30` |
 | `ocr.notify` | 识别结束时弹桌面通知 | `true` |
+| `translate.provider` | `translate --provider` | `google` |
+| `translate.from` | `translate --from` | `auto` |
+| `translate.to` | `translate --to` | `zh-Hans` |
+| `translate.timeout` | 翻译 HTTP 请求的超时（秒） | `20` |
+| `translate.notify` | 翻译结束时弹桌面通知 | `false` |
+| `translate.fallback` | 主 provider 没给出结果后按顺序接着试的 provider（数组） | 空 |
+| `translate.bing.endpoint` / `api-key` / `region` | Bing（Azure Translator）的地址与凭据 | 全球端点 / 无 / 无 |
+| `translate.baidu.app-id` / `secret-key` | 百度翻译的凭据 | 无 |
+| `translate.ai.endpoint` / `api-key` / `model` / `prompt` | OpenAI 兼容接口的地址、凭据、模型与系统提示词（空则用内置） | 无 |
+| `translate.external.command` / `timeout` | 外部翻译程序（数组）与超时（秒） | 无 / `30` |
+| `translate.lingocloud.token` | 彩云（lingocloud）的 token；不填则用内置借来的那个 | 内置借用值 |
 
-`pin.density` 的优先级同样是 `--density` > `VSHOT_PIN_DENSITY` > 配置文件；`cli` 段里不认识的键会被忽略，不会让整个文件失效。`ocr.engine` 只认 `builtin` 与 `external` 两个值，写了别的名字会**报错**而不是当默认值处理，因为把 `external` 拼错会让人以为自己配的 GPU 引擎生效了（`engine: "external"` 而没有 `command`、或命令跑不起来，同样明确报错，详见[「用 GPU：外接引擎」](#用-gpu外接引擎)）。设置窗口覆盖 `editor`、常用的 `cli` 项、`ocr.notify` 这个开关，以及 `record` 与 `replay` 两段；`ocr.engine`、`ocr.external` 要手改文件。**两个 `notify` 开关只写「关」**，因为键不存在就是「开」；麦克风那两项是**从当前会话检测出来的**；`follow` 那两项在窗口里是**一行逗号分隔的窗口名**，在文件里是一个数组——手改时写成 `["game", "chat"]`。
+`google`、`microsoft`、`volcengine`、`transmart` 四个免密钥 provider 没有任何配置键，把名字写进 `translate.provider` 即可使用；`lingocloud` 同样免配，唯一可选的键是 `translate.lingocloud.token`（不填就用内置借来的 token）。
+
+`pin.density` 的优先级同样是 `--density` > `VSHOT_PIN_DENSITY` > 配置文件；`cli` 段里不认识的键会被忽略，不会让整个文件失效。`ocr.engine` 只认 `builtin` 与 `external` 两个值，写了别的名字会**报错**而不是当默认值处理，因为把 `external` 拼错会让人以为自己配的 GPU 引擎生效了（`engine: "external"` 而没有 `command`、或命令跑不起来，同样明确报错，详见[「用 GPU：外接引擎」](#用-gpu外接引擎)）。设置窗口覆盖 `editor`、常用的 `cli` 项、`ocr.notify` 这个开关，以及 `record` 与 `replay` 两段；`ocr.engine`、`ocr.external` 与整个 `cli.translate` 段要手改文件（`translate.provider` 认那九个名字再加 `auto`，写错会报错）。**两个 `notify` 开关只写「关」**，因为键不存在就是「开」；`translate.notify` 相反——它默认就是「关」，所以手改文件时才需要写出来。麦克风那两项是**从当前会话检测出来的**；`follow` 那两项在窗口里是**一行逗号分隔的窗口名**，在文件里是一个数组——手改时写成 `["game", "chat"]`。
 
 `record.follow` / `replay.follow` 只在**不带窗口名、也不给 `--pick`** 的 `record window` / `replay start window` 上生效；其它目标（`monitor`、`all`、`region`，或命令行上点了名的窗口）会**忽略**记着的跟随列表，而不是因为它在而报错。`--no-follow` 是对那一次录制/回录把记着的列表关掉，正如 `--no-mic` 对记着的麦克风那样。`color` 用的是 CSS 那套写法：`#rrggbb`，带透明度时写 `#rrggbbaa`（alpha 在**最后**）——注意这跟 Qt 自己的八位写法 `#aarrggbb` 不同，`vshot settings` 与配置文件都按 CSS 那套来。
 

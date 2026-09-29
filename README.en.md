@@ -19,6 +19,7 @@ A Wayland screenshot tool written in Rust, with a Qt interactive UI and a reside
 - **Pin overlay** — pin images or clipboard content to the screen: drag, wheel to zoom, double-click to close, one-key show/hide, Space to annotate
 - **Clipboard pinning** — colors, images, copied image files, plain text (rendered as a card as HTML / markdown / code / plain text)
 - **OCR** — frame a region and get its text back (Chinese, English and Japanese), through `vshot ocr` or the editor toolbar's *Text+* button, which selects the recognized text in place rather than copying all of it; a desktop notification when it finishes
+- **Translation** — translate the recognized text into another language through `vshot translate`: interactively the translation is drawn over the original, and the same feature can emit a translated envelope for a program to place at the original positions; nine providers, five of them needing no key of your own (Google / Microsoft / Volcengine / Tencent Transmart / Caiyun Lingocloud, the last one on a borrowed token) and the rest Bing / Baidu / any OpenAI-compatible endpoint / a program of your own
 - **Output targets** — file (with strftime paths), stdout, clipboard, or an on-screen pin; exactly one
 - **Bilingual UI** — the interface and `--help` follow the system language
 
@@ -102,6 +103,15 @@ vshot ocr --json                            # OCR: frame a region, the text and 
 vshot ocr --clipboard                       # the same, onto the clipboard
 vshot ocr --input shot.png                  # read an existing image file
 
+vshot translate                             # Translation: frame a region and it translates at once; Enter accepts, text to stdout
+vshot translate --output out.png            # write the composited translated PNG
+vshot translate --clipboard                 # copy the composited translated PNG
+vshot translate --input shot.png            # read an image file and translate its text
+vshot translate --to en --from ja           # choose the target / source language
+vshot translate --provider bing             # choose a different service
+vshot translate --provider auto             # try the usable providers in order
+vshot ocr --json | vshot translate --stdin-ocr --json   # translate an OCR envelope
+
 vshot record monitor eDP-1 --output clip.mp4    # Recording: one output
 vshot record monitor --fps 30                   # the output you are on (NAME defaults to current), 30 fps
 vshot record all                                # every output, default video dir
@@ -141,7 +151,7 @@ When `vshot region` gets no `--geometry`, the frozen frame fills each output and
 
 - Drag to draw the rectangle, eight handles around it resize, dragging inside moves it, arrow keys nudge (Shift accelerates to 10 logical pixels); while dragging or resizing an 8x magnifier and native pixel coordinates appear next to the cursor, and the selection's `width × height` sits at its top-left corner
 - **Enter**, a double-click inside the selection, or the toolbar's OK confirms; **Esc** or right-click cancels the whole capture (Esc inside a text box only closes that box)
-- The toolbar's first row holds the tools Select, Rect, Ellipse, Arrow, Draw, Text, Mosaic and Scroll plus Undo, Redo, OK, Cancel; style sub-panels appear according to the current tool and follow the selection. Scroll hands the selection to the scrolling capture (`vshot long`) instead of keeping it, and is greyed out when the selection spans two outputs
+- The toolbar is two rows of buttons with a pinned corner: the drawing tools Select, Rect, Ellipse, Arrow, Line, Wave, Bezier, Draw, Text, Number and Mosaic on the first row, and on the second the actions that work on the capture — Image, Text+, Translate and Scroll; the corner holds Undo and Redo on the first row and OK and Cancel on the second, against the panel's right-hand edge rather than at the end of the longest row; style sub-panels appear according to the current tool and follow the selection. Scroll hands the selection to the scrolling capture (`vshot long`) instead of keeping it, and is greyed out when the selection spans two outputs
 - Style entries: a color palette (with a custom picker: HSV gradient plus hex input), line style Solid/Dash/Dot, arrow head Open V/Filled, thickness 1-64, arrow size 1-8, font size 7-448 (the number *is* the pixel height), mosaic shape Rect/Ellip/Brush, mosaic strength 1-3, and a system font list (each entry previewed in its own glyphs). Arrow draws a straight arrow from press to release; Draw is freehand; the mosaic strength controls both the pixel block size and the brush radius
 - The **Select** tool picks any annotation: click to select, drag to move (text too), shapes/lines/mosaics resize by their handles, Delete/Backspace removes it; style changes apply to the selected annotation immediately; **Ctrl+Z / Ctrl+Y** (or Ctrl+Shift+Z) undo/redo. Annotations come back to Rust in global logical coordinates and the final PNG is redrawn by the built-in software renderer, matching the preview
 - **Pasting and reading text**: the toolbar's *Image* button picks an image from disk, or **Ctrl+V** pastes whatever image the clipboard holds — it lands centred at its own size, shrunk to fit when it is larger than the selection, and comes up selected so it can be dragged and resized by its handles; the *Text+* button recognizes the text in the selection and selects it in place rather than copying all of it (see [OCR](#ocr); `cli.ocr.notify` turns it off)
@@ -224,6 +234,80 @@ for text in (result.txts or []):
 ```
 
 **A misconfiguration is an error, never a silent fall back to the CPU**: `engine: "external"` with no `command`, a command that will not start, or a program exiting non-zero each produce a specific message (including whatever the program wrote to stderr).
+
+## Translation
+`vshot translate` translates the text of a region of the screen into another language. With no arguments it opens the Qt overlay in its translate mode: frame a region and, the moment the drag ends, vshot recognizes and translates it and draws the translation over the original; Enter accepts it (after an Escape, Enter translates the same frame again):
+
+The translation is drawn **over the original, in place**: each line's fill is the most common colour of the frame a couple of pixels above and below it, and every fill goes down before any text is written, so a later line's fill cannot repaint the glyphs above it. The glyphs are drawn in **the desktop's own font** — the Qt application font, which is the system font — and the built-in CJK list is only the fallback for a desktop font that cannot draw the text. A line that does not fit is shrunk first (never below half the line's height), and past that its fill grows sideways rather than spilling off the frame.
+
+```sh
+vshot translate                    # frame a region, the translation drawn in place; text to stdout
+vshot translate --output out.png   # write the composited translated PNG
+vshot translate --clipboard        # copy the composited translated PNG
+vshot translate --input shot.png   # read an image file and translate its text
+vshot translate --geometry '0,0 800x200'
+vshot translate --to en --from ja  # choose the target / source language
+vshot translate --provider bing    # choose a different service
+vshot translate --provider auto    # try the usable providers in order
+```
+
+`--stdin-ocr` is the primitive the editor calls: it reads the **OCR JSON envelope** `vshot ocr --json` prints from stdin, translates only its `lines[].text`, and writes a **translated envelope** to stdout — no capture, no OCR run, no compositor, and **no notification**. This is exactly how the editor calls it:
+
+```sh
+vshot ocr --json | vshot translate --stdin-ocr --json
+```
+
+`--json` writes the envelope back unchanged except that each line's `text` becomes the translation and the original is kept alongside as `source`; `geometry` and each line's `rect` survive, while `chars` is dropped — per-character boxes exist only to **select the recognized text**, and the translated overlay never selects the original, so it has no use for them. `geometry` still reads `true`, because the line rects are real and are what the Qt text layer places the translation with. That is exactly the shape the editor's text layer already parses, so the translation lands where the original was. A line that fails to translate is still kept: its `text` stays the source and it gains an `error` field — **one bad line never loses the rest of the batch**. The `--stdin-ocr` route always emits the envelope, with or without `--json`, so the flag is implied there.
+
+Without `--json` the translation is printed one line per line, the way `vshot ocr` prints recognized text. `cli.translate.notify` (off by default) controls the desktop notification when a translation finishes; the `--stdin-ocr` route never notifies.
+
+### Providers
+The nine services are chosen by `--provider` or `cli.translate.provider`; **five of them need no key of your own**:
+
+| provider | what it needs | notes |
+| --- | --- | --- |
+| `google` | nothing | the keyless endpoint the official Android app uses; it splits on sentences and does not map them back to the input lines, so vshot asks one line per request (4 in flight) and puts them back in order |
+| `microsoft` | nothing | Microsoft's keyless edge endpoint; several lines go in one request as a JSON array, and an empty `from` means auto-detect |
+| `volcengine` | nothing | Volcengine's endpoint, called with the vendor's own Chrome extension's `Origin`; one line per request |
+| `transmart` | nothing | Tencent Transmart; several lines go in one request (`text_list`) |
+| `lingocloud` | nothing (borrows Caiyun's token; `token` overrides it) | Caiyun's interpreter; several lines go in one request, and `trans_type` is `<from>2<to>`; simplified Chinese is spelled `zh`, traditional `zh-Hant` is taken as written |
+| `bing` | `api-key` (optional `region`) | Azure Translator; several lines go in one request |
+| `baidu` | `app-id` + `secret-key` | Baidu fanyi; the lines are joined with `\n` into one `q`, and `sign` is `md5(appid + q + salt + secret_key)` |
+| `ai` | `endpoint` + `api-key` + `model` | any OpenAI-compatible chat endpoint; `prompt` replaces the built-in system prompt |
+| `external` | nothing (your own program) | reads the source lines on stdin and writes one translated line per line on stdout |
+
+`google`, `microsoft`, `volcengine` and `transmart` all need no key: no account, no token, nothing to put in the config. `lingocloud` needs nothing configured either, but it runs on **a token borrowed from Caiyun's web app** (`9sdftiq37bnv410eon2l`) — the same constant turns up in dozens of third-party client forks, and Caiyun can revoke it at any time. To stop borrowing, put a Caiyun token of your own in `cli.translate.lingocloud.token`; if the borrowed one is ever revoked, that is the fix, not a code change.
+
+`bing`'s `endpoint` defaults to `https://api.cognitive.microsofttranslator.com`; `ai`'s `endpoint` is used verbatim when it already ends in `/chat/completions`, and gains that suffix otherwise. A missing credential is an **error that names the key**, never a silent switch to another provider.
+
+`--provider auto` (or `"provider": "auto"` in the config) names no service: it tries the providers in the built-in order **google, microsoft, volcengine, transmart, lingocloud, bing, baidu, ai, external** — the five credential-free ones first, `lingocloud` last of them because it borrows somebody else's credential — skipping any that has nothing to run with (`bing`, `baidu` and `ai` need their credentials and `external` needs a command; the five credential-free ones always run). The first one that answers is used, and the envelope's `provider` reports the one that actually did.
+
+`cli.translate.fallback` is an optional array of provider names to try, in order, after the primary — or after the whole `auto` order when the primary is `auto`. It is **empty by default**, so nothing runs that you did not ask for. A provider counts as having answered when **at least one line translated**: a provider that fails every line — the throttled Google case, where each line comes back with its own `error` and the command still exits 0 — is passed over for the next, and once any line succeeds the whole result is kept, per-line failures and all. When a chain of two or more is exhausted, the error names each provider tried and the reason it gave. A name that repeats one already in the chain is skipped, and an unknown name is an error.
+
+With **no `fallback`** the chain is a single provider, and it is not treated as a chain: its result comes back as it always has, per-line `error` fields included, so nothing about a plain `--provider google` run changes. The chain — and its all-failed error — only exists once you name a second provider.
+
+`external` is the universal escape hatch — a shell script is all it takes:
+
+```json
+{"cli": {"translate": {"provider": "external",
+                       "external": {"command": ["/usr/local/bin/my-translate"], "timeout": 30}}}}
+```
+
+It writes the source lines to the child's stdin and reads the translations back from stdout; **the line count has to match the input**, and a difference is an error naming the expected and actual counts, along with whatever the program wrote to stderr. The timeout is 30 seconds by default; on expiry the child is killed.
+
+### Language tags
+Languages are written the way vshot writes them (BCP-47-ish): `zh-Hans`, `zh-Hant`, `en`, `ja`, `ko`, … and `auto` detects the source. Each provider has codes of its own, applied before the request goes out:
+
+- **Google** takes `zh-CN`/`zh-TW` and spells detection `auto`;
+- **Microsoft** takes vshot's tags as they are, `zh-Hans`/`zh-Hant` included, and spells detection by leaving `from` empty;
+- **Volcengine** passes most tags through, but **spells simplified Chinese `zh`** (`zh-Hans` makes the live endpoint answer in English); `zh-Hant` is taken as written, and the request carries no source field at all;
+- **Transmart** collapses both Chinese scripts to `zh`, and sends the source exactly as asked, **`auto` included** — the live service accepts `auto` and detects the source, while the `en` some clients substitute makes it echo a non-English line untranslated;
+- **Lingocloud** splices the two tags into one `<from>2<to>`: **only `zh-Hans` is rewritten**, to `zh` (the endpoint rejects `zh-Hans` as a source and as a target alike), while `zh-Hant` is taken as written and **really does yield traditional Chinese** (a live `ja2zh-Hant` comes back 「今天天氣真好啊。」, not the simplified 「今天天气真好啊。」; a `zh-Hant2ja` source is normalised by the service to `zh2ja`). Everything else — `de`, `ko`, any tag the old six-language client would have refused — passes through, and the service's own `rc=-1` is the error;
+- **Bing** takes vshot's tags as they are, and spells detection by **omitting** the `from` parameter;
+- **Baidu** takes `zh`/`cht`/`jp`/`kor`/`fra` and spells detection `auto`;
+- **`ai`** and **`external`** pass the tag through unchanged.
+
+**A tag the table does not know passes through unchanged**, never dropped: a service that does not understand it will say so, which is better than translating with the wrong language.
 
 ## Capturing windows
 ### window active
@@ -579,8 +663,21 @@ command line > environment > config file > built-in default
 | `ocr.external.stdin` | send the PNG on stdin instead of passing a path | `false` |
 | `ocr.external.timeout` | the external program's timeout, in seconds | `30` |
 | `ocr.notify` | a desktop notification when recognition ends | `true` |
+| `translate.provider` | `translate --provider` | `google` |
+| `translate.from` | `translate --from` | `auto` |
+| `translate.to` | `translate --to` | `zh-Hans` |
+| `translate.timeout` | timeout of a translation HTTP request, in seconds | `20` |
+| `translate.notify` | a desktop notification when a translation ends | `false` |
+| `translate.fallback` | providers to try, in order, after the primary produces nothing (an array) | empty |
+| `translate.bing.endpoint` / `api-key` / `region` | Bing (Azure Translator) endpoint and credentials | global endpoint / none / none |
+| `translate.baidu.app-id` / `secret-key` | Baidu fanyi credentials | none |
+| `translate.ai.endpoint` / `api-key` / `model` / `prompt` | OpenAI-compatible endpoint, credentials, model and system prompt (empty uses the built-in one) | none |
+| `translate.external.command` / `timeout` | the external translation program (an array) and its timeout, in seconds | none / `30` |
+| `translate.lingocloud.token` | the Caiyun (`lingocloud`) token; the built-in borrowed one is used when absent | the built-in borrowed token |
 
-`pin.density` follows the same order: `--density` > `VSHOT_PIN_DENSITY` > the config file; unknown keys inside `cli` are ignored rather than making the whole file invalid. `ocr.engine` accepts only `builtin` and `external`, and any other name is an **error** rather than a default, because a misspelled `external` would otherwise look like a working GPU engine (`engine: "external"` with no `command`, or a command that will not run, is reported plainly too — see [Using a GPU](#using-a-gpu-the-external-engine)). The settings window covers `editor`, the common `cli` entries, the `ocr.notify` switch, and both the `record` and `replay` sections, while `ocr.engine` and `ocr.external` are edited by hand. The two `notify` switches **only ever write "off"**, because an absent key already means on; the microphone rows are filled from the running session; the `follow` rows are **one comma-separated line of window names** in the window and an **array** in the file — hand-edit it as `["game", "chat"]`.
+`google`, `microsoft`, `volcengine` and `transmart` are keyless and have no config keys at all — just name one in `translate.provider`. `lingocloud` needs no config either, and its only optional key is `translate.lingocloud.token` (absent uses the built-in borrowed token).
+
+`pin.density` follows the same order: `--density` > `VSHOT_PIN_DENSITY` > the config file; unknown keys inside `cli` are ignored rather than making the whole file invalid. `ocr.engine` accepts only `builtin` and `external`, and any other name is an **error** rather than a default, because a misspelled `external` would otherwise look like a working GPU engine (`engine: "external"` with no `command`, or a command that will not run, is reported plainly too — see [Using a GPU](#using-a-gpu-the-external-engine)). The settings window covers `editor`, the common `cli` entries, the `ocr.notify` switch, and both the `record` and `replay` sections, while `ocr.engine`, `ocr.external` and the whole `cli.translate` section are edited by hand (`translate.provider` accepts the nine names plus `auto`, and any other is an error). The two `notify` switches **only ever write "off"**, because an absent key already means on; `translate.notify` is the other way round — it is off by default, so it has to be written out to turn it on. The microphone rows are filled from the running session; the `follow` rows are **one comma-separated line of window names** in the window and an **array** in the file — hand-edit it as `["game", "chat"]`.
 
 `record.follow` / `replay.follow` apply only to a **bare `record window` / `replay start window`** — no window NAME and no `--pick`; every other target (`monitor`, `all`, `region`, or a window named on the command line) **ignores** a remembered list rather than failing on it. `--no-follow` turns a remembered list off for one recording, the way `--no-mic` does a remembered microphone. `color` uses the CSS spelling: `#rrggbb`, or `#rrggbbaa` with the alpha **last** when it is not opaque — note that this differs from Qt's own eight-digit order (`#aarrggbb`); both `vshot settings` and the config file follow CSS.
 

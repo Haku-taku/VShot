@@ -77,6 +77,14 @@ public:
     int lineCount() const { return lineTexts_.size(); }
     const TextUnit &unit(int index) const { return units_.at(index); }
 
+    /// The text of one line, in reading order, or an empty string out of range.
+    ///
+    /// A translation replaces `lines[].text` and leaves every character box
+    /// alone, so the units still hold the characters the engine read while the
+    /// line holds what was put in their place: whoever draws the translation
+    /// reads the line's text here rather than rebuilding it from the units.
+    QString lineText(int index) const { return lineTexts_.value(index); }
+
     /// The unit whose box contains `(x, y)`, or -1 when none does.
     int indexAt(int x, int y) const;
 

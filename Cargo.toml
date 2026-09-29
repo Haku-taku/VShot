@@ -36,6 +36,13 @@ serde_json = "1.0.151"
 # The recording loop stops cleanly on SIGINT/SIGTERM: the flag registration
 # is what makes a signal set an `AtomicBool` without an unsafe handler.
 signal-hook = "0.4.4"
+# Translation, for `vshot translate` and the overlay's translate mode. `ureq`
+# is a blocking HTTP client with no async runtime behind it, which is what a
+# command that runs once and exits wants; `json` gives it serde integration.
+ureq = { version = "3.4.2", features = ["json"] }
+# Baidu's API signs its request with an MD5 digest of appid + text + salt +
+# secret; RustCrypto's `md-5` is the digest, and it is not in the tree yet.
+md-5 = "0.10.6"
 # `dlopen` for libva, and the open/close of the DRM render node.  libc is
 # already in the tree through other dependencies; naming it makes it a direct
 # dependency of the one module that drops to the C ABI.

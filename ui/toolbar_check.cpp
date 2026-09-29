@@ -21,11 +21,24 @@
 #include "capture_overlay.hpp"
 
 #include <QApplication>
+#include <QBoxLayout>
+#include <QFontMetrics>
+#include <QFrame>
+#include <QGridLayout>
+#include <QLayout>
 #include <QPoint>
+#include <QPushButton>
+#include <QRect>
 #include <QScreen>
+#include <QSize>
 #include <QString>
+#include <QStyle>
+#include <QStyleOptionButton>
+#include <QToolButton>
 #include <QWidget>
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
@@ -47,21 +60,27 @@ void expect(bool condition, const char *what, const QString &detail = QString())
     }
 }
 
-// A one-output region session with a fixed 400x400 output and an already-made
+// A one-output region session with a fixed output and an already-made
 // selection, so the controller opens in editing state with the toolbar up.
-vshot::Session sessionFor(const vshot::LogicalRect &selection)
+//
+// The output is 400x400 by default, which is small enough that the toolbar is
+// clamped against its edge -- that is what the placement checks want.  A check
+// that measures the toolbar's own width asks for a display-sized one instead.
+vshot::Session sessionFor(const vshot::LogicalRect &selection,
+                          const QSize &screen = QSize(400, 400))
 {
     vshot::Session session;
     session.mode = QStringLiteral("region");
-    session.bounds = vshot::LogicalRect{0, 0, 400, 400};
+    session.bounds = vshot::LogicalRect{0, 0, static_cast<std::uint32_t>(screen.width()),
+                                        static_cast<std::uint32_t>(screen.height())};
     vshot::OutputSession output;
     output.id = 1;
     output.name = QStringLiteral("CHECK-1");
-    output.geometry = vshot::LogicalRect{0, 0, 400, 400};
+    output.geometry = session.bounds;
     output.surface = output.geometry;
     output.scale = 1;
-    output.pixelWidth = 400;
-    output.pixelHeight = 400;
+    output.pixelWidth = screen.width();
+    output.pixelHeight = screen.height();
     session.outputs.push_back(output);
     session.selection = selection;
     return session;
@@ -78,6 +97,45 @@ ToolbarParts toolbarParts(vshot::CaptureOverlay *overlay)
     parts.command = overlay->findChild<QWidget *>(QStringLiteral("toolbarCommandSurface"));
     parts.style = overlay->findChild<QWidget *>(QStringLiteral("toolbarStyleRow"));
     return parts;
+}
+
+// The card's own layout: the two rows of buttons in a column on the left, a
+// stretch, the divider, and the grid of the four ends pinned to the right.
+QBoxLayout *cardLayout(QWidget *command)
+{
+    return command != nullptr ? qobject_cast<QBoxLayout *>(command->layout()) : nullptr;
+}
+
+// One of the two rows of that column: 0 is the drawing tools, 1 is everything
+// that acts on the capture.
+QLayout *commandRow(QWidget *command, int index)
+{
+    QBoxLayout *card = cardLayout(command);
+    if (card == nullptr || card->count() < 1) {
+        return nullptr;
+    }
+    QLayout *column = card->itemAt(0)->layout();
+    if (column == nullptr || column->count() <= index) {
+        return nullptr;
+    }
+    return column->itemAt(index)->layout();
+}
+
+// The grid the four ends live in, which is the last thing in the card.
+QGridLayout *endsGrid(QWidget *command)
+{
+    QBoxLayout *card = cardLayout(command);
+    if (card == nullptr || card->count() < 1) {
+        return nullptr;
+    }
+    return qobject_cast<QGridLayout *>(card->itemAt(card->count() - 1)->layout());
+}
+
+// Where a widget sits inside the card, as the card's own margins measure it.
+QRect inCard(QWidget *command, QWidget *widget)
+{
+    const QPoint at = widget->mapTo(command, QPoint(0, 0));
+    return QRect(at, widget->size());
 }
 
 int globalTop(const QWidget *widget)
@@ -130,6 +188,12 @@ void checkCrampedCaptureKeepsTheButtonsStill()
 
 // Room above the selection: the whole panel stays above it and the style row
 // grows further up, away from the selection.
+//
+// The command bar stands two rows tall, so the room the panel needs above a
+// selection is about the panel's own height.  The selection is placed far
+// enough down this 400 px output for that room to exist, and close enough to
+// its bottom that the panel still cannot fit below instead -- a panel that
+// dropped would otherwise pass this check without keeping any side at all.
 void checkPanelAboveKeepsTheStyleRowAbove()
 {
     QScreen *screen = QGuiApplication::primaryScreen();
@@ -137,7 +201,7 @@ void checkPanelAboveKeepsTheStyleRowAbove()
         expect(false, "a screen to hang an overlay off");
         return;
     }
-    vshot::OverlayController controller(sessionFor(vshot::LogicalRect{150, 150, 100, 100}));
+    vshot::OverlayController controller(sessionFor(vshot::LogicalRect{150, 200, 100, 100}));
     QString error;
     vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
     if (overlay == nullptr) {
@@ -152,9 +216,9 @@ void checkPanelAboveKeepsTheStyleRowAbove()
         return;
     }
     const int before = globalTop(parts.command);
-    expect(before + parts.command->height() <= 150,
+    expect(before + parts.command->height() <= 200,
            "the command bar sits above the selection",
-           QStringLiteral("bar bottom %1, selection top 150")
+           QStringLiteral("bar bottom %1, selection top 200")
                .arg(before + parts.command->height()));
 
     controller.chooseTool(vshot::Tool::Rectangle);
@@ -202,6 +266,452 @@ void checkPanelBelowKeepsTheStyleRowBelow()
            "the style row grows below the command bar, away from the selection");
 }
 
+// The command bar is two rows: the drawing tools, then everything that acts on
+// the capture, steps it back or ends it.  One row of all of them came to about a
+// thousand logical pixels -- most of a 1080p output, and wider than the panels
+// it has to sit beside -- and a bar that long can only be clamped against the
+// screen edge, where it reads as a band across the capture rather than a panel
+// on it.  So the split is the fix, and what it has to keep is this: the tools in
+// the first row, the actions in the second, and the bar as wide as its wider row
+// rather than as wide as both.
+void checkCommandBarIsTwoRows()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(sessionFor(vshot::LogicalRect{100, 100, 120, 120}));
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    controller.beginPresetEdit();
+    const ToolbarParts parts = toolbarParts(overlay);
+    if (parts.command == nullptr) {
+        expect(false, "the toolbar has a command bar");
+        return;
+    }
+    QBoxLayout *card = cardLayout(parts.command);
+    QLayout *column = card != nullptr && card->count() > 0 ? card->itemAt(0)->layout() : nullptr;
+    expect(column != nullptr && column->count() == 2, "the command bar is two rows",
+           QStringLiteral("%1 of them").arg(column != nullptr ? column->count() : -1));
+    if (column == nullptr || column->count() != 2) {
+        return;
+    }
+    QLayout *tools = commandRow(parts.command, 0);
+    QLayout *actions = commandRow(parts.command, 1);
+    if (tools == nullptr || actions == nullptr) {
+        expect(false, "both rows are laid out as rows");
+        return;
+    }
+    int inToolsRow = 0;
+    for (QToolButton *button : parts.command->findChildren<QToolButton *>()) {
+        if (tools->indexOf(button) >= 0) {
+            ++inToolsRow;
+        }
+    }
+    expect(inToolsRow == 11, "the drawing tools keep its first row to themselves",
+           QStringLiteral("%1 of them in it").arg(inToolsRow));
+    auto *paste = parts.command->findChild<QToolButton *>(QStringLiteral("pasteButton"));
+    expect(paste != nullptr && actions->indexOf(paste) >= 0,
+           "the actions that act on the capture take the second");
+    // The two rows are one column, so the card is as wide as the wider of them
+    // plus the ends -- not as wide as both rows laid end to end, which is what
+    // one row of all of them would have been.
+    const int bothRows = tools->sizeHint().width() + actions->sizeHint().width();
+    expect(parts.command->sizeHint().width() < bothRows,
+           "and is no wider than its widest row",
+           QStringLiteral("bar %1, both rows %2")
+               .arg(parts.command->sizeHint().width())
+               .arg(bothRows));
+    expect(column->sizeHint().width() == std::max(tools->sizeHint().width(),
+                                                  actions->sizeHint().width()),
+           "the column is as wide as its wider row",
+           QStringLiteral("column %1, rows %2 and %3")
+               .arg(column->sizeHint().width())
+               .arg(tools->sizeHint().width())
+               .arg(actions->sizeHint().width()));
+}
+
+// The four ends -- undo, redo, OK, Cancel -- are pinned to the right-hand edge
+// of the card, two rows of two: the history pair on the first row, the two ends
+// of the capture on the second, Cancel in the corner.
+//
+// They used to sit at the end of the second row, which put the two buttons the
+// user reaches for most at the far end of the longest row, dragged them along
+// whenever the style row changed the panel's width, and left the corner of the
+// card empty.  Where they sit now is geometry rather than intent, so it is the
+// geometry that is asserted.
+void checkTheEndsArePinnedToTheRight()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    // A display-sized output: this check is about the card's own width, and on a
+    // small one the panel is clamped and the card never reaches it.
+    vshot::OverlayController controller(
+        sessionFor(vshot::LogicalRect{200, 300, 800, 500}, QSize(1920, 1080)));
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    controller.beginPresetEdit();
+    overlay->show();
+    // The tool the user's config remembers can open the session with a style row
+    // up, which widens the card; this check measures what Select's card comes to
+    // and then what the widest style row does to it, so pin Select first.
+    controller.chooseTool(vshot::Tool::Select);
+    const ToolbarParts parts = toolbarParts(overlay);
+    QGridLayout *grid = endsGrid(parts.command);
+    expect(grid != nullptr && grid->count() == 4, "the four ends are one grid",
+           QStringLiteral("%1 of them").arg(grid != nullptr ? grid->count() : -1));
+    if (parts.command == nullptr || grid == nullptr || grid->count() != 4) {
+        return;
+    }
+    auto *divider = parts.command->findChild<QFrame *>(QStringLiteral("toolbarDivider"));
+    auto *undo = parts.command->findChild<QToolButton *>(QStringLiteral("undoButton"));
+    auto *redo = parts.command->findChild<QToolButton *>(QStringLiteral("redoButton"));
+    auto *confirm = parts.command->findChild<QPushButton *>(QStringLiteral("confirmButton"));
+    auto *cancel = parts.command->findChild<QPushButton *>(QStringLiteral("cancelButton"));
+    if (undo == nullptr || redo == nullptr || confirm == nullptr || cancel == nullptr) {
+        expect(false, "the four ends are on the command bar");
+        return;
+    }
+    const auto cellOf = [grid](QWidget *widget, int *row, int *column) {
+        const int index = grid->indexOf(widget);
+        if (index < 0) {
+            return false;
+        }
+        int rowSpan = 0;
+        int columnSpan = 0;
+        grid->getItemPosition(index, row, column, &rowSpan, &columnSpan);
+        return true;
+    };
+    int row = -1;
+    int column = -1;
+    const bool placed = cellOf(undo, &row, &column);
+    expect(placed && row == 0 && column == 0, "undo opens the grid",
+           QStringLiteral("at %1,%2").arg(row).arg(column));
+    expect(cellOf(redo, &row, &column) && row == 0 && column == 1,
+           "with redo beside it", QStringLiteral("at %1,%2").arg(row).arg(column));
+    expect(cellOf(confirm, &row, &column) && row == 1 && column == 0,
+           "OK opens the row under them", QStringLiteral("at %1,%2").arg(row).arg(column));
+    expect(cellOf(cancel, &row, &column) && row == 1 && column == 1,
+           "and Cancel sits in the corner", QStringLiteral("at %1,%2").arg(row).arg(column));
+
+    // Pinned right: the block's right edge is the card's own right margin, and
+    // everything else on the card is to its left.
+    const QRect cancelRect = inCard(parts.command, cancel);
+    expect(parts.command->width() - cancelRect.right() - 1 == 2,
+           "the ends are against the card's right-hand edge",
+           QStringLiteral("card %1 wide, Cancel ends at %2")
+               .arg(parts.command->width())
+               .arg(cancelRect.right()));
+    const QRect undoRect = inCard(parts.command, undo);
+    const QRect redoRect = inCard(parts.command, redo);
+    const QRect confirmRect = inCard(parts.command, confirm);
+    expect(redoRect.y() == undoRect.y() && redoRect.x() > undoRect.x(),
+           "redo is directly right of undo",
+           QStringLiteral("undo at %1,%2, redo at %3,%4")
+               .arg(undoRect.x())
+               .arg(undoRect.y())
+               .arg(redoRect.x())
+               .arg(redoRect.y()));
+    expect(confirmRect.y() > undoRect.y() && confirmRect.center().x() == undoRect.center().x(),
+           "OK is centred under undo",
+           QStringLiteral("undo centred on %1, OK on %2")
+               .arg(undoRect.center().x())
+               .arg(confirmRect.center().x()));
+    const QRect cancelRectInBlock = inCard(parts.command, cancel);
+    expect(cancelRectInBlock.center().x() == redoRect.center().x(),
+           "Cancel is centred under redo",
+           QStringLiteral("redo centred on %1, Cancel on %2")
+               .arg(redoRect.center().x())
+               .arg(cancelRectInBlock.center().x()));
+
+    // The history pair is a tool button: as tall as the tools, the same label
+    // under the same icon, the same hover and press painting.  Its width is the
+    // ends' rather than the tools', because the two columns of the block are what
+    // the two ends below it need.
+    QWidget *firstTool = nullptr;
+    QLayout *toolsRow = commandRow(parts.command, 0);
+    for (int i = 0; toolsRow != nullptr && i < toolsRow->count() && firstTool == nullptr; ++i) {
+        firstTool = toolsRow->itemAt(i)->widget();
+    }
+    auto *paste = parts.command->findChild<QToolButton *>(QStringLiteral("pasteButton"));
+    if (firstTool == nullptr || paste == nullptr) {
+        expect(false, "the two rows of buttons are there to measure against");
+        return;
+    }
+    const QRect toolRect = inCard(parts.command, firstTool);
+    const QRect pasteRect = inCard(parts.command, paste);
+    expect(undoRect.height() == toolRect.height() && redoRect.height() == toolRect.height() &&
+               undoRect.width() == redoRect.width(),
+           "the history pair is as tall as the tools on the left",
+           QStringLiteral("%1x%2 against the tools' %3x%4")
+               .arg(undoRect.width())
+               .arg(undoRect.height())
+               .arg(toolRect.width())
+               .arg(toolRect.height()));
+    expect(undo->property("toolButton").toBool() &&
+               undo->toolButtonStyle() == Qt::ToolButtonTextUnderIcon &&
+               !undo->text().isEmpty(),
+           "and is drawn like them, label and all", undo->text());
+
+    // The two ends of the capture are a size of their own, and it is not the
+    // height of the rows: a text button stretched to the row's own 41 px is a
+    // slab with a small word in it, which is what the corner looked like before.
+    expect(confirmRect.size() == cancelRectInBlock.size() &&
+               confirmRect.width() == undoRect.width(),
+           "the two ends of the capture are one size, and the width of the block",
+           QStringLiteral("%1x%2 and %3x%4")
+               .arg(confirmRect.width())
+               .arg(confirmRect.height())
+               .arg(cancelRectInBlock.width())
+               .arg(cancelRectInBlock.height()));
+    expect(confirmRect.height() < toolRect.height(),
+           "and shorter than the rows beside them",
+           QStringLiteral("%1 against a %2-tall row").arg(confirmRect.height()).arg(toolRect.height()));
+    // The block is as wide as the wider of the two ends' own hints, which is
+    // what the style sizes to their label plus the padding the corner is drawn
+    // at.  Summing the label and a padding here instead is the same arithmetic
+    // a second time, and the copy is the one that goes stale: it did, at the
+    // style's generic ten pixels rather than the corner's seven, and in English
+    // "Cancel" came out wider than its own button, which cut the first and last
+    // letters off.  The hint cannot drift from the box it describes.
+    const int widestHint = std::max(confirm->sizeHint().width(), cancel->sizeHint().width());
+    expect(confirmRect.width() == widestHint,
+           "the block is as wide as the wider of the two ends' own hints",
+           QStringLiteral("block %1, widest hint %2").arg(confirmRect.width()).arg(widestHint));
+    // And that is the point of measuring it there: the label of each fits inside
+    // the box it is drawn in, in either language.  The room the style leaves for
+    // the text is the one `SE_PushButtonContents` reports, padding and border
+    // already taken out.
+    const auto labelSlack = [](QPushButton *button) {
+        QStyleOptionButton option;
+        option.initFrom(button);
+        option.text = button->text();
+        const QRect label =
+            button->style()->subElementRect(QStyle::SE_PushButtonContents, &option, button);
+        return label.width() - QFontMetrics(button->font()).horizontalAdvance(button->text());
+    };
+    const int okSlack = labelSlack(confirm);
+    const int cancelSlack = labelSlack(cancel);
+    expect(okSlack >= 0 && cancelSlack >= 0,
+           "and the label of each fits inside the box it is drawn in",
+           QStringLiteral("OK has %1 px to spare, Cancel %2").arg(okSlack).arg(cancelSlack));
+    // And the two buttons of a row stand apart by the same gap in both rows: the
+    // ends of the capture at the style's own 2 px read as one box with a line
+    // down it.
+    const int endsGap = cancelRectInBlock.left() - confirmRect.right() - 1;
+    const int historyGap = redoRect.left() - undoRect.left() - undoRect.width();
+    expect(endsGap == historyGap && endsGap >= 4,
+           "the two buttons of a row are the same distance apart in both rows",
+           QStringLiteral("%1 between the ends, %2 between the history pair")
+               .arg(endsGap)
+               .arg(historyGap));
+    expect(std::abs(undoRect.center().y() - toolRect.center().y()) <= 1 &&
+               std::abs(confirmRect.center().y() - pasteRect.center().y()) <= 1,
+           "each centred on the row it belongs to",
+           QStringLiteral("undo %1 against %2, OK %3 against %4")
+               .arg(undoRect.center().y())
+               .arg(toolRect.center().y())
+               .arg(confirmRect.center().y())
+               .arg(pasteRect.center().y()));
+
+    // The room in front of the block is the room the panel leaves behind it: a
+    // block pressed up against the divider reads as though the line were cutting
+    // into it, and the corner has the same breathing space on both sides.
+    QWidget *panel = parts.command->parentWidget();
+    const auto inPanel = [panel](QWidget *widget) {
+        return QRect(widget->mapTo(panel, QPoint(0, 0)), widget->size());
+    };
+    const int before = inPanel(undo).left() - inPanel(divider).right() - 1;
+    const int after = panel->width() - 1 - inPanel(cancel).right();
+    expect(std::abs(before - after) <= 1,
+           "the gap in front of the ends is the one the panel leaves behind them",
+           QStringLiteral("%1 before, %2 after").arg(before).arg(after));
+    int rightOfRows = 0;
+    for (QLayout *row_ : {commandRow(parts.command, 0), commandRow(parts.command, 1)}) {
+        for (int i = 0; row_ != nullptr && i < row_->count(); ++i) {
+            QWidget *button = row_->itemAt(i)->widget();
+            if (button != nullptr) {
+                rightOfRows = std::max(rightOfRows, inCard(parts.command, button).right());
+            }
+        }
+    }
+    expect(rightOfRows < undoRect.left(),
+           "and the two rows of buttons are to their left",
+           QStringLiteral("rows end at %1, the ends start at %2")
+               .arg(rightOfRows)
+               .arg(undoRect.left()));
+
+    // The divider stands between the two, one line for the height of both rows.
+    if (divider == nullptr) {
+        expect(false, "the card has a divider");
+        return;
+    }
+    const QRect dividerRect = inCard(parts.command, divider);
+    expect(dividerRect.left() > rightOfRows && dividerRect.right() < undoRect.left(),
+           "the divider stands between the rows and the ends",
+           QStringLiteral("rows end at %1, divider at %2..%3, ends start at %4")
+               .arg(rightOfRows)
+               .arg(dividerRect.left())
+               .arg(dividerRect.right())
+               .arg(undoRect.left()));
+    expect(dividerRect.height() > dividerRect.width() * 10,
+           "and is one line rather than one per row",
+           QStringLiteral("%1x%2").arg(dividerRect.width()).arg(dividerRect.height()));
+
+    // The same with a style row up.  In a language whose tool labels are short
+    // the command bar is narrower than the style row, so raising it widens the
+    // card past its own two rows; in a longer one the command bar already sets
+    // the card's width and the style row brings nothing.  Either way the same
+    // property has to hold: whatever the card gains goes to the stretch in front
+    // of the divider, so the ends stay in the corner, the rows stay where they
+    // were, and the ends move right by exactly what the card grew by.
+    const int narrowCardWidth = parts.command->width();
+    controller.chooseTool(vshot::Tool::Rectangle);
+    const QRect wideCancel = inCard(parts.command, cancel);
+    expect(parts.command->width() - wideCancel.right() - 1 == 2,
+           "the ends stay in the corner when the style row raises the card",
+           QStringLiteral("card %1 wide, Cancel ends at %2")
+               .arg(parts.command->width())
+               .arg(wideCancel.right()));
+    expect(inCard(parts.command, undo).left() > rightOfRows,
+           "with the two rows still to their left",
+           QStringLiteral("rows end at %1, the ends start at %2")
+               .arg(rightOfRows)
+               .arg(inCard(parts.command, undo).left()));
+    const int grew = parts.command->width() - narrowCardWidth;
+    expect(wideCancel.left() - cancelRect.left() == grew,
+           "and the widening went to the gap rather than to the rows",
+           QStringLiteral("Cancel at %1 then %2, card %3 then %4")
+               .arg(cancelRect.left())
+               .arg(wideCancel.left())
+               .arg(narrowCardWidth)
+               .arg(parts.command->width()));
+}
+
+// Every button on the command bar is one size, and that size is one the label
+// of the button actually fits in.
+//
+// The size is read from the style -- the widest label the row has to draw --
+// rather than picked by hand, so the promise worth locking down is not a number:
+// it is that the eleven tools share one box, that the actions which follow them
+// are as tall as that box, that the history pair and the two ends of the capture
+// are too, and that no button is narrower or shorter than its own size hint.
+// Undo and redo were 32x28 in a 46-tall row, which is what a floating box in the
+// middle of a row of buttons looks like; a hand-picked 48x46 for the tools is
+// what put about a fifth of slack into the row's width for nothing.
+void checkCommandBarButtonsShareOneSize()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(sessionFor(vshot::LogicalRect{100, 100, 120, 120}));
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    controller.beginPresetEdit();
+    overlay->show();
+    auto *surface = overlay->findChild<QWidget *>(QStringLiteral("toolbarCommandSurface"));
+    if (surface == nullptr) {
+        expect(false, "the toolbar has a command surface");
+        return;
+    }
+    QLayout *tools = commandRow(surface, 0);
+    if (tools == nullptr) {
+        expect(false, "the command bar is two rows to measure");
+        return;
+    }
+    // The heights are the ones the buttons were built at rather than the ones the
+    // layout would hand them: each button is fixed to the row's height, so a
+    // shorter one cannot be evened out by the layout later.
+    //
+    // The two rows are what this measures.  The four ends pinned to their right
+    // are a block of their own and a button's height rather than the row's --
+    // see `checkTheEndsArePinnedToTheRight`.
+    QVector<QAbstractButton *> buttons;
+    for (int row = 0; row < 2; ++row) {
+        QLayout *layout = commandRow(surface, row);
+        for (int i = 0; layout != nullptr && i < layout->count(); ++i) {
+            if (auto *button = qobject_cast<QAbstractButton *>(layout->itemAt(i)->widget())) {
+                buttons.append(button);
+            }
+        }
+    }
+    expect(buttons.size() >= 14, "the two rows carry the tools and the actions",
+           QStringLiteral("%1 of them").arg(buttons.size()));
+    if (buttons.isEmpty()) {
+        return;
+    }
+    int heightMismatches = 0;
+    int squeezed = 0;
+    QString worst;
+    for (QAbstractButton *button : buttons) {
+        if (button->height() != buttons.first()->height()) {
+            ++heightMismatches;
+            worst = QStringLiteral("%1 is %2 tall in a %3-tall bar")
+                        .arg(button->objectName().isEmpty() ? button->text()
+                                                            : button->objectName())
+                        .arg(button->height())
+                        .arg(buttons.first()->height());
+        }
+        if (button->sizeHint().width() > button->width() ||
+            button->sizeHint().height() > button->height()) {
+            ++squeezed;
+        }
+    }
+    expect(heightMismatches == 0, "every button on the bar is the height of the bar", worst);
+    expect(squeezed == 0, "no button is smaller than its own size hint",
+           QStringLiteral("%1 of %2").arg(squeezed).arg(buttons.size()));
+
+    // The tools are one column: the widest of their labels sets the width of all
+    // eleven, so the row reads across rather than stepping.  And the width it
+    // comes to is exactly the widest hint -- not more: a size measured before
+    // the buttons were polished is measured in the application's font, which
+    // leaves the row wider than any label in it needs.
+    int uniform = 0;
+    int widest = 0;
+    QString toolDetail;
+    QSize toolSize;
+    for (QAbstractButton *button : surface->findChildren<QToolButton *>()) {
+        if (tools->indexOf(button) < 0) {
+            continue;
+        }
+        widest = std::max(widest, button->sizeHint().width());
+        if (toolSize.isEmpty()) {
+            toolSize = button->size();
+            continue;
+        }
+        if (button->size() != toolSize) {
+            ++uniform;
+            toolDetail = QStringLiteral("%1x%2 next to %3x%4")
+                             .arg(button->width())
+                             .arg(button->height())
+                             .arg(toolSize.width())
+                             .arg(toolSize.height());
+        }
+    }
+    expect(uniform == 0, "the drawing tools are all one size", toolDetail);
+    expect(!toolSize.isEmpty() && toolSize.width() == widest,
+           "and exactly as wide as the widest label in the row",
+           QStringLiteral("%1 against a %2-wide label").arg(toolSize.width()).arg(widest));
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -211,6 +721,9 @@ int main(int argc, char *argv[])
     checkCrampedCaptureKeepsTheButtonsStill();
     checkPanelAboveKeepsTheStyleRowAbove();
     checkPanelBelowKeepsTheStyleRowBelow();
+    checkCommandBarIsTwoRows();
+    checkCommandBarButtonsShareOneSize();
+    checkTheEndsArePinnedToTheRight();
 
     if (failures != 0) {
         std::printf("\n%d toolbar checks failed\n", failures);

@@ -21,6 +21,7 @@
 #include <QFontDatabase>
 #include <QFontMetrics>
 #include <QFrame>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QHash>
 #include <QIcon>
@@ -768,6 +769,11 @@ bool annotationLogicalBounds(const Annotation &annotation, LogicalRect *bounds)
                               static_cast<std::uint32_t>(metrics.height())};
         return true;
     }
+    case Annotation::Kind::Translation:
+        // The line boxes the translation replaces are its whole extent; the
+        // union of the fills is what was stored as `rect`.
+        *bounds = annotation.rect;
+        return !bounds->isEmpty();
     case Annotation::Kind::Stroke:
         break;
     }
@@ -989,6 +995,31 @@ QIcon recognizeTextIcon(const QColor &color = QColor(230, 225, 229),
                                    QPointF(right - arm, bottom)});
     painter.drawLine(QPointF(8.5, 10.5), QPointF(15.5, 10.5));
     painter.drawLine(QPointF(8.5, 14.0), QPointF(13.0, 14.0));
+    return QIcon(pixmap);
+}
+
+// The translation action's icon: a Latin "A" and an arrow into whatever script
+// it becomes.  Drawn from strokes rather than glyphs so the picture is the same
+// on a font-less machine, and kept apart from the recognition brackets.
+QIcon translateIcon(const QColor &color = QColor(230, 225, 229),
+                    qreal devicePixelRatio = 1.0)
+{
+    const qreal ratio = std::max(1.0, devicePixelRatio);
+    QPixmap pixmap(qRound(24 * ratio), qRound(24 * ratio));
+    pixmap.setDevicePixelRatio(ratio);
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(QPen(color, 1.8, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    painter.setBrush(Qt::NoBrush);
+    // The "A": two legs and a crossbar.
+    painter.drawLine(QPointF(2.5, 19.0), QPointF(6.5, 6.0));
+    painter.drawLine(QPointF(6.5, 6.0), QPointF(10.5, 19.0));
+    painter.drawLine(QPointF(4.2, 14.0), QPointF(8.8, 14.0));
+    // The arrow into the translated text.
+    painter.drawLine(QPointF(13.0, 12.5), QPointF(21.0, 12.5));
+    painter.drawPolyline(QPolygonF{QPointF(17.5, 8.5), QPointF(21.5, 12.5),
+                                   QPointF(17.5, 16.5)});
     return QIcon(pixmap);
 }
 
@@ -2548,7 +2579,17 @@ public:
             "QAbstractSpinBox::up-button, QAbstractSpinBox::down-button { "
             "width: 14px; border: 0; background: transparent; } "
             "QAbstractSpinBox::up-button:hover, QAbstractSpinBox::down-button:hover { "
-            "background: #3a414b; border-radius: 4px; }"));
+            "background: #3a414b; border-radius: 4px; } ")
+            // The two ends of the capture are the only buttons on the card whose
+            // width is fixed rather than asked for, so their padding is the one
+            // thing that can leave a label wider than its own box: "Cancel" at
+            // the generic ten pixels either side wants more than the block is
+            // given, and its last letters are cut off.  The block's width is
+            // measured from these two hints below, so the padding here and the
+            // size the corner is drawn at cannot drift apart.
+            + QStringLiteral("QPushButton#confirmButton, QPushButton#cancelButton "
+                             "{ padding: 0 %1px; }")
+                  .arg(kEndsPadding));
 
         auto *rootLayout = new QVBoxLayout(this);
         rootLayout->setContentsMargins(6, 5, 6, 6);
@@ -2558,29 +2599,67 @@ public:
         toolSurface->setObjectName(QStringLiteral("toolbarCommandSurface"));
         toolSurface->setCursor(Qt::ArrowCursor);
         commandSurface_ = toolSurface;
-        auto *toolLayout = new QHBoxLayout(toolSurface);
-        toolLayout->setContentsMargins(2, 2, 2, 2);
-        toolLayout->setSpacing(2);
-        addTool(toolLayout, uiTr("Select"), Tool::Select);
-        addTool(toolLayout, uiTr("Rect"), Tool::Rectangle);
-        addTool(toolLayout, uiTr("Ellipse"), Tool::Ellipse);
-        addTool(toolLayout, uiTr("Arrow"), Tool::Arrow);
-        addTool(toolLayout, uiTr("Line"), Tool::Line);
-        addTool(toolLayout, uiTr("Wave"), Tool::Wave);
-        addTool(toolLayout, uiTr("Bezier"), Tool::Bezier);
-        addTool(toolLayout, uiTr("Draw"), Tool::Pen);
-        addTool(toolLayout, uiTr("Text"), Tool::Text);
-        addTool(toolLayout, uiTr("Number"), Tool::Number);
-        addTool(toolLayout, uiTr("Mosaic"), Tool::Mosaic);
-        // The two one-shot actions sit at the end of the tool row, drawn the
-        // same way: they are the same kind of thing to click, and a second row
-        // of text buttons beside them only made the bar taller.  They are not
-        // modes -- nothing stays selected -- so they are kept out of
+        // The command surface is two rows of buttons with the four that end or
+        // step back the capture pinned to its right-hand edge, one row each:
+        // undo over redo, OK over Cancel.
+        //
+        // It was one row until the tools filled it: eleven drawing tools, four
+        // one-shot actions, the history pair and the two ends of the capture came
+        // to about a thousand logical pixels, which is most of a 1080p output and
+        // wider than the panels it has to sit beside -- a bar that long can only
+        // be clamped against the screen edge, and there it reads as a band across
+        // the capture rather than a panel on it.  So the tools took the first row
+        // and everything that acts on the picture took the second.
+        //
+        // The ends then had to be somewhere, and the second row was the wrong
+        // place for them twice over: it made that row the height of whatever it
+        // held while leaving a stretch of empty card beside the buttons, and the
+        // buttons themselves were the four the eye goes to last, at the far end
+        // of the longest row.  Pinned to the right they are always in the same
+        // place -- the corner of the card, which is where a confirm and a cancel
+        // are looked for -- and the two rows to their left are one column whose
+        // width no longer depends on how long the tool row happens to be.
+        auto *cardLayout = new QHBoxLayout(toolSurface);
+        cardLayout->setContentsMargins(2, 2, 2, 2);
+        cardLayout->setSpacing(2);
+        auto *commandColumn = new QVBoxLayout();
+        commandColumn->setSpacing(2);
+        auto *toolRow = new QHBoxLayout();
+        toolRow->setSpacing(2);
+        auto *actionRow = new QHBoxLayout();
+        actionRow->setSpacing(2);
+        commandColumn->addLayout(toolRow);
+        commandColumn->addLayout(actionRow);
+        cardLayout->addLayout(commandColumn);
+        addTool(toolRow, uiTr("Select"), Tool::Select);
+        addTool(toolRow, uiTr("Rect"), Tool::Rectangle);
+        addTool(toolRow, uiTr("Ellipse"), Tool::Ellipse);
+        addTool(toolRow, uiTr("Arrow"), Tool::Arrow);
+        addTool(toolRow, uiTr("Line"), Tool::Line);
+        addTool(toolRow, uiTr("Wave"), Tool::Wave);
+        addTool(toolRow, uiTr("Bezier"), Tool::Bezier);
+        addTool(toolRow, uiTr("Draw"), Tool::Pen);
+        addTool(toolRow, uiTr("Text"), Tool::Text);
+        addTool(toolRow, uiTr("Number"), Tool::Number);
+        addTool(toolRow, uiTr("Mosaic"), Tool::Mosaic);
+        // The eleven are in, so their one size can be measured from their own
+        // labels; the row of actions below is built at it, which is why this
+        // stands between the two rows rather than at the end of both.
+        sizeToolButtons();
+        // Both rows are packed to the left rather than spread across the panel:
+        // a row with room to spare would otherwise space its own buttons evenly
+        // apart, which slides them out from under the pointer as the style row
+        // above or below changes the panel's width.  The button positions are
+        // what the user aims at, so they stay put.
+        toolRow->addStretch(1);
+        // The one-shot actions open the second row, drawn the same way as the
+        // tools they follow: they are the same kind of thing to click, and they
+        // are not modes -- nothing stays selected -- so they are kept out of
         // `toolButtons_`, which is what the active-state pass walks.
         //
         // Paste takes an image off disk through the file dialog; Ctrl+V takes
         // whatever is on the clipboard.  Both land in the same paste.
-        auto *paste = addToolAction(toolLayout, uiTr("Image"), pasteIcon(QColor(230, 225, 229),
+        auto *paste = addToolAction(actionRow, uiTr("Image"), pasteIcon(QColor(230, 225, 229),
                                                                        devicePixelRatioF()),
                                     uiTr("Paste an image onto the capture (Ctrl+V for the "
                                          "clipboard)"),
@@ -2597,7 +2676,7 @@ public:
         // range is copied.  The mode lives in the controller -- the toolbar has
         // no selection to work on -- so the button only asks for it, and the
         // controller reports the result back through the callback below.
-        auto *text = addToolAction(toolLayout, uiTr("Text+"),
+        auto *text = addToolAction(actionRow, uiTr("Text+"),
                                    recognizeTextIcon(QColor(230, 225, 229), devicePixelRatioF()),
                                    uiTr("Select the text in the selection and copy what you "
                                         "select"),
@@ -2643,6 +2722,45 @@ public:
                 textButton_->setText(uiTr("Text+"));
             });
         });
+        // Screenshot translation: the same selection the text button reads is
+        // recognized and then translated, and the translation is drawn over the
+        // text it replaces.  It is a one-shot action like `Text+`, so it is not
+        // a mode and stays out of `toolButtons_`; the controller reports its
+        // two-subprocess wait and its outcome through the callback below.
+        auto *translate = addToolAction(
+            actionRow, uiTr("Translate"),
+            translateIcon(QColor(230, 225, 229), devicePixelRatioF()),
+            uiTr("Translate the text in the selection and draw it in place"),
+            QStringLiteral("translateButton"),
+            {uiTr("Translating…"), uiTr("Failed")});
+        translateButton_ = translate;
+        connect(translate, &QToolButton::clicked, [controller = controller_] {
+            controller->translateSelection(nullptr);
+        });
+        controller_->setTranslateResultCallback([this](TextOutcome outcome, const QString &) {
+            if (translateButton_ == nullptr) {
+                return;
+            }
+            switch (outcome) {
+            case TextOutcome::Busy:
+                translateButton_->setText(uiTr("Translating…"));
+                return;
+            case TextOutcome::Idle:
+                translateButton_->setText(uiTr("Translate"));
+                return;
+            case TextOutcome::Copied:
+                break;
+            case TextOutcome::Failed:
+                translateButton_->setText(uiTr("Failed"));
+                break;
+            }
+            QTimer::singleShot(1200, translateButton_, [this] {
+                if (controller_->isFinished() || controller_->isCancelled()) {
+                    return;
+                }
+                translateButton_->setText(uiTr("Translate"));
+            });
+        });
         // Scrolling capture: the region the user drew is scrolled with
         // synthetic wheels and stitched into one tall image.  It is not a mode
         // -- nothing stays selected -- and it is not the ordinary confirmation
@@ -2655,61 +2773,106 @@ public:
         // `syncState`'s to say.
         if (controller_->longAllowed_) {
             longButton_ = addToolAction(
-                toolLayout, uiTr("Scroll"),
+                actionRow, uiTr("Scroll"),
                 scrollIcon(QColor(230, 225, 229), devicePixelRatioF()),
                 uiTr("Scroll the selection and stitch it into one tall image"),
                 QStringLiteral("longButton"));
             connect(longButton_, &QToolButton::clicked,
                     [controller = controller_] { controller->requestLongCapture(); });
         }
-        // Every button in this row, the two above included, gets the frame's
-        // hover and press painting; it finds them by type, so this has to run
-        // after the last one was added.
-        for (QToolButton *button : toolSurface->findChildren<QToolButton *>()) {
-            button->installEventFilter(toolSurface);
-        }
-        toolLayout->addSpacing(5);
-        auto *historyDivider = new QFrame(toolSurface);
-        historyDivider->setObjectName(QStringLiteral("toolbarDivider"));
-        historyDivider->setFrameShape(QFrame::VLine);
-        historyDivider->setFrameShadow(QFrame::Plain);
-        historyDivider->setFixedHeight(20);
-        historyDivider->setCursor(Qt::ArrowCursor);
-        toolLayout->addWidget(historyDivider);
-        toolLayout->addSpacing(3);
-        undo_ = addActionButton(toolLayout, uiTr("Undo"));
-        undo_->setObjectName(QStringLiteral("undoButton"));
-        undo_->setText(QString());
-        undo_->setIcon(historyIcon(false, QColor(QStringLiteral("#dfe4ec"))));
-        undo_->setIconSize(QSize(18, 18));
-        undo_->setFixedSize(32, 28);
-        undo_->setToolTip(uiTr("Undo last change (Ctrl+Z)"));
-        connect(undo_, &QPushButton::clicked, [controller = controller_] { controller->undo(); });
-        redo_ = addActionButton(toolLayout, uiTr("Redo"));
-        redo_->setObjectName(QStringLiteral("redoButton"));
-        redo_->setText(QString());
-        redo_->setIcon(historyIcon(true, QColor(QStringLiteral("#dfe4ec"))));
-        redo_->setIconSize(QSize(18, 18));
-        redo_->setFixedSize(32, 28);
-        redo_->setToolTip(uiTr("Redo last change (Ctrl+Y)"));
-        connect(redo_, &QPushButton::clicked, [controller = controller_] { controller->redo(); });
-        toolLayout->addSpacing(5);
-        auto *actionDivider = new QFrame(toolSurface);
-        actionDivider->setObjectName(QStringLiteral("toolbarDivider"));
-        actionDivider->setFrameShape(QFrame::VLine);
-        actionDivider->setFrameShadow(QFrame::Plain);
-        actionDivider->setFixedHeight(20);
-        actionDivider->setCursor(Qt::ArrowCursor);
-        toolLayout->addWidget(actionDivider);
-        toolLayout->addSpacing(3);
-        auto *ok = addActionButton(toolLayout, uiTr("OK"));
+        // The slack of the card -- what the style row below is wider than the
+        // two rows are -- is taken up here, between the column and the ends, so
+        // the tools stay where the pointer left them and the ends stay in the
+        // corner however wide the panel turns out to be.
+        cardLayout->addStretch(1);
+        // One divider for the whole height of the block rather than one per row:
+        // it separates the two rows from the four ends, and there is one gap to
+        // read rather than two.  Its height is the two rows and the gap between
+        // them, which is the column's own spacing.
+        auto *endsDivider = new QFrame(toolSurface);
+        endsDivider->setObjectName(QStringLiteral("toolbarDivider"));
+        endsDivider->setFrameShape(QFrame::VLine);
+        endsDivider->setFrameShadow(QFrame::Plain);
+        endsDivider->setFixedHeight(toolButtonHeight_ * 2 + 2);
+        endsDivider->setCursor(Qt::ArrowCursor);
+        cardLayout->addWidget(endsDivider);
+        // The four ends, the history pair over the two ends of the capture:
+        // undo and redo on the first row, OK and Cancel under them.  Two rows of
+        // two, so the block is exactly as tall as the two rows beside it, and
+        // Cancel, which ends the capture either way, lands in the corner it is
+        // looked for in.
+        //
+        // The history pair is built like the tools on the left -- same box, same
+        // label under the same icon, same hover and press painting -- because it
+        // is the same kind of thing to click.  The two ends of the capture are
+        // not: one of them is the primary button and reads as one, and neither
+        // wants a label, so they stay the text buttons they are.
+        auto *endsGrid = new QGridLayout();
+        endsGrid->setContentsMargins(0, 0, 0, 0);
+        // Two rows a hair apart like the rows beside them, but the two buttons of
+        // a row further apart than that: at the style's own 2 px the two ends of
+        // the capture read as one box with a line down it.
+        endsGrid->setVerticalSpacing(2);
+        endsGrid->setHorizontalSpacing(kEndsSpacing);
+        undo_ = makeToolButton(uiTr("Undo"), historyIcon(false, QColor(QStringLiteral("#dfe4ec"))),
+                               uiTr("Undo last change (Ctrl+Z)"), QStringLiteral("undoButton"));
+        connect(undo_, &QToolButton::clicked, [controller = controller_] { controller->undo(); });
+        redo_ = makeToolButton(uiTr("Redo"), historyIcon(true, QColor(QStringLiteral("#dfe4ec"))),
+                               uiTr("Redo last change (Ctrl+Y)"), QStringLiteral("redoButton"));
+        connect(redo_, &QToolButton::clicked, [controller = controller_] { controller->redo(); });
+        auto *ok = addActionButton(uiTr("OK"));
         ok->setObjectName(QStringLiteral("confirmButton"));
         ok->setToolTip(uiTr("Confirm capture (Enter)"));
         connect(ok, &QPushButton::clicked, [controller = controller_] { controller->confirm(); });
-        auto *cancel = addActionButton(toolLayout, uiTr("Cancel"));
+        auto *cancel = addActionButton(uiTr("Cancel"));
         cancel->setObjectName(QStringLiteral("cancelButton"));
         cancel->setToolTip(uiTr("Discard capture (Esc)"));
         connect(cancel, &QPushButton::clicked, [controller = controller_] { controller->cancel(); });
+        // The width of the whole block: the wider of the two ends' own hints,
+        // which the style already sizes to its label plus the padding the rule
+        // above gives these two.  Summing the label and the padding here by
+        // hand was the same arithmetic a second time, and it is the copy that
+        // went stale -- the labels were measured in a font that had not been
+        // polished yet and the padding was the panel's generic ten rather than
+        // the seven the box is drawn at, so "Cancel" came out wider than the
+        // button it was drawn in and the ends were clipped.  The hint cannot
+        // drift from either: it is the box.  The history pair above takes the
+        // same width, so the columns of the grid are the buttons themselves
+        // rather than the buttons and a strip of slack.
+        //
+        // The two ends are not the height of the rows beside them either: a text
+        // button stretched to 41 px is a slab with a small word in it, which is
+        // what the corner looked like before.  The history pair is the tool box,
+        // so the cells are as tall as the rows and each button sits centred in
+        // its own.
+        ok->ensurePolished();
+        cancel->ensurePolished();
+        const int endsWidth = std::max(ok->sizeHint().width(), cancel->sizeHint().width());
+        const int endsHeight = std::max(ok->sizeHint().height(), cancel->sizeHint().height());
+        for (QPushButton *button : {ok, cancel}) {
+            button->setFixedSize(endsWidth, endsHeight);
+        }
+        undo_->setFixedWidth(endsWidth);
+        redo_->setFixedWidth(endsWidth);
+        endsGrid->setRowMinimumHeight(0, toolButtonHeight_);
+        endsGrid->setRowMinimumHeight(1, toolButtonHeight_);
+        endsGrid->addWidget(undo_, 0, 0, Qt::AlignCenter);
+        endsGrid->addWidget(redo_, 0, 1, Qt::AlignCenter);
+        endsGrid->addWidget(ok, 1, 0, Qt::AlignCenter);
+        endsGrid->addWidget(cancel, 1, 1, Qt::AlignCenter);
+        // And a gap in front of the block as wide as the one the panel's own
+        // margin leaves behind it: the four buttons pressed up against the
+        // divider read as though the line were cutting into them, while the
+        // corner has room to spare.
+        cardLayout->addSpacing(kEndsGap);
+        cardLayout->addLayout(endsGrid);
+        // Every button on the card gets the frame's hover and press painting; it
+        // finds them by type, so this has to run after the last one was added --
+        // the history pair among the ends included.
+        for (QToolButton *button : toolSurface->findChildren<QToolButton *>()) {
+            button->installEventFilter(toolSurface);
+        }
+        actionRow->addStretch(1);
         rootLayout->addWidget(toolSurface);
 
         styleDivider_ = new QFrame(this);
@@ -3124,6 +3287,11 @@ public:
             // region anyway.  Saying so on the button beats a failure after
             // the fact.
             longButton_->setEnabled(!textMode && controller_->canRequestLongCapture());
+        }
+        if (translateButton_ != nullptr) {
+            // Translation reads the same selection the text mode works on, so
+            // it is out of reach while that mode is up.
+            translateButton_->setEnabled(!textMode);
         }
         const Annotation *selected = nullptr;
         if (controller_->selectedAnnotation_ >= 0 &&
@@ -3746,14 +3914,17 @@ private:
         return group;
     }
 
-    QPushButton *addActionButton(QHBoxLayout *layout, const QString &label)
+    // A button that does something to the capture rather than draw on it: the
+    // two ends of it and the history pair.  Built here, placed by the caller --
+    // the four of them are one grid, and the layout they go into is that grid's
+    // business rather than this one's.
+    QPushButton *addActionButton(const QString &label)
     {
         auto *button = new QPushButton(label, this);
         button->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
         button->setCursor(Qt::PointingHandCursor);
         button->setFocusPolicy(Qt::NoFocus);
         button->setAccessibleName(label);
-        layout->addWidget(button);
         return button;
     }
 
@@ -3765,7 +3936,10 @@ private:
         button->setText(label);
         button->setIcon(toolbarIcon(tool, QColor(230, 225, 229), devicePixelRatioF()));
         button->setIconSize(QSize(20, 20));
-        button->setFixedSize(kToolButtonWidth, kToolButtonHeight);
+        // No size of its own: the eleven of them are sized together once the
+        // last one is in, by `sizeToolButtons`.  A button fixed here would
+        // report that fixed width back from `sizeHint`, which is the one number
+        // that pass has to read.
         button->setCursor(Qt::PointingHandCursor);
         button->setFocusPolicy(Qt::NoFocus);
         button->setToolTip(toolTipForTool(tool));
@@ -3827,11 +4001,11 @@ private:
     // This has to run before the width is fixed: a button at a fixed width
     // reports that width back from `sizeHint`, so measuring afterwards would
     // only ever confirm the width it already had.
-    static int widthForLabels(QToolButton *button, const QStringList &labels)
+    int widthForLabels(QToolButton *button, const QStringList &labels) const
     {
         button->ensurePolished();
         const QString shown = button->text();
-        int widest = kToolButtonWidth;
+        int widest = toolButtonWidth_;
         for (const QString &label : labels) {
             button->setText(label);
             widest = std::max(widest, button->sizeHint().width());
@@ -3840,11 +4014,65 @@ private:
         return widest;
     }
 
-    // The size every button in the tool row is built at, whether it enters a
-    // mode or does one thing.  A button that has to flash a longer label is
-    // widened past this; see `widthForLabels`.
-    static constexpr int kToolButtonWidth = 48;
-    static constexpr int kToolButtonHeight = 46;
+    // One size for all eleven drawing tools, taken from what each label and icon
+    // actually asks the style for rather than from a number picked by hand.
+    //
+    // The hand-picked number was 48x46, chosen when the labels were the widest
+    // thing in the row; measured against the labels of both languages it stood
+    // about a tenth more than any of them needed, and the eleven buttons put
+    // that slack on the panel's width and height together.  Reading the size
+    // back from the style is also what keeps a wider font -- the desktop's own,
+    // which the toolbar is drawn in -- from eliding a label.
+    //
+    // Uniform rather than per-button: a row of buttons each as wide as its own
+    // word is a row with no column to read across, and it is the same size the
+    // row of one-shot actions below is built at.
+    void sizeToolButtons()
+    {
+        int width = 0;
+        int height = 0;
+        for (QAbstractButton *button : toolButtons_) {
+            // The font is the toolbar's own style sheet's, and that is only in
+            // force once the button has been polished; measuring before that
+            // measures the application's font, which is wider.
+            button->ensurePolished();
+            width = std::max(width, button->sizeHint().width());
+            height = std::max(height, button->sizeHint().height());
+        }
+        toolButtonWidth_ = std::max(kMinToolButtonWidth, width);
+        toolButtonHeight_ = std::max(kMinToolButtonHeight, height);
+        for (QAbstractButton *button : toolButtons_) {
+            button->setFixedSize(toolButtonWidth_, toolButtonHeight_);
+        }
+    }
+
+    // The floor under the measured size: a tool button narrower or shorter than
+    // this is a corner rather than a button, however short its label is.
+    static constexpr int kMinToolButtonWidth = 34;
+    static constexpr int kMinToolButtonHeight = 34;
+
+    // How much room the two ends of the capture keep inside their own box: the
+    // label and this much either side of it, rather than the style's own ten.
+    // The constructor appends it as a stylesheet rule, and the block's width is
+    // the buttons' own hints, so this is the one place the corner's padding is
+    // written down.
+    static constexpr int kEndsPadding = 7;
+
+    // And how far apart the two buttons of a row are: the ends of the capture
+    // have to read as two buttons rather than one box with a line down it.
+    static constexpr int kEndsSpacing = 6;
+
+    // The room between the divider and the four ends pinned to the right of it:
+    // what the panel's own margin leaves on their other side.  Measured against
+    // the rendered panel, this is what makes the two gaps the same width -- the
+    // layout's spacing already sits between the divider and this.
+    static constexpr int kEndsGap = 6;
+
+    // The size the tool row came out at, which the row of one-shot actions below
+    // is built at so the two rows are one panel rather than two.  Set by
+    // `sizeToolButtons`, before the first action is added.
+    int toolButtonWidth_ = kMinToolButtonWidth;
+    int toolButtonHeight_ = kMinToolButtonHeight;
 
     // A button in the tool row that does one thing instead of entering a mode,
     // laid out exactly like the tool buttons: same size, same text-under-icon
@@ -3859,6 +4087,20 @@ private:
                                const QString &tooltip, const QString &objectName,
                                const QStringList &alsoShows = QStringList())
     {
+        QToolButton *button = makeToolButton(label, icon, tooltip, objectName, alsoShows);
+        layout->addWidget(button);
+        return button;
+    }
+
+    // The same button, built but not placed: the caller puts it in whatever
+    // layout it belongs to.  The four ends pinned to the right of the card are
+    // one such grid, and the history pair among them is built exactly like the
+    // tools on the left -- same box, same label under the same 20 px icon, same
+    // hover and press painting -- because it is the same kind of thing to click.
+    QToolButton *makeToolButton(const QString &label, const QIcon &icon, const QString &tooltip,
+                                const QString &objectName,
+                                const QStringList &alsoShows = QStringList())
+    {
         auto *button = new QToolButton(this);
         button->setProperty("toolButton", true);
         button->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
@@ -3872,8 +4114,7 @@ private:
         button->setObjectName(objectName);
         QStringList all;
         all << label << alsoShows;
-        button->setFixedSize(widthForLabels(button, all), kToolButtonHeight);
-        layout->addWidget(button);
+        button->setFixedSize(widthForLabels(button, all), toolButtonHeight_);
         return button;
     }
 
@@ -3887,6 +4128,9 @@ private:
     // result can come from a key the toolbar never sees, so it is stored rather
     // than reached through the click handler's capture.
     QToolButton *textButton_ = nullptr;
+    // The Translate button, whose label reports the two-subprocess wait and its
+    // outcome the same way the text button's does.
+    QToolButton *translateButton_ = nullptr;
     // The scrolling-capture button, enabled only when the session offers the
     // action and the selection fits in one output; its state is set by
     // `syncState` along with every other button's.
@@ -3946,8 +4190,8 @@ private:
     // One line telling the user how the pointer-heavy tools work, shown only
     // while one of them is armed.
     QLabel *usageHint_ = nullptr;
-    QPushButton *undo_ = nullptr;
-    QPushButton *redo_ = nullptr;
+    QToolButton *undo_ = nullptr;
+    QToolButton *redo_ = nullptr;
     bool dragging_ = false;
     QPoint dragOffset_;
     QImage backdrop_;
@@ -4013,6 +4257,11 @@ OverlayController::OverlayController(Session session)
     // Scrolling capture wants a rectangle, not an editor: the pixels it will
     // annotate only exist once the page has been scrolled and stitched.
     selectOnly_ = session_.mode == QStringLiteral("region-only");
+    // Screenshot translation is its own small flow: frame a region and the
+    // translation runs the moment the frame is finished, then Enter accepts it.
+    // No toolbar is ever shown, so the flag that draws one is never set for it.
+    translateMode_ = session_.mode == QStringLiteral("translate");
+    resultPath_ = session_.resultPath;
     // The style the user last left the editor in.
     const EditorPreferences preferences = loadEditorPreferences();
     currentFont_ = preferences.font;
@@ -4187,6 +4436,18 @@ void OverlayController::translateAnnotations(std::int32_t dx, std::int32_t dy)
                 // badge where the image used to be.
                 annotation.rect.x = static_cast<std::int32_t>(annotation.rect.x + dx);
                 annotation.rect.y = static_cast<std::int32_t>(annotation.rect.y + dy);
+            }
+            break;
+        case Annotation::Kind::Translation:
+            // Every box of a placed translation travels with the frame it was
+            // read from, or it would sit over the wrong words.
+            annotation.rect.x = static_cast<std::int32_t>(annotation.rect.x + dx);
+            annotation.rect.y = static_cast<std::int32_t>(annotation.rect.y + dy);
+            for (TranslatedLine &line : annotation.translation) {
+                line.source.x = static_cast<std::int32_t>(line.source.x + dx);
+                line.source.y = static_cast<std::int32_t>(line.source.y + dy);
+                line.fill.x = static_cast<std::int32_t>(line.fill.x + dx);
+                line.fill.y = static_cast<std::int32_t>(line.fill.y + dy);
             }
             break;
         }
@@ -4551,6 +4812,25 @@ void OverlayController::finishSelection(Point point)
         // a stray click leaves the surface alone so the user can try again.
         if (hasValidSelection()) {
             terminal(false);
+        }
+        return;
+    }
+    if (translateMode_) {
+        // The rectangle is only the frame the translation will be drawn in, and
+        // finishing it *is* the request: the drag ends, the translation runs,
+        // and Enter is what accepts it from there on.  (Enter still runs the
+        // translation too, so the frame an Escape took the translation off can
+        // be translated again without drawing it anew.)  A stray click that made
+        // nothing usable leaves no frame to translate.
+        if (!hasValidSelection()) {
+            selection_.reset();
+            updateAll();
+            return;
+        }
+        QString error;
+        if (!runTranslateStage(&error)) {
+            std::fprintf(stderr, "vshot-qt-ui: %s\n", error.toUtf8().constData());
+            std::fflush(stderr);
         }
         return;
     }
@@ -4950,6 +5230,11 @@ void OverlayController::finishText(bool accept)
 
 void OverlayController::showToolbar()
 {
+    if (translateMode_) {
+        // The translate overlay is a region frame with no editor: the marks a
+        // toolbar places have nowhere to go and the frame is not saved as one.
+        return;
+    }
     if (!selection_.has_value() || overlays_.isEmpty()) {
         return;
     }
@@ -5407,6 +5692,18 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
     if (button != Qt::LeftButton) {
         return;
     }
+    // The standalone translate overlay: the frame is the whole interaction.
+    // While framing, a press starts the rectangle over -- the same drag a
+    // region-only session has -- and once a translation is up the frame is
+    // frozen, so a click cannot drag a box the painted translation would not
+    // follow; Escape is what takes it back to framing.
+    if (translateMode_) {
+        if (!translated_) {
+            startSelection(globalPoint(overlay, local));
+            updateAll();
+        }
+        return;
+    }
     if (textMode_) {
         // The mode owns the left button: a press on a character starts the
         // range there, a press on the empty canvas clears it.  No tool path
@@ -5752,7 +6049,18 @@ void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifi
 {
     Q_UNUSED(overlay);
     if (key == Qt::Key_Escape) {
-        if (textEdit_ != nullptr) {
+        if (translateMode_) {
+            // The translation goes first, back to the framing it replaced; a
+            // second Escape is the cancel the framing has.
+            if (translated_) {
+                translated_ = false;
+                translatedLines_.clear();
+                translatedText_.clear();
+                updateAll();
+            } else {
+                cancel();
+            }
+        } else if (textEdit_ != nullptr) {
             finishText(false);
         } else if (textMode_) {
             // The mode goes first: Escape leaves the text selection without
@@ -5771,7 +6079,22 @@ void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifi
         return;
     }
     if (key == Qt::Key_Return || key == Qt::Key_Enter) {
-        if (textEdit_ != nullptr) {
+        if (translateMode_) {
+            // Enter keeps its two stages: it translates a frame nothing has
+            // translated yet -- the drag that drew it normally has, so this is
+            // the re-run after an Escape -- and accepts the translation that is
+            // up.  The same key walks both because the overlay has no toolbar
+            // to put a button in.
+            const bool accepting = translated_;
+            QString error;
+            const bool ok = accepting ? acceptTranslation(&error) : runTranslateStage(&error);
+            if (!ok) {
+                std::fprintf(stderr, "vshot-qt-ui: %s\n", error.toUtf8().constData());
+                std::fflush(stderr);
+            } else if (accepting) {
+                terminal(false);
+            }
+        } else if (textEdit_ != nullptr) {
             finishText(true);
         } else if (textMode_) {
             // Enter copies what the range holds and leaves the mode.
@@ -5782,6 +6105,14 @@ void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifi
         return;
     }
     if (textEdit_ != nullptr) {
+        return;
+    }
+    if (translateMode_) {
+        // Only the copy and the step back reach the translate overlay; every
+        // other key is swallowed so nothing moves the frame under it.
+        if ((modifiers & Qt::ControlModifier) && key == Qt::Key_C && translated_) {
+            writeClipboard(translatedText_);
+        }
         return;
     }
     if (textMode_) {
@@ -6358,6 +6689,90 @@ bool OverlayController::canPaste() const
     return !finished_ && !cancelled_ && editing_ && selection_.has_value();
 }
 
+// The `vshot` binary this helper drives: a sibling of this process, because
+// both live in the same directory once installed.  `VSHOT_BIN` names it
+// outright, which is also the hook a check uses to point at a stub script.
+QString vshotProgram()
+{
+    const QString override = QString::fromLocal8Bit(qgetenv("VSHOT_BIN"));
+    if (!override.isEmpty()) {
+        return override;
+    }
+    char buffer[4096];
+    const ssize_t length = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+    if (length <= 0) {
+        return QString();
+    }
+    buffer[length] = '\0';
+    const QString helper = QString::fromLocal8Bit(buffer);
+    // `vshot` is the same binary with the helper's directory walked back one
+    // level: installed layouts put both in /usr/bin, and a source checkout has
+    // `build-qt/vshot-qt-ui` beside `target/release/vshot`.
+    QString program = QFileInfo(helper).absolutePath() + QStringLiteral("/vshot");
+    if (!QFileInfo::exists(program)) {
+        const QString beside =
+            QFileInfo(helper).absolutePath() + QStringLiteral("/../target/release/vshot");
+        if (QFileInfo::exists(beside)) {
+            program = QDir::cleanPath(beside);
+        } else {
+            program = QStringLiteral("vshot");
+        }
+    }
+    return program;
+}
+
+// How long a recognition run is given: a model load takes a moment on the first
+// run, the recognition itself is a fraction of a second, and a hang still has
+// to end.
+constexpr int kTextProcessTimeoutMs = 60 * 1000;
+// The translation reaches a provider over the network, so it gets the same
+// generous deadline rather than the clipboard's short one.
+constexpr int kTranslateProcessTimeoutMs = 60 * 1000;
+
+// What one completed `vshot` run left behind.  A run that never started and one
+// killed at the deadline are told apart by the two flags, which is what lets
+// each caller name the failure it saw.
+struct ProcessRun {
+    bool started = false;
+    bool finished = false;
+    int exitCode = -1;
+    QByteArray output;
+    QByteArray errorOutput;
+};
+
+// One `vshot` run.  A null `input` gives the child no standard input at all --
+// what the recognition step wants -- while a non-null one, even empty, is piped
+// in, which is how the translated envelope reaches the translation step.
+ProcessRun runProcess(const QString &program, const QStringList &arguments, const QByteArray &input,
+                      int timeoutMs)
+{
+    ProcessRun result;
+    QProcess process;
+    process.setProgram(program);
+    process.setArguments(arguments);
+    if (input.isNull()) {
+        process.setStandardInputFile(QProcess::nullDevice());
+    }
+    process.start();
+    if (!process.waitForStarted(kClipboardProcessTimeoutMs)) {
+        return result;
+    }
+    result.started = true;
+    if (!input.isNull()) {
+        process.write(input);
+        process.closeWriteChannel();
+    }
+    result.finished = process.waitForFinished(timeoutMs);
+    if (!result.finished) {
+        process.kill();
+        process.waitForFinished(kClipboardProcessTimeoutMs);
+    }
+    result.output = process.readAllStandardOutput();
+    result.errorOutput = process.readAllStandardError();
+    result.exitCode = process.exitStatus() == QProcess::NormalExit ? process.exitCode() : -1;
+    return result;
+}
+
 bool OverlayController::beginTextSelection(QString *error)
 {
     // Every way this can fail is reported both to the caller and to the button
@@ -6411,28 +6826,11 @@ bool OverlayController::beginTextSelection(QString *error)
         return fail(uiTr("Cannot write the selection to read its text."));
     }
 
-    // The engine lives in `vshot`, which is a sibling of this helper: the
-    // same discovery the file dialog uses, for the same reason (this process
-    // is the helper, so its own path names the program to run).
-    char buffer[4096];
-    const ssize_t length = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
-    if (length <= 0) {
+    // The engine lives in `vshot`, which is a sibling of this helper; the
+    // translation path finds it the same way, and `VSHOT_BIN` overrides both.
+    const QString program = vshotProgram();
+    if (program.isEmpty()) {
         return fail(uiTr("Cannot locate vshot to read the text."));
-    }
-    buffer[length] = '\0';
-    const QString helper = QString::fromLocal8Bit(buffer);
-    // `vshot` is the same binary with the helper's directory walked back one
-    // level: installed layouts put both in /usr/bin, and a source checkout has
-    // `build-qt/vshot-qt-ui` beside `target/release/vshot`.
-    QString program = QFileInfo(helper).absolutePath() + QStringLiteral("/vshot");
-    if (!QFileInfo::exists(program)) {
-        const QString beside =
-            QFileInfo(helper).absolutePath() + QStringLiteral("/../target/release/vshot");
-        if (QFileInfo::exists(beside)) {
-            program = QDir::cleanPath(beside);
-        } else {
-            program = QStringLiteral("vshot");
-        }
     }
 
     // The engine takes a moment -- a model load on the first run -- and the
@@ -6445,31 +6843,26 @@ bool OverlayController::beginTextSelection(QString *error)
     }
     QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
 
-    QProcess process;
-    process.setProgram(program);
     // `--json` carries the position of every character, which is what the text
     // mode draws and selects with; without it the engine prints only the text.
-    process.setArguments(
-        {QStringLiteral("ocr"), QStringLiteral("--input"), path, QStringLiteral("--json")});
-    process.setStandardInputFile(QProcess::nullDevice());
-    process.start();
-    if (!process.waitForStarted(kClipboardProcessTimeoutMs)) {
+    const ProcessRun run = runProcess(
+        program,
+        {QStringLiteral("ocr"), QStringLiteral("--input"), path, QStringLiteral("--json")},
+        QByteArray(), kTextProcessTimeoutMs);
+    if (!run.started) {
         return fail(uiTr("Cannot start vshot to read the text."));
     }
     // A model load takes a moment on the first run and the recognition itself
     // is a fraction of a second, so the wait is generous compared to the
     // clipboard's; a hang still has to end, hence the deadline.
-    const int ocrTimeoutMs = 60 * 1000;
-    if (!process.waitForFinished(ocrTimeoutMs)) {
-        process.kill();
-        process.waitForFinished(kClipboardProcessTimeoutMs);
+    if (!run.finished) {
         return fail(uiTr("Reading the text took too long."));
     }
-    const QByteArray document = process.readAllStandardOutput();
-    if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
-        const QString stderr = QString::fromUtf8(process.readAllStandardError()).trimmed();
+    if (run.exitCode != 0) {
+        const QString stderr = QString::fromUtf8(run.errorOutput).trimmed();
         return fail(stderr.isEmpty() ? uiTr("Reading the text failed.") : stderr);
     }
+    const QByteArray document = run.output;
     // The recognition came back: the mode starts, or -- for an engine that
     // reported no positions -- the whole text is copied here and now.
     if (!enterTextSelection(document, error)) {
@@ -6624,6 +7017,299 @@ bool OverlayController::writeClipboard(const QString &text)
         return clipboardWriter_(text);
     }
     return runWlCopy(text);
+}
+
+void OverlayController::setTranslateResultCallback(
+    std::function<void(TextOutcome, const QString &)> callback)
+{
+    translateResultCallback_ = std::move(callback);
+}
+
+bool OverlayController::translateSelection(QString *error)
+{
+    // Every way this can fail is reported to the button the user pressed; the
+    // translation itself can also be started from the overlay's own drag or
+    // Enter, and the button is the only place the user is looking either way.
+    const auto fail = [this, error](const QString &message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+        if (translateResultCallback_) {
+            translateResultCallback_(TextOutcome::Failed, message);
+        }
+        return false;
+    };
+    if (finished_ || cancelled_) {
+        return fail(uiTr("Translation needs a selection to read from."));
+    }
+    QVector<TranslatedLine> lines;
+    QString text;
+    if (!computeTranslation(&lines, &text, error)) {
+        return fail(error != nullptr ? *error : QString());
+    }
+    Annotation annotation;
+    annotation.kind = Annotation::Kind::Translation;
+    annotation.tool = QStringLiteral("translate");
+    annotation.font = lines.constFirst().family;
+    annotation.translation = lines;
+    LogicalRect box = lines.constFirst().fill;
+    for (const TranslatedLine &line : lines) {
+        const std::int64_t left = std::min<std::int64_t>(box.x, line.fill.x);
+        const std::int64_t top = std::min<std::int64_t>(box.y, line.fill.y);
+        const std::int64_t right = std::max<std::int64_t>(box.right(), line.fill.right());
+        const std::int64_t bottom = std::max<std::int64_t>(box.bottom(), line.fill.bottom());
+        box = LogicalRect{static_cast<std::int32_t>(left), static_cast<std::int32_t>(top),
+                          static_cast<std::uint32_t>(right - left),
+                          static_cast<std::uint32_t>(bottom - top)};
+    }
+    annotation.rect = box;
+    // One annotation, so the whole translation undoes in one step and rides the
+    // existing commit path as a single bitmap.
+    QVector<Annotation> next = annotations_;
+    next.push_back(annotation);
+    mutateAnnotations(std::move(next));
+    if (translateResultCallback_) {
+        translateResultCallback_(TextOutcome::Idle, QString());
+    }
+    return true;
+}
+
+bool OverlayController::computeTranslation(QVector<TranslatedLine> *lines, QString *text,
+                                           QString *error)
+{
+    const auto fail = [error](const QString &message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+        return false;
+    };
+    // The frame the translation reads: the selection, or -- for the editor's
+    // button, which a session could in principle reach with none -- the whole
+    // captured image of the first output.
+    LogicalRect canvas;
+    int index = -1;
+    if (selection_.has_value() && !selection_->isEmpty()) {
+        canvas = *selection_;
+        index = outputContaining(canvas);
+    } else if (!session_.outputs.isEmpty()) {
+        index = 0;
+        canvas = session_.outputs.at(0).geometry;
+    }
+    if (index < 0 || index >= session_.outputs.size()) {
+        return fail(uiTr("Translation needs a selection to read from."));
+    }
+    const OutputSession &output = session_.outputs.at(index);
+    if (output.image.isNull()) {
+        return fail(uiTr("The captured frame is not available."));
+    }
+    const QRect source = sourceRect(output, canvas)
+                             .intersected(QRect(0, 0, output.image.width(), output.image.height()));
+    if (source.isEmpty()) {
+        return fail(uiTr("The selection has no pixels on this output."));
+    }
+    const QImage pixels = output.image.copy(source);
+    if (pixels.isNull()) {
+        return fail(uiTr("The selection has no pixels on this output."));
+    }
+
+    // The two subprocesses take a while -- a model load, then a network round
+    // trip -- and both run on the GUI thread, so the button says so first and
+    // is given its paint before the wait starts.
+    if (translateResultCallback_) {
+        translateResultCallback_(TextOutcome::Busy, QString());
+    }
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+
+    QByteArray document;
+    if (!runTranslationPipeline(pixels, &document, error)) {
+        return false;
+    }
+
+    // The engine's coordinates are counted from the crop, so its top-left in
+    // the overlay's own logical pixels is where the layer is placed -- the same
+    // placement the text-selection mode uses.
+    const LogicalRect sourceLogical = logicalFromSource(output, source);
+    TextLayerPlacement placement;
+    placement.scale = static_cast<double>(output.scale);
+    placement.originX = sourceLogical.x;
+    placement.originY = sourceLogical.y;
+    QString parseError;
+    std::optional<TextLayer> layer = TextLayer::fromJson(document, placement, &parseError);
+    if (!layer.has_value()) {
+        // The parser's own message says what was wrong with the document, which
+        // is a diagnostic rather than something to show the user.
+        std::fprintf(stderr, "vshot-qt-ui: %s\n", parseError.toUtf8().constData());
+        std::fflush(stderr);
+        return fail(uiTr("Translating the text failed."));
+    }
+    if (!layer->hasGeometry() || layer->lineCount() == 0) {
+        return fail(uiTr("The translation has no positions to draw."));
+    }
+    const QString plain = layer->plainText();
+    // The editor's own font is the starting point, the same one the text tool
+    // draws a label with; `placedTranslations` then swaps in a family that can
+    // actually draw each line's script rather than boxing every CJK glyph.
+    //
+    // The fills grow within `canvas`, the crop that becomes the image: a box
+    // against the selection's right edge is pulled back rather than spilling
+    // onto pixels the saved picture will not contain, so the preview the user
+    // sees and the PNG that is written hold the same text in the same place.
+    QVector<TranslatedLine> placed =
+        placedTranslations(*layer, output.image, output.geometry,
+                           static_cast<double>(output.scale), canvas, currentFont_);
+    if (placed.isEmpty()) {
+        return fail(uiTr("No text was found in the selection."));
+    }
+    *lines = std::move(placed);
+    *text = plain;
+    return true;
+}
+
+bool OverlayController::runTranslationPipeline(const QImage &pixels, QByteArray *document,
+                                               QString *error) const
+{
+    const auto fail = [error](const QString &message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+        return false;
+    };
+    const QString program = vshotProgram();
+    if (program.isEmpty()) {
+        return fail(uiTr("Cannot locate vshot to translate the text."));
+    }
+    QTemporaryDir directory;
+    if (!directory.isValid()) {
+        return fail(uiTr("Cannot create a temporary directory for the text."));
+    }
+    const QString path = directory.filePath(QStringLiteral("selection.png"));
+    if (!pixels.save(path, "PNG")) {
+        return fail(uiTr("Cannot write the selection to read its text."));
+    }
+    const ProcessRun recognition = runProcess(
+        program,
+        {QStringLiteral("ocr"), QStringLiteral("--input"), path, QStringLiteral("--json")},
+        QByteArray(), kTextProcessTimeoutMs);
+    if (!recognition.started) {
+        return fail(uiTr("Cannot start vshot to read the text."));
+    }
+    if (!recognition.finished) {
+        return fail(uiTr("Reading the text took too long."));
+    }
+    if (recognition.exitCode != 0) {
+        const QString stderr = QString::fromUtf8(recognition.errorOutput).trimmed();
+        return fail(stderr.isEmpty() ? uiTr("Reading the text failed.") : stderr);
+    }
+
+    // The recognized envelope is piped straight into the translation step, and
+    // the session's own choices are added only when it made them: an absent one
+    // is the CLI's config default, which is what asking for nothing means.
+    QStringList arguments{QStringLiteral("translate"), QStringLiteral("--stdin-ocr"),
+                          QStringLiteral("--json")};
+    if (session_.translate.has_value()) {
+        const TranslateOptions &options = *session_.translate;
+        if (!options.to.isEmpty()) {
+            arguments << QStringLiteral("--to") << options.to;
+        }
+        if (!options.from.isEmpty()) {
+            arguments << QStringLiteral("--from") << options.from;
+        }
+        if (!options.provider.isEmpty()) {
+            arguments << QStringLiteral("--provider") << options.provider;
+        }
+    }
+    const ProcessRun translated =
+        runProcess(program, arguments, recognition.output, kTranslateProcessTimeoutMs);
+    if (!translated.started) {
+        return fail(uiTr("Cannot start vshot to translate the text."));
+    }
+    if (!translated.finished) {
+        return fail(uiTr("Translating the text took too long."));
+    }
+    if (translated.exitCode != 0) {
+        const QString stderr = QString::fromUtf8(translated.errorOutput).trimmed();
+        return fail(stderr.isEmpty() ? uiTr("Translating the text failed.") : stderr);
+    }
+    *document = translated.output;
+    return true;
+}
+
+bool OverlayController::runTranslateStage(QString *error)
+{
+    // The standalone overlay translates the rectangle it framed -- the moment
+    // the drag that drew it ends, or on Enter after an Escape took an earlier
+    // translation off -- so it needs one: there is nothing to crop without it.
+    // (The editor's button is the caller that falls back to the whole image.)
+    if (!selection_.has_value() || selection_->isEmpty()) {
+        if (error != nullptr) {
+            *error = uiTr("Translation needs a selection to read from.");
+        }
+        return false;
+    }
+    QVector<TranslatedLine> lines;
+    QString text;
+    if (!computeTranslation(&lines, &text, error)) {
+        return false;
+    }
+    translatedLines_ = std::move(lines);
+    translatedText_ = std::move(text);
+    translated_ = true;
+    updateAll();
+    return true;
+}
+
+bool OverlayController::acceptTranslation(QString *error)
+{
+    const auto fail = [error](const QString &message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+        return false;
+    };
+    if (!translated_ || translatedLines_.isEmpty() || !selection_.has_value()) {
+        return fail(uiTr("There is no translation to save."));
+    }
+    const int index = outputContaining(*selection_);
+    if (index < 0 || index >= session_.outputs.size()) {
+        return fail(uiTr("The selection is on no output."));
+    }
+    const OutputSession &output = session_.outputs.at(index);
+    if (resultPath_.isEmpty()) {
+        return fail(uiTr("The session names no file to write the translation to."));
+    }
+    if (output.image.isNull()) {
+        return fail(uiTr("The captured frame is not available."));
+    }
+    const QRect source = sourceRect(output, *selection_)
+                             .intersected(QRect(0, 0, output.image.width(), output.image.height()));
+    if (source.isEmpty()) {
+        return fail(uiTr("The selection has no pixels on this output."));
+    }
+    // The frozen scene the user framed, with the translation composited over it
+    // through the same painter the preview uses, so the file matches the screen.
+    QImage composite =
+        output.image.copy(source).convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    const double scale = output.scale > 0 ? static_cast<double>(output.scale) : 1.0;
+    {
+        QPainter painter(&composite);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        painter.setRenderHint(QPainter::TextAntialiasing, true);
+        paintTranslation(
+            painter, translatedLines_,
+            [&](const TranslatedLine &line) {
+                const qreal x =
+                    (static_cast<qreal>(line.fill.x) - output.geometry.x) * scale - source.x();
+                const qreal y =
+                    (static_cast<qreal>(line.fill.y) - output.geometry.y) * scale - source.y();
+                return QRectF(x, y, line.fill.width * scale, line.fill.height * scale);
+            },
+            scale);
+    }
+    if (!composite.save(resultPath_, "PNG")) {
+        return fail(uiTr("Cannot write the translated image."));
+    }
+    resultImagePath_ = resultPath_;
+    return true;
 }
 
 void OverlayController::selectTextRange(int anchor, int focus)
@@ -7255,6 +7941,18 @@ Annotation OverlayController::translatedAnnotation(const Annotation &original, i
             result.rect.y = static_cast<std::int32_t>(result.rect.y + clampedDy);
         }
         break;
+    case Annotation::Kind::Translation:
+        // Each box travels with the frame it was read from, the same way the
+        // bits of a stroke do.
+        result.rect.x = static_cast<std::int32_t>(result.rect.x + clampedDx);
+        result.rect.y = static_cast<std::int32_t>(result.rect.y + clampedDy);
+        for (TranslatedLine &line : result.translation) {
+            line.source.x = static_cast<std::int32_t>(line.source.x + clampedDx);
+            line.source.y = static_cast<std::int32_t>(line.source.y + clampedDy);
+            line.fill.x = static_cast<std::int32_t>(line.fill.x + clampedDx);
+            line.fill.y = static_cast<std::int32_t>(line.fill.y + clampedDy);
+        }
+        break;
     }
     return result;
 }
@@ -7267,6 +7965,13 @@ Annotation OverlayController::scaledAnnotation(const Annotation &original,
         // A shape's rect *is* its geometry, and a pasted image's rect is where
         // it sits and how big it is; both scale by taking the new rect.
         result.rect = newBounds;
+        return result;
+    }
+    if (original.kind == Annotation::Kind::Translation) {
+        // A translation is not stretched: its boxes were fitted to the text
+        // they replace, and scaling them would undo the fit.  It is not
+        // resizable -- the handles are never offered for it -- so this is only
+        // here to keep the two ends of the switch in step.
         return result;
     }
     LogicalRect oldBounds;
@@ -7493,6 +8198,12 @@ QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
         point.insert(QStringLiteral("y"), static_cast<qint64>(pointer_.y));
         root.insert(QStringLiteral("point"), point);
     }
+    // The standalone translate overlay reports what it produced and where it
+    // wrote it, once the user accepted.
+    if (translateMode_ && !resultImagePath_.isEmpty()) {
+        root.insert(QStringLiteral("translated_text"), translatedText_);
+        root.insert(QStringLiteral("image_path"), resultImagePath_);
+    }
 
     QJsonArray outputAnnotations;
     for (const Annotation &annotation : annotations_) {
@@ -7616,6 +8327,72 @@ QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
                 points.push_back(item);
             }
             value.insert(QStringLiteral("points"), points);
+        } else if (annotation.kind == Annotation::Kind::Translation) {
+            // The translation travels as an image, exactly the way a pasted
+            // image does: its own kind never reaches the renderer, which only
+            // ever has to blit the bitmap the helper drew.  That is what keeps
+            // the final PNG the same pixels the preview showed -- both come
+            // from the placed lines the annotation carries.
+            value.insert(QStringLiteral("kind"), QStringLiteral("image"));
+            value.insert(QStringLiteral("tool"), QStringLiteral("translate"));
+            QJsonObject rect;
+            rect.insert(QStringLiteral("x"), static_cast<qint64>(annotation.rect.x));
+            rect.insert(QStringLiteral("y"), static_cast<qint64>(annotation.rect.y));
+            rect.insert(QStringLiteral("width"), static_cast<qint64>(annotation.rect.width));
+            rect.insert(QStringLiteral("height"), static_cast<qint64>(annotation.rect.height));
+            value.insert(QStringLiteral("rect"), rect);
+            if (bitmapDirectory.isEmpty() || annotation.translation.isEmpty()) {
+                continue;
+            }
+            const int scale = sceneScale();
+            const int width = static_cast<int>(annotation.rect.width) * scale;
+            const int height = static_cast<int>(annotation.rect.height) * scale;
+            if (width <= 0 || height <= 0
+                || static_cast<qint64>(width) * static_cast<qint64>(height) > 16LL * 1024 * 1024) {
+                if (error != nullptr) {
+                    *error = QStringLiteral("the translation is too large to render (%1x%2)")
+                                 .arg(width)
+                                 .arg(height);
+                    return QJsonDocument();
+                }
+                continue;
+            }
+            QImage bitmap(width, height, QImage::Format_RGBA8888);
+            if (bitmap.isNull()) {
+                continue;
+            }
+            bitmap.fill(Qt::transparent);
+            {
+                QPainter bitmapPainter(&bitmap);
+                bitmapPainter.setRenderHint(QPainter::Antialiasing, true);
+                bitmapPainter.setRenderHint(QPainter::TextAntialiasing, true);
+                paintTranslation(
+                    bitmapPainter, annotation.translation,
+                    [&](const TranslatedLine &line) {
+                        return QRectF((line.fill.x - annotation.rect.x) * scale,
+                                      (line.fill.y - annotation.rect.y) * scale,
+                                      line.fill.width * scale, line.fill.height * scale);
+                    },
+                    scale);
+            }
+            const QString path = QStringLiteral("%1/image-%2.rgba")
+                                     .arg(bitmapDirectory)
+                                     .arg(imageBitmapIndex_++);
+            QFile file(path);
+            if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)
+                || file.write(reinterpret_cast<const char *>(bitmap.constBits()),
+                              static_cast<qint64>(bitmap.sizeInBytes()))
+                    != static_cast<qint64>(bitmap.sizeInBytes())) {
+                if (error != nullptr) {
+                    *error = QStringLiteral("cannot write translation bitmap `%1`: %2")
+                                 .arg(path, file.errorString());
+                    return QJsonDocument();
+                }
+                continue;
+            }
+            value.insert(QStringLiteral("bitmap_width"), static_cast<qint64>(width));
+            value.insert(QStringLiteral("bitmap_height"), static_cast<qint64>(height));
+            value.insert(QStringLiteral("bitmap"), path);
         } else {
             const bool number = isNumberAnnotation(annotation);
             value.insert(QStringLiteral("kind"), QStringLiteral("text"));
@@ -8244,6 +9021,55 @@ protected:
     int padding(const Annotation &) const override { return 2; }
 };
 
+// A placed translation, drawn from the lines the annotation carries: the boxes,
+// the fill colours and the fitted fonts were settled when the translation came
+// back, so nothing here depends on the frame under it and the cached raster is
+// valid for as long as the lines are.
+class TranslationRaster final : public AnnotationRaster {
+protected:
+    QRectF bounds(const Annotation &annotation, const OutputSession &output,
+                  const QSize &size) const override
+    {
+        LogicalRect rect;
+        if (!annotationLogicalBounds(annotation, &rect)) {
+            return QRectF();
+        }
+        return localRect(output, rect, size);
+    }
+
+    QByteArray signature(const Annotation &annotation, const OutputSession &output,
+                         const QSize &size) const override
+    {
+        QByteArray data;
+        QDataStream stream(&data, QIODevice::WriteOnly);
+        writeContext(stream, output, size);
+        stream << annotation.font << annotation.translation.size();
+        for (const TranslatedLine &line : annotation.translation) {
+            stream << static_cast<qint64>(line.source.x) << static_cast<qint64>(line.source.y)
+                   << static_cast<quint64>(line.source.width)
+                   << static_cast<quint64>(line.source.height) << line.text << line.family
+                   << line.fontPixels << static_cast<quint32>(line.fill.x)
+                   << static_cast<quint32>(line.fill.y) << static_cast<quint32>(line.fill.width)
+                   << static_cast<quint32>(line.fill.height)
+                   << static_cast<quint32>(line.background.rgba())
+                   << static_cast<quint32>(line.textColor.rgba());
+        }
+        return data;
+    }
+
+    void draw(QPainter *painter, const Annotation &annotation, const OutputSession &output,
+              const QSize &size) const override
+    {
+        paintTranslation(
+            *painter, annotation.translation,
+            [&](const TranslatedLine &line) { return localRect(output, line.fill, size); }, 1.0);
+    }
+
+    // The fills are exact, so the pad only has to cover antialiasing at their
+    // edges rather than a pen that reaches outside the geometry.
+    int padding(const Annotation &) const override { return 2; }
+};
+
 std::shared_ptr<AnnotationRaster> makeAnnotationRaster(const Annotation &annotation)
 {
     switch (annotation.kind) {
@@ -8258,6 +9084,8 @@ std::shared_ptr<AnnotationRaster> makeAnnotationRaster(const Annotation &annotat
         return std::make_shared<TextRaster>();
     case Annotation::Kind::Image:
         return std::make_shared<ImageRaster>();
+    case Annotation::Kind::Translation:
+        return std::make_shared<TranslationRaster>();
     case Annotation::Kind::Stroke:
         break;
     }
@@ -8438,6 +9266,21 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
             }
             lineStart = lineEnd + 1;
         }
+    }
+
+    // The standalone translate overlay: the translation drawn in place over the
+    // frozen scene, inside the rectangle the user framed.  Clipped to that
+    // rectangle so the fill a long line grows cannot stray onto the rest of the
+    // frame -- and so the PNG the accept writes, which is exactly this crop,
+    // shows the same thing.
+    if (translateMode_ && translated_ && !translatedLines_.isEmpty() && selection_.has_value()) {
+        painter->save();
+        painter->setClipRect(localRect(output, *selection_, overlay->size()));
+        paintTranslation(
+            *painter, translatedLines_,
+            [&](const TranslatedLine &line) { return localRect(output, line.fill, overlay->size()); },
+            1.0);
+        painter->restore();
     }
 
     painter->setRenderHint(QPainter::Antialiasing, true);
@@ -8695,7 +9538,8 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
             painter->setPen(QPen(Qt::white, 1.0, Qt::DashLine));
             painter->setBrush(Qt::NoBrush);
             painter->drawRect(local);
-            if (annotation.kind != Annotation::Kind::Text) {
+            if (annotation.kind != Annotation::Kind::Text &&
+                annotation.kind != Annotation::Kind::Translation) {
                 painter->setBrush(Qt::white);
                 painter->setPen(QPen(Qt::black, 1.0));
                 const QPointF midX((local.left() + local.right()) / 2.0, 0);

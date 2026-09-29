@@ -20,6 +20,7 @@ mod qt_overlay;
 mod record;
 mod selection;
 mod stitch;
+mod translate;
 mod wayland;
 
 use std::io::Write;
@@ -92,6 +93,14 @@ fn run() -> Result<()> {
             destination,
             json,
         } => return run_ocr(source, destination, json),
+        Action::Translate {
+            source,
+            destination,
+            provider,
+            from,
+            to,
+            json,
+        } => return run_translate(source, destination, &provider, &from, &to, json),
         Action::Record(action) => {
             // Recording owns its own loop and writer; nothing below is shared
             // with the screenshot routes beyond the `Capturer`.
@@ -731,6 +740,217 @@ fn write_ocr_text(text: &str, destination: cli::OcrDestination) -> Result<()> {
         }
         cli::OcrDestination::Clipboard => output::copy_text_to_clipboard(text),
     }
+}
+
+/// Reads what to translate from the route the request named, translates it,
+/// and puts the result where the request pointed.
+///
+/// The four routes share the translation itself and differ only in where the
+/// source lines come from and what the result is: the `--stdin-ocr` route
+/// never touches the compositor (it is the editor's primitive), the file and
+/// fixed-region routes recognize and translate, and the overlay route hands
+/// the whole interaction to the Qt helper, which composites the translation
+/// into a PNG of its own.
+fn run_translate(
+    source: cli::TranslateSource,
+    destination: cli::TranslateDestination,
+    provider: &str,
+    from: &str,
+    to: &str,
+    json: bool,
+) -> Result<()> {
+    match source {
+        cli::TranslateSource::StdinOcr => {
+            // The envelope is already on stdin, so there is no capture and no
+            // OCR run: this path has to stay fast and leave the desktop alone,
+            // because the editor calls it while its window is on screen.
+            let mut input = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).map_err(|error| {
+                VshotError::Translate(format!("cannot read the OCR JSON from stdin: {error}"))
+            })?;
+            let defaults = crate::config::load().translate;
+            let chain = translate::engine_chain(&defaults, provider)?;
+            let providers = translate::as_providers(&chain);
+            let translated = translate::translate_envelope_chain(&input, &providers, from, to)?;
+            match destination {
+                // The primitive always answers with the envelope; a caller
+                // that asked for the clipboard gets the translated text.
+                cli::TranslateDestination::Clipboard => {
+                    output::copy_text_to_clipboard(&translated.text)
+                }
+                _ => write_plain_text(&translated.envelope),
+            }
+        }
+        cli::TranslateSource::File(path) => {
+            let bytes = std::fs::read(&path).map_err(|error| {
+                VshotError::Translate(format!("cannot read `{}`: {error}", path.display()))
+            })?;
+            let frame = Frame::from_png(&bytes)?;
+            finish_translation(
+                ocr::recognize(&frame),
+                destination,
+                provider,
+                from,
+                to,
+                json,
+            )
+        }
+        cli::TranslateSource::Geometry(geometry) => {
+            // The fixed-region route is `vshot ocr --geometry` up to the
+            // recognition, then translation instead of output.
+            let mut wayland = WaylandSession::connect()?;
+            let topology = wayland.output_infos()?;
+            let mut capture = Capturer::connect()?;
+            let scene = capture_scene(&mut capture, &topology, false)?;
+            let geometry = selection::validate_selection(&scene, geometry)?;
+            let (frame, _density) = crop_native(&scene, geometry)?;
+            // The overlays have to be gone before anything is printed: an
+            // error path that leaves them mapped would freeze the desktop.
+            wayland.show_frozen(false)?;
+            let cleanup = wayland.destroy_overlays();
+            let lines = ocr::recognize(&frame);
+            cleanup?;
+            finish_translation(lines, destination, provider, from, to, json)
+        }
+        cli::TranslateSource::Screen => run_translate_overlay(destination, provider, from, to),
+    }
+}
+
+/// Ends a translation: the envelope to stdout when JSON was asked for,
+/// otherwise the translated text to wherever the caller wanted it and — for
+/// the routes that captured — a notification about it.
+fn finish_translation(
+    lines: Result<Vec<ocr::OcrLine>>,
+    destination: cli::TranslateDestination,
+    provider: &str,
+    from: &str,
+    to: &str,
+    json: bool,
+) -> Result<()> {
+    let lines = lines?;
+    let defaults = crate::config::load().translate;
+    let chain = translate::engine_chain(&defaults, provider)?;
+    let providers = translate::as_providers(&chain);
+    let translated =
+        translate::translate_envelope_chain(&ocr::to_json(&lines), &providers, from, to)?;
+    if json {
+        // A JSON caller is a program: no notification, and the envelope is the
+        // whole answer.
+        return write_plain_text(&translated.envelope);
+    }
+    // A failed line falls back to its source, which is otherwise
+    // indistinguishable from a translation: say so on stderr, but leave the
+    // exit code alone.
+    translated.warn_left_in_source();
+    let to_clipboard = matches!(destination, cli::TranslateDestination::Clipboard);
+    let outcome = match destination {
+        cli::TranslateDestination::Clipboard => output::copy_text_to_clipboard(&translated.text),
+        _ => write_plain_text(&translated.text),
+    };
+    announce_translation(&translated.text, to_clipboard, &outcome);
+    outcome
+}
+
+/// The overlay route: the Qt helper runs the whole interaction — pick a
+/// region, recognize it, translate it, draw the translation over the original
+/// — and writes the composited PNG to `result_path`.  This side only reports
+/// or copies it.
+fn run_translate_overlay(
+    destination: cli::TranslateDestination,
+    provider: &str,
+    from: &str,
+    to: &str,
+) -> Result<()> {
+    let mut wayland = WaylandSession::connect()?;
+    let topology = wayland.output_infos()?;
+    let mut capture = Capturer::connect()?;
+    let scene = capture_scene(&mut capture, &topology, false)?;
+    wayland.set_scene(scene.clone());
+
+    // The helper needs an absolute path to write to.  A requested `--output`
+    // is expanded (strftime and all) and made absolute; with no output the
+    // composited PNG goes to a private temporary file that lives until this
+    // function is done reading or copying it.
+    let directory = tempfile::Builder::new()
+        .prefix("vshot-translate-")
+        .tempdir_in("/dev/shm")
+        .or_else(|_| tempfile::tempdir())
+        .map_err(|error| {
+            VshotError::Translate(format!(
+                "cannot create a temporary directory for the translation: {error}"
+            ))
+        })?;
+    let result_path = match &destination {
+        cli::TranslateDestination::Png(path) => absolute_output_path(path)?,
+        _ => directory.path().join("translated.png"),
+    };
+
+    let outcome = qt_overlay::translate_overlay(&scene, from, to, provider, &result_path);
+    wayland.show_frozen(false)?;
+    let cleanup = wayland.destroy_overlays();
+    let outcome = outcome.and_then(|outcome| cleanup.map(|()| outcome));
+    let outcome = outcome?;
+
+    let result = match &destination {
+        // The helper wrote the file itself.
+        cli::TranslateDestination::Png(_) => Ok(()),
+        cli::TranslateDestination::Clipboard => {
+            let image_path = outcome.image_path.as_deref().unwrap_or(&result_path);
+            let bytes = std::fs::read(image_path).map_err(|error| {
+                VshotError::Translate(format!(
+                    "cannot read the translated image `{}`: {error}",
+                    image_path.display()
+                ))
+            });
+            bytes.and_then(|bytes| output::copy_png_to_clipboard(&bytes))
+        }
+        cli::TranslateDestination::Stdout => write_plain_text(&outcome.text),
+    };
+    let to_clipboard = matches!(destination, cli::TranslateDestination::Clipboard);
+    announce_translation(&outcome.text, to_clipboard, &result);
+    result
+}
+
+/// Expands a `--output` path and makes it absolute, so the Qt helper has a
+/// path its own working directory cannot change the meaning of.
+fn absolute_output_path(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    let expanded = output::expanded_output_path(path);
+    if expanded.is_absolute() {
+        return Ok(expanded);
+    }
+    let directory = std::env::current_dir().map_err(|error| {
+        VshotError::Translate(format!("cannot resolve the output path: {error}"))
+    })?;
+    Ok(directory.join(expanded))
+}
+
+/// Says a translation finished, or failed, using the same switch `vshot ocr`
+/// has.  A failure to announce is never a failure of the translation.
+fn announce_translation(text: &str, to_clipboard: bool, outcome: &Result<()>) {
+    match outcome {
+        Ok(()) => notify::translate_finished(text, to_clipboard),
+        Err(error) => notify::translate_failed(&error.to_string()),
+    }
+}
+
+/// Prints one line without letting the shell prompt sit on it, the way
+/// `vshot ocr` prints text.
+fn write_plain_text(text: &str) -> Result<()> {
+    let mut written = text.to_owned();
+    if !written.is_empty() {
+        written.push('\n');
+    }
+    write_stdout(&written)
+}
+
+/// Writes `text` to stdout exactly, adding no newline of its own.
+fn write_stdout(text: &str) -> Result<()> {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout();
+    stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
+        .map_err(|error| VshotError::Translate(format!("cannot write to stdout: {error}")))
 }
 
 /// Renders the annotations into the captured frame and writes it where the
