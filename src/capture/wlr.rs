@@ -514,36 +514,21 @@ struct ColorQuery {
     reference_nits: Option<f32>,
 }
 
-/// The gamut behind an explicit set of primaries, in the protocol's units of one
-/// millionth.
+/// The gamut a description's chromaticities describe.
 ///
 /// Every description carries the coordinates whether or not it also names a
 /// gamut, and one built from a monitor rule or an EDID often names none — so
-/// this is the only reading available then.  The two gamuts this pipeline knows
-/// are told apart by all three primaries at once; anything else lands on the
-/// nearer of them, which is a near miss (a P3 description reads as BT.709)
-/// rather than a wrong transfer function.
+/// this is the only reading available then.  The coordinates are taken as they
+/// are: a set this pipeline has a name for reads as that name, and any other
+/// gamut keeps the matrix its coordinates imply instead of being read as
+/// BT.709, which shifted every colour of a Display P3 or EDID-only output.
 fn classify_primaries(r_x: i32, r_y: i32, g_x: i32, g_y: i32, b_x: i32, b_y: i32) -> Primaries {
     const SCALE: f32 = 1_000_000.0;
-    const BT709: [(f32, f32); 3] = [(0.640, 0.330), (0.300, 0.600), (0.150, 0.060)];
-    const BT2020: [(f32, f32); 3] = [(0.708, 0.292), (0.170, 0.797), (0.131, 0.046)];
-    let given = [
+    Primaries::from_chromaticities(
         (r_x as f32 / SCALE, r_y as f32 / SCALE),
         (g_x as f32 / SCALE, g_y as f32 / SCALE),
         (b_x as f32 / SCALE, b_y as f32 / SCALE),
-    ];
-    let distance = |known: [(f32, f32); 3]| -> f32 {
-        given
-            .iter()
-            .zip(known)
-            .map(|((x, y), (kx, ky))| (x - kx).abs() + (y - ky).abs())
-            .sum()
-    };
-    if distance(BT2020) < distance(BT709) {
-        Primaries::Bt2020
-    } else {
-        Primaries::Bt709
-    }
+    )
 }
 
 impl ColorQuery {
@@ -561,6 +546,7 @@ impl ColorQuery {
             // The named set is authoritative when there is one; the coordinates
             // are read only when it is absent.
             Some(6) => Primaries::Bt2020,
+            Some(8) | Some(9) => Primaries::DisplayP3,
             Some(_) => Primaries::Bt709,
             None => self.primaries_coords.unwrap_or(Primaries::Bt709),
         };
@@ -1897,11 +1883,12 @@ mod tests {
             classify_primaries(640_000, 330_000, 300_000, 600_000, 150_000, 60_000),
             Primaries::Bt709
         );
-        // A gamut that is neither lands on the nearer set rather than nowhere:
-        // here Display P3, whose blue and red sit between the two.
+        // A gamut that is neither reads as its own coordinates rather than as
+        // the nearer of the two: here Display P3, whose green and red sit
+        // between the two BT sets, and which used to be read as BT.709.
         assert_eq!(
             classify_primaries(680_000, 320_000, 265_000, 690_000, 150_000, 60_000),
-            Primaries::Bt709
+            Primaries::DisplayP3
         );
     }
 

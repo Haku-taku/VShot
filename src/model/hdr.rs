@@ -53,12 +53,73 @@ pub enum Transfer {
     Hlg,
 }
 
-/// The primaries an HDR buffer carries.  Only the two the pipeline needs to
-/// tell apart: BT.709 (scRGB) and BT.2020 (HDR10).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// The primaries an RGB buffer carries.
+///
+/// The sets this pipeline has a name for are named, so a description reads as
+/// what it is; a gamut it has no name for keeps the matrix its own
+/// chromaticities imply.  A Display P3 or an EDID-only description therefore
+/// converts correctly instead of being read as BT.709, which shifted every
+/// colour it carried.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Primaries {
     Bt709,
+    DisplayP3,
     Bt2020,
+    /// A gamut with no name here: the matrix from its linear RGB to BT.709
+    /// linear, built from the chromaticities the compositor reported.
+    Custom { to_bt709: [[f32; 3]; 3] },
+}
+
+impl Primaries {
+    /// Linear RGB in this gamut to BT.709 linear (both D65).
+    pub fn to_bt709(&self) -> [[f32; 3]; 3] {
+        match self {
+            Primaries::Bt709 => IDENTITY,
+            Primaries::DisplayP3 => DISPLAY_P3_TO_BT709,
+            Primaries::Bt2020 => BT2020_TO_BT709,
+            Primaries::Custom { to_bt709 } => *to_bt709,
+        }
+    }
+
+    /// Linear RGB in this gamut to BT.2020 linear — the space a colour-managed
+    /// HDR surface is described in.
+    ///
+    /// The named gamuts have their own matrix rather than a product of two:
+    /// composing BT.709 into the path would leave off-diagonal terms of ~1e-6
+    /// behind, and PQ's toe turns a linear 1e-6 into a code of a few, so a
+    /// black pixel would come back faintly lit.
+    pub fn to_bt2020(&self) -> [[f32; 3]; 3] {
+        match self {
+            Primaries::Bt709 => BT709_TO_BT2020,
+            Primaries::DisplayP3 => DISPLAY_P3_TO_BT2020,
+            Primaries::Bt2020 => IDENTITY,
+            Primaries::Custom { .. } => multiply3(BT709_TO_BT2020, self.to_bt709()),
+        }
+    }
+
+    /// BT.709 linear into this gamut: what a mark drawn in sRGB needs before it
+    /// can be blended into a frame of this gamut.
+    pub fn from_bt709(&self) -> [[f32; 3]; 3] {
+        invert3(self.to_bt709())
+    }
+
+    /// The gamut a `wp_color_manager_v1` description's chromaticities describe.
+    /// The protocol carries no white point, so D65 is the one assumed; a set
+    /// that matches one of the named gamuts reads as that name, and anything
+    /// else keeps the matrix its coordinates imply.
+    pub fn from_chromaticities(r: (f32, f32), g: (f32, f32), b: (f32, f32)) -> Self {
+        let to_bt709 = multiply3(XYZ_TO_BT709, rgb_to_xyz([r, g, b], D65));
+        for (known, name) in [
+            (IDENTITY, Primaries::Bt709),
+            (DISPLAY_P3_TO_BT709, Primaries::DisplayP3),
+            (BT2020_TO_BT709, Primaries::Bt2020),
+        ] {
+            if matrices_close(to_bt709, known) {
+                return name;
+            }
+        }
+        Primaries::Custom { to_bt709 }
+    }
 }
 
 /// The colour properties of one output, as the compositor describes them over
@@ -252,6 +313,8 @@ fn srgb_oetf(linear: f32) -> f32 {
 
 // --- primaries ------------------------------------------------------------
 
+const IDENTITY: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
 /// BT.2020 to BT.709, linear light.  The rows sum to one, so the shared D65
 /// white point is preserved exactly and a neutral HDR pixel stays neutral.
 const BT2020_TO_BT709: [[f32; 3]; 3] = [
@@ -267,6 +330,33 @@ const BT709_TO_BT2020: [[f32; 3]; 3] = [
     [0.016_391, 0.088_013, 0.895_595],
 ];
 
+/// Display P3 to BT.709, linear light.  P3's green and red sit between the two
+/// BT sets, and its blue is BT.709's, so a P3 capture read as BT.709 — which is
+/// what "the nearer of the two" used to do — came out too saturated.
+const DISPLAY_P3_TO_BT709: [[f32; 3]; 3] = [
+    [1.224_940, -0.224_940, 0.0],
+    [-0.042_057, 1.042_057, 0.0],
+    [-0.019_638, -0.078_636, 1.098_274],
+];
+
+/// Display P3 to BT.2020, linear light — what a P3 capture needs before it goes
+/// to a BT.2020 surface.
+const DISPLAY_P3_TO_BT2020: [[f32; 3]; 3] = [
+    [0.753_833, 0.198_597, 0.047_570],
+    [0.045_744, 0.941_777, 0.012_479],
+    [-0.001_210, 0.017_602, 0.983_609],
+];
+
+/// CIE XYZ (D65) to BT.709 linear: the other half of `rgb_to_xyz`.
+const XYZ_TO_BT709: [[f32; 3]; 3] = [
+    [3.240_970, -1.537_383, -0.498_611],
+    [-0.969_244, 1.875_968, 0.041_555],
+    [0.055_630, -0.203_977, 1.056_972],
+];
+
+/// The D65 white point, the one `wp_color_manager_v1` assumes.
+const D65: (f32, f32) = (0.3127, 0.3290);
+
 fn multiply(matrix: [[f32; 3]; 3], rgb: [f32; 3]) -> [f32; 3] {
     [
         matrix[0][0] * rgb[0] + matrix[0][1] * rgb[1] + matrix[0][2] * rgb[2],
@@ -275,18 +365,139 @@ fn multiply(matrix: [[f32; 3]; 3], rgb: [f32; 3]) -> [f32; 3] {
     ]
 }
 
+/// The product `first * second` of two 3×3 matrices.
+fn multiply3(first: [[f32; 3]; 3], second: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let mut product = [[0.0f32; 3]; 3];
+    for row in 0..3 {
+        for column in 0..3 {
+            product[row][column] = (0..3).map(|k| first[row][k] * second[k][column]).sum();
+        }
+    }
+    product
+}
+
+/// Whether two matrices agree to within the precision a description's
+/// millionth-unit coordinates can carry.
+fn matrices_close(first: [[f32; 3]; 3], second: [[f32; 3]; 3]) -> bool {
+    first
+        .iter()
+        .flatten()
+        .zip(second.iter().flatten())
+        .all(|(a, b)| (a - b).abs() < 5.0e-3)
+}
+
+/// The linear RGB → CIE XYZ matrix a set of primaries and a white point imply:
+/// each primary at full scale, scaled so that the three of them add up to the
+/// white point.
+fn rgb_to_xyz(primaries: [(f32, f32); 3], white: (f32, f32)) -> [[f32; 3]; 3] {
+    let xyz = |(x, y): (f32, f32)| [x / y, 1.0, (1.0 - x - y) / y];
+    let [r, g, b] = primaries.map(xyz);
+    // Columns are the primaries at unit scale.
+    let matrix = [
+        [r[0], g[0], b[0]],
+        [r[1], g[1], b[1]],
+        [r[2], g[2], b[2]],
+    ];
+    let scale = solve3(matrix, xyz(white));
+    [
+        [matrix[0][0] * scale[0], matrix[0][1] * scale[1], matrix[0][2] * scale[2]],
+        [matrix[1][0] * scale[0], matrix[1][1] * scale[1], matrix[1][2] * scale[2]],
+        [matrix[2][0] * scale[0], matrix[2][1] * scale[1], matrix[2][2] * scale[2]],
+    ]
+}
+
+/// The inverse of a 3×3 matrix, column by column.
+fn invert3(matrix: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let column = |index: usize| {
+        let mut unit = [0.0f32; 3];
+        unit[index] = 1.0;
+        solve3(matrix, unit)
+    };
+    let (first, second, third) = (column(0), column(1), column(2));
+    [
+        [first[0], second[0], third[0]],
+        [first[1], second[1], third[1]],
+        [first[2], second[2], third[2]],
+    ]
+}
+
+/// Solves `matrix * x = target` by Cramer's rule; the primaries always give a
+/// well-conditioned matrix, and a degenerate one would fall back to zeros.
+fn solve3(matrix: [[f32; 3]; 3], target: [f32; 3]) -> [f32; 3] {
+    let determinant = |m: [[f32; 3]; 3]| {
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    };
+    let base = determinant(matrix);
+    if base.abs() < 1.0e-12 {
+        return [0.0; 3];
+    }
+    let with = |column: usize| {
+        let mut copy = matrix;
+        for row in 0..3 {
+            copy[row][column] = target[row];
+        }
+        determinant(copy) / base
+    };
+    [with(0), with(1), with(2)]
+}
+
+/// Pulls an out-of-gamut linear colour back in by moving it toward its own
+/// luminance until its smallest component is zero.
+///
+/// The alternative — clamping each component at zero — shifts the hue of every
+/// colour the target gamut cannot hold, which is what a saturated HDR colour
+/// looked like after the conversion to BT.709.  Moving along the line to the
+/// achromatic axis gives up only the chroma that does not fit and keeps the
+/// hue, which is what a gamut map is for.
+fn map_into_gamut(rgb: [f32; 3]) -> [f32; 3] {
+    let smallest = rgb[0].min(rgb[1]).min(rgb[2]);
+    if smallest >= 0.0 {
+        return rgb;
+    }
+    let luma = 0.212_6 * rgb[0] + 0.715_2 * rgb[1] + 0.072_2 * rgb[2];
+    let span = luma - smallest;
+    if span <= 0.0 {
+        let grey = luma.max(0.0);
+        return [grey; 3];
+    }
+    let toward = (-smallest / span).clamp(0.0, 1.0);
+    [
+        (rgb[0] + toward * (luma - rgb[0])).max(0.0),
+        (rgb[1] + toward * (luma - rgb[1])).max(0.0),
+        (rgb[2] + toward * (luma - rgb[2])).max(0.0),
+    ]
+}
+
 // --- the frame ------------------------------------------------------------
 
-/// A frame in linear light (scRGB-like), one `[r, g, b, a]` per pixel.
+/// A frame in linear light, one `[r, g, b, a]` per pixel, in `primaries`.
+///
+/// The gamut travels with the frame because the two consumers want different
+/// spaces: a colour-managed surface is described in the output's own primaries
+/// and wants the frame as it was captured, while an 8-bit PNG or a Radiance
+/// file carries no colorimetry and has to be BT.709.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HdrFrame {
     size: Size,
     pixels: Vec<[f32; 4]>,
+    primaries: Primaries,
 }
 
 impl HdrFrame {
-    /// Wraps already-linear scRGB pixels.
+    /// Wraps already-linear pixels in BT.709, the space every test and every
+    /// caller without a compositor description uses.
     pub fn new(size: Size, pixels: Vec<[f32; 4]>) -> Result<Self> {
+        Self::in_primaries(size, pixels, Primaries::Bt709)
+    }
+
+    /// Wraps already-linear pixels that are in `primaries`.
+    pub fn in_primaries(
+        size: Size,
+        pixels: Vec<[f32; 4]>,
+        primaries: Primaries,
+    ) -> Result<Self> {
         let expected = size.area()?;
         if pixels.len() != expected {
             return Err(VshotError::InvalidGeometry(format!(
@@ -294,7 +505,16 @@ impl HdrFrame {
                 pixels.len()
             )));
         }
-        Ok(Self { size, pixels })
+        Ok(Self {
+            size,
+            pixels,
+            primaries,
+        })
+    }
+
+    /// The gamut the pixels are in.
+    pub const fn primaries(&self) -> Primaries {
+        self.primaries
     }
 
     pub const fn size(&self) -> Size {
@@ -369,9 +589,10 @@ impl HdrFrame {
                 if transfer == Transfer::Hlg {
                     rgb = hlg_ootf(rgb, reference_nits);
                 }
-                if primaries == Primaries::Bt2020 {
-                    rgb = multiply(BT2020_TO_BT709, rgb);
-                }
+                // The gamut is *kept*, not converted: a colour-managed surface
+                // is described in this same space, so the HDR half reaches the
+                // panel with its wide gamut intact.  The 8-bit consumers
+                // convert on the way out.
                 let alpha = if alpha {
                     ((word >> 30) & 0x3) as f32 / 3.0
                 } else {
@@ -380,7 +601,7 @@ impl HdrFrame {
                 *destination = [rgb[0], rgb[1], rgb[2], alpha];
             }
         });
-        Self::new(size, pixels)
+        Self::in_primaries(size, pixels, primaries)
     }
 
     /// Encodes the frame as the ten-bit pixels a colour-managed surface reads:
@@ -414,7 +635,7 @@ impl HdrFrame {
         map_rows(&mut words, self.size.width as usize, |offset, row| {
             for (index, destination) in row.iter_mut().enumerate() {
                 let pixel = self.pixels[offset + index];
-                let rgb = multiply(BT709_TO_BT2020, [pixel[0], pixel[1], pixel[2]]);
+                let rgb = multiply(self.primaries.to_bt2020(), [pixel[0], pixel[1], pixel[2]]);
                 *destination =
                     (3 << 30) | (code(rgb[0]) << 20) | (code(rgb[1]) << 10) | code(rgb[2]);
             }
@@ -444,7 +665,14 @@ impl HdrFrame {
         map_rows(&mut bytes, self.size.width as usize * 4, |offset, row| {
             for (index, destination) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let pixel = self.pixels[offset / 4 + index];
-                let rgb = [pixel[0].max(0.0), pixel[1].max(0.0), pixel[2].max(0.0)];
+                // Into BT.709 first, and out of gamut by desaturation rather
+                // than by clipping: clamping a negative component moves a
+                // saturated colour's hue, which is the inaccurate colour a
+                // wide-gamut capture used to come out with.
+                let rgb = map_into_gamut(multiply(
+                    self.primaries.to_bt709(),
+                    [pixel[0], pixel[1], pixel[2]],
+                ));
                 // One factor for the whole triple, so hue survives the roll-off
                 // of anything brighter than white.
                 let peak = rgb[0].max(rgb[1]).max(rgb[2]);
@@ -482,11 +710,18 @@ impl HdrFrame {
                 if alpha == 0.0 {
                     continue;
                 }
-                let source = [
-                    srgb_eotf(f32::from(rgba[0]) / 255.0),
-                    srgb_eotf(f32::from(rgba[1]) / 255.0),
-                    srgb_eotf(f32::from(rgba[2]) / 255.0),
-                ];
+                // The layer is 8-bit sRGB (BT.709) and the frame is in its own
+                // gamut, so the mark is brought into that gamut before the
+                // blend; otherwise a mark on a BT.2020 frame would be added as
+                // if its values were BT.2020, which they are not.
+                let source = multiply(
+                    self.primaries.from_bt709(),
+                    [
+                        srgb_eotf(f32::from(rgba[0]) / 255.0),
+                        srgb_eotf(f32::from(rgba[1]) / 255.0),
+                        srgb_eotf(f32::from(rgba[2]) / 255.0),
+                    ],
+                );
                 let below = destination[3];
                 let out_alpha = alpha + below * (1.0 - alpha);
                 if out_alpha <= 0.0 {
@@ -503,10 +738,33 @@ impl HdrFrame {
         Ok(())
     }
 
+    /// The frame's pixels in BT.709 linear — the space a format with no
+    /// colorimetry to carry (an 8-bit PNG, a Radiance file) is read in.
+    /// Out-of-gamut colours are mapped into it, not clipped.
+    fn bt709_pixels(&self) -> Vec<[f32; 4]> {
+        if self.primaries == Primaries::Bt709 {
+            return self.pixels.clone();
+        }
+        let matrix = self.primaries.to_bt709();
+        self.pixels
+            .iter()
+            .map(|pixel| {
+                let rgb = map_into_gamut(multiply(matrix, [pixel[0], pixel[1], pixel[2]]));
+                [rgb[0], rgb[1], rgb[2], pixel[3]]
+            })
+            .collect()
+    }
+
     /// Encodes the frame as Radiance RGBE (`.hdr`).  The values are linear
     /// light, which is exactly what the format holds, so an HDR viewer shows
     /// the content as captured.
+    ///
+    /// The file is written in BT.709 linear: RGBE carries no colorimetry, so a
+    /// file of BT.2020 numbers would be read as Rec.709 by every viewer and
+    /// come out over-saturated.  The wide gamut lives where it can be shown —
+    /// on the colour-managed surface an HDR pin is drawn on.
     pub fn encode_radiance(&self) -> Vec<u8> {
+        let pixels = self.bt709_pixels();
         let width = self.size.width;
         let height = self.size.height;
         let mut out = Vec::new();
@@ -520,7 +778,7 @@ impl HdrFrame {
         // encoder is split into are whole rows, and every row in one gets its
         // own scanline: emitting a chunk as a single scanline would shift every
         // row after the first.
-        for rows in collect_rows(&self.pixels, width as usize, |chunk| {
+        for rows in collect_rows(&pixels, width as usize, |chunk| {
             let mut bytes = Vec::new();
             for scanline in chunk.chunks(width as usize) {
                 encode_scanline(scanline, width, rle, &mut bytes);
@@ -570,7 +828,11 @@ impl HdrFrame {
             let start = (y + row) * source_width + x;
             pixels.extend_from_slice(&self.pixels[start..start + width]);
         }
-        Self::new(Size::new(crop.size.width, crop.size.height), pixels)
+        Self::in_primaries(
+            Size::new(crop.size.width, crop.size.height),
+            pixels,
+            self.primaries,
+        )
     }
 
     /// Pixelates `rect` with a rect-aligned block grid, averaging the **linear**
@@ -1052,7 +1314,9 @@ mod tests {
     #[test]
     fn bt2020_white_becomes_bt709_white() {
         // The 2020->709 matrix has rows that sum to one, so a neutral stays
-        // neutral; without that a white HDR pixel would come out tinted.
+        // neutral; without that a white HDR pixel would come out tinted.  The
+        // conversion happens when the frame is written out as SDR, not when it
+        // is decoded: the frame itself keeps the output's gamut.
         let frame = HdrFrame::from_rgb10(
             &[0x3fff_ffff],
             Size::new(1, 1),
@@ -1062,10 +1326,56 @@ mod tests {
             REFERENCE_WHITE_NITS,
         )
         .unwrap();
-        let pixel = frame.pixel(0, 0).unwrap();
-        assert!((pixel[0] - 1.0).abs() < 1e-3, "{}", pixel[0]);
-        assert!((pixel[1] - 1.0).abs() < 1e-3, "{}", pixel[1]);
-        assert!((pixel[2] - 1.0).abs() < 1e-3, "{}", pixel[2]);
+        assert_eq!(frame.primaries(), Primaries::Bt2020);
+        let pixel = frame.tone_map_to_srgb().unwrap().pixel(Point::new(0, 0)).unwrap();
+        for channel in &pixel[..3] {
+            assert!((i32::from(*channel) - 255).abs() <= 1, "{pixel:?}");
+        }
+    }
+
+    #[test]
+    fn a_gamut_is_read_from_its_chromaticities() {
+        assert_eq!(
+            Primaries::from_chromaticities((0.708, 0.292), (0.170, 0.797), (0.131, 0.046)),
+            Primaries::Bt2020
+        );
+        assert_eq!(
+            Primaries::from_chromaticities((0.640, 0.330), (0.300, 0.600), (0.150, 0.060)),
+            Primaries::Bt709
+        );
+        assert_eq!(
+            Primaries::from_chromaticities((0.680, 0.320), (0.265, 0.690), (0.150, 0.060)),
+            Primaries::DisplayP3
+        );
+        // A gamut that is none of them keeps its own matrix instead of being
+        // read as BT.709, which is what shifted a monitor's colours.
+        let custom =
+            Primaries::from_chromaticities((0.700, 0.300), (0.200, 0.750), (0.140, 0.050));
+        assert!(matches!(custom, Primaries::Custom { .. }));
+        // It shares the D65 white point, so a neutral stays neutral through it.
+        let neutral = multiply(custom.to_bt709(), [0.5, 0.5, 0.5]);
+        for channel in neutral {
+            assert!((channel - 0.5).abs() < 2.0e-3, "{neutral:?}");
+        }
+    }
+
+    #[test]
+    fn an_out_of_gamut_colour_is_mapped_not_clipped() {
+        // A saturated BT.2020 green is outside sRGB.  Clamping its negative red
+        // and blue leaves sRGB's own pure green, which is a different hue; the
+        // map pulls the colour toward the white point until it fits, which
+        // keeps the hue and gives up only the chroma that does not fit.
+        let frame = HdrFrame::in_primaries(
+            Size::new(1, 1),
+            vec![[0.0, 1.0, 0.0, 1.0]],
+            Primaries::Bt2020,
+        )
+        .unwrap();
+        let pixel = frame.tone_map_to_srgb().unwrap().pixel(Point::new(0, 0)).unwrap();
+        // Green stays the largest and red stays zero, but blue is not clamped
+        // away: the result is the same hue at lower chroma, not sRGB's green.
+        assert!(pixel[2] > 0, "blue was clipped away: {pixel:?}");
+        assert!(pixel[1] >= pixel[0] && pixel[1] >= pixel[2], "{pixel:?}");
     }
 
     #[test]
@@ -1191,10 +1501,15 @@ mod tests {
             rgb10(0, 0, 0),
             rgb10(1023, 1023, 1023),
             rgb10(300, 500, 800),
+            // The saturated primaries are outside sRGB: a detour through BT.709
+            // would clip them and the codes would come back desaturated.
+            rgb10(1023, 0, 0),
+            rgb10(0, 1023, 0),
+            rgb10(0, 0, 1023),
         ];
         let frame = HdrFrame::from_rgb10(
             &words,
-            Size::new(3, 1),
+            Size::new(6, 1),
             color.transfer,
             color.primaries,
             false,
