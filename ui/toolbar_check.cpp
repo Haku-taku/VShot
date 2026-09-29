@@ -22,9 +22,14 @@
 
 #include <QApplication>
 #include <QBoxLayout>
+#include <QCoreApplication>
 #include <QFontMetrics>
 #include <QFrame>
 #include <QGridLayout>
+#include <QHelpEvent>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QLabel>
 #include <QLayout>
 #include <QPoint>
 #include <QPushButton>
@@ -265,6 +270,137 @@ void checkPanelBelowKeepsTheStyleRowBelow()
     expect(globalTop(parts.style) > after,
            "the style row grows below the command bar, away from the selection");
 }
+
+// Hovering a button: the panel draws the tip itself.
+//
+// Qt's `QToolTip` is a popup window, and this process's layer-shell platform
+// integration cannot host one: the compositor never gets a usable popup and Qt
+// paints the text into the overlay's own full-output surface, which the user
+// meets as a screen-sized block of panel colour.  This must stay a small child
+// of the overlay, and no Qt tooltip window may appear.
+void checkHoverShowsThePanelTooltip()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(sessionFor(vshot::LogicalRect{150, 150, 100, 100}));
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+
+    QAbstractButton *button = nullptr;
+    const QList<QAbstractButton *> buttons = overlay->findChildren<QAbstractButton *>();
+    for (QAbstractButton *candidate : buttons) {
+        if (candidate->isVisible() && !candidate->toolTip().isEmpty()) {
+            button = candidate;
+            break;
+        }
+    }
+    if (button == nullptr) {
+        expect(false, "a visible toolbar button with a tooltip");
+        return;
+    }
+
+    const QPoint local(button->width() / 2, button->height() / 2);
+    const int windowsBefore = QApplication::topLevelWidgets().size();
+    QHelpEvent hover(QEvent::ToolTip, local, button->mapToGlobal(local));
+    QCoreApplication::sendEvent(button, &hover);
+    const int windowsAfter = QApplication::topLevelWidgets().size();
+    expect(windowsAfter == windowsBefore,
+           "a hover raises no tooltip window of Qt's own",
+           QStringLiteral("%1 window(s) appeared").arg(windowsAfter - windowsBefore));
+
+    auto *tip = overlay->findChild<QLabel *>(QStringLiteral("vshotTooltip"));
+    expect(tip != nullptr && tip->isVisible(), "the panel shows its own tooltip");
+    if (tip == nullptr) {
+        return;
+    }
+    expect(tip->text() == button->toolTip(), "the tip carries the hovered button's text");
+    // A one-line card that fits the overlay: the failure this guards is a block
+    // of panel colour covering the whole surface, not a wide line of text.
+    expect(tip->height() < 60 && tip->width() < overlay->width(),
+           "the tip is a small card, not a screen-sized block",
+           QStringLiteral("tip %1x%2 over %3x%4")
+               .arg(tip->width())
+               .arg(tip->height())
+               .arg(overlay->width())
+               .arg(overlay->height()));
+    const QPoint tipTopLeft = tip->mapTo(overlay, QPoint(0, 0));
+    const QPoint buttonTopLeft = button->mapTo(overlay, QPoint(0, 0));
+    expect(std::abs(tipTopLeft.y() - buttonTopLeft.y()) < 200,
+           "the tip stays near the button it describes");
+}
+
+// The toolbar's Pin button: it finishes the session the way OK does and the
+// result asks for the image on the screen instead of on disk.  The pin editor
+// is already editing a pin, so it does not offer it again.
+void checkPinButtonAsksForTheScreen()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(sessionFor(vshot::LogicalRect{100, 100, 120, 90}));
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+
+    auto *pin = overlay->findChild<QToolButton *>(QStringLiteral("pinButton"));
+    expect(pin != nullptr && pin->isVisible(), "the capture editor offers a Pin button");
+    if (pin == nullptr) {
+        return;
+    }
+    // It is drawn as one of the tools -- the same square icon button -- rather
+    // than as a text button beside OK, and it carries a pin glyph.
+    expect(pin->property("toolButton").toBool(),
+           "the Pin button wears the tool buttons' shape");
+    expect(pin->toolButtonStyle() == Qt::ToolButtonTextUnderIcon && !pin->icon().isNull(),
+           "the Pin button shows a pin icon over its label");
+    controller.pin();
+    expect(controller.isFinished() && !controller.isCancelled(),
+           "the Pin button finishes the session like OK does");
+    const QJsonObject result = controller.resultDocument().object();
+    expect(result.value(QStringLiteral("status")).toString() == QStringLiteral("ok"),
+           "the result is a kept capture");
+    expect(result.value(QStringLiteral("pin")).toBool(),
+           "the result asks for the image to be pinned");
+}
+
+void checkThePinEditorOffersNoPinButton()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(sessionFor(vshot::LogicalRect{0, 0, 200, 160}));
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.setPinEditMode(true);
+    controller.beginPinEdit();
+    auto *pin = overlay->findChild<QToolButton *>(QStringLiteral("pinButton"));
+    expect(pin != nullptr && !pin->isVisible(),
+           "the pin editor does not offer Pin a second time");
+}
+
 
 // The command bar is two rows: the drawing tools, then everything that acts on
 // the capture, steps it back or ends it.  One row of all of them came to about a
@@ -721,6 +857,9 @@ int main(int argc, char *argv[])
     checkCrampedCaptureKeepsTheButtonsStill();
     checkPanelAboveKeepsTheStyleRowAbove();
     checkPanelBelowKeepsTheStyleRowBelow();
+    checkHoverShowsThePanelTooltip();
+    checkPinButtonAsksForTheScreen();
+    checkThePinEditorOffersNoPinButton();
     checkCommandBarIsTwoRows();
     checkCommandBarButtonsShareOneSize();
     checkTheEndsArePinnedToTheRight();

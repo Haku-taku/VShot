@@ -182,6 +182,30 @@ if(VSHOT_BUILD_CHECKS)
         target_compile_options(vshot-pin-outline-check PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 
+    # The HDR marker check: the `HDR` tag a pinned HDR capture wears while the
+    # pointer is over it -- which pin gets it, and which of the two inks it is
+    # drawn in. Renders the real surface offscreen and counts the pixels, so no
+    # compositor and no pointer are needed.
+    add_executable(vshot-pin-hdr-check
+        ui/pin_hdr_check.cpp
+        ui/pin_surface.cpp
+        ui/pin_surface.hpp
+        ui/i18n.cpp
+        ui/i18n.hpp
+        ui/shadow.cpp
+        ui/shadow.hpp
+    )
+    target_link_libraries(vshot-pin-hdr-check PRIVATE
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+        LayerShellQt::Interface
+    )
+    target_compile_features(vshot-pin-hdr-check PRIVATE cxx_std_17)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(vshot-pin-hdr-check PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
     # The text card check: it measures how much empty card surrounds the text
     # on a pinned text card, which is what decides whether the card reads as a
     # white frame or as the text itself. Needs Qt Gui for QTextDocument and the
@@ -257,6 +281,41 @@ if(VSHOT_BUILD_CHECKS)
     target_compile_features(vshot-paste-check PRIVATE cxx_std_17)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(vshot-paste-check PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    # The backdrop check: when VShot shows the frozen frame itself, on an HDR
+    # surface below the overlay, the overlay must leave it alone -- the veil
+    # with the selection cut out, and no frame of its own.  It paints the real
+    # overlay offscreen and reads the alpha back, because the failure it guards
+    # (drawing the SDR frame over the better picture) looks like a slightly
+    # dimmer selection rather than a broken one.  Needs Widgets and the
+    # offscreen platform plugin, no compositor: no layer surface is shown.
+    add_executable(vshot-backdrop-check
+        ui/backdrop_check.cpp
+        ui/capture_overlay.cpp
+        ui/capture_overlay.hpp
+        ui/text_layer.cpp
+        ui/text_layer.hpp
+        ui/translation_layer.cpp
+        ui/translation_layer.hpp
+        ui/session_protocol.cpp
+        ui/session_protocol.hpp
+        ui/config.cpp
+        ui/config.hpp
+        ui/text_size.hpp
+        ui/i18n.cpp
+        ui/i18n.hpp
+    )
+    target_link_libraries(vshot-backdrop-check PRIVATE
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+        Qt6::Network
+        LayerShellQt::Interface
+    )
+    target_compile_features(vshot-backdrop-check PRIVATE cxx_std_17)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(vshot-backdrop-check PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 
     # The toolbar check: it drives the real editor and reads the floating

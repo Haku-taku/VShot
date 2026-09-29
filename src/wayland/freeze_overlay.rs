@@ -30,12 +30,39 @@ pub(crate) struct PoolUserData;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BufferToken {
     Parent(u64),
+    /// One of a pinned HDR image's picture buffers, named by its slot.  A pin is
+    /// drawn on a half-float dma-buf, not on shared memory, so its buffers carry
+    /// their own token kind rather than reusing the frozen backdrop's.
+    Pin(u64),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BufferUserData {
     pub(crate) output_id: u32,
     pub(crate) token: BufferToken,
+}
+
+/// One picture buffer of a pinned HDR image: the `wl_buffer` the compositor
+/// takes, and whether it has given it back.
+///
+/// The pixels are *not* here.  They live in a half-float dma-buf the helper
+/// allocated and draws into through EGL, so this side only ever names it: the
+/// buffer is built from the descriptor facts the helper read back out of its own
+/// allocation, and the drawing happens on the other side of the connection.
+pub(crate) struct PinSlot {
+    pub(crate) buffer: wl_buffer::WlBuffer,
+    pub(crate) token: BufferToken,
+    pub(crate) available: bool,
+}
+
+impl std::fmt::Debug for PinSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PinSlot")
+            .field("token", &self.token)
+            .field("available", &self.available)
+            .finish_non_exhaustive()
+    }
 }
 
 pub(crate) fn release_buffer_if_current(
@@ -173,6 +200,42 @@ impl ShmSlot {
         scale: u32,
     ) -> Result<()> {
         self.render_editor(frame, selection, output_geometry, scale, None, None)
+    }
+
+    /// Blits packed `XRGB2101010` words into this slot.  This is the HDR
+    /// backdrop's render: the words already carry the encoding the surface's
+    /// colour description names (PQ over BT.2020, for `HdrFrame::to_rgb10_pq`),
+    /// so nothing is converted here, and no dimming or annotation cache applies
+    /// — the backdrop is the untouched frozen frame and the editor's marks are
+    /// drawn over it by the helper.
+    pub(crate) fn render_words(&mut self, words: &[u32]) -> Result<()> {
+        let expected = u64::from(self.width)
+            .checked_mul(u64::from(self.height))
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(|| VshotError::WaylandProtocol("SHM slot size overflows".into()))?;
+        if words.len() != expected {
+            return Err(VshotError::WaylandProtocol(format!(
+                "backdrop frame has {} pixels, but the layer surface buffer is {expected}",
+                words.len()
+            )));
+        }
+        let map_len = checked_buffer_len(self.stride, self.width, self.height)?;
+        if self.map.len() < map_len {
+            return Err(VshotError::WaylandProtocol(
+                "SHM map is smaller than its declared dimensions".into(),
+            ));
+        }
+        let (words_out, _) = self.map[..map_len].as_chunks_mut::<4>();
+        for (destination, word) in words_out.iter_mut().zip(words) {
+            *destination = word.to_le_bytes();
+        }
+        self.dimmed = None;
+        self.editor_dimmed = None;
+        self.editor_bgra = None;
+        self.editor_annotations = None;
+        self.content_mode = ContentMode::Raw;
+        self.last_selection = None;
+        Ok(())
     }
 
     fn validate_frame(&self, frame: &Frame) -> Result<usize> {
@@ -1364,7 +1427,32 @@ pub(crate) struct OverlaySurface {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) slots: Vec<ShmSlot>,
+    /// A pinned HDR image's picture buffers, when this surface is the pin
+    /// helper's rather than the frozen scene's.  They are dma-bufs the helper
+    /// draws into, so there is nothing here to render into them.
+    pub(crate) pin_slots: Vec<PinSlot>,
     pub(crate) pending_parent_redraw: bool,
+    /// The colour-management objects an HDR backdrop hangs on its surface,
+    /// held so they outlive it.
+    pub(crate) color: Option<OverlayColor>,
+}
+
+/// An HDR backdrop surface's colour management: the output the description came
+/// from, the description itself, and the surface object it was set on.
+///
+/// The description is the **output's own** — what
+/// `wp_color_management_output_v1.get_image_description()` hands back — not one
+/// built to look like it.  The compositor dedupes descriptions by content, so
+/// this is the very object it uses for the monitor; a surface carrying it needs
+/// no conversion and, more to the point, no tone map, which is what makes the
+/// frozen frame show at the light levels the screen showed.
+#[derive(Debug)]
+pub(crate) struct OverlayColor {
+    pub(crate) _output:
+        wayland_protocols::wp::color_management::v1::client::wp_color_management_output_v1::WpColorManagementOutputV1,
+    pub(crate) _description:
+        wayland_protocols::wp::color_management::v1::client::wp_image_description_v1::WpImageDescriptionV1,
+    pub(crate) _surface: wayland_protocols::wp::color_management::v1::client::wp_color_management_surface_v1::WpColorManagementSurfaceV1,
 }
 
 impl std::fmt::Debug for OverlaySurface {
@@ -1384,6 +1472,44 @@ impl std::fmt::Debug for OverlaySurface {
 impl OverlaySurface {
     pub(crate) fn attach_available(&mut self) -> Option<usize> {
         self.slots.iter().position(|slot| slot.available)
+    }
+
+    /// Attaches one of the pin's picture buffers and commits only `region` of
+    /// it.  `false` when that slot has nothing, or is still with the compositor.
+    ///
+    /// The pixels are already in the buffer — the helper drew them and copied
+    /// the region across — so this is the attach, the damage and the commit, and
+    /// nothing else.
+    pub(crate) fn present_pin_slot(&mut self, slot: usize, region: Rect) -> bool {
+        if region.is_empty() {
+            return false;
+        }
+        let Some(pin) = self.pin_slots.get_mut(slot) else {
+            return false;
+        };
+        if !pin.available {
+            return false;
+        }
+        pin.available = false;
+        self.surface.attach(Some(&pin.buffer), 0, 0);
+        // `damage_buffer` rather than `damage`: the region is already in buffer
+        // pixels, and `damage` would be scaled by the output's scale on top.
+        self.surface.damage_buffer(
+            region.origin.x,
+            region.origin.y,
+            region.size.width as i32,
+            region.size.height as i32,
+        );
+        self.surface.commit();
+        true
+    }
+
+    /// Marks one picture buffer as free again after the compositor returned it.
+    pub(crate) fn release_pin_slot(&mut self, token: BufferToken) -> bool {
+        let Some(pin) = self.pin_slots.iter_mut().find(|slot| slot.token == token) else {
+            return false;
+        };
+        release_buffer_if_current(pin.token, token, &mut pin.available)
     }
 
     pub(crate) fn commit_slot(&mut self, slot: usize) {

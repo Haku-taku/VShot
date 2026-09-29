@@ -37,6 +37,11 @@ struct OutputSession {
     std::uint32_t pixelWidth = 0;
     std::uint32_t pixelHeight = 0;
     QString path;
+    // Set when VShot is already showing this output's frozen frame on an HDR
+    // backdrop surface below the overlay: the overlay then draws no image and
+    // veils the backdrop, so what shows through the selection is the light the
+    // screen showed.  `image` is still loaded, for the mosaic preview.
+    bool backdrop = false;
     QImage image;
 };
 

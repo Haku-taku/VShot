@@ -7,9 +7,24 @@ use wayland_client::protocol::wl_output;
 use wayland_protocols::wp::cursor_shape::v1::client::{
     wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
 };
+use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1;
 
 use crate::error::{Result, VshotError};
 use crate::geometry::{Point, Rect, Size};
+
+/// `DRM_FORMAT_MOD_INVALID`, the modifier a compositor offers when it can take a
+/// buffer in any layout the allocation side can produce.
+pub(crate) const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+/// `DRM_FORMAT_MOD_LINEAR`.
+const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+
+/// Whether `modifier` is the NVIDIA block-linear family, and how tall its block
+/// is.  The framing is NVIDIA's own fourcc-modifier encoding, and the height is
+/// the low nibble of its value.
+fn nvidia_block_height(modifier: u64) -> Option<u64> {
+    const NVIDIA_VENDOR: u64 = 0x03;
+    (modifier >> 56 == NVIDIA_VENDOR).then_some(modifier & 0xf)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutputInfo {
@@ -55,6 +70,17 @@ pub(crate) struct TopologyState {
     pub(crate) shm: Option<wayland_client::protocol::wl_shm::WlShm>,
     pub(crate) shm_argb8888: bool,
     pub(crate) shm_xrgb8888: bool,
+    // Ten-bit shm formats, what an HDR backdrop surface is written in.
+    pub(crate) shm_argb2101010: bool,
+    pub(crate) shm_xrgb2101010: bool,
+    // `wp_color_manager_v1`, when the compositor offers it: the backdrop sets
+    // an output's own image description on its surface through this.
+    pub(crate) color_manager: Option<wayland_protocols::wp::color_management::v1::client::wp_color_manager_v1::WpColorManagerV1>,
+    // `zwp_linux_dmabuf_v1`, and the formats it will take: the pinned HDR image
+    // is a half-float dma-buf, and only a modifier the compositor lists can be
+    // imported.
+    pub(crate) dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
+    pub(crate) dmabuf_formats: HashMap<u32, Vec<u64>>,
     pub(crate) layer_shell: Option<wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::ZwlrLayerShellV1>,
     pub(crate) cursor_shape_manager: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
     pub(crate) cursor_shape_device: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
@@ -103,6 +129,53 @@ impl TopologyState {
         } else {
             None
         }
+    }
+
+    /// The ten-bit shm format a backdrop surface is written in.  Ten bits is
+    /// what a PQ code wants: it is the depth an HDR capture arrives at, and
+    /// rounding it to eight would band the very gradients the backdrop exists
+    /// to show.  `None` means the compositor offers none, and the backdrop
+    /// falls back to the SDR overlay.
+    ///
+    /// Only the `…rgb…`-ordered forms are usable: the backdrop's words are
+    /// packed ``XRGB2101010``-wise (see [`crate::model::HdrFrame::to_rgb10_pq`]),
+    /// and the buffer is written straight from them.  A compositor that offers
+    /// only the `…bgr…` pair therefore falls back to the SDR overlay; the
+    /// capture side reads all four, but it can swap the fields as it decodes.
+    pub(crate) fn shm_format_10bit(&self) -> Option<wayland_client::protocol::wl_shm::Format> {
+        if self.shm_argb2101010 {
+            Some(wayland_client::protocol::wl_shm::Format::Argb2101010)
+        } else if self.shm_xrgb2101010 {
+            Some(wayland_client::protocol::wl_shm::Format::Xrgb2101010)
+        } else {
+            None
+        }
+    }
+
+    /// The modifiers to offer GBM for `fourcc`, most preferred first, or `None`
+    /// when the compositor will not take that format at all.
+    ///
+    /// Order matters because `gbm_bo_create_with_modifiers` takes the first
+    /// modifier of the list it can allocate.  In principle the layout of a
+    /// half-float picture should not change a single pixel of what the
+    /// compositor shows, but measurably it does: on NVIDIA, the block-linear
+    /// layouts of different heights come back with slightly different light, and
+    /// the tallest block is the one that matched a software control exactly.  So
+    /// the block-linear family is offered tallest block first, whichever order
+    /// the compositor happened to list it in; everything else keeps the order it
+    /// was given, and `INVALID` -- "any layout you like" -- goes last because a
+    /// concrete layout is a stronger promise.
+    pub(crate) fn dmabuf_modifier_order(&self, fourcc: u32) -> Option<Vec<u64>> {
+        let modifiers = self.dmabuf_formats.get(&fourcc)?;
+        let mut ordered = modifiers.clone();
+        ordered.sort_by_key(|modifier| match *modifier {
+            DRM_FORMAT_MOD_LINEAR | DRM_FORMAT_MOD_INVALID => (2_u8, 0_u64),
+            modifier => match nvidia_block_height(modifier) {
+                Some(height) => (0, u64::MAX - height),
+                None => (1, modifier),
+            },
+        });
+        Some(ordered)
     }
 
     /// The outputs, as the compositor describes them.

@@ -77,6 +77,16 @@ pub enum VshotError {
     Clipboard(String),
     #[error("pin failed: {0}")]
     Pin(String),
+    /// The HDR half of a pinned image: the file the daemon wrote for the surface
+    /// helper, or the helper's own protocol.  Named separately because it is the
+    /// only part of a pin that can fail without the pin itself being wrong.
+    #[error("pinning HDR pixels failed for {}: {reason}", .path.display())]
+    HdrPin { path: PathBuf, reason: String },
+    /// The half-float surface a pinned HDR image is drawn on: the render node,
+    /// EGL, GBM, a shader or a buffer.  Separate from [`VshotError::HdrPin`]
+    /// because it names the drawing side rather than the daemon's protocol.
+    #[error("the pinned HDR image's surface failed: {0}")]
+    PinSurface(String),
     /// Screen annotation: the resident overlay daemon, its socket, or the Qt
     /// helper behind it.  The message is a complete sentence because the
     /// failures span an optional helper process the user may never have built.

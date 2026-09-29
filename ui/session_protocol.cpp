@@ -389,6 +389,12 @@ bool loadSession(const QString &sessionPath, Session *session, QString *error)
                 return fail(error, QStringLiteral("output %1 path must be a non-empty string").arg(index));
             }
             output.path = object.value(QStringLiteral("path")).toString();
+            // Optional, and only ever set on a frozen-screen session: the frame
+            // is already on screen underneath, shown by VShot's own HDR
+            // backdrop surface, so this overlay leaves it out and veils the
+            // backdrop instead. The image is still loaded, because mosaics are
+            // previewed from its pixels.
+            output.backdrop = object.value(QStringLiteral("backdrop")).toBool(false);
 
             const std::uint64_t expectedWidth = static_cast<std::uint64_t>(output.geometry.width) * output.scale;
             const std::uint64_t expectedHeight = static_cast<std::uint64_t>(output.geometry.height) * output.scale;

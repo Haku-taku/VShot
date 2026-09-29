@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, VshotError};
+use crate::geometry::Size;
+use crate::model::hdr::{Primaries, Transfer};
+use crate::model::HdrFrame;
+use crate::output::HdrHalf;
 use crate::qt_overlay::helper_program;
 
 /// Budget for the daemon to come up after we start it ourselves.
@@ -24,6 +28,13 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) enum PinCommand {
     Add {
         path: PathBuf,
+        /// The same capture's HDR half, when it has one: the PQ codes a
+        /// ten-bit surface shows with no tone map in between.  The daemon
+        /// copies the file out of the CLI's temp directory (which is gone by
+        /// the time it replies) and hands the copy to the surface helper; a pin
+        /// without it is shown from `path` alone, the way every pin used to be.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hdr: Option<PathBuf>,
         /// Device pixels per logical pixel of the image, when it came from a
         /// capture: the scale of the output it was taken on. A pin shows the
         /// image at the logical size it had there. Bare files and clipboard
@@ -41,6 +52,13 @@ pub(crate) enum PinCommand {
         /// compositor reports one.
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<WireOutputRect>,
+        /// Where on the desktop the capture came from, in global logical
+        /// pixels, when it came from a place at all.  A pin made from a capture
+        /// lands back exactly there instead of in the middle of the output, so
+        /// pinning a window over itself is seamless.  Bare files and clipboard
+        /// images have no such place and leave this out.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        at: Option<WirePoint>,
     },
     #[serde(rename = "add-clipboard")]
     AddClipboard {
@@ -61,6 +79,12 @@ pub(crate) enum PinCommand {
         y: i32,
         #[serde(skip_serializing_if = "Option::is_none")]
         path: Option<PathBuf>,
+        /// A replacement HDR half for the new pixels, when the editor rendered
+        /// them in HDR as well.  `None` keeps whatever the pin had, which is
+        /// what a plain move wants; a pin whose pixels were replaced from the
+        /// SDR editor sends neither and becomes an ordinary SDR pin.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hdr: Option<PathBuf>,
     },
     Toggle,
     Show,
@@ -77,6 +101,22 @@ pub(crate) struct WireOutputRect {
     pub y: i32,
     pub width: u32,
     pub height: u32,
+}
+
+/// A point on the desktop's global logical grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct WirePoint {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl From<crate::geometry::Point> for WirePoint {
+    fn from(point: crate::geometry::Point) -> Self {
+        Self {
+            x: point.x,
+            y: point.y,
+        }
+    }
 }
 
 impl From<crate::geometry::Rect> for WireOutputRect {
@@ -261,9 +301,11 @@ pub(crate) fn run(invocation: PinInvocation) -> Result<()> {
         // sizes the image from what it can find out about it.
         execute(PinCommand::Add {
             path: absolute,
+            hdr: None,
             density,
             output,
             output_name: output_name.clone(),
+            at: None,
         })?;
     }
     if clipboard {
@@ -425,14 +467,46 @@ fn read_reply(stream: &mut UnixStream) -> Result<PinReply> {
     reply.into_result()
 }
 
-/// Pins freshly encoded PNG bytes: written to a private temp file, handed to
-/// the daemon (which loads them into memory), then unlinked right away, so a
-/// `--pin` capture never leaves a file on the user's disk. `density` is the
-/// capture's device pixels per logical pixel — the scale of the output it was
-/// taken on — so the pin reappears at the size it had there.
-pub(crate) fn pin_png(png: &[u8], density: u32) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
+/// The HDR half of a capture as a pin travels: PQ-encoded words at the frame's
+/// own device size, the exact shape a ten-bit surface buffer takes, with the
+/// light a code of `1.0` stands for.  The white travels with the pixels because
+/// a PQ code alone does not say what light it means, and both the surface
+/// helper and the pin editor have to read it back.
+pub(crate) struct PqPin {
+    pub words: Vec<u32>,
+    pub width: u32,
+    pub height: u32,
+    pub reference_nits: f32,
+}
 
+impl PqPin {
+    /// The file body the surface helper reads: the magic, the size, the white,
+    /// and the words in little-endian order.
+    fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(20 + self.words.len() * 4);
+        bytes.extend_from_slice(b"VSHTPQ01");
+        bytes.extend_from_slice(&self.width.to_le_bytes());
+        bytes.extend_from_slice(&self.height.to_le_bytes());
+        bytes.extend_from_slice(&self.reference_nits.to_le_bytes());
+        for word in &self.words {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes
+    }
+}
+
+/// Pins an in-memory capture.  `at` is the global logical top-left of the
+/// content the capture came from, when it came from the desktop at all: the pin
+/// lands back exactly there, which is what makes pinning a window over itself
+/// seamless.  `None` (a composed or synthetic image) lets the daemon place it.
+/// `hdr` is the capture's HDR half, when the content really is HDR; the daemon
+/// takes it and shows the pin on a surface of its own.
+pub(crate) fn pin_png(
+    png: &[u8],
+    density: u32,
+    at: Option<crate::geometry::Point>,
+    hdr: Option<&PqPin>,
+) -> Result<()> {
     let directory = tempfile::Builder::new()
         .prefix("vshot-pin-")
         .tempdir_in("/dev/shm")
@@ -440,7 +514,44 @@ pub(crate) fn pin_png(png: &[u8], density: u32) -> Result<()> {
         .map_err(|error| {
             VshotError::Pin(format!("failed to create pin temp directory: {error}"))
         })?;
-    let path = directory.path().join("capture.png");
+    let path = write_private_file(directory.path(), "capture.png", png)?;
+    // The helper reads this file by path, so it has to be a file and not a pipe:
+    // the daemon copies it before this directory goes.
+    let hdr_path = match hdr {
+        Some(hdr) => Some(write_private_file(
+            directory.path(),
+            "capture.pq",
+            &hdr.encode(),
+        )?),
+        None => None,
+    };
+    // A capture is pinned where the user just made the selection; the
+    // compositor still knows which output is focused.
+    let (output, output_name) = active_output_hints();
+    let result = execute(PinCommand::Add {
+        path: path.clone(),
+        hdr: hdr_path.clone(),
+        density: Some(density.clamp(1, 4)),
+        output,
+        output_name,
+        at: at.map(WirePoint::from),
+    });
+    // The daemon has copied the pixels by the time it replied; the temp files
+    // are ours to remove even when the reply said no.
+    remove_pin_temp(&path);
+    if let Some(hdr_path) = &hdr_path {
+        remove_pin_temp(hdr_path);
+    }
+    result.map(|_| ())
+}
+
+/// Writes `bytes` into `directory` as a private file the pin daemon can read,
+/// and answers the path.  Nothing here survives the request: the daemon copies
+/// what it keeps, so the file only has to outlive a single round trip.
+fn write_private_file(directory: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = directory.join(name);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -450,25 +561,20 @@ pub(crate) fn pin_png(png: &[u8], density: u32) -> Result<()> {
             path: path.clone(),
             source,
         })?;
-    file.write_all(png)
+    file.write_all(bytes)
         .map_err(|source| VshotError::WriteFile {
             path: path.clone(),
             source,
         })?;
     drop(file);
-    // A capture is pinned where the user just made the selection; the
-    // compositor still knows which output is focused.
-    let (output, output_name) = active_output_hints();
-    let result = execute(PinCommand::Add {
-        path: path.clone(),
-        density: Some(density.clamp(1, 4)),
-        output,
-        output_name,
-    });
-    // The daemon has copied the pixels by the time it replied; the temp file
-    // is ours to remove even when the reply said no.
-    let _ = std::fs::remove_file(&path);
-    result.map(|_| ())
+    Ok(path)
+}
+
+/// Removes one pin temp file, ignoring a failure: the whole directory goes with
+/// the temp guard anyway, and a removal that fails must not turn a successful
+/// pin into an error.
+fn remove_pin_temp(path: &Path) {
+    let _ = std::fs::remove_file(path);
 }
 
 /// One interactive pin editing round: the Qt helper edits the pinned image,
@@ -533,6 +639,19 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
         ))
     })?)?;
 
+    // A pin that is shown in HDR carries a second file, and an edit has to land
+    // on both halves or the pin would drop back to SDR the moment it is
+    // annotated.  The PQ codes are decoded back to linear light here, the same
+    // light the surface is showing, so the marks composite over what the user
+    // sees on screen.
+    let hdr_half = match session
+        .pointer("/outputs/0/hdr")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(hdr_path) => Some(decode_pq_half(Path::new(hdr_path))?),
+        None => None,
+    };
+
     let scale = pin_edit_scale(frame.size().width, window.size.width);
     let (_editor_dir, editor_session) =
         crate::qt_overlay::write_pin_edit_session(&crate::qt_overlay::PinEditSpec {
@@ -561,36 +680,65 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
     // device pixels — and it is also the scale the editor rasterized its text
     // bitmaps at, since that is the only scale its single output declares.
     let pipeline = crate::edit::pipeline_for_annotations(annotations, selection, scale, scale)?;
-    let edited = pipeline.apply(crate::model::ImageDocument::new(frame))?;
-    let png = edited.frame().to_png()?;
-
-    let rendered_path = directory.join("pin-edited.png");
-    let mut file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true).mode(0o600);
-        options
-            .open(&rendered_path)
-            .map_err(|source| VshotError::WriteFile {
-                path: rendered_path.clone(),
-                source,
-            })?
+    // An HDR pin is annotated in HDR and its SDR half is vshot's own tone map of
+    // the same marks, exactly as a fresh capture with a Pin button is; an SDR pin
+    // keeps the plain path it always had.
+    let (png, hdr_path) = match hdr_half {
+        Some(half) => {
+            let reference_nits = if half.reference_nits.is_finite() && half.reference_nits > 0.0 {
+                half.reference_nits
+            } else {
+                crate::model::hdr::REFERENCE_WHITE_NITS
+            };
+            let annotated = pipeline.apply_to_hdr(half.frame)?;
+            let png = annotated.tone_map_to_srgb()?.to_png()?;
+            let pq = PqPin {
+                words: annotated.to_rgb10_pq(reference_nits),
+                width: annotated.size().width,
+                height: annotated.size().height,
+                reference_nits,
+            };
+            let rendered = write_private_file(&directory, "pin-edited.pq", &pq.encode())?;
+            (png, Some(rendered))
+        }
+        None => {
+            let edited = pipeline.apply(crate::model::ImageDocument::new(frame))?;
+            (edited.frame().to_png()?, None)
+        }
     };
-    file.write_all(&png)
-        .map_err(|source| VshotError::WriteFile {
-            path: rendered_path.clone(),
-            source,
-        })?;
-    drop(file);
+
+    let rendered_path = write_private_file(&directory, "pin-edited.png", &png)?;
 
     let reply = execute(PinCommand::Move {
         id,
         x: selection.origin.x,
         y: selection.origin.y,
         path: Some(rendered_path.clone()),
+        hdr: hdr_path.clone(),
     });
     let _ = std::fs::remove_file(&rendered_path);
+    if let Some(hdr_path) = &hdr_path {
+        let _ = std::fs::remove_file(hdr_path);
+    }
     reply.map(|_| ())
+}
+
+/// Decodes one pin HDR file back to linear light: the same header the surface
+/// helper reads, PQ over BT.2020, and the white the file names as its own.
+fn decode_pq_half(path: &Path) -> Result<HdrHalf> {
+    let image = crate::pin_hdr::read_pq_file(path)?;
+    Ok(HdrHalf {
+        frame: HdrFrame::from_rgb10(
+            &image.words,
+            Size::new(image.width, image.height),
+            Transfer::Pq,
+            Primaries::Bt2020,
+            // The words carry real alpha bits, the way a surface buffer does.
+            true,
+            image.reference_nits,
+        )?,
+        reference_nits: image.reference_nits,
+    })
 }
 
 /// Device pixels per logical pixel for a pin-edit round trip: the pin's
@@ -660,9 +808,11 @@ mod tests {
     fn add_command_encodes_the_wire_shape() {
         let encoded = serde_json::to_vec(&PinCommand::Add {
             path: PathBuf::from("/tmp/x.png"),
+            hdr: None,
             density: None,
             output: None,
             output_name: None,
+            at: None,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -672,13 +822,17 @@ mod tests {
         assert!(value.get("output").is_none(), "{value}");
         assert!(value.get("output_name").is_none(), "{value}");
         assert!(value.get("density").is_none(), "{value}");
+        // An image with no place of its own says nothing about where it goes.
+        assert!(value.get("at").is_none(), "{value}");
         let encoded = serde_json::to_vec(&PinCommand::Add {
             path: PathBuf::from("/tmp/x.png"),
+            hdr: None,
             density: Some(2),
             output: Some(WireOutputRect::from(crate::geometry::Rect::new(
                 1920, 0, 3840, 2160,
             ))),
             output_name: Some("DP-2".into()),
+            at: None,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -690,9 +844,11 @@ mod tests {
         // active output and no geometry at all.
         let encoded = serde_json::to_vec(&PinCommand::Add {
             path: PathBuf::from("/tmp/x.png"),
+            hdr: None,
             density: None,
             output: None,
             output_name: Some("DP-2".into()),
+            at: None,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -782,24 +938,66 @@ mod tests {
     fn a_capture_brings_its_source_density_and_files_leave_it_open() {
         let encoded = serde_json::to_vec(&PinCommand::Add {
             path: PathBuf::from("/tmp/x.png"),
+            hdr: None,
             density: Some(2),
             output: None,
             output_name: None,
+            at: Some(WirePoint { x: 100, y: 240 }),
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(value["density"], 2);
+        // The place the capture came from travels with it, so the pin can land
+        // back on it.
+        assert_eq!(value["at"]["x"], 100);
+        assert_eq!(value["at"]["y"], 240);
         // No density stated: the field is absent and the daemon sizes the
         // image from what it can find out about it.
         let encoded = serde_json::to_vec(&PinCommand::Add {
             path: PathBuf::from("/tmp/x.png"),
+            hdr: None,
             density: None,
             output: None,
             output_name: None,
+            at: None,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         assert!(value.get("density").is_none(), "{value}");
+        assert!(value.get("at").is_none(), "{value}");
+    }
+
+    #[test]
+    fn a_pq_pin_round_trips_through_the_surface_helpers_reader() {
+        // The file a pin writes has to be exactly what the surface helper reads
+        // and what the pin-edit path decodes: one header, then the words.
+        let half = HdrFrame::new(
+            Size::new(2, 1),
+            vec![[1.0, 1.0, 1.0, 1.0], [4.0, 4.0, 4.0, 1.0]],
+        )
+        .unwrap();
+        let pin = PqPin {
+            words: half.to_rgb10_pq(crate::model::hdr::REFERENCE_WHITE_NITS),
+            width: 2,
+            height: 1,
+            reference_nits: crate::model::hdr::REFERENCE_WHITE_NITS,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_private_file(directory.path(), "x.pq", &pin.encode()).unwrap();
+        let image = crate::pin_hdr::read_pq_file(&path).unwrap();
+        assert_eq!((image.width, image.height), (2, 1));
+        assert_eq!(
+            image.reference_nits,
+            crate::model::hdr::REFERENCE_WHITE_NITS
+        );
+        assert_eq!(image.words, pin.words);
+        // And the words decode back to the light they were encoded from: SDR
+        // white stays white, and the bright pixel stays well above it.
+        let decoded = decode_pq_half(&path).unwrap();
+        let white = decoded.frame.pixel(0, 0).unwrap();
+        assert!((white[0] - 1.0).abs() < 0.01, "{white:?}");
+        let bright = decoded.frame.pixel(1, 0).unwrap();
+        assert!((bright[0] - 4.0).abs() < 0.05, "{bright:?}");
     }
 
     #[test]

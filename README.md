@@ -151,7 +151,8 @@ vshot all --output 'shots/capture-%Y%m%d-%H%M%S.final.png'
 
 - 拖拽画矩形，四周 8 个手柄调整大小，拖选区内部移动位置，方向键微调（Shift 加速为 10 逻辑像素）；拖拽或调整时，光标旁显示 8x 放大镜与原生像素坐标，选区左上角显示 `宽 × 高`
 - **Enter**、选区内双击或工具栏 OK 确认；**Esc** 或右键取消整次截图（文本框内的 Esc 只关闭文本框）
-- 工具栏是两行按钮加右侧固定的一角：第一行是绘图工具 Select、Rect、Ellipse、Arrow、Line、Wave、Bezier、Draw、Text、Number、Mosaic，第二行是作用在截图上的动作——图片、取字、翻译、长截图；右下角是两行两列的 Undo/Redo 与 OK/Cancel（上排撤销/重做，下排确定/取消），贴着面板右边而不是跟在最长那行的末尾（面板宽度取命令条与样式子面板里更宽的那个）；样式子面板按当前工具显隐，跟随选区移动。「长截图」把这块选区交给滚动长截图（`vshot long`）而不是保留它；选区横跨两块屏幕时该按钮置灰
+- 工具栏是两行按钮加右侧固定的一角：第一行是绘图工具 Select、Rect、Ellipse、Arrow、Line、Wave、Bezier、Draw、Text、Number、Mosaic，第二行是作用在截图上的动作——图片、取字、翻译、长截图、Pin；右下角是两行两列的 Undo/Redo 与 OK/Cancel（上排撤销/重做，下排确定/取消），贴着面板右边而不是跟在最长那行的末尾（面板宽度取命令条与样式子面板里更宽的那个）；样式子面板按当前工具显隐，跟随选区移动。「长截图」把这块选区交给滚动长截图（`vshot long`）而不是保留它；选区横跨两块屏幕时该按钮置灰
+- **Pin** 和 OK 一样结束编辑，但成品直接钉在屏幕上（等同 `--pin`）而不落盘；Pin 编辑器里不再提供它
 - 样式项：颜色色板（含自定义取色器：HSV 渐变 + 十六进制输入）、线型 Solid/Dash/Dot、箭头头型 Open V/Filled、粗细 1-64、箭头大小 1-8、字号 7-448（直接就是像素高）、马赛克形状 Rect/Ellip/Brush、马赛克程度 1-3、系统字体列表（每项按自身字形预览）。Arrow 是按下点到释放点的直线箭头；Draw 是自由绘制；Mosaic 的马赛克程度控制像素块大小与涂抹半径
 - **Select** 工具可点选任意标注：单击选中，拖动移动（文本同样），形状/线条/马赛克可拖把手缩放，Delete/Backspace 删除；样式修改即时应用到选中标注；**Ctrl+Z / Ctrl+Y**（或 Ctrl+Shift+Z）撤销/重做。标注以全局逻辑坐标传回 Rust，最终 PNG 由内置软件渲染重绘，与预览一致
 - **贴图 / 取字**：工具栏的「图片」按钮从磁盘挑一张，或 **Ctrl+V** 直接把剪贴板里的图贴进来——原尺寸落在选区正中，比选区大时等比缩小塞进去，贴完自动切到 Select 并选中它；「取字」按钮把选区里的文字识别成一层可就地选取的文字层，而不是整段复制走（见[「OCR 取字」](#ocr-取字)，`cli.ocr.notify` 可关）
@@ -432,7 +433,7 @@ bind = SUPER ALT, R, exec, vshot replay stop
 - 指针在某张 pin 上且该屏持有键盘时按 **Space** 进入与 `vshot region` 相同的标注编辑器
 - 右键点击**任意** pin 弹出菜单：色卡在前几行列出它的各种格式，点哪一项就把那个值抄回剪贴板（↑/↓ 选行、回车抄走、Esc 关闭；复制成功后右下角闪一个徽标）；最后两行对所有 pin 都在：`另存为…` 弹出保存对话框把这张图写成 PNG，存完在右下角报结果；`取字…` 打开 pin 编辑器并直接进入取字模式（见[「OCR 取字」](#ocr-取字)），钉住的图也能这样读字
 
-新 pin 落在**激活的输出**上：指针所在的那块屏优先，指针读不到时退回键盘焦点所在的输出，都没有则回退主输出。pin 的对象：
+新 pin 落在**激活的输出**上：指针所在的那块屏优先，指针读不到时退回键盘焦点所在的输出，都没有则回退主输出。**区域与窗口的截图 pin 回它被拍下来的位置**：截图中带上了那块矩形在桌面上的全局坐标，pin 就严丝合缝地落在原地（既不居中也不级联），于是把一扇窗 pin 在自己头上不需要再拖。它的外观与其余 pin 一样，描边与阴影都按配置画（把设置里的「边框宽度」调成 0 就是不画边框）——那道边框正是告诉用户桌面上那东西是 pin 而不是原窗的依据。文件、剪贴板、色卡与整屏截图没有“原位”（整屏那一份落在它的输出上本就和居中重合），才落在激活输出的中间。pin 的对象：
 
 ```sh
 vshot pin a.png b.png          # 图片文件
@@ -509,6 +510,15 @@ bind = SUPER SHIFT, A, exec, vshot annotate quit
 
 ## 图像与输出映射
 **落在单个输出内的矩形一律从那块输出自己那份原生帧裁剪，并按那块屏的 scale 写密度**：`region` 的 `--geometry` 与交互选择、`window active`、`window pick` 以及像素识别给出的矩形都走这条路，只有**跨接缝**的矩形才回落到合成场景；`all` 是整块桌面，只能由场景给出。内部帧统一为 RGBA8、top-left origin，多输出合成支持负 logical origin 和输出间空隙（场景画布用最高输出 scale，较低 scale 的输出用 nearest-neighbor 放大）。当前要求正整数 scale、`transform=normal` 以及可安全证明的 logical/pixel 映射；fractional scale、旋转和无法证明的映射会清晰失败，而不是生成疑似错误的截图。这个校验只在**需要把输出合成为场景**的路径上生效，所以 KWin 与 niri 直接给窗口像素的两条路在旋转/翻转输出上仍然可用。
+
+### HDR
+输出自己被合成器描述为 HDR（PQ 或 HLG）时，一次截图产出**两份**：`<name>.png` 是同一份内容的 SDR 色调映射，`<name>.hdr` 是 Radiance RGBE 的 HDR 原样；有标注时标注在**线性光**里合成到 HDR 那一份上，SDR 那一份再由它映射而来，两份因此描述同一束光、同一批标记。SDR 那一份**以显示器的 SDR 白为准**而不是以画面的峰值为准：SDR 白以内的像素原样落成对应的 sRGB 码（所以同一扇窗无论画面里还有没有更亮的东西，映射出来的字节都一样，pin 出来的副本也就和它来源的画面一致），超过 SDR 白的那部分在 8-bit 里无处可放，整体按同一系数压到白点，只丢格式装不下的光、色相不变。内容本身没有超过 SDR 白时不会写 `.hdr`。
+
+颜色一律问显示器，不猜像素：10-bit 缓冲区在 HDR 输出上就是那块输出自己的像素，按它宣告的传递函数与参考白解码（`wp_color_manager_v1` 的输出描述，参考白即该输出的 SDR 白）。Hyprland 上这是 `misc:screencopy_hdr` 打开时**才**成立的约定——关掉时合成器只交 8-bit sRGB，此时不会写 `.hdr`。
+
+冻结帧在交互界面上也按原样显示：VShot 在 overlay 下面另起一层 surface，挂的是**那块输出自己的 image description**（不是照着它造一个像的），所以合成器既不转换也不做色调映射，选中的区域就是屏幕上原本的光；overlay 自己只画遮罩（选区挖空）、标注与工具条。别的路线是造一份“像”的描述，那不够：compositor 会把它当成另一个空间，往面板自己的范围里做一次色调映射，整幅画面会一起变暗。
+
+**pin 到屏幕上的 HDR 图也是 HDR 的**，走的是同一条道理：pin daemon 随自己启动一个小进程（`vshot --pin-hdr-server`），它在每块输出上铺一张 overlay 层的 surface，挂上和冻结帧一样的那块输出自己的 image description，把标注后重新按 PQ 编码的十位像素写进去，于是合成器不转换、不色调映射，贴上去的就是原来那束光。Qt 的 pin 浮层做不到这一点——它是 Qt 窗口，描述由 `QColorSpace` 造出，没有亮度信息，合成器会当成另一个空间压暗。所以**图像由这个 helper 画**，Qt 浮层只留边框、角标和右键菜单，并把图像那块挖空留给它；helper 的 surface 必须在 Qt 的之前映射（同一层按映射顺序堆叠，协议没有 restack），因此它在 daemon 启动时就被拉起、在 daemon 的第一张 surface 之前报过到。截下来的内容没有超过 SDR 白（不写 `.hdr`）时没有 HDR 那一份，pin 就是普通 SDR pin；合成器不提供 `wp_color_manager_v1` 时 helper 干脆不铺 surface，同样退回 SDR。像素只在内存里读一次，拖动时 daemon 只发坐标，而同一批里只合成最后一条位置，所以快速拖动不会每个鼠标事件都重画一遍。
 
 ## 截图后端与 KDE 授权
 启动时探测一次：先连 `wlr-screencopy-unstable-v1`，只有它以「缺少 `zwlr_screencopy_manager_v1`」失败时才说明这个合成器不提供该协议；再试 **KWin ScreenShot2**——KWin 的私有会话总线服务 `org.kde.KWin.ScreenShot2`（KWin 既没有 screencopy，也没有 `ext-image-copy-capture`）。vshot 传一根管道的写端，KWin 把像素写进管道并在回复里给出 `width` / `height` / `stride` / `format` / `scale`；像素是预乘 alpha 的 BGRA，输出截图把 alpha 归一为 255，窗口截图原样保留。
@@ -729,6 +739,7 @@ pin 同样是 layer surface，里面只有图片，所以圆角、身下的阴�
 | `VSHOT_VULKAN_DEVICE=N` | 指定 Vulkan 编码用第 N 个物理设备（多显卡机器；默认第一个） |
 | `VSHOT_OCR_MODELS=<dir>` | OCR 模型目录，覆盖 `/usr/share/vshot/models` 与可执行文件旁的查找 |
 | `VSHOT_PIN_SOCKET` | pin daemon 监听的 socket 路径 |
+| `VSHOT_HDR_HELPER` | 指定显示 HDR pin 的 `vshot --pin-hdr-server` helper 进程的 `vshot` 路径（默认按 `vshot-qt-ui` 所在位置推断） |
 | `VSHOT_PIN_DENSITY=N` | 每张 pin 图的来源密度，等同 `--density` |
 | `VSHOT_PIN_DEBUG=1` | daemon 打印每张 pin 的密度判定 |
 | `VSHOT_PIN_FOCUS_DEBUG=1` | daemon 打印 pin 渲染面每一次焦点变化 |
@@ -762,7 +773,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --release --locked
 ```
 
-Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**（默认不构建，加 `-DVSHOT_BUILD_CHECKS=ON`），覆盖配置读写与设置窗口、字号换算、剪贴板颜色解析与色卡渲染、文件对话框的样式表与缩略图、pin 的图片自述密度与描边、文字卡片留白、色卡右键菜单、贴图的导出格式、标注浮层的落笔/橡皮/撤销与工具栏上误拖不落笔、编辑器浮动工具栏的落位、标注渲染缓存的命中、高 DPI 屏上的缓存分辨率，以及文字层——它解析 `vshot ocr --json` 打印的 JSON（这套线格式一头在 `src/ocr.rs`、一头在 Qt 侧），并且不建控件，因此不需要 `QT_QPA_PLATFORM`：
+Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**（默认不构建，加 `-DVSHOT_BUILD_CHECKS=ON`），覆盖配置读写与设置窗口、字号换算、剪贴板颜色解析与色卡渲染、文件对话框的样式表与缩略图、pin 的图片自述密度、描边与 HDR 标记、文字卡片留白、色卡右键菜单、贴图的导出格式、标注浮层的五个工具与撤销/清除/工具栏位置、overlay 是否把冻结帧留给 backdrop、工具栏的落位、标注渲染缓存的命中、高 DPI 屏上的缓存分辨率，以及文字层——它解析 `vshot ocr --json` 打印的 JSON（这套线格式一头在 `src/ocr.rs`、一头在 Qt 侧），并且不建控件，因此不需要 `QT_QPA_PLATFORM`：
 
 ```sh
 cmake -S . -B build-qt -DVSHOT_BUILD_CHECKS=ON && cmake --build build-qt
@@ -772,11 +783,13 @@ build-qt/vshot-text-size-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-color-check
 build-qt/vshot-pin-density-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-outline-check
+QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-hdr-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-text-card-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-menu-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-paste-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-file-dialog-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-annotate-check
+QT_QPA_PLATFORM=offscreen build-qt/vshot-backdrop-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-toolbar-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-annotation-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-dpr-check

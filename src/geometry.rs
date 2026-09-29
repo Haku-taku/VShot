@@ -132,6 +132,34 @@ impl Rect {
     pub fn clamp_to(self, bounds: Self) -> Option<Self> {
         self.intersection(bounds)
     }
+
+    /// The smallest rectangle covering both.  An empty rectangle is the other
+    /// one rather than a degenerate corner, so an absent region never drags the
+    /// union off to the origin.
+    pub fn union(self, other: Self) -> Self {
+        if self.is_empty() {
+            return other;
+        }
+        if other.is_empty() {
+            return self;
+        }
+        let left = self.left().min(other.left());
+        let top = self.top().min(other.top());
+        let right = self
+            .right()
+            .unwrap_or(i32::MAX)
+            .max(other.right().unwrap_or(i32::MAX));
+        let bottom = self
+            .bottom()
+            .unwrap_or(i32::MAX)
+            .max(other.bottom().unwrap_or(i32::MAX));
+        Self::new(
+            left,
+            top,
+            u32::try_from(i64::from(right) - i64::from(left)).unwrap_or(u32::MAX),
+            u32::try_from(i64::from(bottom) - i64::from(top)).unwrap_or(u32::MAX),
+        )
+    }
 }
 
 impl fmt::Display for Rect {

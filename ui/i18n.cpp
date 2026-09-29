@@ -59,6 +59,11 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("Drag to move"), QString::fromUtf8("拖动移动")},
         {QStringLiteral("OK"), QString::fromUtf8("确定")},
         {QStringLiteral("Cancel"), QString::fromUtf8("取消")},
+        // The Pin button: it ends the session the way OK does, but the result
+        // goes to the screen rather than to disk.
+        {QStringLiteral("Pin"), QString::fromUtf8("钉住")},
+        {QStringLiteral("Pin the result on the screen"),
+         QString::fromUtf8("把成品钉在屏幕上")},
         {QStringLiteral("Undo last change (Ctrl+Z)"),
          QString::fromUtf8("撤销上一步 (Ctrl+Z)")},
         {QStringLiteral("Redo last change (Ctrl+Y)"),

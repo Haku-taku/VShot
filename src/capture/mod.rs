@@ -19,7 +19,7 @@ pub use wlr::WlrCapture;
 
 use crate::error::{Result, VshotError};
 use crate::geometry::Rect;
-use crate::model::Frame;
+use crate::model::{Frame, HdrFrame, OutputColor};
 
 /// The compositor families vshot can capture from.
 ///
@@ -61,6 +61,33 @@ impl Capturer {
         match self {
             Self::Wlr(capture) => capture.capture_output(name, cursor),
             Self::Kwin(capture) => capture.capture_output(name, cursor),
+        }
+    }
+
+    /// How the compositor describes one output's colour, when it describes it
+    /// at all.  `None` (KWin, or a compositor without `wp_color_manager_v1`)
+    /// means the capture side falls back to its own defaults.
+    pub fn output_color(&mut self, name: &str) -> Result<Option<OutputColor>> {
+        match self {
+            Self::Wlr(capture) => capture.output_color(name),
+            Self::Kwin(_) => Ok(None),
+        }
+    }
+
+    /// One output as HDR content, when this backend and session can hand it
+    /// over.  `Ok(None)` means "this output is not offering HDR" and the caller
+    /// keeps the SDR frame it already has; KWin answers `None` outright, since
+    /// its screenshots arrive as SDR PNG over D-Bus.  `color` is the output's
+    /// own description, which `output_color` already read.
+    pub fn capture_output_hdr(
+        &mut self,
+        name: &str,
+        cursor: bool,
+        color: OutputColor,
+    ) -> Result<Option<HdrFrame>> {
+        match self {
+            Self::Wlr(capture) => capture.capture_output_hdr(name, cursor, color),
+            Self::Kwin(_) => Ok(None),
         }
     }
 

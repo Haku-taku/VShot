@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 VShot contributors
 
-// The recording C shims: `shim.c` (the libavcodec encoder and the MP4 muxer)
-// and, where libpipewire's headers are installed, `pipewire_client.c` (the
-// portal's screen-cast stream).  Both libraries are loaded with dlopen inside
-// the C code, so the link here is against the small `vshot_av` archive alone —
-// no libavcodec or libpipewire symbols in the binary's dynamic table.
+// The recording C shims: `shim.c` (the libavcodec encoder and the MP4 muxer),
+// `pin_hdr_fp16.c` (the half-float surface a pinned HDR image is drawn on) and,
+// where libpipewire's headers are installed, `pipewire_client.c` (the portal's
+// screen-cast stream).  Both libraries are loaded with dlopen inside the C code,
+// so the link here is against the small `vshot_av` archive alone — no
+// libavcodec, libpipewire or libgbm symbols in the binary's dynamic table.
 
 fn main() {
     println!("cargo:rerun-if-changed=src/record/shim.c");
     println!("cargo:rerun-if-changed=src/record/pipewire_client.c");
     println!("cargo:rerun-if-changed=src/record/pipewire_audio.c");
+    println!("cargo:rerun-if-changed=src/pin_hdr_fp16.c");
+    println!("cargo:rerun-if-changed=src/pin_hdr_fp16.h");
     // `cfg` names a build script chooses have to be declared, or rustc reports
     // every use of them as a typo.
     println!("cargo:rustc-check-cfg=cfg(vshot_pipewire)");
@@ -46,6 +49,20 @@ fn main() {
     }
     build.warnings(true);
     build.compile("vshot_av");
+
+    // The half-float pin surface: GBM, EGL and OpenGL, all dlopen'd inside the C
+    // file, so nothing here links against them either.  It compiles wherever the
+    // headers are, and a build without them leaves the caller its SDR path --
+    // which is why the include directories are best-effort rather than required.
+    let mut fp16 = cc::Build::new();
+    fp16.file("src/pin_hdr_fp16.c");
+    // `gbm.h` pulls in `drm_fourcc.h`, which lives in libdrm's own directory on
+    // the distributions that split the headers out.
+    for flag in pkg_config_cflags(&["libdrm"]) {
+        fp16.flag(flag);
+    }
+    fp16.warnings(true);
+    fp16.compile("vshot_pin_hdr_fp16");
 
     // dlopen lives in libc on musl and libdl on glibc; linking `dl` covers
     // both without pulling in libavcodec itself.

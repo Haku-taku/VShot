@@ -3,8 +3,10 @@
 
 pub mod document;
 pub mod frame;
+pub mod hdr;
 pub mod scene;
 
 pub use document::ImageDocument;
 pub use frame::{Frame, PngCompression};
+pub use hdr::{HdrFrame, OutputColor};
 pub use scene::{OutputSnapshot, SceneSnapshot};
