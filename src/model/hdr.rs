@@ -12,8 +12,16 @@
 //! primaries, PQ (ST 2084) transfer — is decoded into that space, the editor's
 //! marks are composited there in linear light, and two images come out:
 //!
-//! * `<name>.png`, 8-bit sRGB, the tone-mapped SDR view of the same content;
+//! * `<name>.png`, 8-bit sRGB, the SDR view of the same content;
 //! * `<name>.hdr`, Radiance RGBE, the HDR content itself.
+//!
+//! The SDR view is **the compositor's own**, not one computed here: a capture
+//! reads its SDR half over a connection that is not a `wp_color_manager_v1`
+//! client, and the compositor answers that with the rendition it already
+//! produced for ordinary clients — tone-mapped by the component that owns the
+//! display's colour management.  [`HdrFrame::tone_map_to_srgb`] is this module's
+//! own conversion, kept for a frame with no compositor rendition behind it, and
+//! is deliberately not what a capture saves.
 //!
 //! Both the PQ curve and the BT.2020↔BT.709 matrices are the ones a colour
 //! pipeline is expected to use; the same constants appear in the reference
@@ -682,6 +690,15 @@ impl HdrFrame {
     /// Tone-maps the whole frame to an 8-bit sRGB frame, the SDR half of the
     /// pair.
     ///
+    /// **The capture path does not use this.**  A capture takes its SDR half from
+    /// the compositor, which hands an ordinary client the SDR rendition it
+    /// produced itself — tone-mapped against that display's own peak by the
+    /// component that owns its colour management — and this map cannot match
+    /// that (see `capture::wlr::WlrCapture::capture` and `main::sdr_and_hdr`).
+    /// It is kept as the model's own conversion, for a caller that holds an HDR
+    /// frame with no compositor rendition behind it; the SDR half of a capture is
+    /// never such a frame.
+    ///
     /// The map is **display-referred**: linear 1.0 is the output's own SDR white
     /// (see [`OutputColor::reference_nits`]) and it lands on sRGB white, so a
     /// sample inside the SDR range keeps exactly the code its light deserves.
@@ -693,9 +710,10 @@ impl HdrFrame {
     /// Light beyond SDR white has nowhere to go in an 8-bit SDR image — the
     /// format ends at white — so it is rolled off: the whole triple is scaled by
     /// one factor until its brightest channel lands on white, which keeps hue
-    /// and clips only what the format cannot hold.  The `.hdr` half is what
-    /// carries that light.  Alpha is quantised to a byte like every other
-    /// channel (a capture is opaque).
+    /// and clips only what the format cannot hold.  That is a blunt roll-off
+    /// beside a real tone map's knee, which is the other reason the compositor's
+    /// own rendition is what a capture saves.  Alpha is quantised to a byte like
+    /// every other channel (a capture is opaque).
     pub fn tone_map_to_srgb(&self) -> Result<Frame> {
         let mut bytes = vec![0u8; self.pixels.len() * 4];
         map_rows(&mut bytes, self.size.width as usize * 4, |offset, row| {

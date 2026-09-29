@@ -680,9 +680,11 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
     // device pixels — and it is also the scale the editor rasterized its text
     // bitmaps at, since that is the only scale its single output declares.
     let pipeline = crate::edit::pipeline_for_annotations(annotations, selection, scale, scale)?;
-    // An HDR pin is annotated in HDR and its SDR half is vshot's own tone map of
-    // the same marks, exactly as a fresh capture with a Pin button is; an SDR pin
-    // keeps the plain path it always had.
+    // An HDR pin is annotated in both halves, exactly as a fresh capture with a
+    // Pin button is: the SDR half is the SDR picture the pin already carried
+    // with the SDR marks composited over it, and the HDR half is the pin's own
+    // pixels with the marks composited in linear light.  An SDR pin keeps the
+    // plain path it always had.
     let (png, hdr_path) = match hdr_half {
         Some(half) => {
             let reference_nits = if half.reference_nits.is_finite() && half.reference_nits > 0.0 {
@@ -691,7 +693,7 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
                 crate::model::hdr::REFERENCE_WHITE_NITS
             };
             let annotated = pipeline.apply_to_hdr(half.frame)?;
-            let png = annotated.tone_map_to_srgb()?.to_png()?;
+            let png = pipeline.apply(crate::model::ImageDocument::new(frame))?.frame().to_png()?;
             let pq = PqPin {
                 words: annotated.to_rgb10_pq(reference_nits),
                 width: annotated.size().width,

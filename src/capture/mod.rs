@@ -57,6 +57,24 @@ impl Capturer {
         }
     }
 
+    /// A connection that is a `wp_color_manager_v1` client, for the half of a
+    /// capture that wants the output's own pixels.
+    ///
+    /// The binding is what a compositor keys HDR capture on, so a client that
+    /// wants the *SDR* rendition — which is what an ordinary capture is — must
+    /// not be one.  KWin answers with SDR PNGs over D-Bus either way, so its
+    /// backend is the same as the plain one.
+    pub fn connect_colour_managed() -> Result<Self> {
+        match WlrCapture::connect_colour_managed() {
+            Ok(capture) => Ok(Self::Wlr(capture)),
+            Err(error) if is_missing_screencopy(&error) => match kwin::KwinCapture::connect() {
+                Ok(capture) => Ok(Self::Kwin(capture)),
+                Err(kwin_error) => Err(no_capture_backend(&kwin_error)),
+            },
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn capture_output(&mut self, name: &str, cursor: bool) -> Result<Frame> {
         match self {
             Self::Wlr(capture) => capture.capture_output(name, cursor),
