@@ -4583,11 +4583,19 @@ OverlayController::~OverlayController()
 {
     removeTextEditor();
     delete toolbar_;
+    toolbar_ = nullptr;
     delete gesture_;
     // Explicit rather than parented: the controller is not a QObject.
     delete pinSocket_;
     delete candidateReader_;
     delete candidateTimer_;
+    // The overlays are the controller's too.  A window left mapped would keep
+    // painting through a controller that is already gone, which is a crash the
+    // moment anything runs the event loop again.
+    for (CaptureOverlay *overlay : overlays_) {
+        delete overlay;
+    }
+    overlays_.clear();
 }
 
 int OverlayController::outputCount() const
