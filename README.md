@@ -512,6 +512,8 @@ bind = SUPER SHIFT, A, exec, vshot annotate quit
 **落在单个输出内的矩形一律从那块输出自己那份原生帧裁剪，并按那块屏的 scale 写密度**：`region` 的 `--geometry` 与交互选择、`window active`、`window pick` 以及像素识别给出的矩形都走这条路，只有**跨接缝**的矩形才回落到合成场景；`all` 是整块桌面，只能由场景给出。内部帧统一为 RGBA8、top-left origin，多输出合成支持负 logical origin 和输出间空隙（场景画布用最高输出 scale，较低 scale 的输出用 nearest-neighbor 放大）。当前要求正整数 scale、`transform=normal` 以及可安全证明的 logical/pixel 映射；fractional scale、旋转和无法证明的映射会清晰失败，而不是生成疑似错误的截图。这个校验只在**需要把输出合成为场景**的路径上生效，所以 KWin 与 niri 直接给窗口像素的两条路在旋转/翻转输出上仍然可用。
 
 ### HDR
+**这一节没有经过真机验证。** 写它的机器上既没有 HDR 显示器，也没有能给出 HDR 输出的合成器，所以下面描述的路径**一次都没有在真实的 HDR 内容上跑过**：协议交互与像素换算只有离屏检查（`vshot-pin-hdr-check`、`vshot-backdrop-check`）覆盖，HDR 捕获、色调映射、`.hdr` 的写出和 HDR pin 都是照着协议写出来的，没有实测。SDR 输出不受影响——合成器不描述 HDR 时不写 `.hdr`，也不铺 backdrop surface。
+
 输出自己被合成器描述为 HDR（PQ 或 HLG）时，一次截图产出**两份**：`<name>.png` 是同一份内容的 SDR 色调映射，`<name>.hdr` 是 Radiance RGBE 的 HDR 原样；有标注时标注在**线性光**里合成到 HDR 那一份上，SDR 那一份再由它映射而来，两份因此描述同一束光、同一批标记。SDR 那一份**以显示器的 SDR 白为准**而不是以画面的峰值为准：SDR 白以内的像素原样落成对应的 sRGB 码（所以同一扇窗无论画面里还有没有更亮的东西，映射出来的字节都一样，pin 出来的副本也就和它来源的画面一致），超过 SDR 白的那部分在 8-bit 里无处可放，整体按同一系数压到白点，只丢格式装不下的光、色相不变。内容本身没有超过 SDR 白时不会写 `.hdr`。
 
 颜色一律问显示器，不猜像素：10-bit 缓冲区在 HDR 输出上就是那块输出自己的像素，按它宣告的传递函数与参考白解码（`wp_color_manager_v1` 的输出描述，参考白即该输出的 SDR 白）。Hyprland 上这是 `misc:screencopy_hdr` 打开时**才**成立的约定——关掉时合成器只交 8-bit sRGB，此时不会写 `.hdr`。
