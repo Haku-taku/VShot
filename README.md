@@ -136,6 +136,7 @@ vshot replay stop                               # 结束回录会话
 | `--pin` | 把图像 pin 到屏幕，不落盘（daemon 读入内存后立即删除临时文件） |
 | `-c, --cursor` | 请求合成器把光标画进每个输出帧。**`long` 不支持**（见[「已知不稳定点」](#已知不稳定点)）；截图里没有光标最常见的原因见[「光标（`--cursor`）」](#光标--cursor) |
 | `--png-compression LEVEL` | `none` / `fastest` / `fast`（默认）/ `balanced` / `high`，全部无损，区别只在耗时与体积 |
+| `--hdr-format FORMAT` | 截图带 HDR 内容时 PNG 旁第二份的格式：`avif`（默认）或 `hdr`。见 [HDR](#hdr) |
 
 每次捕获必须且只能给一个输出目标。`region --geometry` 与 `--interactive` 互斥，不给 geometry 时默认交互选择（`--interactive` 用于显式声明这一意图）。路径格式示例：
 
@@ -512,13 +513,15 @@ bind = SUPER SHIFT, A, exec, vshot annotate quit
 **落在单个输出内的矩形一律从那块输出自己那份原生帧裁剪，并按那块屏的 scale 写密度**：`region` 的 `--geometry` 与交互选择、`window active`、`window pick` 以及像素识别给出的矩形都走这条路，只有**跨接缝**的矩形才回落到合成场景；`all` 是整块桌面，只能由场景给出。内部帧统一为 RGBA8、top-left origin，多输出合成支持负 logical origin 和输出间空隙（场景画布用最高输出 scale，较低 scale 的输出用 nearest-neighbor 放大）。当前要求正整数 scale、`transform=normal` 以及可安全证明的 logical/pixel 映射；fractional scale、旋转和无法证明的映射会清晰失败，而不是生成疑似错误的截图。这个校验只在**需要把输出合成为场景**的路径上生效，所以 KWin 与 niri 直接给窗口像素的两条路在旋转/翻转输出上仍然可用。
 
 ### HDR
-输出自己被合成器描述为 HDR（PQ 或 HLG）时，一次截图产出**两份**：`<name>.png` 是同一份内容的 SDR 色调映射，`<name>.hdr` 是 Radiance RGBE 的 HDR 原样；有标注时标注在**线性光**里合成到 HDR 那一份上，SDR 那一份再由它映射而来，两份因此描述同一束光、同一批标记。SDR 那一份**以显示器的 SDR 白为准**而不是以画面的峰值为准：SDR 白以内的像素原样落成对应的 sRGB 码（所以同一扇窗无论画面里还有没有更亮的东西，映射出来的字节都一样，pin 出来的副本也就和它来源的画面一致），超过 SDR 白的那部分在 8-bit 里无处可放，整体按同一系数压到白点，只丢格式装不下的光、色相不变。**色域按输出自己报的色度坐标换算**：Hyprland 对一块 P3 面板报出的坐标既不是 BT.709 也不是 BT.2020，按「更接近哪个」去猜会把整幅画面的颜色算错；落在目标色域之外的颜色按**朝白点去饱和**映射进去，而不是把负分量截成 0——截断会挪动色相，去饱和只丢装不下的彩度。`.hdr` 那一份**原样保留截取时的色域**（不做任何转换，广色域留给它），色域写在 `PRIMARIES=` 头里——RGBE 本身没有色度字段，而 ffmpeg 与 ImageMagick 都会忽略这一行、按 Rec.709 解读，所以用这类工具看广色域内容会偏艳；为它们转换过的是旁边的 SDR 那一份。内容本身没有超过 SDR 白时不会写 `.hdr`。
+输出自己被合成器描述为 HDR（PQ 或 HLG）时，一次截图产出**两份**：`<name>.png` 是同一份内容的 SDR 视图，第二份是 HDR 内容本身，与 PNG 同名、只有后缀不同（默认 `<name>.avif`；`--hdr-format hdr` 改成 Radiance RGBE 的 `<name>.hdr`）。两份各走各的来路，VShot 不做两者之间的推导：**SDR 那一份就是合成器自己交给普通客户端的画面**——截图用一条**不绑定** `wp_color_manager_v1` 的连接去取，合成器于是把它已经渲染好的 SDR 版本交出来（由掌握这块屏色彩管理的那个组件，按这块屏自己的峰值做的色调映射），而**HDR 那一份**走另一条**绑定了** `wp_color_manager_v1` 的连接，拿到输出自己的像素。VShot 因此**不再自己给截图做色调映射**：它自己那份只能是对合成器那份的近似——按像素峰值归一，超过 SDR 白的一律压成纯白，而 SDR 白本来就是纯白，于是 HDR 里最要紧的高光与周围的 SDR 再也分不出来（testufo 的 HDR 测试里 `HDR`/`WCG` 字样就是这样被抹平的）。标注在两份里各按各自的空间渲染：SDR 那一份在 sRGB 里合成到 SDR 画面上，HDR 那一份在**线性光**里合成到 HDR 帧上，正对应它们在屏幕上各自的画法。内容本身没有超过 SDR 白（`is_hdr()` 为假）时不会写第二份。
 
-颜色一律问显示器，不猜像素：10-bit 缓冲区在 HDR 输出上就是那块输出自己的像素，按它宣告的传递函数与参考白解码（`wp_color_manager_v1` 的输出描述，参考白即该输出的 SDR 白）。Hyprland 上这是 `misc:screencopy_hdr` 打开时**才**成立的约定——关掉时合成器只交 8-bit sRGB，此时不会写 `.hdr`。
+第二份的格式由 `--hdr-format`（或配置文件里的 `cli.hdr-format`）决定，默认 `avif`：10-bit、BT.2020 + PQ，AV1 序列头与容器的 `colr` box 声明同一个 CICP 三元组，所以任何懂 AVIF 的读取器都能正确显示，代价是**有损**。`hdr` 则是 Radiance RGBE，**原样保留截取时的色域**（不做任何转换，广色域留给它），色域写在 `PRIMARIES=` 头里——RGBE 本身没有色度字段，而 ffmpeg 与 ImageMagick 都会忽略这一行、按 Rec.709 解读，所以用这类工具看广色域内容会偏艳；为它们转换过的是旁边的 SDR 那一份。要无损归档就选它。AVIF 走 `rav1e` + `avif-serialize`：`image` 自带的 AVIF 编码器写不了 HDR（它固定 8-bit，且色彩描述固定为 sRGB / BT.709），详见 `src/model/avif.rs`。
+
+颜色一律问显示器，不猜像素：10-bit 缓冲区在 HDR 输出上就是那块输出自己的像素，按它宣告的传递函数与参考白解码（`wp_color_manager_v1` 的输出描述，参考白即该输出的 SDR 白）。Hyprland 上这是 `misc:screencopy_hdr` 打开时**才**成立的约定——关掉时合成器只交 8-bit sRGB，此时不会写第二份。
 
 冻结帧在交互界面上也按原样显示：VShot 在 overlay 下面另起一层 surface，挂的是**那块输出自己的 image description**（不是照着它造一个像的），所以合成器既不转换也不做色调映射，选中的区域就是屏幕上原本的光；overlay 自己只画遮罩（选区挖空）、标注与工具条。别的路线是造一份“像”的描述，那不够：compositor 会把它当成另一个空间，往面板自己的范围里做一次色调映射，整幅画面会一起变暗。
 
-**pin 到屏幕上的 HDR 图也是 HDR 的**，走的是同一条道理：pin daemon 随自己启动一个小进程（`vshot --pin-hdr-server`），它在每块输出上铺一张 overlay 层的 surface，挂上和冻结帧一样的那块输出自己的 image description，把标注后重新按 PQ 编码的十位像素写进去，于是合成器不转换、不色调映射，贴上去的就是原来那束光。Qt 的 pin 浮层做不到这一点——它是 Qt 窗口，描述由 `QColorSpace` 造出，没有亮度信息，合成器会当成另一个空间压暗。所以**图像由这个 helper 画**，Qt 浮层只留边框、角标和右键菜单，并把图像那块挖空留给它；helper 的 surface 必须在 Qt 的之前映射（同一层按映射顺序堆叠，协议没有 restack），因此它在 daemon 启动时就被拉起、在 daemon 的第一张 surface 之前报过到。截下来的内容没有超过 SDR 白（不写 `.hdr`）时没有 HDR 那一份，pin 就是普通 SDR pin；合成器不提供 `wp_color_manager_v1` 时 helper 干脆不铺 surface，同样退回 SDR。像素只在内存里读一次，拖动时 daemon 只发坐标，而同一批里只合成最后一条位置，所以快速拖动不会每个鼠标事件都重画一遍。
+**pin 到屏幕上的 HDR 图也是 HDR 的**，走的是同一条道理：pin daemon 随自己启动一个小进程（`vshot --pin-hdr-server`），它在每块输出上铺一张 overlay 层的 surface，挂上和冻结帧一样的那块输出自己的 image description，把标注后重新按 PQ 编码的十位像素写进去，于是合成器不转换、不色调映射，贴上去的就是原来那束光。Qt 的 pin 浮层做不到这一点——它是 Qt 窗口，描述由 `QColorSpace` 造出，没有亮度信息，合成器会当成另一个空间压暗。所以**图像由这个 helper 画**，Qt 浮层只留边框、角标和右键菜单，并把图像那块挖空留给它；helper 的 surface 必须在 Qt 的之前映射（同一层按映射顺序堆叠，协议没有 restack），因此它在 daemon 启动时就被拉起、在 daemon 的第一张 surface 之前报过到。截下来的内容没有超过 SDR 白（不写第二份）时没有 HDR 那一份，pin 就是普通 SDR pin；合成器不提供 `wp_color_manager_v1` 时 helper 干脆不铺 surface，同样退回 SDR。像素只在内存里读一次，拖动时 daemon 只发坐标，而同一批里只合成最后一条位置，所以快速拖动不会每个鼠标事件都重画一遍。
 
 ## 截图后端与 KDE 授权
 启动时探测一次：先连 `wlr-screencopy-unstable-v1`，只有它以「缺少 `zwlr_screencopy_manager_v1`」失败时才说明这个合成器不提供该协议；再试 **KWin ScreenShot2**——KWin 的私有会话总线服务 `org.kde.KWin.ScreenShot2`（KWin 既没有 screencopy，也没有 `ext-image-copy-capture`）。vshot 传一根管道的写端，KWin 把像素写进管道并在回复里给出 `width` / `height` / `stride` / `format` / `scale`；像素是预乘 alpha 的 BGRA，输出截图把 alpha 归一为 255，窗口截图原样保留。
@@ -600,6 +603,7 @@ vshot settings
   },
   "cli": {
     "png-compression": "high",
+    "hdr-format": "hdr",
     "monitor": "DP-2",
     "long": { "notches": 2, "max-height": 20000, "timeout": 60 },
     "pin": { "density": 2 },
@@ -647,6 +651,7 @@ vshot settings
 | 键 | 对应参数 | 内置默认 |
 | --- | --- | --- |
 | `png-compression` | `--png-compression` | `fast` |
+| `hdr-format` | `--hdr-format` | `avif` |
 | `monitor` | `monitor [NAME]` 的输出名 | `current` |
 | `long.notches` | `long --notches` | `1` |
 | `long.max-height` | `long --max-height` | `30000` |

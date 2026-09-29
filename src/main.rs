@@ -1105,6 +1105,7 @@ fn finish_capture(
         destination,
         density,
         request.compression,
+        request.hdr_format,
         capture_rect.map(|rect| rect.origin),
     );
     result.and(cleanup)

@@ -58,6 +58,9 @@ struct EditorPreferences {
 /// "the user wants `fast`" apart from "the user never touched this".
 struct CliPreferences {
     QString pngCompression; ///< `none` | `fastest` | `fast` | `balanced` | `high`
+    /// How the HDR half of a capture is written: `avif` or `hdr`.  Empty means
+    /// the file says nothing and the built-in default (AVIF) stands.
+    QString hdrFormat;
     QString monitor;        ///< an output name, or `current`
     std::uint32_t longNotches = 0;
     std::uint32_t longMaxHeight = 0;
@@ -316,6 +319,8 @@ const QStringList &dashNames();
 const QStringList &arrowStyleNames();
 const QStringList &mosaicShapeNames();
 const QStringList &compressionNames();
+/// The HDR half's format: `avif`, `hdr`.
+const QStringList &hdrFormatNames();
 const QStringList &injectNames();
 const QStringList &encoderNames();
 /// The hardware backends `record --encoder-backend` and its replay twin accept:

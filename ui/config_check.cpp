@@ -202,6 +202,33 @@ void checkBadValuesFallBackFieldByField()
     expect(config.cli.monitor == QStringLiteral("DP-3"), "a good monitor name survives");
 }
 
+void checkTheHdrFormatRoundTripsAndIsCleared()
+{
+    std::printf("--- the HDR format is remembered and can be cleared ----------------\n");
+    // The HDR half's format, on the same terms as the compression level: an
+    // absent key or an empty value means "let the built-in default stand", and
+    // only a name this build knows is read at all.
+    writeConfig(QStringLiteral(R"({"cli": {"hdr-format": "hdr", "future": 1}})"));
+    expect(vshot::loadConfig().cli.hdrFormat == QStringLiteral("hdr"),
+           "a known HDR format name is read", vshot::loadConfig().cli.hdrFormat);
+
+    writeConfig(QStringLiteral(R"({"cli": {"hdr-format": "webp", "future": 1}})"));
+    expect(vshot::loadConfig().cli.hdrFormat.isEmpty(),
+           "an unknown HDR format name falls back to the built-in default");
+
+    vshot::Config config = vshot::loadConfig();
+    config.cli.hdrFormat = QStringLiteral("avif");
+    QJsonObject root = afterSave([&] { vshot::saveConfig(config); });
+    expect(textAt(root, "cli/hdr-format") == QStringLiteral("avif"),
+           "the chosen HDR format was written", textAt(root, "cli/hdr-format"));
+    expect(numberAt(root, "cli/future") == 1, "an unknown key beside it is still kept");
+
+    config.cli.hdrFormat.clear();
+    root = afterSave([&] { vshot::saveConfig(config); });
+    expect(textAt(root, "cli/hdr-format").isEmpty() && !containsAt(root, "cli/hdr-format"),
+           "clearing it removes the key rather than writing an empty one");
+}
+
 void checkEditorSaveKeepsTheCliSection()
 {
     std::printf("--- saving the editor style keeps the CLI section ------------------\n");
@@ -637,6 +664,13 @@ void checkRoundTripOfEveryField()
         expect(vshot::loadConfig().cli.pngCompression == value,
                "the settings window's compression names all load back", value);
     }
+    for (const QString &value : vshot::hdrFormatNames()) {
+        vshot::Config probe = written;
+        probe.cli.hdrFormat = value;
+        vshot::saveConfig(probe);
+        expect(vshot::loadConfig().cli.hdrFormat == value,
+               "the settings window's HDR format names all load back", value);
+    }
     for (const QString &value : vshot::toolNames()) {
         vshot::Config probe = written;
         probe.editor.tool = value;
@@ -773,6 +807,7 @@ int main(int argc, char **argv)
     checkDefaultsWhenTheFileIsMissing();
     checkUnknownKeysAreIgnored();
     checkBadValuesFallBackFieldByField();
+    checkTheHdrFormatRoundTripsAndIsCleared();
     checkColorsUseTheCssSpelling();
     checkTheLegacyTextSizeIsMigrated();
     checkEditorSaveKeepsTheCliSection();

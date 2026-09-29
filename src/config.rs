@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 use crate::model::PngCompression;
+use crate::output::HdrFormat;
 
 /// The defaults a command-line flag falls back to when it is not given.
 ///
@@ -33,6 +34,9 @@ pub struct CliDefaults {
     /// `--png-compression`, one of `none` / `fastest` / `fast` / `balanced` /
     /// `high`.
     pub png_compression: Option<String>,
+    /// `--hdr-format`, one of `avif` / `hdr`: how the second file of an HDR
+    /// capture is written.
+    pub hdr_format: Option<String>,
     /// `monitor`'s output name when none is given; `current` means the output
     /// under the pointer.
     pub monitor: Option<String>,
@@ -350,6 +354,12 @@ fn parse_compression(name: &str) -> Option<PngCompression> {
     }
 }
 
+/// The HDR format the config file remembers, or `None` when it says nothing
+/// usable.  The caller keeps its own built-in default (AVIF).
+pub fn hdr_format_default() -> Option<HdrFormat> {
+    HdrFormat::parse(load().hdr_format.as_deref()?).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,6 +372,28 @@ mod tests {
         // An unknown name is a typo in a hand-edited file: ignore it and let
         // the built-in default stand.
         assert!(parse_compression("slowest").is_none());
+    }
+
+    #[test]
+    fn the_hdr_format_section_is_read_and_a_bad_name_is_ignored() {
+        let file: ConfigFile = serde_json::from_str(r#"{"cli":{"hdr-format":"hdr"}}"#)
+            .expect("an hdr-format key parses");
+        assert_eq!(file.cli.hdr_format.as_deref(), Some("hdr"));
+        assert_eq!(
+            file.cli
+                .hdr_format
+                .as_deref()
+                .and_then(|name| HdrFormat::parse(name).ok()),
+            Some(HdrFormat::Radiance)
+        );
+        // Absent is absent: the caller keeps its own default (AVIF).
+        let bare: ConfigFile = serde_json::from_str(r#"{"cli":{}}"#).expect("an empty cli parses");
+        assert!(bare.cli.hdr_format.is_none());
+        // A name the parser does not know leaves the built-in default standing
+        // rather than failing the whole capture.
+        let wrong: ConfigFile = serde_json::from_str(r#"{"cli":{"hdr-format":"webp"}}"#)
+            .expect("an unknown name still parses as JSON");
+        assert!(HdrFormat::parse(wrong.cli.hdr_format.as_deref().unwrap()).is_err());
     }
 
     #[test]

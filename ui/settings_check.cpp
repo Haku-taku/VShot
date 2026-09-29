@@ -148,6 +148,8 @@ void checkEveryFieldReachesTheFile()
 
     expect(choose(find<QComboBox>(dialog.get(), "pngCompression"), QStringLiteral("balanced")),
            "the compression list offers balanced");
+    expect(choose(find<QComboBox>(dialog.get(), "hdrFormat"), QStringLiteral("hdr")),
+           "the HDR format list offers hdr");
     find<QLineEdit>(dialog.get(), "monitor")->setText(QStringLiteral("  HDMI-A-1  "));
     find<QSpinBox>(dialog.get(), "pinDensity")->setValue(3);
     find<QSpinBox>(dialog.get(), "longNotches")->setValue(7);
@@ -247,6 +249,8 @@ void checkEveryFieldReachesTheFile()
     expect(saved.editor.mosaicStrength == 3, "the mosaic strength reached the file");
     expect(saved.cli.pngCompression == QStringLiteral("balanced"),
            "the compression default reached the file", saved.cli.pngCompression);
+    expect(saved.cli.hdrFormat == QStringLiteral("hdr"),
+           "the HDR format default reached the file", saved.cli.hdrFormat);
     // Whitespace around a hand-typed monitor name is trimmed rather than saved.
     expect(saved.cli.monitor == QStringLiteral("HDMI-A-1"),
            "the monitor default reached the file", saved.cli.monitor);

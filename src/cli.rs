@@ -10,6 +10,7 @@ use crate::geometry::{parse_geometry, Rect};
 use crate::inject::Prefer;
 use crate::longshot::LongShotOptions;
 use crate::model::PngCompression;
+use crate::output::HdrFormat;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -40,6 +41,8 @@ Destination (every capture above goes to exactly one)
 Shared modifiers
   -c, --cursor        draw the compositor cursor into the capture
   --png-compression   none|fastest|fast (default)|balanced|high, lossless
+  --hdr-format        avif (default)|hdr, the file beside the PNG when the
+                      capture carries HDR content
 
 Compositors: wlroots sessions (Hyprland, Sway, labwc, niri) through
 wlr-screencopy; KWin/Plasma through org.kde.KWin.ScreenShot2, granted only to a
@@ -102,6 +105,13 @@ pub struct Cli {
     /// all lossless. `--pin` writes nothing to disk.
     #[arg(long = "png-compression", global = true, value_name = "LEVEL")]
     pub png_compression: Option<String>,
+    /// Format of the HDR file written beside the PNG when the capture carries
+    /// HDR content: `avif` (the default) or `hdr` (Radiance RGBE). `avif` is
+    /// ten-bit BT.2020 PQ and states its colour in the file, but is lossy;
+    /// `hdr` is the light exactly as captured, in the output's own primaries.
+    /// Neither affects a capture without HDR content.
+    #[arg(long = "hdr-format", global = true, value_name = "FORMAT")]
+    pub hdr_format: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -905,6 +915,8 @@ pub struct Request {
     pub destination: Destination,
     pub cursor: bool,
     pub compression: PngCompression,
+    /// How the HDR half is written when the capture carries HDR content.
+    pub hdr_format: HdrFormat,
 }
 
 /// What `vshot` was asked to do.  Only the capture arm touches the Wayland
@@ -1756,6 +1768,10 @@ impl Cli {
             Some(name) => PngCompression::parse(name)?,
             None => crate::config::compression_default().unwrap_or_default(),
         };
+        let hdr_format = match self.hdr_format.as_deref() {
+            Some(name) => HdrFormat::parse(name)?,
+            None => crate::config::hdr_format_default().unwrap_or_default(),
+        };
         let destination = match (self.output, self.clipboard, self.pin) {
             (Some(path), false, false) if path.as_os_str() == "-" => Destination::Stdout,
             (Some(path), false, false) => Destination::File(path),
@@ -1875,6 +1891,7 @@ impl Cli {
             destination,
             cursor: self.cursor,
             compression,
+            hdr_format,
         })
     }
 
@@ -2436,6 +2453,7 @@ mod tests {
                 destination: Destination::Clipboard,
                 cursor: false,
                 compression: PngCompression::Fast,
+                hdr_format: HdrFormat::default(),
             })
         );
         let action =

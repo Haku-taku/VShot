@@ -120,6 +120,7 @@ constexpr int kDefaultReplayFps = 30;
 // CLI falls back to, which the box's leading entry shows so the default is
 // readable rather than implied by the word "default".
 constexpr const char *kDefaultPngCompression = "fast";
+constexpr const char *kDefaultHdrFormat = "avif";
 constexpr const char *kDefaultEncoder = "h264";
 constexpr const char *kDefaultEncoderBackend = "auto";
 constexpr const char *kDefaultLongInject = "auto";
@@ -1292,6 +1293,19 @@ private:
                uiTr("All levels are lossless; slower ones buy a smaller file"),
                compressionBox_, true);
 
+        hdrFormatBox_ =
+            choiceBox(output, hdrFormatNames(), QString::fromLatin1(kDefaultHdrFormat));
+        hdrFormatBox_->setObjectName(QStringLiteral("hdrFormat"));
+        hdrFormatBox_->setMinimumWidth(200);
+        selectChoice(hdrFormatBox_, config_.cli.hdrFormat);
+        addRow(output, uiTr("HDR format"),
+               uiTr("The second file of a capture that carries HDR content, written "
+                    "beside the PNG with the same name. AVIF is ten-bit BT.2020 PQ and "
+                    "says so in the file, so every reader shows it right, but it is "
+                    "lossy; Radiance RGBE is the light exactly as captured, and is read "
+                    "by few"),
+               hdrFormatBox_, true);
+
         monitorEdit_ = new QLineEdit(output);
         monitorEdit_->setObjectName(QStringLiteral("monitor"));
         monitorEdit_->setMinimumWidth(220);
@@ -1853,6 +1867,7 @@ private:
 
         CliPreferences &cli = config.cli;
         cli.pngCompression = compressionBox_->currentData().toString();
+        cli.hdrFormat = hdrFormatBox_->currentData().toString();
         cli.monitor = monitorEdit_->text().trimmed();
         // Every spin box is read back with the built-in default it opened on: a
         // value still sitting there is written as the sentinel, which is what
@@ -1946,6 +1961,7 @@ private:
     QComboBox *mosaicShapeBox_ = nullptr;
     QSpinBox *mosaicStrengthSpin_ = nullptr;
     QComboBox *compressionBox_ = nullptr;
+    QComboBox *hdrFormatBox_ = nullptr;
     QLineEdit *monitorEdit_ = nullptr;
     QSpinBox *densitySpin_ = nullptr;
     QSpinBox *notchesSpin_ = nullptr;

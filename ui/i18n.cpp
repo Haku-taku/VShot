@@ -299,6 +299,15 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("PNG compression"), QString::fromUtf8("PNG 压缩")},
         {QStringLiteral("All levels are lossless; slower ones buy a smaller file"),
          QString::fromUtf8("各档全部无损；越慢换来越小的文件")},
+        {QStringLiteral("HDR format"), QString::fromUtf8("HDR 格式")},
+        {QStringLiteral("The second file of a capture that carries HDR content, written "
+                        "beside the PNG with the same name. AVIF is ten-bit BT.2020 PQ and "
+                        "says so in the file, so every reader shows it right, but it is "
+                        "lossy; Radiance RGBE is the light exactly as captured, and is read "
+                        "by few"),
+         QString::fromUtf8("截图带 HDR 内容时，与 PNG 同名并排写出的第二个文件。"
+                           "AVIF 是 10 位 BT.2020 PQ 并在文件里声明，所有读取器都能正确"
+                           "显示，但为有损；Radiance RGBE 是原样记录的光，但读取器很少")},
         {QStringLiteral("Default monitor"), QString::fromUtf8("默认输出")},
         {QStringLiteral("Which output a capture takes when the command line names none. Leave it "
                         "empty to use whichever output the pointer is on -- `current` says the "

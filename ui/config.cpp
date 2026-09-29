@@ -41,6 +41,9 @@ const QStringList kMosaicShapeNames = {QStringLiteral("rect"), QStringLiteral("e
 const QStringList kCompressionNames = {QStringLiteral("none"), QStringLiteral("fastest"),
                                        QStringLiteral("fast"), QStringLiteral("balanced"),
                                        QStringLiteral("high")};
+// The HDR half's format.  The names are the file suffixes, which is also what
+// `--hdr-format` accepts.
+const QStringList kHdrFormatNames = {QStringLiteral("avif"), QStringLiteral("hdr")};
 const QStringList kInjectNames = {QStringLiteral("auto"), QStringLiteral("wlr"),
                                   QStringLiteral("portal"), QStringLiteral("uinput")};
 const QStringList kEncoderNames = {QStringLiteral("h264"), QStringLiteral("hevc"),
@@ -335,7 +338,7 @@ void dropRetiredEditorKeys(QJsonObject &root)
 /// still survives.  The `editor` section needs no such list: the editor always
 /// writes all of it.
 const std::pair<const char *, const char *> kOwnedCliKeys[] = {
-    {"", "png-compression"}, {"", "monitor"},
+    {"", "png-compression"}, {"", "hdr-format"}, {"", "monitor"},
     {"long", "notches"},     {"long", "max-height"},
     {"long", "max-frames"},  {"long", "timeout"},
     {"long", "ignore-top"},  {"long", "inject"},
@@ -451,6 +454,8 @@ CliPreferences readCli(const QJsonObject &cli)
     CliPreferences preferences;
     preferences.pngCompression =
         readChoice(cli, QStringLiteral("png-compression"), QString(), kCompressionNames);
+    preferences.hdrFormat =
+        readChoice(cli, QStringLiteral("hdr-format"), QString(), kHdrFormatNames);
     preferences.monitor = readString(cli, QStringLiteral("monitor"), QString());
     const QJsonObject longSection = cli.value(QStringLiteral("long")).toObject();
     preferences.longInject =
@@ -562,6 +567,9 @@ QJsonObject cliJson(const CliPreferences &preferences)
     QJsonObject cli;
     if (!preferences.pngCompression.isEmpty()) {
         cli.insert(QStringLiteral("png-compression"), preferences.pngCompression);
+    }
+    if (!preferences.hdrFormat.isEmpty()) {
+        cli.insert(QStringLiteral("hdr-format"), preferences.hdrFormat);
     }
     if (!preferences.monitor.isEmpty()) {
         cli.insert(QStringLiteral("monitor"), preferences.monitor);
@@ -999,6 +1007,11 @@ const QStringList &mosaicShapeNames()
 const QStringList &compressionNames()
 {
     return kCompressionNames;
+}
+
+const QStringList &hdrFormatNames()
+{
+    return kHdrFormatNames;
 }
 
 const QStringList &injectNames()
