@@ -150,12 +150,55 @@ vshot::Session editingSession()
     return session;
 }
 
+// A one-output session whose every pixel names itself, so a magnified sample
+// can be read back and checked against the pixel it should be showing.  No
+// selection: the check drives one itself.
+vshot::Session coordinateSession()
+{
+    vshot::Session session = editingSession();
+    session.selection.reset();
+    vshot::OutputSession &output = session.outputs[0];
+    QImage image(400, 400, QImage::Format_RGBA8888);
+    for (int y = 0; y < 400; ++y) {
+        for (int x = 0; x < 400; ++x) {
+            image.setPixelColor(x, y, QColor(x % 256, y % 256, (x * 7 + y * 13) % 256, 255));
+        }
+    }
+    output.image = image;
+    return session;
+}
+
+// A one-output session whose frame is solid black, so a green label's ink can be
+// read back with a low threshold and compared between two renderings of it.
+vshot::Session scaledCoordinateSession()
+{
+    vshot::Session session = editingSession();
+    session.selection.reset();
+    vshot::OutputSession &output = session.outputs[0];
+    output.scale = 2;
+    output.pixelWidth = 800;
+    output.pixelHeight = 800;
+    QImage image(800, 800, QImage::Format_RGBA8888);
+    for (int y = 0; y < 800; ++y) {
+        for (int x = 0; x < 800; ++x) {
+            image.setPixelColor(x, y, QColor(x % 256, y % 256, (x * 7 + y * 13) % 256, 255));
+        }
+    }
+    output.image = image;
+    return session;
+}
+
 void paintOnce(vshot::CaptureOverlay *overlay, QImage *target)
 {
     target->fill(Qt::transparent);
     overlay->render(target);
 }
 
+// One step of what the compositor actually asks the overlay for: Qt repaints
+// only the region the previous step invalidated, on top of the pixels that are
+// already there.  The check above full-renders after every step and so can
+// never see a gap the narrow path leaves; this one keeps the pixels between
+// steps, exactly like the live widget, and redraws just the asked-for rect.
 void renderIncremental(vshot::OverlayController &controller, vshot::CaptureOverlay *overlay,
                        QImage *backing)
 {
@@ -1750,6 +1793,103 @@ void checkLiveStrokeSurvivesIncrementalRepaint()
 // to keep the cursor's own pixel centred; that is exactly what "the magnifier
 // looks scrambled while dragging" means.  This reads the painted circle back and
 // matches every sampled pixel against the source pixel it should be showing.
+void checkLoupeShowsTheCursorPixelEverywhere()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    const auto run = [screen](const vshot::Session &session, bool *ok) {
+        vshot::OverlayController controller(session);
+        QString error;
+        vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+        if (overlay == nullptr) {
+            expect(false, "the controller accepts an overlay", error);
+            *ok = false;
+            return;
+        }
+        overlay->show();
+        const QSize size = overlay->size();
+        const vshot::OutputSession &output = controller.session().outputs.at(0);
+        const QImage &source = output.image;
+        const int scale = static_cast<int>(output.scale > 0 ? output.scale : 1);
+        constexpr int radius = 60; // (2 * kLoupeRadius + 1) * kLoupeZoom / 2
+        constexpr int margin = 10;
+
+        // Corners, edges and the middle, in logical pixels of the session's
+        // 400x400 selection canvas.
+        const QPoint pointers[] = {{0, 0},     {3, 3},     {7, 7},     {30, 30},
+                                   {200, 200}, {399, 399}, {3, 399},   {399, 3},
+                                   {150, 0},   {0, 150}};
+        int wrong = 0;
+        int checked = 0;
+        for (const QPoint &pointer : pointers) {
+            // One drag step pins the pointer and turns the magnifier on.
+            controller.press(overlay, QPointF(pointer), Qt::LeftButton, Qt::NoModifier);
+            controller.move(overlay, QPointF(pointer), Qt::LeftButton, Qt::NoModifier);
+            QImage frame(size, QImage::Format_ARGB32_Premultiplied);
+            paintOnce(overlay, &frame);
+
+            // Same placement the overlay computes.
+            QPointF center(pointer.x() + radius * 1.1, pointer.y() + radius * 1.1);
+            if (center.x() + radius > size.width() - margin) {
+                center.setX(pointer.x() - radius * 1.1);
+            }
+            if (center.y() + radius > size.height() - margin) {
+                center.setY(pointer.y() - radius * 1.1);
+            }
+            const int centerX = std::clamp((pointer.x() - output.geometry.x) * scale, 0,
+                                           source.width() - 1);
+            const int centerY = std::clamp((pointer.y() - output.geometry.y) * scale, 0,
+                                           source.height() - 1);
+            // The magnified window, now always the full span centred on the
+            // cursor pixel: the crop borrows the nearest edge pixel where the
+            // window runs off the frame, so every sample below has an answer.
+            const QPointF origin(center.x() - radius, center.y() - radius);
+
+            for (int i : {3, 11}) {
+                for (int j : {3, 11}) {
+                    const QPoint at(static_cast<int>(origin.x()) + i * 8 + 4,
+                                    static_cast<int>(origin.y()) + j * 8 + 4);
+                    if (at.x() < 0 || at.y() < 0 || at.x() >= size.width() ||
+                        at.y() >= size.height()) {
+                        continue;
+                    }
+                    const QColor shown = frame.pixelColor(at);
+                    const int wantX = std::clamp(centerX - 7 + i, 0, source.width() - 1);
+                    const int wantY = std::clamp(centerY - 7 + j, 0, source.height() - 1);
+                    const QColor want = source.pixelColor(wantX, wantY);
+                    ++checked;
+                    if (colorDistance(shown, want) > 2) {
+                        ++wrong;
+                        if (wrong <= 4) {
+                            std::printf("loupe at (%d,%d) samples (%d,%d): got %d,%d,%d want "
+                                        "%d,%d,%d\n",
+                                        pointer.x(), pointer.y(), wantX, wantY, shown.red(),
+                                        shown.green(), shown.blue(), want.red(), want.green(),
+                                        want.blue());
+                        }
+                    }
+                }
+            }
+        }
+        expect(checked > 0, "the magnifier was sampled", QStringLiteral("no samples taken"));
+        expect(wrong == 0, "the magnifier shows the pixel under the cursor at every edge",
+               QStringLiteral("%1 of %2 samples wrong").arg(wrong).arg(checked));
+        *ok = wrong == 0 && checked > 0;
+    };
+
+    bool ok = true;
+    run(coordinateSession(), &ok);
+    run(scaledCoordinateSession(), &ok);
+}
+
+// Where the label is typed has to be where it lands.  The inline editor is a
+// QLineEdit child widget; whatever frame or padding it carries shifts its
+// glyphs away from the origin the committed label is drawn at, so the label
+// visibly jumps the moment the editor is accepted.  This measures the ink of
+// the typed text and of the committed label and requires them to agree.
 // session bounds) has moved.  That is exactly the state the editor is in after
 // the daemon confirms a move, and it is where an overlay's surface, the image
 // rect and the stale output geometry all disagree.
@@ -1825,6 +1965,70 @@ void checkPinEditStepsCoverTheirChange()
 // count from where the image now is.  Counting from the stale session rect
 // showed the wrong part of the picture -- the "scrambled magnifier" the pin
 // drag was blamed for.
+void checkMovedPinLoupeFollowsTheImage()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(pinEditSession());
+    controller.setPinEditMode(true);
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPinEdit();
+    controller.chooseTool(vshot::Tool::Select);
+
+    const vshot::OutputSession &output = controller.session().outputs.at(0);
+    const QImage &source = output.image;
+    const QSize size = overlay->size();
+    constexpr int radius = 60;
+    constexpr int margin = 10;
+
+    // A pointer whose whole magnifier lands inside the image (and so inside the
+    // image clip the overlay draws it through).
+    const QPoint pointer(200, 200);
+    controller.press(overlay, QPointF(pointer), Qt::LeftButton, Qt::NoModifier);
+    controller.move(overlay, QPointF(pointer), Qt::LeftButton, Qt::NoModifier);
+    QImage frame(size, QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &frame);
+
+    QPointF center(pointer.x() + radius * 1.1, pointer.y() + radius * 1.1);
+    if (center.x() + radius > size.width() - margin) {
+        center.setX(pointer.x() - radius * 1.1);
+    }
+    if (center.y() + radius > size.height() - margin) {
+        center.setY(pointer.y() - radius * 1.1);
+    }
+    // The image's current rect is the session bounds, not output.geometry.
+    const int centerX = std::clamp(pointer.x() - controller.session().bounds.x, 0,
+                                   source.width() - 1);
+    const int centerY = std::clamp(pointer.y() - controller.session().bounds.y, 0,
+                                   source.height() - 1);
+    const QPointF origin(center.x() - radius, center.y() - radius);
+
+    int wrong = 0;
+    for (int i : {3, 11}) {
+        for (int j : {3, 11}) {
+            const QPoint at(static_cast<int>(origin.x()) + i * 8 + 4,
+                            static_cast<int>(origin.y()) + j * 8 + 4);
+            const QColor shown = frame.pixelColor(at);
+            const int wantX = std::clamp(centerX - 7 + i, 0, source.width() - 1);
+            const int wantY = std::clamp(centerY - 7 + j, 0, source.height() - 1);
+            const QColor want = source.pixelColor(wantX, wantY);
+            if (colorDistance(shown, want) > 2) {
+                ++wrong;
+            }
+        }
+    }
+    expect(wrong == 0, "the magnifier follows an image that has been dragged",
+           QStringLiteral("%1 of 4 samples wrong").arg(wrong));
+}
 
 } // namespace
 
@@ -1851,7 +2055,9 @@ int main(int argc, char *argv[])
     checkEachOutputKeepsItsOwnRaster();
     checkEdgeOfCanvasKeepsTheRaster();
     checkLiveStrokeMatchesTheCommittedMark();
+    checkLoupeShowsTheCursorPixelEverywhere();
     checkPinEditStepsCoverTheirChange();
+    checkMovedPinLoupeFollowsTheImage();
     checkLiveStrokeSurvivesIncrementalRepaint();
     checkInteractiveUpdateCoversTheChange();
     checkWaveSerializesAsATwoPointStroke();

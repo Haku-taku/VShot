@@ -204,6 +204,29 @@ QPointF localPoint(const OutputSession &output, const Point &point, const QSize 
                    (static_cast<double>(point.y) - surface.y) * sy);
 }
 
+// The fixed device-pixel crop the magnifier shows, centred on the cursor's own
+// pixel.  Near a frame edge the window would run off the image; the pixels that
+// do not exist are borrowed from the nearest edge instead of being dropped, so
+// the cursor's pixel stays at the centre of the loupe and the circle is filled
+// edge to edge.  Dropping them is what left the loupe showing the frame under
+// it near the screen's borders.
+QImage loupeCrop(const QImage &image, int centerX, int centerY)
+{
+    constexpr int span = 2 * kLoupeRadius + 1;
+    QImage crop(span, span, QImage::Format_ARGB32);
+    if (crop.isNull()) {
+        return crop;
+    }
+    for (int row = 0; row < span; ++row) {
+        const int sourceY = std::clamp(centerY - kLoupeRadius + row, 0, image.height() - 1);
+        for (int column = 0; column < span; ++column) {
+            const int sourceX = std::clamp(centerX - kLoupeRadius + column, 0, image.width() - 1);
+            crop.setPixel(column, row, image.pixel(sourceX, sourceY));
+        }
+    }
+    return crop;
+}
+
 // Two pi, spelled out rather than read from a platform's `M_PI`: the wave the
 // preview draws and the one the Rust renderer bakes into the PNG have to be the
 // same curve, and the constant is the one place that could silently differ.
@@ -10090,17 +10113,18 @@ void OverlayController::drawLoupe(CaptureOverlay *overlay, QPainter *painter)
     if (sourceWidth <= 0 || sourceHeight <= 0) {
         return;
     }
+    // The magnifier samples the *image*, so it has to count from where the image
+    // actually is: in the pin editor that is the daemon-confirmed rect, not the
+    // rect the session recorded when the editor opened, and counting from the
+    // stale one made the loupe show the wrong part of the picture while a pin
+    // was being dragged -- the "scrambled magnifier".
+    const LogicalRect &image = pinEdit_ && marksOrigin_.has_value() ? *marksOrigin_ : output.geometry;
     const int centerX = std::clamp(
-        static_cast<int>(std::floor((pointer_.x - output.geometry.x) * static_cast<double>(scale))),
-        0, sourceWidth - 1);
+        static_cast<int>(std::floor((pointer_.x - image.x) * static_cast<double>(scale))), 0,
+        sourceWidth - 1);
     const int centerY = std::clamp(
-        static_cast<int>(std::floor((pointer_.y - output.geometry.y) * static_cast<double>(scale))),
-        0, sourceHeight - 1);
-    const int sampleLeft = std::clamp(centerX - kLoupeRadius, 0, sourceWidth - 1);
-    const int sampleTop = std::clamp(centerY - kLoupeRadius, 0, sourceHeight - 1);
-    const int sampleWidth = std::min(2 * kLoupeRadius + 1, sourceWidth - sampleLeft);
-    const int sampleHeight = std::min(2 * kLoupeRadius + 1, sourceHeight - sampleTop);
-    const QRect source(sampleLeft, sampleTop, sampleWidth, sampleHeight);
+        static_cast<int>(std::floor((pointer_.y - image.y) * static_cast<double>(scale))), 0,
+        sourceHeight - 1);
     const qreal radius = kLoupeDiameter / 2.0;
 
     QPointF center = local + QPointF(radius * 1.1, radius * 1.1);
@@ -10119,10 +10143,16 @@ void OverlayController::drawLoupe(CaptureOverlay *overlay, QPainter *painter)
     clipPath.addEllipse(center, radius, radius);
     painter->setClipPath(clipPath);
     painter->setRenderHint(QPainter::SmoothPixmapTransform, false);
-    const QRectF target(center.x() - radius + (sampleLeft - (centerX - kLoupeRadius)) * kLoupeZoom,
-                        center.y() - radius + (sampleTop - (centerY - kLoupeRadius)) * kLoupeZoom,
-                        sampleWidth * kLoupeZoom, sampleHeight * kLoupeZoom);
-    painter->drawImage(target, output.image, source);
+    // The crop is the fixed window the loupe magnifies, centred on the cursor's
+    // own pixel.  Near a screen edge that window runs off the frame; sampling
+    // only the part still inside leaves the rest of the circle showing whatever
+    // is underneath, which is the "scrambled magnifier".  Replicating the edge
+    // pixels instead keeps the cursor's pixel dead centre and the whole circle
+    // filled, which is the one thing the magnifier is read for.
+    const QImage crop = loupeCrop(output.image, centerX, centerY);
+    painter->drawImage(QRectF(center.x() - radius, center.y() - radius, 2.0 * radius,
+                              2.0 * radius),
+                       crop);
     painter->restore();
 
     painter->save();
@@ -10138,7 +10168,16 @@ void OverlayController::drawLoupe(CaptureOverlay *overlay, QPainter *painter)
     painter->drawLine(center, center + QPointF(0, radius / 2.5));
     const QString coordinates = QStringLiteral("%1, %2").arg(centerX).arg(centerY);
     painter->restore();
-    drawInfoPill(painter, center + QPointF(0, radius + 2.0), coordinates,
+    // The pill hangs just under the loupe.  When there is no room below -- a
+    // cursor near the bottom edge -- hanging it "above the anchor" would drop it
+    // back inside the circle and cover the very pixels the magnifier exists to
+    // show, so it is lifted clear over the top of the loupe instead.
+    QPointF pillAnchor = center + QPointF(0, radius + 2.0);
+    const int pillHeight = QFontMetrics(pillFont()).height() + 8;
+    if (pillAnchor.y() + 10.0 + pillHeight > overlay->height()) {
+        pillAnchor.setY(center.y() - radius - 12.0);
+    }
+    drawInfoPill(painter, pillAnchor, coordinates,
                  QRectF(0, 0, overlay->width(), overlay->height()));
 }
 
