@@ -448,6 +448,36 @@ int main(int argc, char **argv)
         ++failures;
     }
 
+    // The offset is baked into the silhouette the blur is built from, so it
+    // belongs in the cache key as much as the size does: the shadow's own image
+    // depends on it, and a surface that kept the image of the offset it was
+    // first drawn with would show the same shadow whatever the config said.
+    // Measured as weight in the band below the pin, where a dropped silhouette
+    // puts more of its falloff.
+    // The two paints are back to back with nothing else changed between them:
+    // that is the case the key has to cover, since any other difference rebuilds
+    // the image for its own reasons and hides the one being measured here.
+    vshot::PinSurface::Style near = styled;
+    near.shadow.size = 24;
+    near.shadow.offset = 3;
+    surface.setStyle(near);
+    const QImage nearShadow = paint(surface);
+    vshot::PinSurface::Style dropped = near;
+    dropped.shadow.offset = 40;
+    surface.setStyle(dropped);
+    const QImage droppedShadow = paint(surface);
+    const long nearWeight = weight(nearShadow, bandTop, bandBottom);
+    const long droppedWeight = weight(droppedShadow, bandTop, bandBottom);
+    if (droppedWeight > nearWeight) {
+        std::printf("ok    %-48s %ld against %ld\n", "a dropped shadow lands further down",
+                    droppedWeight, nearWeight);
+    } else {
+        std::printf("FAIL  %-48s %ld against %ld\n", "a dropped shadow lands further down",
+                    droppedWeight, nearWeight);
+        ++failures;
+    }
+    surface.setStyle(styled);
+
     // And a size of zero paints nothing, the same as switching it off: the
     // offset is what a blur-less shadow would still have to draw, and there is
     // nothing to draw with.

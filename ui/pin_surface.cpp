@@ -560,12 +560,16 @@ void PinSurface::paintShadow(QPainter &painter, Entry &entry, const QRect &targe
     const qreal ratio = std::max<qreal>(1.0, devicePixelRatioF());
     // The key covers everything the built image depends on, so a drag (which
     // changes only the origin) re-uses it while a zoom step or a config change
-    // rebuilds it.
-    const QString key = QStringLiteral("%1x%2/%3/%4/%5/%6")
+    // rebuilds it.  The offset is part of that: it is baked into the silhouette
+    // the blur is built from, so two offsets are two different images -- leaving
+    // it out of the key meant a pin kept the shadow of the offset it was first
+    // drawn with, and the file dialog's own key has carried it all along.
+    const QString key = QStringLiteral("%1x%2/%3/%4/%5/%6/%7")
                             .arg(target.width())
                             .arg(target.height())
                             .arg(radius)
                             .arg(style_.shadow.size)
+                            .arg(style_.shadow.offset)
                             .arg(style_.shadow.opacity)
                             .arg(qRound(ratio * 100));
     if (entry.shadow.isNull() || entry.shadowKey != key) {
