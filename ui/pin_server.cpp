@@ -267,13 +267,17 @@ void installTerminateNotifier(QObject *context, std::function<void()> onTerminat
                      });
 }
 
+// Writes one reply.  The connection is deliberately left open: a client that
+// drives a drag sends many requests over one socket, and hanging up after each
+// reply would make it pay a connect and an accept per motion event.  A client
+// that only wanted one answer (the CLI) simply closes its end, which the
+// server turns into a deleteLater.
 void respond(QLocalSocket *socket, const QJsonObject &payload)
 {
     const QByteArray encoded = QJsonDocument(payload).toJson(QJsonDocument::Compact);
     socket->write(encoded);
     socket->write("\n", 1);
     socket->flush();
-    socket->disconnectFromServer();
 }
 
 // After the last pin is gone the daemon owns no surfaces, so it exits and
@@ -960,7 +964,11 @@ public:
         while (QLocalSocket *socket = server_->nextPendingConnection()) {
             connect(socket, &QLocalSocket::readyRead, this,
                     [this, socket] { readRequest(socket); });
-            connect(socket, &QLocalSocket::disconnected, socket, &QObject::deleteLater);
+            connect(socket, &QLocalSocket::disconnected, socket, [this, socket] {
+                // The client is gone; whatever it left mid-request goes with it.
+                buffer_.remove(socket);
+                socket->deleteLater();
+            });
         }
     }
 
@@ -1024,38 +1032,82 @@ private:
                            {QStringLiteral("error"), message}};
     }
 
-    // Requests are newline-terminated single JSON objects.
+    // Requests are newline-terminated single JSON objects.  One connection may
+    // carry as many as the client sends: a drag pipelines its positions, so the
+    // loop below drains every complete line before it answers.
     void readRequest(QLocalSocket *socket)
     {
         buffer_[socket] += socket->readAll();
-        const qsizetype newline = buffer_[socket].indexOf('\n');
-        if (newline < 0) {
-            return; // still streaming
+        QElapsedTimer clock;
+        if (debug_) {
+            clock.start();
         }
-        const QByteArray line = buffer_[socket].left(newline);
-        buffer_.remove(socket);
+        // Positions are applied as they are read but the stack is rendered once,
+        // after the whole batch: a client that pipelines several drag positions
+        // gets one repaint and one answer each, and every answer carries the
+        // position that repaint actually landed on.
+        QVector<QPair<QLocalSocket *, quint64>> moved;
+        qsizetype newline = -1;
+        while ((newline = buffer_[socket].indexOf('\n')) >= 0) {
+            const QByteArray line = buffer_[socket].left(newline);
+            buffer_[socket].remove(0, newline + 1);
 
-        QJsonParseError parseError;
-        const QJsonDocument document = QJsonDocument::fromJson(line, &parseError);
-        if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
-            respond(socket, error(QStringLiteral("invalid pin request JSON: %1")
-                                      .arg(parseError.errorString())));
+            QJsonParseError parseError;
+            const QJsonDocument document = QJsonDocument::fromJson(line, &parseError);
+            if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+                respond(socket, error(QStringLiteral("invalid pin request JSON: %1")
+                                          .arg(parseError.errorString())));
+                continue;
+            }
+            const QJsonObject request = document.object();
+            const QString command = request.value(QStringLiteral("cmd")).toString();
+            if (command == QStringLiteral("move")) {
+                quint64 id = 0;
+                const QJsonObject reply = movePin(request, &id);
+                if (reply.value(QStringLiteral("ok")).toBool()) {
+                    moved.append({socket, id});
+                } else {
+                    respond(socket, reply);
+                    armIdleQuit();
+                }
+                continue;
+            }
+            const bool quit = command == QStringLiteral("quit");
+            const QJsonObject reply = dispatch(request);
+            respond(socket, reply);
+            // A daemon that owns nothing has no reason to stay resident, and a
+            // failed first add (an empty clipboard, an unreadable file) would
+            // otherwise leave one running forever with nothing pinned.
+            if (!reply.value(QStringLiteral("ok")).toBool(true)) {
+                armIdleQuit();
+            }
+            if (quit) {
+                shutdownAll();
+                QCoreApplication::quit();
+                return;
+            }
+        }
+        if (buffer_.value(socket).isEmpty()) {
+            buffer_.remove(socket);
+        }
+        if (moved.isEmpty()) {
             return;
         }
-        const QJsonObject request = document.object();
-        const bool quit =
-            request.value(QStringLiteral("cmd")).toString() == QStringLiteral("quit");
-        const QJsonObject reply = dispatch(request);
-        respond(socket, reply);
-        // A daemon that owns nothing has no reason to stay resident, and a
-        // failed first add (an empty clipboard, an unreadable file) would
-        // otherwise leave one running forever with nothing pinned.
-        if (!reply.value(QStringLiteral("ok")).toBool(true)) {
-            armIdleQuit();
+        syncAll();
+        for (const auto &entry : moved) {
+            const Pin *pin = byId_.value(entry.second, nullptr);
+            if (pin == nullptr) {
+                respond(entry.first,
+                        error(QStringLiteral("pin %1 no longer exists").arg(entry.second)));
+                continue;
+            }
+            respond(entry.first, moveReply(*pin));
         }
-        if (quit) {
-            shutdownAll();
-            QCoreApplication::quit();
+        if (debug_) {
+            std::fprintf(stderr, "vshot-pin: %lld move(s) applied and rendered in %lld ms\n",
+                         static_cast<long long>(moved.size()),
+                         static_cast<long long>(clock.elapsed()));
+            std::fflush(stderr);
         }
     }
 
@@ -1069,7 +1121,9 @@ private:
             return addClipboardPin(request);
         }
         if (command == QStringLiteral("move")) {
-            return movePin(request);
+            // `readRequest` handles moves itself: it applies them and answers
+            // once the batch has been rendered.
+            return error(QStringLiteral("pin move must be answered by the reader"));
         }
         if (command == QStringLiteral("save")) {
             return savePin(request);
@@ -1354,10 +1408,12 @@ wl-clipboard package"));
     }
 
     // Replaces the pixels of an existing pin and/or moves it. Coordinates are
-    // global logical pixels (the editor's frame of reference); the response
-    // carries the rect the pin actually landed on, after clamping, so the
-    // caller can follow it.
-    QJsonObject movePin(const QJsonObject &request)
+    // global logical pixels (the editor's frame of reference).  Applies the
+    // change only: it does not render and does not answer -- the batch that
+    // carried it does both once, in `readRequest`, and `moveReply` carries the
+    // rect the pin actually landed on, after clamping, so a pipelined drag
+    // repaints the stack once for several positions.
+    QJsonObject movePin(const QJsonObject &request, quint64 *movedId)
     {
         bool idOk = false;
         const quint64 id = request.value(QStringLiteral("id")).toVariant().toULongLong(&idOk);
@@ -1407,8 +1463,16 @@ wl-clipboard package"));
             pin->hdrWhite = pqWhiteNits(taken);
         }
         pin->origin = clampOrigin(*pin, QPoint(x, y));
-        syncAll();
-        const QRect landed = pin->globalRect();
+        if (movedId != nullptr) {
+            *movedId = id;
+        }
+        return okReply();
+    }
+
+    // Where the pin ended up, which is what a move answers with.
+    static QJsonObject moveReply(const Pin &pin)
+    {
+        const QRect landed = pin.globalRect();
         QJsonObject reply = okReply();
         reply.insert(QStringLiteral("x"), static_cast<qint64>(landed.x()));
         reply.insert(QStringLiteral("y"), static_cast<qint64>(landed.y()));

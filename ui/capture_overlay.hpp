@@ -611,16 +611,25 @@ private:
     // veil again.  `baseCompositeKey_` says when it has to be rebuilt.
     QImage baseComposite_;
     QByteArray baseCompositeKey_;
-    // Live pin window the editor drives in pin-edit mode. The daemon answers
-    // exactly one request per connection and then closes, so each move gets a
-    // fresh socket instead of a reconnected one.
+    // Live pin window the editor drives in pin-edit mode.  One connection
+    // serves the whole drag: opening a socket costs a connect, a server accept
+    // and a fresh object on both sides, and paying that per motion event was
+    // most of the drag's latency.  The protocol is newline-delimited, so a move
+    // is just a line on the connection the first one opened.
     std::uint64_t pinId_ = 0;
     QString pinSocketPath_;
     QLocalSocket *pinSocket_ = nullptr;
     QByteArray pinReplyBuffer_;
-    // Moves are coalesced: while one request is in flight the newest position
-    // waits here, since a drag produces far more motion than the daemon needs.
+    // Positions waiting for a free slot and the number already written but not
+    // yet answered.  A few may be in flight at once -- the position is absolute
+    // and the newest wins, so a small queue only keeps the daemon busy instead
+    // of letting it idle between replies -- but bounded, so a stalled daemon
+    // cannot grow it without end.
     std::optional<Point> pendingPinOrigin_;
+    int pinMovesInFlight_ = 0;
+    // Set from VSHOT_PIN_DEBUG: traces the drag's round trip to stderr.
+    bool pinDebug_ = false;
+    QElapsedTimer pinMoveClock_;
     // The position the marks are anchored to in pin-edit mode: the last
     // confirmed reply from the daemon, not the optimistic cursor position.  The
     // FP16 helper surface shows the image at this same position, so clipping
@@ -638,9 +647,14 @@ private:
     void applySelectionMove(LogicalRect origin, Point anchor, Point current);
     void requestPinMove(Point globalTopLeft);
     void flushPinMove();
+    void openPinSocket();
+    void dropPinSocket();
+    void readPinReplies();
     void applyPinReply(QByteArray line);
-    void consumePinReply(QLocalSocket *socket);
     void applyPinRect(const LogicalRect &rect);
+    // Repaints exactly the overlays' part of `region` (global logical pixels),
+    // without touching the "last touch" bookkeeping a gesture's steps share.
+    void invalidateLogicalRegion(const LogicalRect &region);
     Point clampPoint(Point point) const;
     int candidateIndexAt(Point point) const;
     QString candidatePillText() const;

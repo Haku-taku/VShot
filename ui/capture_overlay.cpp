@@ -85,6 +85,10 @@ constexpr int kCandidateRefreshIntervalMs = 150;
 // seeing an event, and the highlight must not keep describing what used to be
 // there.  Only the picker's lifetime pays for this.
 constexpr int kCandidateRefreshPollMs = 300;
+// How many pin moves may be written before the daemon answers the first.  More
+// than one keeps it from idling between replies; the position is absolute and
+// only the newest matters, so the queue never needs to be long.
+constexpr int kPinMovesInFlight = 3;
 constexpr int kMaxUndoSteps = 100;
 constexpr int kLoupeRadius = 7;
 constexpr int kLoupeZoom = 8;
@@ -4517,6 +4521,8 @@ OverlayController::OverlayController(Session session)
     // `session_` rather than the parameter: the parameter has already been
     // moved from by the time this body runs.
     longAllowed_ = session_.longAllowed;
+    // A trace of the drag's round trip, for measuring where the latency is.
+    pinDebug_ = qEnvironmentVariableIsSet("VSHOT_PIN_DEBUG");
     // Window picking is driven by the session's candidate list instead of a
     // free-hand drag: the pointer highlights a candidate and a click takes it.
     if (session_.mode == QStringLiteral("window-pick")) {
@@ -6013,6 +6019,27 @@ QRect OverlayController::lastInteractiveUpdate() const
     return lastTouchLocal_;
 }
 
+// Repaints the overlays' part of `region`, nothing else.  Unlike `updateTouch`
+// this leaves the "last touch" bookkeeping alone: it exists for damage that is
+// not a gesture step (the pin editor's daemon confirmation), which must not
+// clobber the rect a gesture's next step unions against.
+void OverlayController::invalidateLogicalRegion(const LogicalRect &region)
+{
+    if (region.width == 0 || region.height == 0) {
+        return;
+    }
+    for (CaptureOverlay *overlay : overlays_) {
+        LogicalRect visible;
+        if (!intersection(region, surfaceOf(overlay->output()), &visible)) {
+            continue;
+        }
+        const QRect local =
+            localRect(overlay->output(), visible, overlay->size()).toAlignedRect().adjusted(
+                -1, -1, 1, 1);
+        overlay->update(local);
+    }
+}
+
 void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
                               Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
@@ -6584,11 +6611,10 @@ void OverlayController::setPinTarget(std::uint64_t pinId, const QString &socketP
     pinSocketPath_ = socketPath;
 }
 
-// Opens one short-lived connection, sends the pin's new top-left (global
-// logical pixels) and applies whatever comes back. The daemon serves exactly
-// one request per connection — it writes the reply and disconnects — so a
-// fresh socket per move mirrors the CLI's own client and avoids any
-// reconnect bookkeeping.
+// Sends the pin's new top-left (global logical pixels) to the daemon that owns
+// it and applies whatever comes back.  The daemon keeps the connection open and
+// the protocol is newline-delimited, so a drag reuses one socket rather than
+// opening and tearing down one per motion event.
 void OverlayController::requestPinMove(Point globalTopLeft)
 {
     if (pinSocketPath_.isEmpty() || pinId_ == 0) {
@@ -6600,76 +6626,93 @@ void OverlayController::requestPinMove(Point globalTopLeft)
 
 void OverlayController::flushPinMove()
 {
-    if (pinSocket_ != nullptr || !pendingPinOrigin_.has_value()) {
+    if (!pendingPinOrigin_.has_value() || pinSocketPath_.isEmpty() || pinId_ == 0) {
         return;
     }
-    if (pinSocketPath_.isEmpty() || pinId_ == 0) {
-        pendingPinOrigin_.reset();
+    if (pinSocket_ == nullptr) {
+        // The pending position goes out as soon as it connects.
+        openPinSocket();
+        return;
+    }
+    if (pinSocket_->state() != QLocalSocket::ConnectedState) {
+        return;
+    }
+    if (pinMovesInFlight_ >= kPinMovesInFlight) {
+        // The reply to an earlier position frees a slot and flushes the newest
+        // one; keeping the queue short is what bounds the lead the marks can
+        // take over the image the daemon has actually drawn.
         return;
     }
     const Point origin = *pendingPinOrigin_;
     pendingPinOrigin_.reset();
+    QJsonObject request;
+    request.insert(QStringLiteral("cmd"), QStringLiteral("move"));
+    request.insert(QStringLiteral("id"), static_cast<qint64>(pinId_));
+    request.insert(QStringLiteral("x"), static_cast<qint64>(origin.x));
+    request.insert(QStringLiteral("y"), static_cast<qint64>(origin.y));
+    QByteArray line = QJsonDocument(request).toJson(QJsonDocument::Compact);
+    line.append('\n');
+    pinSocket_->write(line);
+    pinSocket_->flush();
+    ++pinMovesInFlight_;
+    if (pinDebug_) {
+        pinMoveClock_.start();
+    }
+}
 
+// Opens the drag's one connection.  A refused or dropped connection is not
+// fatal: the editor keeps working, it just cannot move the live pin, and the
+// next move opens a fresh connection.
+void OverlayController::openPinSocket()
+{
     auto *socket = new QLocalSocket;
     pinSocket_ = socket;
-    const auto ownsSocket = [this, socket] { return pinSocket_ == socket; };
-    QObject::connect(socket, &QLocalSocket::connected, socket, [this, socket, origin, ownsSocket] {
-        if (!ownsSocket()) {
-            return;
-        }
-        QJsonObject request;
-        request.insert(QStringLiteral("cmd"), QStringLiteral("move"));
-        request.insert(QStringLiteral("id"), static_cast<qint64>(pinId_));
-        request.insert(QStringLiteral("x"), static_cast<qint64>(origin.x));
-        request.insert(QStringLiteral("y"), static_cast<qint64>(origin.y));
-        QByteArray line = QJsonDocument(request).toJson(QJsonDocument::Compact);
-        line.append('\n');
-        socket->write(line);
-        socket->flush();
+    QObject::connect(socket, &QLocalSocket::connected, socket, [this] {
+        pinMovesInFlight_ = 0;
+        flushPinMove();
     });
-    QObject::connect(socket, &QLocalSocket::readyRead, socket,
-                     [this, socket, ownsSocket] {
-                         if (ownsSocket()) {
-                             consumePinReply(socket);
-                         }
-                     });
-    // A refused or dropped connection is not fatal: the editor keeps working,
-    // it just cannot move the live pin. A later move retries from scratch.
+    QObject::connect(socket, &QLocalSocket::readyRead, socket, [this] { readPinReplies(); });
+    const auto lost = [this] { dropPinSocket(); };
     QObject::connect(socket, &QLocalSocket::errorOccurred, socket,
-                     [this, socket, ownsSocket](QLocalSocket::LocalSocketError) {
-                         if (ownsSocket()) {
-                             consumePinReply(socket);
-                         }
-                     });
-    // The daemon closes the connection right after replying, so the reply must
-    // be drained here too.
-    QObject::connect(socket, &QLocalSocket::disconnected, socket,
-                     [this, socket, ownsSocket] {
-                         if (ownsSocket()) {
-                             consumePinReply(socket);
-                         }
-                     });
+                     [lost](QLocalSocket::LocalSocketError) { lost(); });
+    QObject::connect(socket, &QLocalSocket::disconnected, socket, lost);
     socket->connectToServer(pinSocketPath_);
 }
 
-// Drains the daemon's answer, applies it and retires this request's socket.
-// Called from every terminal signal; the owner check upstream makes repeats
-// harmless.
-void OverlayController::consumePinReply(QLocalSocket *socket)
+void OverlayController::dropPinSocket()
 {
-    pinReplyBuffer_ += socket->readAll();
-    const qsizetype newline = pinReplyBuffer_.indexOf('\n');
-    QByteArray line;
-    if (newline >= 0) {
-        line = pinReplyBuffer_.left(newline);
+    if (pinSocket_ != nullptr) {
+        // Cleared before deleteLater() so a repeated signal finds nothing to do.
+        pinSocket_->deleteLater();
+        pinSocket_ = nullptr;
     }
     pinReplyBuffer_.clear();
-    // Cleared before deleteLater() so the guard in every handler above stops
-    // this socket from being treated as the live one while it is queued away.
-    pinSocket_ = nullptr;
-    socket->deleteLater();
-    if (!line.isEmpty()) {
-        applyPinReply(line);
+    pinMovesInFlight_ = 0;
+}
+
+// Drains every answer the daemon has sent.  One move is one reply, so each line
+// retires one in-flight position and frees a slot for the newest one.
+void OverlayController::readPinReplies()
+{
+    if (pinSocket_ == nullptr) {
+        return;
+    }
+    pinReplyBuffer_ += pinSocket_->readAll();
+    qsizetype newline = -1;
+    while ((newline = pinReplyBuffer_.indexOf('\n')) >= 0) {
+        const QByteArray line = pinReplyBuffer_.left(newline);
+        pinReplyBuffer_.remove(0, newline + 1);
+        if (pinMovesInFlight_ > 0) {
+            --pinMovesInFlight_;
+        }
+        if (pinDebug_) {
+            std::fprintf(stderr, "vshot-qt-ui: pin move round trip %lld ms\n",
+                         static_cast<long long>(pinMoveClock_.elapsed()));
+            pinMoveClock_.restart();
+        }
+        if (!line.isEmpty()) {
+            applyPinReply(line);
+        }
     }
     flushPinMove();
 }
@@ -6701,9 +6744,10 @@ void OverlayController::applyPinRect(const LogicalRect &rect)
     if (!marksOrigin_.has_value()) {
         return;
     }
-    const std::int32_t dx = rect.x - marksOrigin_->x;
-    const std::int32_t dy = rect.y - marksOrigin_->y;
-    marksOrigin_ = LogicalRect{rect.x, rect.y, marksOrigin_->width, marksOrigin_->height};
+    const LogicalRect previous = *marksOrigin_;
+    const std::int32_t dx = rect.x - previous.x;
+    const std::int32_t dy = rect.y - previous.y;
+    marksOrigin_ = LogicalRect{rect.x, rect.y, previous.width, previous.height};
     // Keep the session's own record of where the image is in step with the
     // confirmation.  Region capture pins that rect to the output, but here it
     // describes the image, and it is what the mosaic samples its blocks through
@@ -6720,7 +6764,14 @@ void OverlayController::applyPinRect(const LogicalRect &rect)
         return;
     }
     translateAnnotations(dx, dy);
-    updateAll();
+    // Only the image's old and new rects can hold pixels that changed: marks are
+    // clipped to the image, so the union of the two covers every one of them.
+    // A full repaint here was a whole output's worth of work on every motion
+    // event's confirmation.
+    invalidateLogicalRegion(uniteLogical(previous, *marksOrigin_));
+    if (toolbar_ != nullptr && toolbar_->isVisible()) {
+        updateToolbarGeometry();
+    }
 }
 
 void OverlayController::chooseTool(Tool tool)

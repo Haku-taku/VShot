@@ -27,7 +27,9 @@
 
 #include <QApplication>
 #include <QColor>
+#include <QCoreApplication>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QImage>
@@ -35,6 +37,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLineEdit>
+#include <QLocalServer>
+#include <QLocalSocket>
 #include <QPainter>
 #include <QPointF>
 #include <QRegion>
@@ -2115,6 +2119,108 @@ void checkMovedPinLoupeFollowsTheImage()
            QStringLiteral("%1 of 4 samples wrong").arg(wrong));
 }
 
+// A drag's latency is dominated by how it talks to the daemon.  A fresh socket
+// per motion event costs a connect, an accept and a fresh object on both sides,
+// and the editor used to allow exactly one request in flight, so the next
+// position had to wait for the whole round trip before it was even sent.  This
+// drives the editor against a stand-in daemon and pins down that a drag keeps
+// one connection and pipelines its positions over it.
+void checkPinDragKeepsOneConnection()
+{
+    QTemporaryDir dir;
+    if (!dir.isValid()) {
+        expect(false, "a temporary directory for the stand-in daemon");
+        return;
+    }
+    const QString path = dir.filePath(QStringLiteral("pin.sock"));
+    QLocalServer::removeServer(path);
+    QLocalServer server;
+    if (!server.listen(path)) {
+        expect(false, "the stand-in daemon listens", server.errorString());
+        return;
+    }
+
+    int connections = 0;
+    QVector<QPoint> requested;
+    QByteArray buffer;
+    QObject::connect(&server, &QLocalServer::newConnection, &server, [&] {
+        while (QLocalSocket *socket = server.nextPendingConnection()) {
+            ++connections;
+            QObject::connect(socket, &QLocalSocket::readyRead, socket, [&, socket] {
+                buffer += socket->readAll();
+                qsizetype newline = -1;
+                while ((newline = buffer.indexOf('\n')) >= 0) {
+                    const QByteArray line = buffer.left(newline);
+                    buffer.remove(0, newline + 1);
+                    const QJsonObject request = QJsonDocument::fromJson(line).object();
+                    const int x = request.value(QStringLiteral("x")).toInt();
+                    const int y = request.value(QStringLiteral("y")).toInt();
+                    requested.append(QPoint(x, y));
+                    // Echo the position back the way the daemon answers.
+                    QJsonObject reply{{QStringLiteral("ok"), true},
+                                      {QStringLiteral("x"), x},
+                                      {QStringLiteral("y"), y},
+                                      {QStringLiteral("width"), 240},
+                                      {QStringLiteral("height"), 180}};
+                    QByteArray out = QJsonDocument(reply).toJson(QJsonDocument::Compact);
+                    out.append('\n');
+                    socket->write(out);
+                    socket->flush();
+                }
+            });
+        }
+    });
+
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(pinEditSession());
+    controller.setPinEditMode(true);
+    controller.setPinTarget(1, path);
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPinEdit();
+    controller.chooseTool(vshot::Tool::Select);
+
+    // Drag the pin up and to the left, inside its clamp, one motion event at a
+    // time with the event loop turning between them so the socket can breathe.
+    const QPointF from(200, 200);
+    controller.press(overlay, from, Qt::LeftButton, Qt::NoModifier);
+    QPointF to = from;
+    for (int step = 1; step <= 12; ++step) {
+        to = from + QPointF(-step * 4, -step * 2);
+        controller.move(overlay, to, Qt::LeftButton, Qt::NoModifier);
+        QCoreApplication::processEvents();
+    }
+    controller.release(overlay, to, Qt::LeftButton, Qt::NoModifier);
+    QElapsedTimer drain;
+    drain.start();
+    while (drain.elapsed() < 300) {
+        QCoreApplication::processEvents();
+    }
+
+    expect(connections == 1, "a pin drag keeps one connection to the daemon",
+           QStringLiteral("%1 connections opened").arg(connections));
+    expect(requested.size() >= 3, "the drag pipelines its positions over it",
+           QStringLiteral("%1 positions sent").arg(requested.size()));
+    expect(controller.selection().has_value() &&
+               controller.selection()->x == requested.constLast().x() &&
+               controller.selection()->y == requested.constLast().y(),
+           "the daemon's answer anchors the editor",
+           QStringLiteral("selection %1,%2 vs last request %3,%4")
+               .arg(controller.selection().has_value() ? controller.selection()->x : -1)
+               .arg(controller.selection().has_value() ? controller.selection()->y : -1)
+               .arg(requested.isEmpty() ? -1 : requested.constLast().x())
+               .arg(requested.isEmpty() ? -1 : requested.constLast().y()));
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -2144,6 +2250,7 @@ int main(int argc, char *argv[])
     checkLoupeShowsTheCursorPixelEverywhere();
     checkPinEditStepsCoverTheirChange();
     checkMovedPinLoupeFollowsTheImage();
+    checkPinDragKeepsOneConnection();
     checkLiveStrokeSurvivesIncrementalRepaint();
     checkInteractiveUpdateCoversTheChange();
     checkWaveSerializesAsATwoPointStroke();
