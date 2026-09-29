@@ -35,6 +35,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLineEdit>
+#include <QPainter>
 #include <QPointF>
 #include <QRegion>
 #include <QScreen>
@@ -153,6 +154,43 @@ void paintOnce(vshot::CaptureOverlay *overlay, QImage *target)
 {
     target->fill(Qt::transparent);
     overlay->render(target);
+}
+
+void renderIncremental(vshot::OverlayController &controller, vshot::CaptureOverlay *overlay,
+                       QImage *backing)
+{
+    const QRect claimed = controller.lastInteractiveUpdate();
+    if (claimed.isNull() || claimed.isEmpty()) {
+        // A full repaint is its own eraser: repaint everything, as the widget
+        // would when the step asked for the whole surface.
+        paintOnce(overlay, backing);
+        return;
+    }
+    QPainter painter(backing);
+    painter.setClipRect(claimed);
+    overlay->render(&painter, QPoint(0, 0));
+    painter.end();
+}
+
+// Pixels the two images disagree on, ignoring the areas the overlay's child
+// widgets (the floating toolbar, the inline text editor) paint themselves.
+int differingPixelsOutside(const QRegion &ignore, const QImage &first, const QImage &second)
+{
+    int diff = 0;
+    for (int y = 0; y < first.height(); ++y) {
+        for (int x = 0; x < first.width(); ++x) {
+            if (ignore.contains(QPoint(x, y))) {
+                continue;
+            }
+            const QColor a = first.pixelColor(x, y);
+            const QColor b = second.pixelColor(x, y);
+            if (std::max({std::abs(a.red() - b.red()), std::abs(a.green() - b.green()),
+                          std::abs(a.blue() - b.blue())}) > 30) {
+                ++diff;
+            }
+        }
+    }
+    return diff;
 }
 
 // Draws a rectangle drag with the current tool.
@@ -1663,6 +1701,131 @@ void checkSelectModeDecidesWhatAPressPicksUp()
     run(QStringLiteral("precise"), false);
 }
 
+// The live stroke has to survive the narrow repaint the widget actually does.
+// Every move invalidates a rect; Qt then repaints only that rect on top of what
+// is already on screen.  If any segment the stroke baked is not covered by a
+// later step's rect, the pixels it should have painted are simply never drawn --
+// the symptom being a scribble with holes that fills in only when the button is
+// released (which full-repaints).  The check drives the gesture, repaints the
+// way Qt does, and compares against a full render.
+void checkLiveStrokeSurvivesIncrementalRepaint()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+    controller.chooseTool(vshot::Tool::Pen);
+    controller.setWidth(5);
+    controller.setCurrentColor(QColor(255, 30, 30));
+
+    const QVector<QPointF> path = serpentine();
+    QImage backing(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    backing.fill(Qt::transparent);
+    controller.press(overlay, path.constFirst(), Qt::LeftButton, Qt::NoModifier);
+    paintOnce(overlay, &backing);
+    for (int i = 1; i < path.size(); ++i) {
+        controller.move(overlay, path.at(i), Qt::LeftButton, Qt::NoModifier);
+        renderIncremental(controller, overlay, &backing);
+    }
+    QImage full(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &full);
+    const int diff = differingPixelsOutside(childAreas(overlay), backing, full);
+    expect(diff == 0, "the live stroke survives repainting only what each move invalidated",
+           QStringLiteral("%1 px differ between the incremental and full repaint").arg(diff));
+}
+
+// The magnifier has to show the pixel under the cursor at its centre, whichever
+// edge the cursor is near.  The formula is easy to get subtly wrong at the
+// edges, where the sample window is clamped and has to be shifted the other way
+// to keep the cursor's own pixel centred; that is exactly what "the magnifier
+// looks scrambled while dragging" means.  This reads the painted circle back and
+// matches every sampled pixel against the source pixel it should be showing.
+// session bounds) has moved.  That is exactly the state the editor is in after
+// the daemon confirms a move, and it is where an overlay's surface, the image
+// rect and the stale output geometry all disagree.
+vshot::Session pinEditSession()
+{
+    vshot::Session session;
+    session.mode = QStringLiteral("pin-edit");
+    session.bounds = vshot::LogicalRect{150, 150, 240, 180};
+    vshot::OutputSession output;
+    output.id = 1;
+    output.name = QStringLiteral("CHECK-1");
+    output.geometry = vshot::LogicalRect{40, 40, 240, 180};
+    output.surface = vshot::LogicalRect{0, 0, 400, 400};
+    output.scale = 1;
+    output.pixelWidth = 240;
+    output.pixelHeight = 180;
+    QImage image(240, 180, QImage::Format_RGBA8888);
+    for (int y = 0; y < 180; ++y) {
+        for (int x = 0; x < 240; ++x) {
+            image.setPixelColor(x, y, QColor(x % 256, y % 256, (x * 7 + y * 13) % 256, 255));
+        }
+    }
+    output.image = image;
+    session.outputs.push_back(output);
+    return session;
+}
+
+// Every step of a pin-editor gesture has to repaint what it changed, on the
+// canvas as well as on the image: the marks are drawn against the image's
+// *current* rect, which is not the rect the session recorded.
+void checkPinEditStepsCoverTheirChange()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(pinEditSession());
+    controller.setPinEditMode(true);
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPinEdit();
+
+    // Dragging the image: the selection chrome and the magnifier travel with it.
+    controller.chooseTool(vshot::Tool::Select);
+    controller.press(overlay, QPointF(200, 200), Qt::LeftButton, Qt::NoModifier);
+    expectStepCovered(controller, overlay, QPointF(210, 208),
+                      "dragging a pin invalidates where it drew");
+    expectStepCovered(controller, overlay, QPointF(220, 216),
+                      "a moving pin invalidates where it draws");
+    expectStepCovered(controller, overlay, QPointF(215, 212),
+                      "a moving pin invalidates its last place");
+    controller.release(overlay, QPointF(215, 212), Qt::LeftButton, Qt::NoModifier);
+
+    // Drawing on the image: the growing pen preview has to cover each new
+    // segment, even where the image stands outside the session's recorded rect.
+    controller.chooseTool(vshot::Tool::Pen);
+    controller.setWidth(5);
+    controller.press(overlay, QPointF(180, 180), Qt::LeftButton, Qt::NoModifier);
+    expectStepCovered(controller, overlay, QPointF(280, 210),
+                      "a pen stroke on a pin invalidates where it drew");
+    expectStepCovered(controller, overlay, QPointF(360, 280),
+                      "a growing pen stroke on a pin invalidates where it drew");
+    controller.release(overlay, QPointF(360, 280), Qt::LeftButton, Qt::NoModifier);
+}
+
+// The magnifier samples the image, so on a pin that has been dragged it has to
+// count from where the image now is.  Counting from the stale session rect
+// showed the wrong part of the picture -- the "scrambled magnifier" the pin
+// drag was blamed for.
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -1688,6 +1851,8 @@ int main(int argc, char *argv[])
     checkEachOutputKeepsItsOwnRaster();
     checkEdgeOfCanvasKeepsTheRaster();
     checkLiveStrokeMatchesTheCommittedMark();
+    checkPinEditStepsCoverTheirChange();
+    checkLiveStrokeSurvivesIncrementalRepaint();
     checkInteractiveUpdateCoversTheChange();
     checkWaveSerializesAsATwoPointStroke();
     checkNumberSerializesAsATextBitmap();

@@ -5566,7 +5566,13 @@ void OverlayController::updateToolbarGeometry()
     // the display -- it doubles back over the selection instead, so showing or
     // hiding it never nudges the buttons.
     const OutputSession &output = owner->output();
-    const QRectF localSelection = localRect(output, *selection_, owner->size());
+    // Anchor to the same rect the marks and the image are drawn against: in the
+    // pin editor that is the daemon-confirmed image rect, not the optimistic
+    // cursor target, so the bar tracks the picture rather than running ahead of
+    // it mid-drag.
+    const LogicalRect &anchor =
+        pinEdit_ && marksOrigin_.has_value() ? *marksOrigin_ : *selection_;
+    const QRectF localSelection = localRect(output, anchor, owner->size());
     const QRect anchorSelection = localSelection.toRect();
     const int width = toolbar_->width();
     const int height = toolbar_->height();
@@ -5881,7 +5887,12 @@ void OverlayController::updateTouch(const LogicalRect &touched)
     hasLastTouch_ = true;
     for (CaptureOverlay *overlay : overlays_) {
         LogicalRect visible;
-        if (!intersection(region, overlay->output().geometry, &visible)) {
+        // The overlay drawable is the whole surface, not the output geometry: in
+        // the pin editor the image (and the marks pinned to it) can be dragged
+        // away from the rect the session recorded, and the magnifier and chrome
+        // are clipped to the image's *current* place.  Clipping the damage to
+        // the stale geometry would leave their pixels on the canvas.
+        if (!intersection(region, surfaceOf(overlay->output()), &visible)) {
             continue;
         }
         // One pixel of slack: a mark's rounded or antialiased edge can spill
@@ -6594,6 +6605,15 @@ void OverlayController::applyPinRect(const LogicalRect &rect)
     const std::int32_t dx = rect.x - marksOrigin_->x;
     const std::int32_t dy = rect.y - marksOrigin_->y;
     marksOrigin_ = LogicalRect{rect.x, rect.y, marksOrigin_->width, marksOrigin_->height};
+    // Keep the session's own record of where the image is in step with the
+    // confirmation.  Region capture pins that rect to the output, but here it
+    // describes the image, and it is what the mosaic samples its blocks through
+    // -- left behind, a mosaic drawn on a dragged pin would average the wrong
+    // part of the picture.
+    for (OutputSession &output : session_.outputs) {
+        output.geometry.x = rect.x;
+        output.geometry.y = rect.y;
+    }
     // Keep the optimistic selection in step with the latest confirmed position
     // so that the next drag's incremental delta is computed from here.
     selection_ = *marksOrigin_;
