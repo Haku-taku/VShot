@@ -1225,13 +1225,38 @@ protected:
     void mouseDoubleClickEvent(QMouseEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
     void closeEvent(QCloseEvent *event) override;
+    void enterEvent(QEnterEvent *event) override;
     void leaveEvent(QEvent *event) override;
 
 private:
+    // Takes the keyboard while the pointer is over the surface and gives it back
+    // when the pointer leaves.  The surface asks for exclusive interactivity --
+    // it is a full-output editor and every key belongs to it while the user is
+    // working in it -- but exclusive interactivity is not scoped to focus: the
+    // compositor routes every key to a mapped surface that holds it, so an
+    // editor left holding it swallows the keyboard of whatever the user switches
+    // to.  Following the pointer is what scopes it: on the surface the user is
+    // typing into the editor, off it they are typing into their own window.
+    //
+    // The same pair `PinSurface` uses, and for the same reason.
+    void wantKeyboard();
+    void offerKeyboardBack();
+
     int outputIndex_;
     OverlayController *controller_;
     QScreen *screen_;
     QWindow *layerWindow_ = nullptr;
+    // Whether this surface is the one currently holding the keyboard, so a
+    // repeated enter or leave does not re-send an interactivity the compositor
+    // already has.  It starts true because both layer surfaces are created with
+    // exclusive interactivity and `setActivateOnShow`: the surface has the
+    // keyboard from the moment it is shown, and a flag that started false would
+    // make the first leave a no-op -- the one leave that most needs to give it
+    // back.
+    bool keyboardWanted_ = true;
+    // The input region last handed to the window, so an unchanged one is not
+    // re-sent to the compositor on every frame of a pin drag.
+    QRegion inputMask_;
 };
 
 } // namespace vshot

@@ -12974,9 +12974,53 @@ void CaptureOverlay::closeEvent(QCloseEvent *event)
     event->accept();
 }
 
+void CaptureOverlay::wantKeyboard()
+{
+    if (layerWindow_ == nullptr || keyboardWanted_) {
+        return;
+    }
+    auto *layer = LayerShellQt::Window::get(layerWindow_);
+    if (layer == nullptr) {
+        return;
+    }
+    keyboardWanted_ = true;
+    layer->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityExclusive);
+    // The interactivity change only reaches the compositor with the next commit,
+    // so the keyboard is asked for now rather than at some later repaint.
+    layerWindow_->requestUpdate();
+}
+
+void CaptureOverlay::offerKeyboardBack()
+{
+    if (layerWindow_ == nullptr || !keyboardWanted_) {
+        return;
+    }
+    auto *layer = LayerShellQt::Window::get(layerWindow_);
+    if (layer == nullptr) {
+        return;
+    }
+    keyboardWanted_ = false;
+    // `None`, not `OnDemand`: the surface covers a whole output and would
+    // otherwise still take the keyboard whenever the compositor felt like giving
+    // it one.  The pointer coming back is what asks for it again.
+    layer->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityNone);
+    layerWindow_->requestUpdate();
+}
+
+void CaptureOverlay::enterEvent(QEnterEvent *event)
+{
+    wantKeyboard();
+    QWidget::enterEvent(event);
+}
+
 void CaptureOverlay::leaveEvent(QEvent *event)
 {
     setCursor(Qt::CrossCursor);
+    // The pointer leaving is the user having gone elsewhere, so the keyboard
+    // goes back with it.  Without this the surface holds it for as long as it is
+    // mapped -- the compositor routes every key to whichever surface has it, so
+    // no other window could be typed into while the editor was open.
+    offerKeyboardBack();
     QWidget::leaveEvent(event);
 }
 
