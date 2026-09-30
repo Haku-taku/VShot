@@ -774,181 +774,19 @@ pub fn crop_operation(frame: &Frame, rect: Rect) -> Result<ImageDocument> {
         .apply(ImageDocument::new(frame.clone()))
 }
 
-/// Converts helper annotations from global (scene) logical coordinates into
-/// `selection`-local device pixels and folds them into one pipeline. Shared
-/// by the capture flow and by pin editing, which renders annotations on top
-/// of a pinned image instead of a frozen scene.
-///
-/// `scale` is the frame's density — device pixels per logical pixel of the
-/// pixels being annotated.  `bitmap_scale` is the density the helper rasterized
-/// its text bitmaps at, which is the scene's scale for a capture and the pin's
-/// own for pin editing; text is resampled when the two differ.
-pub fn pipeline_for_annotations(
-    annotations: Vec<crate::wayland::input::Annotation>,
-    selection: Rect,
-    scale: u32,
-    bitmap_scale: u32,
-) -> Result<EditPipeline> {
-    use crate::wayland::input::Annotation;
-
-    let mut pipeline = EditPipeline::new();
-    for annotation in annotations {
-        let color = annotation.color();
-        let logical_width = annotation.width();
-        let width = device_width(logical_width, scale)?;
-        let dash = annotation.dash();
-        let head = annotation.head();
-        let arrow_style = annotation.arrow_style();
-        let strength = annotation.strength();
-        // A wave's amplitude and wavelength travel as logical pixels; zero means
-        // "derive them from the stroke width". A pen's fill mode says which
-        // parts of the path get painted.
-        let amplitude = annotation.amplitude();
-        let wavelength = annotation.wavelength();
-        let fill = annotation.fill();
-        match annotation {
-            Annotation::Shape {
-                tool, rect, mask, ..
-            } => {
-                let rect = local_rect(rect, selection, scale)?;
-                match tool {
-                    crate::wayland::input::EditorTool::Rectangle => {
-                        pipeline = pipeline.rectangle_stroke(rect, color, width, dash);
-                    }
-                    crate::wayland::input::EditorTool::Ellipse => {
-                        pipeline = pipeline.ellipse_stroke(rect, color, width, dash);
-                    }
-                    crate::wayland::input::EditorTool::Mosaic
-                    | crate::wayland::input::EditorTool::Blur => {
-                        let block = mosaic_block_size(strength, scale);
-                        pipeline = match mask {
-                            ShapeMask::Rect => pipeline.mosaic(rect, block),
-                            ShapeMask::Ellipse => pipeline.mosaic_ellipse(rect, block),
-                        };
-                    }
-                    _ => {}
-                }
-            }
-            Annotation::Stroke {
-                tool,
-                points,
-                closed,
-                ..
-            } => {
-                let points = points
-                    .into_iter()
-                    .map(|point| local_point(point, selection, scale))
-                    .collect::<Result<Vec<_>>>()?;
-                match tool {
-                    crate::wayland::input::EditorTool::Arrow if points.len() >= 2 => {
-                        pipeline = pipeline.arrow_with_style(
-                            points[0],
-                            *points.last().ok_or_else(|| {
-                                VshotError::Selection("arrow has no endpoint".into())
-                            })?,
-                            color,
-                            width,
-                            dash,
-                            head,
-                            arrow_style,
-                        );
-                    }
-                    crate::wayland::input::EditorTool::Wave if points.len() >= 2 => {
-                        // An explicit amplitude or wavelength is a logical-pixel
-                        // value from the helper; zero falls back to the derived
-                        // formula.  Either way the floors of the derivation
-                        // apply to the logical width and the density scales the
-                        // result, matching the Qt preview exactly.
-                        pipeline = pipeline.wave(
-                            points[0],
-                            *points.last().ok_or_else(|| {
-                                VshotError::Selection("wave has no endpoint".into())
-                            })?,
-                            color,
-                            width,
-                            wave_size(amplitude, logical_width, scale, wave_amplitude),
-                            wave_size(wavelength, logical_width, scale, wave_wavelength),
-                        );
-                    }
-                    crate::wayland::input::EditorTool::Bezier => {
-                        // The wire interleaves an anchor and its out-handle, so
-                        // a well-formed path always has an even number of
-                        // points. An odd count means a truncated pair; erroring
-                        // out is better than silently dropping the last point
-                        // or inventing a handle for it.
-                        if points.len() % 2 != 0 {
-                            return Err(VshotError::Selection(
-                                "bezier stroke must contain an even number of points".into(),
-                            ));
-                        }
-                        pipeline = pipeline.bezier(points, closed, fill, color, width, dash);
-                    }
-                    crate::wayland::input::EditorTool::Pen
-                    | crate::wayland::input::EditorTool::Draw
-                    | crate::wayland::input::EditorTool::Line => {
-                        pipeline = pipeline.freehand(points, color, width, dash);
-                    }
-                    crate::wayland::input::EditorTool::Mosaic
-                    | crate::wayland::input::EditorTool::Blur => {
-                        // Freehand mosaic smears discs along the path; the
-                        // strength level scales the smear radius.
-                        let radius = mosaic_brush_radius(strength, width);
-                        pipeline = pipeline.mosaic_brush(points, radius);
-                    }
-                    _ => {}
-                }
-            }
-            Annotation::Image { rect, pixels } => {
-                // Both the destination rect and the image itself are in
-                // logical pixels of the scene the helper drew on; the frame is
-                // in device pixels of the output the selection came from, so
-                // both go through the same scale the other annotations use.
-                let rect = local_rect(rect, selection, scale)?;
-                pipeline = pipeline.blit_scaled(rect, pixels.clone());
-            }
-            Annotation::Text {
-                origin,
-                text,
-                scale: text_scale,
-                bitmap,
-                ..
-            } => {
-                let origin = local_point(origin, selection, scale)?;
-                pipeline = match bitmap {
-                    // Helper-rendered with the user-selected font: composite
-                    // the bitmap, brought to this frame's density if the
-                    // selection came from a lower-density output than the one
-                    // the helper drew it for.
-                    Some(bitmap) => pipeline.blit(origin, bitmap.resampled(bitmap_scale, scale)),
-                    None => {
-                        pipeline.text(origin, text, color, text_scale.saturating_mul(scale).max(1))
-                    }
-                };
-            }
-        }
-    }
-    Ok(pipeline)
-}
-
 /// Peak deviation of a wave stroke from its centre line, in device pixels.
 ///
 /// The floor of `max(width * 2, 4)` is applied to the *logical* width and the
 /// result is then scaled, which is exactly what the Qt preview does; scaling
 /// first and flooring afterwards would flatten the wave at high densities.
-fn wave_amplitude(logical_width: u32, scale: u32) -> u32 {
-    logical_width
-        .saturating_mul(2)
-        .max(4)
-        .saturating_mul(scale.max(1))
+fn wave_amplitude(logical_width: u32, scale: Scale) -> u32 {
+    scale.length(logical_width.saturating_mul(2).max(4))
 }
 
 /// One full period of a wave stroke along its line, in device pixels. Like
 /// [`wave_amplitude`], `max(width * 6, 18)` is applied in logical pixels first.
-fn wave_wavelength(logical_width: u32, scale: u32) -> u32 {
-    logical_width
-        .saturating_mul(6)
-        .max(18)
-        .saturating_mul(scale.max(1))
+fn wave_wavelength(logical_width: u32, scale: Scale) -> u32 {
+    scale.length(logical_width.saturating_mul(6).max(18))
 }
 
 /// Resolves one wave dimension from the helper's logical-pixel value.
