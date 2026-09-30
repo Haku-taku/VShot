@@ -744,7 +744,7 @@ The default is **square corners with a shadow**: a screenshot is a picture of a 
 | `VSHOT_VULKAN_DEVICE=N` | Use the Nth physical device for the Vulkan encoder (multi-GPU machines; the first by default) |
 | `VSHOT_OCR_MODELS=<dir>` | OCR model directory, overriding `/usr/share/vshot/models` and the search beside the executable |
 | `VSHOT_PIN_SOCKET` | The socket the pin daemon listens on |
-| `VSHOT_HDR_HELPER` | Path to the `vshot` that runs as `vshot --pin-hdr-server`, the helper process that shows HDR pins (otherwise inferred from where `vshot-qt-ui` lives) |
+| `VSHOT_HDR_HELPER` | Path to the `vshot` that runs as `vshot --pin-hdr-server`, the helper process that draws the pin stack (otherwise inferred from where `vshot-qt-ui` lives) |
 | `VSHOT_PIN_DENSITY=N` | The source density of every pinned image, same as `--density` |
 | `VSHOT_PIN_DEBUG=1` | The daemon prints every pin's density decision |
 | `VSHOT_PIN_FOCUS_DEBUG=1` | The daemon prints every focus change of every pin render surface |

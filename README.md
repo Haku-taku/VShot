@@ -744,7 +744,7 @@ pin 同样是 layer surface，里面只有图片，所以圆角、身下的阴�
 | `VSHOT_VULKAN_DEVICE=N` | 指定 Vulkan 编码用第 N 个物理设备（多显卡机器；默认第一个） |
 | `VSHOT_OCR_MODELS=<dir>` | OCR 模型目录，覆盖 `/usr/share/vshot/models` 与可执行文件旁的查找 |
 | `VSHOT_PIN_SOCKET` | pin daemon 监听的 socket 路径 |
-| `VSHOT_HDR_HELPER` | 指定显示 HDR pin 的 `vshot --pin-hdr-server` helper 进程的 `vshot` 路径（默认按 `vshot-qt-ui` 所在位置推断） |
+| `VSHOT_HDR_HELPER` | 指定画 pin 图像栈的 `vshot --pin-hdr-server` helper 进程的 `vshot` 路径（默认按 `vshot-qt-ui` 所在位置推断） |
 | `VSHOT_PIN_DENSITY=N` | 每张 pin 图的来源密度，等同 `--density` |
 | `VSHOT_PIN_DEBUG=1` | daemon 打印每张 pin 的密度判定 |
 | `VSHOT_PIN_FOCUS_DEBUG=1` | daemon 打印 pin 渲染面每一次焦点变化 |

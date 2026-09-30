@@ -59,11 +59,24 @@ public:
         double scale = 1.0;
         // Global logical top-left of the image.
         QPoint origin;
-        // Whether this pin's pixels are drawn by the HDR surface helper rather
-        // than by this surface.  The image is still held -- it is what the size,
-        // the mask and every edit are worked out from -- but it is not painted,
-        // so the helper's HDR image shows through.
+        // Whether this pin's picture, its shadow and its rim are drawn by the
+        // HDR surface helper rather than by this surface.  The image is still
+        // held -- it is what the size, the mask and every edit are worked out
+        // from -- but it is not painted, so the helper's copy shows through.
+        //
+        // True for *every* pin once the helper has this output, not only for
+        // HDR ones: the helper is a single surface sitting below this one, and a
+        // layer's surfaces are stacked in map order with no way to restack them,
+        // so anything this surface painted would land above every pin the helper
+        // draws -- including pins that are in front of it.
         bool hdr = false;
+        // Whether this pin is an HDR capture, whatever is showing it.  The
+        // helper's pixels and this pin's own image look the same to the eye, so
+        // the `HDR` tag is the only thing on screen that tells them apart, and
+        // it belongs to the capture rather than to the surface that happens to
+        // be drawing it: it stays up, in a muted ink, on an output the helper
+        // could not take.
+        bool capturedHdr = false;
         // The formats a pinned color card shows, empty for every other pin.
         // A right-click on the card turns them into a copy menu, and the menu
         // hands back the very string the card prints for that format.
@@ -102,10 +115,10 @@ public:
     // LayerShellQt is unavailable.
     bool showLayerSurface();
 
-    // Whether this output can show HDR pixels: true when the surface helper has
-    // the output's own colour description on its copy of it.  An item marked
-    // `hdr` is only left unpainted when this is on -- on any other output the
-    // item's own image is the only copy there is.
+    // Whether the surface helper draws this output's pins: true when it has the
+    // output's own colour description on its copy of it.  An item marked `hdr`
+    // is only left unpainted when this is on -- on any other output this
+    // surface's own image is the only copy there is.
     void setHdrPixels(bool on);
 
     // Replaces the whole stack, back to front: the last entry is painted last,
@@ -363,9 +376,10 @@ private:
     // Where the badge was painted last, so clearing it does not repaint the
     // whole output.
     QRect badgeRect_;
-    // The pin the pointer is over, when that pin is an HDR capture: the marker
-    // this surface paints belongs to it alone.  0 while the pointer is over an
-    // SDR pin, over no pin, or off this output altogether.
+    // The pin the pointer is over, when that pin is drawn by the helper: the
+    // marker this surface paints belongs to it alone.  0 while the pointer is
+    // over no pin, off this output altogether, or on an output the helper
+    // could not take.
     quint64 hoverId_ = 0;
     // Where that marker was painted last, so clearing it repaints its own box
     // rather than the whole pin it was on.
@@ -389,7 +403,7 @@ private:
     bool hasFocus_ = false;
     bool visible_ = true;
     bool surfaceReady_ = false;
-    // Whether the surface helper shows this output's HDR pins; see
+    // Whether the surface helper draws this output's pins; see
     // `setHdrPixels`.
     bool hdrPixels_ = false;
     // This surface's layer-shell window, kept for the keyboard hand-back; null

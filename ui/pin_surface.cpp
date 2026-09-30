@@ -608,11 +608,13 @@ void PinSurface::reportActive()
 
 void PinSurface::trackHover(const QPoint &local)
 {
-    // Only an HDR pin carries the marker: over any other pin the pointer is
-    // simply over a pin, and the surface has nothing to say about it.
+    // Only an HDR capture carries the marker: over any other pin the pointer is
+    // simply over a pin, and the surface has nothing to say about it.  It is the
+    // capture that is marked, not the picture being shown -- the tag is what says
+    // which of the two an HDR pin is currently drawn from.
     const quint64 under = pinAt(local);
     const Entry *entry = entryFor(under);
-    moveHoverTo(entry != nullptr && entry->item.hdr ? under : 0);
+    moveHoverTo(entry != nullptr && entry->item.capturedHdr ? under : 0);
 }
 
 void PinSurface::moveHoverTo(quint64 id)
@@ -814,13 +816,13 @@ void PinSurface::paintEvent(QPaintEvent *event)
         // The corners, clamped to what this pin's size can carry: a radius past
         // half the shorter side turns the image into a lozenge.
         const int radius = paintRadius(style_.radius, target.size());
-        // An HDR pin's picture, its shadow and its rim are all drawn by the
-        // surface helper, on a surface of its own below this one: only a surface
+        // A pin the helper draws has its picture, its shadow and its rim all on
+        // the helper's surface, which sits below this one: only a surface
         // carrying the output's *own* colour description is passed through
         // untouched, and that is a surface this Qt window can never be.  The
-        // three have to travel together — one surface, one commit — or the
-        // picture would trail its own edge the moment the pin was dragged.  What
-        // is left here is the chrome: the badges, the menus and the `HDR` tag.
+        // three travel together -- one surface, one commit -- or the picture
+        // would trail its own edge the moment the pin was dragged.  What is
+        // left here is the chrome: the badges, the menus and the `HDR` tag.
         const bool hdr = entry.item.hdr && hdrPixels_;
         if (hdr) {
             continue;

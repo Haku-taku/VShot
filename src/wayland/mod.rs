@@ -30,7 +30,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_l
 
 use crate::error::{Result, VshotError};
 use crate::geometry::{Point, Rect};
-use crate::model::{HdrFrame, SceneSnapshot};
+use crate::model::{HdrFrame, Primaries, SceneSnapshot};
 
 use self::freeze_overlay::{
     release_buffer_if_current, BufferToken, BufferUserData, LayerSurfaceUserData, OverlayColor,
