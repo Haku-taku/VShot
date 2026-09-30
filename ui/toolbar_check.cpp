@@ -174,9 +174,10 @@ void checkCrampedCaptureKeepsTheButtonsStill()
         return;
     }
     // The remembered tool in the user's config can open the session on another
-    // tool, so pin Select before asserting on what Select's style row does.
-    controller.chooseTool(vshot::Tool::Select);
-    expect(!parts.style->isVisible(), "the Select tool starts with no style row");
+    // tool, so arm nothing before asserting on what an unarmed session's style
+    // row does.
+    controller.chooseTool(std::nullopt);
+    expect(!parts.style->isVisible(), "an unarmed session starts with no style row");
     const int before = globalTop(parts.command);
 
     controller.chooseTool(vshot::Tool::Rectangle);
@@ -449,7 +450,7 @@ void checkCommandBarIsTwoRows()
             ++inToolsRow;
         }
     }
-    expect(inToolsRow == 11, "the drawing tools keep its first row to themselves",
+    expect(inToolsRow == 10, "the drawing tools keep its first row to themselves",
            QStringLiteral("%1 of them in it").arg(inToolsRow));
     auto *paste = parts.command->findChild<QToolButton *>(QStringLiteral("pasteButton"));
     expect(paste != nullptr && actions->indexOf(paste) >= 0,
@@ -501,9 +502,10 @@ void checkTheEndsArePinnedToTheRight()
     controller.beginPresetEdit();
     overlay->show();
     // The tool the user's config remembers can open the session with a style row
-    // up, which widens the card; this check measures what Select's card comes to
-    // and then what the widest style row does to it, so pin Select first.
-    controller.chooseTool(vshot::Tool::Select);
+    // up, which widens the card; this check measures what an unarmed session's
+    // card comes to and then what the widest style row does to it, so arm
+    // nothing first.
+    controller.chooseTool(std::nullopt);
     const ToolbarParts parts = toolbarParts(overlay);
     QGridLayout *grid = endsGrid(parts.command);
     expect(grid != nullptr && grid->count() == 4, "the four ends are one grid",

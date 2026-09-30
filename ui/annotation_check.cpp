@@ -410,7 +410,7 @@ void checkRepaintsReuseTheRaster()
            QStringLiteral("rebuilds=%1").arg(controller.annotations().at(0).rasterRebuilds()));
 
     // Moving the mark changes the source blocks it averages, so it must redraw.
-    controller.chooseTool(vshot::Tool::Select);
+    controller.chooseTool(std::nullopt);
     drag(controller, overlay, QPointF(110, 90), QPointF(150, 115));
     paintOnce(overlay, &target);
     expect(controller.annotations().at(0).rasterRebuilds() == 2,
@@ -796,7 +796,7 @@ void checkPureMoveReusesTheRaster()
     const int strokeRebuilds = controller.annotations().at(0).rasterRebuilds();
     expect(strokeRebuilds == 1, "the stroke rasterizes once",
            QStringLiteral("rebuilds=%1").arg(strokeRebuilds));
-    controller.chooseTool(vshot::Tool::Select);
+    controller.chooseTool(std::nullopt);
     drag(controller, overlay, QPointF(150, 120), QPointF(150, 220));
     paintOnce(overlay, &target);
     expect(controller.annotations().at(0).rasterRebuilds() == strokeRebuilds,
@@ -818,7 +818,7 @@ void checkPureMoveReusesTheRaster()
     const int rectRebuilds = controller.annotations().at(1).rasterRebuilds();
     expect(rectRebuilds == 1, "the rectangle rasterizes once",
            QStringLiteral("rebuilds=%1").arg(rectRebuilds));
-    controller.chooseTool(vshot::Tool::Select);
+    controller.chooseTool(std::nullopt);
     drag(controller, overlay, QPointF(110, 340), QPointF(210, 340));
     paintOnce(overlay, &target);
     expect(controller.annotations().at(1).rasterRebuilds() == rectRebuilds,
@@ -844,7 +844,7 @@ void checkPureMoveReusesTheRaster()
     const int textRebuilds = controller.annotations().at(2).rasterRebuilds();
     expect(textRebuilds == 1, "the label rasterizes once",
            QStringLiteral("rebuilds=%1").arg(textRebuilds));
-    controller.chooseTool(vshot::Tool::Select);
+    controller.chooseTool(std::nullopt);
     drag(controller, overlay, QPointF(66, 66), QPointF(166, 66));
     paintOnce(overlay, &target);
     expect(controller.annotations().at(2).rasterRebuilds() == textRebuilds,
@@ -988,7 +988,7 @@ void checkEdgeOfCanvasKeepsTheRaster()
     expect(settled == 1, "the rectangle rasterizes once",
            QStringLiteral("rebuilds=%1").arg(settled));
 
-    controller.chooseTool(vshot::Tool::Select);
+    controller.chooseTool(std::nullopt);
     const vshot::LogicalRect before = controller.annotations().at(0).rect;
     drag(controller, overlay, QPointF(1535, 1135), QPointF(1565, 1165));
     // Back to the drawing tool: the select tool's white outline and handles sit
@@ -1080,7 +1080,7 @@ void checkInteractiveUpdateCoversTheChange()
     // 2. Moving a committed mark: the mark, its white selection chrome and the
     // magnifier all travel, so each step has to cover the old and the new place
     // of all three.
-    controller.chooseTool(vshot::Tool::Select);
+    controller.chooseTool(std::nullopt);
     const vshot::LogicalRect drawn = controller.annotations().at(0).rect;
     const QPointF centre(drawn.x + static_cast<int>(drawn.width) / 2,
                          drawn.y + static_cast<int>(drawn.height) / 2);
@@ -1164,7 +1164,7 @@ void checkInteractiveUpdateCoversTheChange()
     // seventh) therefore runs first: shrinking from the top-left corner gives
     // the move gesture (listed sixth) room to travel.  Both drag the selection
     // chrome, the magnifier and the toolbar that follows the selection.
-    controller.chooseTool(vshot::Tool::Select);
+    controller.chooseTool(std::nullopt);
     const vshot::LogicalRect canvas = *controller.selection();
     const QPointF topLeft(canvas.x, canvas.y);
     controller.press(overlay, topLeft, Qt::LeftButton, Qt::NoModifier);
@@ -1711,13 +1711,13 @@ void checkSelectModeDecidesWhatAPressPicksUp()
         const vshot::Point before = controller.annotations().at(0).points.constFirst();
 
         // A click on the stroke itself: the one press both modes act on.
-        controller.chooseTool(vshot::Tool::Select);
+        controller.chooseTool(std::nullopt);
         controller.press(overlay, strokeStart, Qt::LeftButton, Qt::NoModifier);
         controller.release(overlay, strokeStart, Qt::LeftButton, Qt::NoModifier);
 
-        controller.press(overlay, nowhere, Qt::LeftButton, Qt::NoModifier);
-        controller.move(overlay, nowhere + travel, Qt::LeftButton, Qt::NoModifier);
-        controller.release(overlay, nowhere + travel, Qt::LeftButton, Qt::NoModifier);
+        controller.press(overlay, nowhere, Qt::MiddleButton, Qt::NoModifier);
+        controller.move(overlay, nowhere + travel, Qt::MiddleButton, Qt::NoModifier);
+        controller.release(overlay, nowhere + travel, Qt::MiddleButton, Qt::NoModifier);
         const vshot::Point after = controller.annotations().at(0).points.constFirst();
         const bool moved = after.x == before.x + static_cast<int>(travel.x()) &&
             after.y == before.y + static_cast<int>(travel.y());
@@ -2028,7 +2028,7 @@ void checkPinEditStepsCoverTheirChange()
     controller.beginPinEdit();
 
     // Dragging the image: the selection chrome and the magnifier travel with it.
-    controller.chooseTool(vshot::Tool::Select);
+    controller.chooseTool(std::nullopt);
     controller.press(overlay, QPointF(200, 200), Qt::LeftButton, Qt::NoModifier);
     expectStepCovered(controller, overlay, QPointF(210, 208),
                       "dragging a pin invalidates where it drew");
@@ -2071,7 +2071,7 @@ void checkMovedPinLoupeFollowsTheImage()
     }
     overlay->show();
     controller.beginPinEdit();
-    controller.chooseTool(vshot::Tool::Select);
+    controller.chooseTool(std::nullopt);
 
     const vshot::OutputSession &output = controller.session().outputs.at(0);
     const QImage &source = output.image;
@@ -2270,30 +2270,52 @@ int main(int argc, char *argv[])
     qputenv("XDG_CONFIG_HOME", configHome.path().toUtf8());
 
     checkRepaintsReuseTheRaster();
+    checkTheDefaultToolIsArmedWhenAnnotationBegins();
     checkEachMarkCachesOnItsOwn();
     checkCachedPixelsLandOnTheMark();
     checkTranslucentColorSerializesWithAlpha();
     checkOpaqueColorSerializesWithoutAlpha();
     checkPureMoveReusesTheRaster();
+    checkPinConfirmationKeepsTheRasters();
     checkEachOutputKeepsItsOwnRaster();
     checkEdgeOfCanvasKeepsTheRaster();
     checkLiveStrokeMatchesTheCommittedMark();
     checkTextEditorMatchesTheCommittedLabel();
     checkLoupeShowsTheCursorPixelEverywhere();
+    checkDraggingOffTheImageLeavesItWhereItIs();
+    checkThePinsBorderMovesItButTakesNoInk();
+    checkThePinFrameGoesWhenAnotherPinTakesOver();
+    checkRestoredMarksCanBeSelected();
+    checkPinEditTakesInputOnlyOverItsChrome();
     checkPinEditStepsCoverTheirChange();
     checkMovedPinLoupeFollowsTheImage();
+    checkZoomedPinEditSessionLoads();
+    checkPinEditSessionCarriesItsMarksAndBorder();
     checkPinDragKeepsOneConnection();
     checkOverlayOutlivesItsController();
     checkLiveStrokeSurvivesIncrementalRepaint();
     checkInteractiveUpdateCoversTheChange();
+    checkTheMagnifierDoesNotFreezeTheDragUnderIt();
     checkWaveSerializesAsATwoPointStroke();
-    checkNumberSerializesAsATextBitmap();
+    checkNumberSerializesWithItsStyleAndSize();
     checkNumberBadgesCompareByCountAndStyle();
     checkBezierSerializesWithItsClosure();
     checkClosedPathsCompareByTheirClosure();
+    checkMarksRoundTripThroughASession();
+    checkImageAndTranslationMarksSurviveAReEdit();
     checkBezierFillsAtHalfAlpha();
     checkBezierStepCoverage();
     checkSelectModeDecidesWhatAPressPicksUp();
+    checkHoldingShiftPicksAMarkUpWithoutArmingATool();
+    checkThePickUpModifierFramesTheMarkUnderThePointer();
+    checkOnlyTheRightButtonBringsUpTheColourPicker();
+    checkWalkingTheCursorAsksTheCliToMoveThePointer();
+    checkAStrokeInProgressFollowsTheCursorKeys();
+    checkThePointerWarpEchoDoesNotPutTheMagnifierOut();
+    checkTheMagnifierKeyDrawsTheMagnifier();
+    checkTheMagnifierShowsTheMarks();
+    checkThePinEditorAsksForThePointerWarpToo();
+    checkTheColourPillShowsTheColourAndReadsOnIt();
 
     if (failures != 0) {
         std::printf("\n%d annotation cache checks failed\n", failures);

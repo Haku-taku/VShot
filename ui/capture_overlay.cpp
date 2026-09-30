@@ -555,16 +555,17 @@ QString toolName(Tool tool)
         return QStringLiteral("text");
     case Tool::Number:
         return QStringLiteral("number");
-    case Tool::Select:
-        return QStringLiteral("select");
     }
     return QStringLiteral("pen");
 }
 
 /// The inverse of [`toolName`], for a name that came out of the config file.
-/// An unrecognized name is a typo in a file the user can edit, so it falls
-/// back to the tool a session has always started with.
-Tool toolForName(const QString &name)
+/// An unrecognized name is a typo in a file the user can edit, and "select" is
+/// the name the old Select tool was remembered under -- still the default in
+/// every config file written before that tool went away.  Neither names a tool
+/// there is anything to arm, so both come back empty and the session stays
+/// unarmed, which is the state that tool used to be.
+std::optional<Tool> toolForName(const QString &name)
 {
     if (name == QStringLiteral("rectangle")) {
         return Tool::Rectangle;
@@ -593,7 +594,10 @@ Tool toolForName(const QString &name)
     if (name == QStringLiteral("text")) {
         return Tool::Text;
     }
-    return Tool::Select;
+    if (name == QStringLiteral("number")) {
+        return Tool::Number;
+    }
+    return std::nullopt;
 }
 
 QFont textFont(const QString &family, int pixelSize)
@@ -919,12 +923,6 @@ QIcon toolbarIcon(Tool tool, const QColor &color = QColor(230, 225, 229),
     painter.setPen(QPen(color, 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
     painter.setBrush(Qt::NoBrush);
     switch (tool) {
-    case Tool::Select:
-        painter.setBrush(color);
-        painter.drawPolygon(QPolygonF{QPointF(5, 3), QPointF(18, 14), QPointF(12, 15),
-                                      QPointF(9, 21), QPointF(6, 19), QPointF(9, 14),
-                                      QPointF(5, 3)});
-        break;
     case Tool::Rectangle:
         painter.drawRoundedRect(QRectF(4, 5, 16, 14), 2, 2);
         break;
@@ -2785,7 +2783,6 @@ public:
         commandColumn->addLayout(toolRow);
         commandColumn->addLayout(actionRow);
         cardLayout->addLayout(commandColumn);
-        addTool(toolRow, uiTr("Select"), Tool::Select);
         addTool(toolRow, uiTr("Rect"), Tool::Rectangle);
         addTool(toolRow, uiTr("Ellipse"), Tool::Ellipse);
         addTool(toolRow, uiTr("Arrow"), Tool::Arrow);
@@ -3447,11 +3444,13 @@ public:
         // itself stays enabled and shows the mode is up.
         const bool textMode = controller_->textMode_;
         for (int index = 0; index < toolButtons_.size(); ++index) {
-            setToolButtonActive(toolButtons_.at(index), tools_.at(index),
-                                tools_.at(index) == controller_->tool_, ratio);
+            // An unarmed session lights no tool: the row says nothing is
+            // selected, which is exactly the state a fresh capture starts in.
+            const bool active = controller_->tool_.has_value() &&
+                tools_.at(index) == *controller_->tool_;
+            setToolButtonActive(toolButtons_.at(index), tools_.at(index), active, ratio);
             toolButtons_.at(index)->setEnabled(!textMode);
-        }
-        if (textButton_ != nullptr) {
+        }        if (textButton_ != nullptr) {
             setButtonActive(textButton_, textMode);
         }
         if (longButton_ != nullptr) {
@@ -4224,17 +4223,13 @@ private:
         tools_.push_back(tool);
         toolButtons_.push_back(button);
         connect(button, &QToolButton::clicked, [controller = controller_, tool] {
-            controller->chooseTool(tool);
+            controller->toggleTool(tool);
         });
     }
 
     static QString toolTipForTool(Tool tool)
     {
         switch (tool) {
-        case Tool::Select:
-            return uiTr(
-                "Adjust selection; click an annotation to select, drag to move, "
-                "handles to resize, double-click text to re-edit");
         case Tool::Rectangle:
             return uiTr("Draw a rectangular annotation");
         case Tool::Ellipse:
@@ -4560,9 +4555,9 @@ OverlayController::OverlayController(Session session)
     // they start from the editor's defaults, with the wave derived from the
     // remembered width so a wide default still draws a proportionate wave.
     const Tool everyTool[] = {
-        Tool::Select,  Tool::Rectangle, Tool::Ellipse, Tool::Arrow, Tool::Line,
-        Tool::Wave,    Tool::Bezier,    Tool::Pen,     Tool::Text,  Tool::Number,
-        Tool::Mosaic,
+        Tool::Rectangle, Tool::Ellipse, Tool::Arrow, Tool::Line,
+        Tool::Wave,      Tool::Bezier,  Tool::Pen,   Tool::Text,
+        Tool::Number,    Tool::Mosaic,
     };
     for (const Tool entry : everyTool) {
         ToolStyle style;
@@ -5191,7 +5186,10 @@ void OverlayController::finishDrawing(Point point)
 {
     updateDrawing(point);
     const QVector<Point> points = gesture_->points;
-    const Tool drawingTool = tool_;
+    // A stroke can only be committed by a tool that is armed: the press that
+    // started it checked, and nothing disarms mid-gesture, so the empty case is
+    // unreachable rather than a state to draw from.
+    const Tool drawingTool = *tool_;
     gesture_->type = Gesture::Type::None;
     gesture_->points.clear();
     gesture_->liveRaster = QImage();
@@ -5971,6 +5969,11 @@ bool OverlayController::drawsGrowingStroke() const
     // Only an opaque pen stroke can be baked a segment at a time: a translucent
     // one has to be composited as a whole, and the mosaic brush stamps blocks
     // the committed mark rebuilds from the source.
+    // The live raster is only ever built for a stroke being drawn, so an
+    // unarmed session -- which cannot draw -- never asks this.
+    if (!tool_.has_value()) {
+        return false;
+    }
     return (tool_ == Tool::Pen && toolStyle(QStringLiteral("pen")).color.alpha() == 255) ||
            (tool_ == Tool::Mosaic && mosaicShape_ == QStringLiteral("brush"));
 }
@@ -6133,26 +6136,167 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
         }
         return;
     }
-    if (pinEdit_ && !canDrawAt(point)) {
-        // Outside the pinned image the surface is bare canvas: only the Select
-        // tool reacts, and only by dropping the current annotation selection.
-        if (tool_ == Tool::Select) {
+    // The membership tests below are asked of the *unclamped* point:
+    // `globalPoint` folds a point outside the image onto its nearest edge, so
+    // asking it would answer "on the image" for every point on the surrounding
+    // canvas -- which is what made a click out there drag the pin.
+    const Point raw = unclampedGlobalPoint(overlay, local);
+    if (pinEdit_ && !insidePinImage(raw)) {
+        // Outside the image itself.  The pin's own border is still the pin --
+        // the daemon draws it centred on the image's edge, and the user aiming
+        // at the rim means to move the pin, not to paint on the canvas -- so a
+        // press there starts the same move a press on the image does.  It takes
+        // no ink, because the mark would be drawn outside the picture and the
+        // renderer clips it away.
+        if (onPinBorder(raw) && selection_.has_value()) {
+            // The rim is the pin too, and a press on it is the same "this one"
+            // as a press on the picture: ask for the pin back on top.
+            requestPinRaise();
             selectAnnotation(-1);
+            // Anchored on the raw point, not the clamped one: a press on
+            // the border lands outside the image, and clamping it to the
+            // edge would swallow the first pixels of the drag.
+            gesture_->anchor = raw;
+            gesture_->current = raw;
+            gesture_->origin = *selection_;
+            gesture_->handle = 9;
+            gesture_->type = Gesture::Type::Moving;
             updateAll();
+            return;
         }
+        // The bare canvas: it drops the current annotation selection and lets
+        // the press go.  A mark is not drawn out here -- there is no image for
+        // it to sit on.
+        selectAnnotation(-1);
+        updateAll();
         return;
     }
-    if (tool_ == Tool::Text) {
+    if (pinEdit_) {
+        // A press on the image is the user saying which pin they mean, and while
+        // an edit is open the pin under the pointer is the one being annotated.
+        // The click cannot reach the pin's own surface to raise it the ordinary
+        // way -- the editor's layer surface covers the output and holds the
+        // keyboard -- so the editor asks the daemon instead.  Asked here, before
+        // anything decides what the press *does*, because that is what a click
+        // on a pin means in every other state: it comes to the front.
+        requestPinRaise();
+    }
+    // A press on a mark picks it up whatever tool is armed, and so does a press
+    // on the selected mark's own handles.  That is what makes the marks
+    // adjustable without a tool of their own: the drawing tools keep drawing,
+    // and the one thing a press does before it draws is ask whether it landed
+    // on something already there.
+    //
+    // A mark's *body* is the exception.  Picking a mark up there and drawing on
+    // it are the same gesture, and the tool the user armed is the one that has
+    // to win: a pen that could not start a stroke on top of an existing mark
+    // would be a pen that stops working wherever the picture is busiest.  So
+    // the body answers to the pick-up modifier instead -- held while the press
+    // is made, and only for the press -- which leaves the armed tool alone:
+    // entering the state is not a tool change, so letting the modifier go puts
+    // the user back exactly where they were.
+    //
+    // The handles are not gated on it.  They are small, deliberate targets that
+    // can only mean one thing, and the user who aims at a mark's rim means to
+    // stretch it whether or not a modifier is down.  Neither is the rim itself:
+    // see below.
+    const bool picksMarkUp = pickingMarks(static_cast<int>(modifiers));
+    {
+        const int annotationHandle = selectedAnnotation_ >= 0 ? annotationHandleAt(point) : 0;
+        const int hit = annotationHitAt(point);
+        // The rim of a mark the pointer is *not* on yet still counts as a hit
+        // even with a tool armed, so that a mark can be picked up and moved
+        // without the tool being put down first.  The body is the case that
+        // cannot: there the armed tool and the pick-up are the same gesture, and
+        // the tool is the one the user chose.  A rim has no such reading -- it
+        // is a deliberate target on an outline, not a place to start a stroke.
+        const int border = annotationBorderOf(hit, point);
+        const int annotationIndex =
+            (!tool_.has_value() || picksMarkUp || border != 0) ? hit : -1;
+        if (annotationHandle != 0) {
+            // A handle, which is the one thing that stretches: the whole of a
+            // mark's edge moves it, and the eight small targets resize it.
+            beginAnnotationDrag(point, true, shortcuts_.held(ShortcutAction::PreserveAspect,
+                                                            static_cast<int>(modifiers)));
+            updateAll();
+            return;
+        }
+        if (annotationIndex >= 0) {
+            selectAnnotation(annotationIndex);
+            beginAnnotationDrag(point, false);
+            updateAll();
+            return;
+        }
+    }
+    // The capture selection's own border and handles.  They are not gated on
+    // the middle button: they are small, deliberate targets that can only mean
+    // one thing, and the user who aims at the rim of the selection means to
+    // resize it.  The *body* of the selection is the middle button's, and is
+    // handled below.
+    if (!pinEdit_ && selection_.has_value() && editing_) {
+        const int handle = hitHandle(point);
+        if (handle != 0 && handle != 9) {
+            selectAnnotation(-1);
+            beginSelectionGesture(point, shortcuts_.held(ShortcutAction::PreserveAspect,
+                                                         static_cast<int>(modifiers)));
+            updateAll();
+            return;
+        }
+    }
+    if (!tool_.has_value()) {
+        // Nothing armed: the selection is adjusted, not drawn on.  The middle
+        // button drags its body; a plain drag starts a new frame over it, which
+        // is the one thing a bare drag has always meant on a capture.
+        //
+        // Loose mode is asked first, and is the one press that does not need
+        // the middle button: a mark the user has just selected follows a drag
+        // from anywhere, and "anywhere" includes the inside of the selection --
+        // asking the selection's body first would swallow every loose drag that
+        // started there, which is nearly all of them.
+        if (looseSelect_ && selectedAnnotation_ >= 0 && !pinEdit_) {
+            // Loose mode: the selected mark follows a drag from anywhere, so
+            // this press is held back rather than acted on -- until it moves it
+            // is still a click, and a click that lands on nothing lets the mark
+            // go.
+            looseDrag_ = point;
+            updateAll();
+            return;
+        }
+        if (pinEdit_) {
+            // Empty image surface: the middle button is what starts the move,
+            // the same as it is for a region selection's body.  Without it the
+            // press lets go of the current selection and does nothing else --
+            // the pin editor's image is not reframed by a drag (the CLI refuses
+            // a size change), so a bare press there has nothing to mean, and the
+            // pointer does not promise one either.
+            selectAnnotation(-1);
+        } else {
+            // A bare drag on the canvas starts a new frame over the old one.
+            // That is what an unarmed drag has always meant on a capture, and
+            // it is the whole point of a region session opening with no tool
+            // armed: the user who has just framed a region and wants a
+            // different one draws it, rather than having to find the toolbar
+            // first.  `startSelection` clears the old frame and puts the
+            // overlay back into the framing state, so the drag that follows is
+            // the same drag that made the first one.
+            selectAnnotation(-1);
+            startSelection(point);
+        }
+        updateAll();
+        return;
+    }
+    const Tool armed = *tool_;
+    if (armed == Tool::Text) {
         beginText(overlay, point);
         return;
     }
-    if (tool_ == Tool::Number) {
+    if (armed == Tool::Number) {
         // One click, one badge.  Nothing waits for a release: the tool has no
         // drag to preview, so the press is the whole gesture.
         placeNumber(point);
         return;
     }
-    if (tool_ == Tool::Bezier) {
+    if (armed == Tool::Bezier) {
         if (!canDrawAt(point)) {
             return;
         }
@@ -6182,46 +6326,7 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
         updateAll();
         return;
     }
-    if (tool_ == Tool::Select) {
-        // Annotation handles and annotations take precedence over the outer
-        // capture selection, so every existing mark remains adjustable.
-        const int annotationHandle =
-            selectedAnnotation_ >= 0 ? annotationHandleAt(point) : 0;
-        const int annotationIndex = annotationHitAt(point);
-        if (annotationHandle != 0) {
-            beginAnnotationDrag(point, true);
-        } else if (annotationIndex >= 0) {
-            selectAnnotation(annotationIndex);
-            beginAnnotationDrag(point, false);
-        } else if (looseSelect_ && selectedAnnotation_ >= 0) {
-            // Loose mode: the selected mark follows a drag from anywhere, so
-            // this press is held back rather than acted on -- until it moves it
-            // is still a click, and a click that lands on nothing lets the mark
-            // go.  A capture handle is the one exception: it is a small,
-            // deliberate target, and dropping the mark is the price of using
-            // it.
-            const int handle = pinEdit_ ? 0 : hitHandle(point);
-            if (handle != 0 && handle != 9) {
-                selectAnnotation(-1);
-                beginSelectionGesture(point);
-            } else {
-                looseDrag_ = point;
-            }
-        } else if (pinEdit_) {
-            // Empty image surface: drop the current annotation selection and
-            // start dragging the image itself (which carries its annotations).
-            selectAnnotation(-1);
-            if (selection_.has_value()) {
-                gesture_->anchor = point;
-                gesture_->current = point;
-                gesture_->origin = *selection_;
-                gesture_->handle = 9;
-                gesture_->type = Gesture::Type::Moving;
-            }
-        } else {
-            beginSelectionGesture(point);
-        }
-    } else {
+    {
         if (!canDrawAt(point)) {
             return;
         }
@@ -6923,15 +7028,27 @@ void OverlayController::chooseTool(Tool tool)
         gesture_->points.clear();
     }
     tool_ = tool;
-    // Keep the annotation selection when moving to Select so a freshly drawn
-    // annotation can be adjusted right away; drawing tools start fresh.
-    if (tool != Tool::Select) {
+    // The mark selection belongs to the state the marks are adjusted in, and
+    // that state is the one with nothing armed: a mark stays picked up while
+    // the user changes the colour or the width, and arming a drawing tool lets
+    // it go -- the white outline and its handles would otherwise sit under the
+    // ink about to be laid down, and be read as part of it.
+    if (tool.has_value()) {
         selectedAnnotation_ = -1;
     }
     for (CaptureOverlay *overlay : overlays_) {
         overlay->setCursor(Qt::CrossCursor);
     }
     updateAll();
+}
+
+void OverlayController::toggleTool(Tool tool)
+{
+    // The button of the tool already armed disarms it, which is how the user
+    // gets back to the state a fresh capture starts in: nothing drawing, the
+    // selection and the marks the only things a press can act on.
+    chooseTool(tool_.has_value() && *tool_ == tool ? std::nullopt
+                                                   : std::optional<Tool>(tool));
 }
 
 void OverlayController::setCurrentColor(const QColor &color)
@@ -7241,8 +7358,9 @@ bool OverlayController::pasteImage(const QImage &image, const QString &source)
     next.push_back(annotation);
     mutateAnnotations(next);
     // Selected, so the handles are up and the image can be moved or resized
-    // without a trip through the toolbar.
-    chooseTool(Tool::Select);
+    // without a trip through the toolbar, and nothing armed so the next drag
+    // adjusts it instead of inking over it.
+    chooseTool(std::nullopt);
     selectAnnotation(next.size() - 1);
     return true;
 }
@@ -8115,7 +8233,12 @@ QString OverlayController::styleTargetTool() const
         }
         return annotation.tool;
     }
-    return toolName(tool_);
+    // Nothing selected and nothing armed: there is no tool to edit, and the
+    // row goes away rather than showing one the user has not chosen -- the
+    // empty name matches no tool's controls, which is exactly what "no tool"
+    // means here.  The styles the tools carry are kept either way, so arming
+    // one brings its own back.
+    return tool_.has_value() ? toolName(*tool_) : QString();
 }
 
 ToolStyle &OverlayController::toolStyle(const QString &tool)
@@ -10079,7 +10202,8 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
         }
         painter->setBrush(Qt::NoBrush);
     }
-    if (gesture_->type == Gesture::Type::Drawing && !gesture_->points.isEmpty()) {
+    if (gesture_->type == Gesture::Type::Drawing && !gesture_->points.isEmpty() && tool_.has_value()) {
+        const Tool armed = *tool_;
         // Rectangle, ellipse, the area mosaic and the arrow all depend on two
         // points, so drawing them straight is already cheap.  The freehand pen
         // and the mosaic brush grow a point per move and build up through the
@@ -10091,7 +10215,7 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
             paintLiveStroke(painter, output, overlay->size(), overlay->outputIndex());
         } else {
             Annotation preview;
-            preview.tool = toolName(tool_);
+            preview.tool = toolName(armed);
             const ToolStyle &previewStyle = toolStyle(preview.tool);
             preview.color = previewStyle.color;
             preview.width = previewStyle.width;
@@ -10101,18 +10225,18 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
             preview.arrowStyle = currentArrowStyle_;
             preview.mask = mosaicShape_;
             preview.strength = mosaicStrength_;
-            if (tool_ == Tool::Rectangle || tool_ == Tool::Ellipse ||
-                (tool_ == Tool::Mosaic && mosaicShape_ != QStringLiteral("brush"))) {
+            if (armed == Tool::Rectangle || armed == Tool::Ellipse ||
+                (armed == Tool::Mosaic && mosaicShape_ != QStringLiteral("brush"))) {
                 preview.kind = Annotation::Kind::Shape;
                 preview.rect = selectionBetween(gesture_->points.constFirst(),
                                                 gesture_->points.constLast());
-                if (tool_ == Tool::Mosaic) {
+                if (armed == Tool::Mosaic) {
                     preview.tool = QStringLiteral("mosaic");
                 }
             } else {
                 preview.kind = Annotation::Kind::Stroke;
                 preview.points = gesture_->points;
-                if (tool_ == Tool::Mosaic) {
+                if (armed == Tool::Mosaic) {
                     preview.tool = QStringLiteral("mosaic");
                 }
             }
@@ -10123,9 +10247,23 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
         }
     }
 
-    // Highlight the selected annotation with handles while the Select tool is
-    // manipulating it.
-    if (tool_ == Tool::Select && selectedAnnotation_ >= 0 &&
+    // Highlight the selected annotation with handles while it is being
+    // manipulated.  The frame is up whatever tool is armed -- a mark can be
+    // picked up with a drawing tool in hand -- but not while that tool is
+    // mid-stroke, where the frame would chase the ink.
+    //
+    // While nothing is armed, or while the pick-up modifier is held.  The
+    // outline and its eight handles are the chrome of the state that adjusts
+    // marks, and that state is the unarmed one; under a drawing tool they would
+    // sit on top of the ink being laid down -- a pen stroke's own start is under
+    // the left-middle handle -- and be read as part of the picture the user is
+    // annotating.  The pick-up modifier is the other way into that state, and it
+    // deliberately leaves the tool armed: the whole point of it is that picking a
+    // mark up is not a tool change.  So it has to be read here as what it is, or
+    // the modifier that exists to hand the user a mark would be the one state in
+    // which the mark's handles never appear.
+    const bool chromeArmed = !tool_.has_value() || pickingMarks(lastModifiers_);
+    if (chromeArmed && selectedAnnotation_ >= 0 &&
         selectedAnnotation_ < annotations_.size() &&
         (gesture_->type == Gesture::Type::None ||
          gesture_->type == Gesture::Type::MovingAnnotation ||
@@ -10330,7 +10468,7 @@ void OverlayController::paintLiveStroke(QPainter *painter, const OutputSession &
         } else {
             Annotation style;
             style.kind = Annotation::Kind::Stroke;
-            style.tool = toolName(tool_);
+            style.tool = liveTool;
             const ToolStyle &strokeStyle = toolStyle(style.tool);
             style.color = strokeStyle.color;
             style.width = strokeStyle.width;

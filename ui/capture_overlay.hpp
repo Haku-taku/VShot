@@ -240,7 +240,11 @@ struct ToolStyle {
 };
 
 enum class Tool {
-    Select,
+    // There is no select tool.  Choosing a mark and adjusting the selection are
+    // not modes the user picks: a mark is picked by clicking it with any tool
+    // armed, and the selection is adjusted through its own border and handles,
+    // which are live whatever tool is up.  What used to be the Select tool is
+    // now the state a session is in when no drawing tool has been chosen.
     Rectangle,
     Ellipse,
     Arrow,
@@ -321,7 +325,11 @@ public:
     void doubleClick(CaptureOverlay *overlay, const QPointF &local, Qt::MouseButton button);
     void key(CaptureOverlay *overlay, int key, Qt::KeyboardModifiers modifiers);
 
-    void chooseTool(Tool tool);
+    // Arms `tool` for the next press, or disarms everything when it is empty.
+    void chooseTool(std::optional<Tool> tool);
+    // What a tool button does: arms the tool, or disarms it when that is the
+    // one already armed.
+    void toggleTool(Tool tool);
     void setCurrentColor(const QColor &color);
     void setCurrentFont(const QString &family);
     void setWidth(std::uint32_t width);

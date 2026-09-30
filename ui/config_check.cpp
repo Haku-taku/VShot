@@ -138,10 +138,10 @@ void checkDefaultsWhenTheFileIsMissing()
     std::printf("--- a missing file is the built-in defaults ------------------------\n");
     QFile::remove(configPath());
     const vshot::Config config = vshot::loadConfig();
-    expect(config.editor.tool == QStringLiteral("select"),
-           "the editor tool falls back to select", config.editor.tool);
+    expect(config.editor.tool.isEmpty(),
+           "the editor opens with no tool armed", config.editor.tool);
     expect(config.editor.selectMode == QStringLiteral("precise"),
-           "the Select tool needs the press on the mark unless the file says otherwise",
+           "a press has to land on the mark unless the file says otherwise",
            config.editor.selectMode);
     expect(config.editor.color == QColor(255, 64, 64, 255), "the color falls back to #ff4040ff",
            config.editor.color.name(QColor::HexArgb));
@@ -186,7 +186,7 @@ void checkUnknownKeysAreIgnored()
     expect(config.cli.pngCompression == QStringLiteral("high"),
            "a known key beside an unknown one still reads", config.cli.pngCompression);
     expect(config.cli.longNotches == 3, "a known nested key still reads");
-    expect(config.editor.tool == QStringLiteral("select"),
+    expect(config.editor.tool.isEmpty(),
            "the absent editor section is still the defaults");
 }
 
@@ -199,8 +199,8 @@ void checkBadValuesFallBackFieldByField()
         "cli": {"png-compression": "slowest", "monitor": "DP-3"}
     })"));
     const vshot::Config config = vshot::loadConfig();
-    expect(config.editor.tool == QStringLiteral("select"),
-           "an unknown tool name falls back", config.editor.tool);
+    expect(config.editor.tool.isEmpty(),
+           "an unknown tool name falls back to nothing armed", config.editor.tool);
     expect(config.editor.selectMode == QStringLiteral("precise"),
            "an unknown select mode falls back", config.editor.selectMode);
     expect(config.editor.width == 64, "an out-of-range width is clamped", QString::number(config.editor.width));
@@ -208,6 +208,18 @@ void checkBadValuesFallBackFieldByField()
     expect(config.editor.color == QColor(255, 64, 64, 255), "an unparseable color falls back");
     expect(config.cli.pngCompression.isEmpty(), "an unknown compression name falls back");
     expect(config.cli.monitor == QStringLiteral("DP-3"), "a good monitor name survives");
+}
+
+// A config file written before the Select tool went away names it, and the state
+// it named is the one the editor still opens in: nothing armed.  Reading the
+// name as a typo would quietly move the user onto the first tool in the list.
+void checkTheRetiredSelectToolStillMeansNothingArmed()
+{
+    std::printf("--- the retired select tool still means nothing armed ---------------\n");
+    writeConfig(QStringLiteral(R"({"editor": {"tool": "select"}})"));
+    expect(vshot::loadConfig().editor.tool.isEmpty(),
+           "a config naming the retired Select tool opens unarmed",
+           vshot::loadConfig().editor.tool);
 }
 
 void checkTheHdrFormatRoundTripsAndIsCleared()

@@ -25,10 +25,14 @@ namespace vshot {
 struct EditorPreferences {
     /// Tool the toolbar opens with: select | rectangle | ellipse | arrow | pen
     /// | text | mosaic.
-    QString tool = QStringLiteral("select");
-    /// How the Select tool starts a drag on an annotation that is already
-    /// selected: `precise` (the default) needs the press on the mark itself,
-    /// `loose` moves it from anywhere on screen.
+    /// The tool the editor opens with.  There is no "select" here any more:
+    /// a session with nothing armed is that state, and the empty string is
+    /// what a config written before the tool went away carries, so it lands
+    /// on the same thing.
+    QString tool;
+    /// How a drag on a mark that is already selected is started: `precise`
+    /// (the default) needs the press on the mark itself, `loose` moves it from
+    /// anywhere on screen.
     ///
     /// A mark that is hard to hit -- a hairline pen stroke, a run of small text
     /// -- is what the second mode is for: once it is selected, the whole screen

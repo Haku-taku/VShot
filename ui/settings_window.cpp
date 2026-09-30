@@ -1718,10 +1718,18 @@ private:
                        uiTr("The style the toolbar opens with next time. Leaving the editor "
                             "writes this back, whether or not the capture went through."));
 
-        QWidget *shape = addCard(page, QString());
+        // The armed tool and the colour it draws in -- the two things a user
+        // reaches for before every capture -- in one card, under a heading of
+        // their own so the card says what it holds. A card with no heading and
+        // three unrelated rows in it is what this used to be.
+        QWidget *shape = addCard(page, uiTr("Tool"));
         toolBox_ = new ModernComboBox(shape);
         toolBox_->setObjectName(QStringLiteral("tool"));
         toolBox_->setMinimumWidth(180);
+        // Nothing armed is the first entry, and the value a config file written
+        // before the Select tool went away carries: the two have to land on the
+        // same state, so the empty value is spelled here as it is stored.
+        toolBox_->addItem(uiTr("No tool"), QString());
         for (const QString &value : toolNames()) {
             toolBox_->addItem(value, value);
         }
