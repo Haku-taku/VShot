@@ -539,6 +539,49 @@ int main(int argc, char **argv)
     expectTransparent("and a pin with no stroke paints nothing outside itself", square,
                       QPoint(60, 19));
 
+    // A stroke the user set to a transparent colour is a pin with no stroke:
+    // `#00000000` is how the settings window spells "no rim", and the alpha is
+    // the whole of what it says.  Qt's pen already drops a zero-alpha stroke, so
+    // this is the SDR half of the pair -- the HDR copy the helper draws has to
+    // agree with it, which is what `a_transparent_rim_colour_is_not_a_black_rim`
+    // checks on the other side of the wire.
+    vshot::PinSurface::Style invisible;
+    invisible.shadow.enabled = false;
+    invisible.borderWidth = 2;
+    invisible.borderColor = QColor(0, 0, 0, 0);
+    invisible.activeBorderColor = QColor(0, 0, 0, 0);
+    surface.setStyle(invisible);
+    const QImage rimless = paint(surface);
+    expectTransparent("a transparent stroke paints nothing above the pin", rimless,
+                      QPoint(60, 19));
+    expectTransparent("nor to the left of it", rimless, QPoint(19, 60));
+    expectPixel("and the image keeps its own edge", rimless, QPoint(20, 60), 255, 255, 255, 255);
+
+    // Half alpha is a half-visible stroke, not a missing one: the colour is the
+    // user's black at half opacity over nothing, so what lands is a black pixel
+    // that is not fully opaque.
+    vshot::PinSurface::Style half;
+    half.shadow.enabled = false;
+    half.borderWidth = 2;
+    half.borderColor = QColor(0, 0, 0, 128);
+    half.activeBorderColor = QColor(0, 0, 0, 128);
+    surface.setStyle(half);
+    const QImage translucent = paint(surface);
+    {
+        const QColor got = translucent.pixelColor(
+            QPoint(qRound(60 * translucent.devicePixelRatio()),
+                   qRound(19 * translucent.devicePixelRatio())));
+        if (got.alpha() > 0 && got.alpha() < 255) {
+            std::printf("ok    %-48s alpha %d\n", "a half-transparent stroke is half painted",
+                        got.alpha());
+        } else {
+            std::printf("FAIL  %-48s alpha %d\n", "a half-transparent stroke is half painted",
+                        got.alpha());
+            ++failures;
+        }
+    }
+    surface.setStyle(plain);
+
     // The corner tags are a fixed size and are anchored to a pin's own corner, so
     // on a pin smaller than a tag the tag reaches past the pin's rect.  A repaint
     // region computed from the pins alone therefore left the tag's outer pixels
@@ -554,7 +597,7 @@ int main(int argc, char **argv)
         pin.id = 1;
         pin.image = solid(16, 16, Qt::white);
         pin.origin = base + QPoint(200, 170);
-        pin.hdr = true;
+        pin.capturedHdr = true;
         tagged.setPins({pin});
         // The pointer on the pin is what puts the `HDR` marker up; the badge is
         // asked for directly, the way a save's outcome would ask for it.  Both

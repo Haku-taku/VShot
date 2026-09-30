@@ -229,11 +229,24 @@ impl Shadow {
 
 /// The stroke around a pin: how wide, and in which colour normally and while the
 /// pin is the one the keyboard would act on.
+///
+/// The colour carries its own alpha, and a stroke with none paints nothing --
+/// `#00000000` is a pin with no rim, not a black one.  Qt's own pen already
+/// behaves that way (a zero-alpha `QPen` draws no pixels), so without the alpha
+/// here the helper and the daemon would disagree about what the same config
+/// means.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Border {
     width: i32,
-    colour: [u8; 3],
-    active: [u8; 3],
+    colour: [u8; 4],
+    active: [u8; 4],
+}
+
+impl Border {
+    /// Whether this rim would put any pixel down at all.
+    fn paints(&self) -> bool {
+        self.width > 0 && (self.colour[3] > 0 || self.active[3] > 0)
+    }
 }
 
 /// Where one pin is drawn on one output, in that output's device pixels: the
@@ -281,7 +294,9 @@ fn pin_damage_rect(pin: &Pin, output: &OutputRect, style: &Style) -> Option<Rect
     let placed = placement(pin, output.geometry, output.scale)?;
     let mut band = style.shadow.as_ref().map(Shadow::band).unwrap_or(0);
     if let Some(border) = &style.border {
-        band = band.max(border.width / 2 + 1);
+        if border.paints() {
+            band = band.max(border.width / 2 + 1);
+        }
     }
     let band = (f64::from(band) * f64::from(output.scale)).ceil() as i64;
     let left = placed.left.checked_sub(band)?;
@@ -818,18 +833,17 @@ impl PinTarget {
         self.surface
             .draw_image(*id, left, top, width, height, radius);
         if let Some(border) = &style.border {
-            if border.width > 0 {
+            if border.paints() {
                 let thickness = ((f64::from(border.width) * scale).round() as i32).max(1);
-                let rgb = if pin.active {
+                let rgba = if pin.active {
                     border.active
                 } else {
                     border.colour
                 };
-                let white = if pin.white.is_finite() && pin.white > 0.0 {
-                    pin.white
-                } else {
-                    crate::model::hdr::REFERENCE_WHITE_NITS
-                };
+                // The rim's own alpha is its opacity, so the compositor blends
+                // it over the pin exactly as the SDR surface's pen does.
+                let alpha = f32::from(rgba[3]) / 255.0;
+                let white = pin.white_on(output);
                 self.surface.draw_rim(
                     left,
                     top,
@@ -838,10 +852,11 @@ impl PinTarget {
                     radius,
                     thickness,
                     [
-                        pq_code(rgb[0], white),
-                        pq_code(rgb[1], white),
-                        pq_code(rgb[2], white),
+                        pq_code(rgba[0], white),
+                        pq_code(rgba[1], white),
+                        pq_code(rgba[2], white),
                     ],
+                    alpha,
                 );
             }
         }
@@ -1226,15 +1241,17 @@ fn style_of(command: &serde_json::Value) -> Option<Style> {
     })
 }
 
-/// One `[r, g, b]` triple out of the command.
-fn colour_of(value: Option<&serde_json::Value>) -> [u8; 3] {
-    let mut rgb = [0u8; 3];
+/// One `[r, g, b, a]` colour out of the command.  A three-element array is
+/// opaque; a four-element one carries the alpha the config's `#rrggbbaa`
+/// spelled, so a rim set to a transparent colour stays transparent here too.
+fn colour_of(value: Option<&serde_json::Value>) -> [u8; 4] {
+    let mut rgba = [0u8, 0, 0, 255];
     if let Some(values) = value.and_then(|value| value.as_array()) {
-        for (slot, value) in rgb.iter_mut().zip(values) {
+        for (slot, value) in rgba.iter_mut().zip(values) {
             *slot = value.as_u64().unwrap_or(0).min(255) as u8;
         }
     }
-    rgb
+    rgba
 }
 
 fn point_of(entry: &serde_json::Value, x_key: &str, y_key: &str) -> Point {
@@ -1455,8 +1472,8 @@ mod tests {
                 }),
                 border: Some(Border {
                     width: 2,
-                    colour: [192, 192, 192],
-                    active: [255, 96, 96],
+                    colour: [192, 192, 192, 255],
+                    active: [255, 96, 96, 255],
                 }),
             })
         );
@@ -1472,5 +1489,31 @@ mod tests {
                 border: None,
             })
         );
+    }
+
+    #[test]
+    fn a_transparent_rim_colour_is_not_a_black_rim() {
+        // `#00000000` is a pin with no rim.  The alpha has to survive the trip
+        // from the daemon: without it the helper draws the black channels as an
+        // opaque stroke, which is the bug this pins down.
+        let command = serde_json::json!({
+            "cmd": "pins",
+            "style": {
+                "radius": 0,
+                "shadow": null,
+                "border": {"width": 2, "color": [0, 0, 0, 0], "active": [0, 0, 0, 0]},
+            },
+        });
+        let style = style_of(&command).expect("the style is read");
+        let border = style.border.expect("the border is read");
+        assert_eq!(border.colour, [0, 0, 0, 0]);
+        assert!(!border.paints(), "a zero-alpha rim draws nothing");
+        // A colour with light in it still paints, at its own opacity.
+        let half = Border {
+            width: 2,
+            colour: [0, 0, 0, 128],
+            active: [0, 0, 0, 128],
+        };
+        assert!(half.paints());
     }
 }

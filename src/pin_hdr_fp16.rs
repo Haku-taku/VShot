@@ -118,6 +118,7 @@ extern "C" {
         red: f32,
         green: f32,
         blue: f32,
+        alpha: f32,
     ) -> c_int;
     fn vshot_fp16_present(
         ctx: *mut c_void,
@@ -280,7 +281,8 @@ impl Surface {
     }
 
     /// Draws the stroke around a pin.  `colour` is three PQ codes: only the
-    /// caller knows what the light behind a colour is on this output.
+    /// caller knows what the light behind a colour is on this output.  `alpha`
+    /// is the stroke's opacity, 0..1.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn draw_rim(
         &self,
@@ -291,10 +293,12 @@ impl Surface {
         radius: i32,
         thickness: i32,
         colour: [f32; 3],
+        alpha: f32,
     ) {
         unsafe {
             vshot_fp16_draw_rim(
                 self.raw, x, y, width, height, radius, thickness, colour[0], colour[1], colour[2],
+                alpha,
             )
         };
     }
