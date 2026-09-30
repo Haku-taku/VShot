@@ -147,6 +147,7 @@ QLabel#pageTitle   { color: %2; font-size: 17px; font-weight: 600; }
 QLabel#pageHint    { color: %3; font-size: 12px; }
 QLabel#rowLabel    { color: %2; font-size: 13px; }
 QLabel#rowHint     { color: %3; font-size: 11px; }
+QLabel#rowValue    { color: %3; font-size: 12px; font-weight: 600; }
 QLabel#status      { color: %3; font-size: 11px; }
 QLabel#status[error="true"] { color: #ffb4ab; }
 
@@ -1808,7 +1809,14 @@ private:
                             "gives nothing: an argument, or an environment variable, always "
                             "wins over these."));
 
-        QWidget *output = addCard(page, QString());
+        // One card per subject, because a subject is what a user opens the page
+        // for: how the PNG is written, how an HDR capture is split into two
+        // files, and which output a capture takes when the command line names
+        // none. Under one card they were told apart by a rule and a bold label
+        // between rows that looked like every other row; a card apiece gives
+        // each subject an edge of its own. They are ordered by how often each is
+        // the reason someone opened this page.
+        QWidget *output = addCard(page, uiTr("PNG"));
         compressionBox_ =
             choiceBox(output, compressionNames(), QString::fromLatin1(kDefaultPngCompression));
         compressionBox_->setObjectName(QStringLiteral("pngCompression"));
@@ -1818,6 +1826,7 @@ private:
                uiTr("All levels are lossless; slower ones buy a smaller file"),
                compressionBox_, true);
 
+        output = addCard(page, uiTr("HDR"));
         hdrFormatBox_ =
             choiceBox(output, hdrFormatNames(), QString::fromLatin1(kDefaultHdrFormat));
         hdrFormatBox_->setObjectName(QStringLiteral("hdrFormat"));
@@ -1916,7 +1925,7 @@ private:
                uiTr("Which output a capture takes when the command line names none. Leave it "
                     "empty to use whichever output the pointer is on -- `current` says the "
                     "same thing -- or write a name like `eDP-1` to pin one down"),
-               monitorEdit_, false);
+               monitorEdit_, true);
 
         return scroll;
     }
@@ -1930,7 +1939,11 @@ private:
                             "command line gives nothing: an argument, or an environment "
                             "variable, always wins over these."));
 
-        QWidget *scrolling = addCard(page, QString());
+        // How the page is scrolled, then how the frames are stitched: the first
+        // is what a user changes when a capture comes back wrong, the second
+        // when one comes back short. A card each, so the two read as the
+        // separate subjects they are.
+        QWidget *scrolling = addCard(page, uiTr("Scrolling"));
         notchesSpin_ = optionalSpin(scrolling, kDefaultLongNotches, kMaxFrameValue, QString());
         notchesSpin_->setObjectName(QStringLiteral("longNotches"));
         notchesSpin_->setMinimumWidth(120);
@@ -1956,6 +1969,7 @@ private:
         timeoutSpin_->setValue(rememberedOr(config_.cli.longTimeout, kDefaultLongTimeout));
         addRow(scrolling, uiTr("Timeout"), QString(), timeoutSpin_, false);
 
+        scrolling = addCard(page, uiTr("Stitching"));
         ignoreTopSpin_ = optionalSpin(scrolling, kDefaultLongIgnoreTop, kMaxFrameValue, uiTr(" px"));
         ignoreTopSpin_->setObjectName(QStringLiteral("longIgnoreTop"));
         ignoreTopSpin_->setMinimumWidth(120);
@@ -2008,12 +2022,16 @@ private:
                        uiTr("Defaults for `record` and `replay`. Used only where the command "
                             "line gives nothing: an argument, or an environment variable, "
                             "always wins over these."));
-
         // Recording is the one card whose control asks the running session a
         // question -- which audio inputs it has -- so the answer is what the
         // row offers: a name has to be a PipeWire node's own, and nobody can
         // type one of those from memory.
-        QWidget *recording = addCard(page, uiTr("Recording"));
+        // Three subjects, in the order a user meets them: what the encoder does,
+        // then what is recorded -- the source and the sound, which are the rows
+        // a user changes between two recordings -- then the receipt at the end,
+        // which is set once and never looked at again. A card each, so the
+        // heading is the card's own rather than a label between rows.
+        QWidget *recording = addCard(page, uiTr("Encoder"));
         recordEncoderBox_ =
             choiceBox(recording, encoderNames(), QString::fromLatin1(kDefaultEncoder));
         recordEncoderBox_->setObjectName(QStringLiteral("recordEncoder"));
@@ -2039,6 +2057,7 @@ private:
         recordFpsSpin_->setValue(rememberedOr(config_.cli.recordFps, kDefaultRecordFps));
         addRow(recording, uiTr("Frame rate"), uiTr("1-240"), recordFpsSpin_, false);
 
+        recording = addCard(page, uiTr("What is recorded"));
         recordFollowEdit_ = new QLineEdit(recording);
         recordFollowEdit_->setObjectName(QStringLiteral("recordFollow"));
         recordFollowEdit_->setMinimumWidth(240);
@@ -2047,7 +2066,7 @@ private:
         addRow(recording, uiTr("Follow the focus"),
                uiTr("Window names, comma-separated (`record window` with no NAME); the "
                     "recording moves to whichever the focus lands on"),
-               recordFollowEdit_, false);
+               recordFollowEdit_, true);
 
         recordPortalSwitch_ = new ModernSwitch(recording);
         recordPortalSwitch_->setObjectName(QStringLiteral("recordPortal"));
@@ -2083,13 +2102,14 @@ private:
                     "file keeps"),
                microphoneRow, false);
 
+        recording = addCard(page, uiTr("Notification"));
         recordNotifySwitch_ = new ModernSwitch(recording);
         recordNotifySwitch_->setObjectName(QStringLiteral("recordNotify"));
         recordNotifySwitch_->setChecked(config_.cli.recordNotify);
         recordNotifySwitch_->setToolTip(uiTr("A receipt for a recording started from a keybinding"));
         addRow(recording, uiTr("Notify when the recording is written"),
                uiTr("A desktop notification naming the file; it needs a notification daemon"),
-               recordNotifySwitch_, false);
+               recordNotifySwitch_, true);
 
         buildReplayCard(page);
 
@@ -2104,8 +2124,12 @@ private:
     /// values each row meant.
     void buildReplayCard(QWidget *page)
     {
-        QWidget *replay = addCard(page, uiTr("Replay"));
-
+        // The same three subjects as the recording page, in the same order, so
+        // the two pages can be read against each other. The ring's own two
+        // numbers lead the first card here: they are the rows that decide
+        // whether a replay is possible at all, and they have no counterpart on
+        // the other page.
+        QWidget *replay = addCard(page, uiTr("Ring"));
         // The one numeric default that keeps a ceiling, and it is not ours to
         // lift: the ring holds encoded packets in RAM, so the window is a memory
         // budget -- an hour of a 30 Mbps capture is already gigabytes -- and the
@@ -2130,6 +2154,7 @@ private:
                     "for, at the cost of a bigger ring"),
                replayGopSpin_, false);
 
+        replay = addCard(page, uiTr("Encoder"));
         replayEncoderBox_ =
             choiceBox(replay, encoderNames(), QString::fromLatin1(kDefaultEncoder));
         replayEncoderBox_->setObjectName(QStringLiteral("replayEncoder"));
@@ -2137,7 +2162,7 @@ private:
         selectChoice(replayEncoderBox_, config_.cli.replayEncoder);
         addRow(replay, uiTr("Encoder"),
                uiTr("All three encode on the GPU's media engine"),
-               replayEncoderBox_, false);
+               replayEncoderBox_, true);
 
         replayEncoderBackendBox_ = choiceBox(replay, encoderBackendNames(),
                                              QString::fromLatin1(kDefaultEncoderBackend));
@@ -2149,6 +2174,7 @@ private:
                     "(VAAPI and Vulkan import the dma-buf, NVENC copies frames via the CPU)"),
                replayEncoderBackendBox_, false);
 
+        replay = addCard(page, uiTr("What is recorded"));
         replayFpsSpin_ = optionalSpin(replay, kDefaultReplayFps, kMaxFrameValue, uiTr(" fps"));
         replayFpsSpin_->setObjectName(QStringLiteral("replayFps"));
         replayFpsSpin_->setMinimumWidth(120);
@@ -2156,7 +2182,7 @@ private:
         addRow(replay, uiTr("Frame rate"),
                uiTr("1-240; a rate below the recording's halves the encoder's work over a "
                     "long session"),
-               replayFpsSpin_, false);
+               replayFpsSpin_, true);
 
         replayFollowEdit_ = new QLineEdit(replay);
         replayFollowEdit_->setObjectName(QStringLiteral("replayFollow"));
@@ -2210,6 +2236,7 @@ private:
                uiTr("Where `replay save` lands when it names no path; strftime is expanded"),
                replaySaveDirEdit_, false);
 
+        replay = addCard(page, uiTr("Notification"));
         replayNotifySwitch_ = new ModernSwitch(replay);
         replayNotifySwitch_->setObjectName(QStringLiteral("replayNotify"));
         replayNotifySwitch_->setChecked(config_.cli.replayNotify);
@@ -2217,7 +2244,7 @@ private:
             uiTr("A receipt for a save triggered from a keybinding"));
         addRow(replay, uiTr("Notify when a save is written"),
                uiTr("A desktop notification naming the file; it needs a notification daemon"),
-               replayNotifySwitch_, false);
+               replayNotifySwitch_, true);
     }
 
     QWidget *buildDialogPage()

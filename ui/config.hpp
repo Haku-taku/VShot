@@ -222,6 +222,15 @@ constexpr int kMaxShadowSize = 512;
 constexpr int kMaxShadowOffset = 512;
 constexpr int kMaxShadowOpacity = 255;
 
+/// The ceilings on a mark's own style, in the units the toolbar's controls show
+/// them in.  They live here rather than in `config.cpp` because the session
+/// reader has to accept exactly the marks the editor writes back: a value the
+/// file takes but the toolbar cannot show would come back clamped the next time
+/// that mark was touched.
+constexpr int kMaxWidth = 64;
+constexpr int kMaxArrowSize = 8;
+constexpr int kMaxMosaicStrength = 3;
+
 /// The look of a pinned image.
 ///
 /// A pin has no decoration from anyone else either -- it is a layer surface

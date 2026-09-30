@@ -58,12 +58,6 @@ const QStringList kEncoderNames = {QStringLiteral("h264"), QStringLiteral("hevc"
 const QStringList kEncoderBackendNames = {QStringLiteral("auto"), QStringLiteral("vaapi"),
                                           QStringLiteral("vulkan"), QStringLiteral("nvenc")};
 
-constexpr int kMaxWidth = 64;
-// The text size is a pixel height, and its range comes from `ui/text_size.hpp`
-// (7 px, one glyph cell, to 448 px, the legacy scale's maximum).  It is not
-// repeated here as a literal so the two cannot drift.
-constexpr int kMaxArrowSize = 8;
-constexpr int kMaxMosaicStrength = 3;
 constexpr int kMaxDensity = 4;
 /// The frame rate `record --fps` accepts, `vshot record`'s own range.  A file
 /// that names a rate above it is read as saying nothing, the way the CLI reads
