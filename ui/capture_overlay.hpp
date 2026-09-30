@@ -718,6 +718,12 @@ private:
     // is just a line on the connection the first one opened.
     std::uint64_t pinId_ = 0;
     QString pinSocketPath_;
+    // Whether the pin being edited is still the daemon's live one.  True at the
+    // open, where the editor has just brought it to the front, and set from
+    // `notePinActive` afterwards.  It gates the image's frame and nothing else:
+    // the marks, the input region and the drag all carry on either way, because
+    // the edit itself has not ended.
+    bool pinActive_ = true;
     QLocalSocket *pinSocket_ = nullptr;
     QByteArray pinReplyBuffer_;
     // Positions waiting for a free slot and the number already written but not
@@ -746,12 +752,24 @@ private:
     void translateAnnotations(std::int32_t dx, std::int32_t dy);
     void applySelectionMove(LogicalRect origin, Point anchor, Point current);
     void requestPinMove(Point globalTopLeft);
+    // Asks the daemon to put the pin being edited back on top of the stack.  A
+    // click that would normally raise a pin cannot reach its surface while an
+    // edit is open -- the editor's layer surface covers the output -- so a press
+    // on the image asks on the user's behalf.
+    void requestPinRaise();
     void flushPinMove();
     void openPinSocket();
     void dropPinSocket();
     void readPinReplies();
     void applyPinReply(QByteArray line);
     void applyPinRect(const LogicalRect &rect);
+    // The daemon's answer to "which pin is the live one", which decides whether
+    // the frame is drawn around the image being annotated.  The frame is Qt
+    // chrome and every other pin is painted by a Wayland surface one layer
+    // below, and the compositor orders a layer's surfaces by map time with no
+    // restack -- so a frame left up for a pin the user has moved on from would
+    // be drawn on top of every other pin on the screen.
+    void notePinActive(std::uint64_t pinId);
     // Repaints exactly the overlays' part of `region` (global logical pixels),
     // without touching the "last touch" bookkeeping a gesture's steps share.
     void invalidateLogicalRegion(const LogicalRect &region);

@@ -3076,6 +3076,780 @@ vshot::Session pinEditSession()
     return session;
 }
 
+// A stand-in for the pin daemon: it answers every `move` with the position it
+// was asked for, and counts the requests, so a move that should never have been
+// sent is visible as a move rather than swallowed. Owns the server and the
+// socket path, which the controller dials.
+class StubPinDaemon {
+public:
+    explicit StubPinDaemon(QTemporaryDir *dir)
+        : path_(dir->filePath(QStringLiteral("pin.sock")))
+    {
+        QLocalServer::removeServer(path_);
+        listening_ = server_.listen(path_);
+        if (!listening_) {
+            return;
+        }
+        QObject::connect(&server_, &QLocalServer::newConnection, &server_, [this] {
+            while (QLocalSocket *socket = server_.nextPendingConnection()) {
+                client_ = socket;
+                QObject::connect(socket, &QLocalSocket::readyRead, socket, [this, socket] {
+                    buffer_ += socket->readAll();
+                    qsizetype newline = -1;
+                    while ((newline = buffer_.indexOf('\n')) >= 0) {
+                        const QByteArray line = buffer_.left(newline);
+                        buffer_.remove(0, newline + 1);
+                        const QJsonObject request = QJsonDocument::fromJson(line).object();
+                        const QString command =
+                            request.value(QStringLiteral("cmd")).toString();
+                        if (command == QStringLiteral("watch-active")) {
+                            // The daemon answers the subscription at once with
+                            // the pin the open edit is on.
+                            reportActive(1);
+                            continue;
+                        }
+                        if (command == QStringLiteral("raise")) {
+                            ++raises_;
+                            QJsonObject reply;
+                            reply.insert(QStringLiteral("raised"),
+                                         request.value(QStringLiteral("id")));
+                            QByteArray out =
+                                QJsonDocument(reply).toJson(QJsonDocument::Compact);
+                            out.append('\n');
+                            socket->write(out);
+                            socket->flush();
+                            continue;
+                        }
+                        if (command != QStringLiteral("move")) {
+                            continue;
+                        }
+                        ++moves_;
+                        QJsonObject reply{
+                            {QStringLiteral("ok"), true},
+                            {QStringLiteral("x"), request.value(QStringLiteral("x"))},
+                            {QStringLiteral("y"), request.value(QStringLiteral("y"))},
+                            {QStringLiteral("width"), 240},
+                            {QStringLiteral("height"), 180}};
+                        QByteArray out = QJsonDocument(reply).toJson(QJsonDocument::Compact);
+                        out.append('\n');
+                        socket->write(out);
+                        socket->flush();
+                    }
+                });
+            }
+        });
+    }
+
+    bool listening() const { return listening_; }
+    QString error() const { return server_.errorString(); }
+    const QString &path() const { return path_; }
+    int moves() const { return moves_; }
+    int raises() const { return raises_; }
+    bool hasClient() const { return client_ != nullptr; }
+    // Says which pin is the live one, the way the daemon does once an edit is
+    // open: a line with no `ok`, so it is not a move's answer.
+    void reportActive(quint64 id)
+    {
+        if (client_ == nullptr) {
+            return;
+        }
+        QJsonObject notice;
+        notice.insert(QStringLiteral("active"), static_cast<qint64>(id));
+        QByteArray out = QJsonDocument(notice).toJson(QJsonDocument::Compact);
+        out.append('\n');
+        client_->write(out);
+        client_->flush();
+    }
+
+private:
+    QLocalServer server_;
+    QString path_;
+    QByteArray buffer_;
+    QPointer<QLocalSocket> client_;
+    int moves_ = 0;
+    int raises_ = 0;
+    bool listening_ = false;
+};
+
+// A drag on a pinned image is confirmed by the daemon over and over -- one
+// reply per motion event -- and each confirmation rewrites the session's own
+// record of where the frame sits.  That record used to be part of every mark's
+// raster key, so a single drag threw away and rebuilt every mark on the pin,
+// once per motion: re-entering a pin to edit it was the only session that had
+// marks to rebuild, which is why the lag showed up there and nowhere else.
+// The key is the mark's own content now, and this is the check that says so:
+// the daemon moves the image under the marks and the rasters are left alone.
+//
+// The mosaic is the deliberate exception and is checked separately: it samples
+// the frame, so a move that changes the pixels under it has to redraw.  What
+// this pins down is that a *plain* mark does not.
+void checkPinConfirmationKeepsTheRasters()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    QTemporaryDir dir;
+    StubPinDaemon daemon(&dir);
+    if (!daemon.listening()) {
+        expect(false, "the stand-in daemon listens", daemon.error());
+        return;
+    }
+
+    vshot::OverlayController controller(pinEditSession());
+    controller.setPinEditMode(true);
+    controller.setPinTarget(1, daemon.path());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPinEdit();
+
+    // Three marks of the kinds whose pixels are their own: a shape, a freehand
+    // stroke and a label.  Each rasterizes once, and none of them samples the
+    // frame, so a confirmation may not touch any of them.
+    controller.setCurrentColor(QColor(20, 200, 40));
+    controller.chooseTool(vshot::Tool::Rectangle);
+    controller.setWidth(4);
+    drag(controller, overlay, QPointF(180, 180), QPointF(280, 250));
+    controller.chooseTool(vshot::Tool::Pen);
+    controller.setWidth(5);
+    drag(controller, overlay, QPointF(190, 270), QPointF(300, 300));
+    controller.chooseTool(vshot::Tool::Text);
+    controller.press(overlay, QPointF(200, 200), Qt::LeftButton, Qt::NoModifier);
+    QLineEdit *editor = overlay->findChild<QLineEdit *>();
+    if (editor == nullptr) {
+        expect(false, "the text tool opens its inline editor");
+        return;
+    }
+    editor->setText(QStringLiteral("Pin"));
+    controller.key(overlay, Qt::Key_Return, Qt::NoModifier);
+    controller.chooseTool(std::nullopt);
+    expect(controller.annotations().size() == 3, "three marks are down",
+           QString::number(controller.annotations().size()));
+    if (controller.annotations().size() != 3) {
+        return;
+    }
+
+    QImage target(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &target);
+    QVector<int> rebuilds;
+    for (const vshot::Annotation &annotation : controller.annotations()) {
+        rebuilds.push_back(annotation.rasterRebuilds());
+    }
+    for (int index = 0; index < rebuilds.size(); ++index) {
+        expect(rebuilds.at(index) == 1, "a mark rasterizes once before the drag",
+               QStringLiteral("mark %1: rebuilds=%2").arg(index).arg(rebuilds.at(index)));
+    }
+
+    // A drag on the image: the daemon confirms every step, and the confirmation
+    // moves the frame out from under the marks.  The marks travel with it --
+    // that is what `applyPinRect` is for -- but their own pixels do not change.
+    // The middle button is what moves the image in here, and the press lands on
+    // a clear part of it, so this is the frame being moved rather than a mark.
+    controller.press(overlay, QPointF(350, 200), Qt::MiddleButton, Qt::NoModifier);
+    for (int step = 1; step <= 4; ++step) {
+        controller.move(overlay, QPointF(350 - step * 8, 200 - step * 6), Qt::MiddleButton,
+                        Qt::NoModifier);
+        QCoreApplication::processEvents();
+    }
+    controller.release(overlay, QPointF(318, 176), Qt::MiddleButton, Qt::NoModifier);
+    // The daemon socket connects asynchronously, so let the confirmations land
+    // before reading the counts back.
+    QElapsedTimer drain;
+    drain.start();
+    while (drain.elapsed() < 200) {
+        QCoreApplication::processEvents();
+    }
+    expect(daemon.moves() > 0, "the drag asked the daemon to move the pin",
+           QStringLiteral("%1 move(s) sent").arg(daemon.moves()));
+    paintOnce(overlay, &target);
+    for (int index = 0; index < rebuilds.size(); ++index) {
+        expect(controller.annotations().at(index).rasterRebuilds() == rebuilds.at(index),
+               "a daemon confirmation does not rebuild the mark's raster",
+               QStringLiteral("mark %1: %2 -> %3")
+                   .arg(index)
+                   .arg(rebuilds.at(index))
+                   .arg(controller.annotations().at(index).rasterRebuilds()));
+    }
+}
+
+// The bare canvas around a pinned image is not part of the image, so a drag
+// that starts there must not move it.  It did: the press and the motion were
+// both turned into global points by the *clamping* conversion, which folds a
+// point outside the image onto its nearest edge -- so the "is the pointer on
+// the image" test was answered by the clamp rather than by the pointer, and
+// every click on the surrounding canvas read as a click on the image.
+void checkDraggingOffTheImageLeavesItWhereItIs()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    QTemporaryDir dir;
+    StubPinDaemon daemon(&dir);
+    if (!daemon.listening()) {
+        expect(false, "the stand-in daemon listens", daemon.error());
+        return;
+    }
+
+    vshot::OverlayController controller(pinEditSession());
+    controller.setPinEditMode(true);
+    controller.setPinTarget(1, daemon.path());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPinEdit();
+    controller.chooseTool(std::nullopt);
+
+    // The image is 150,150..390,330; these are on the canvas around it, in each
+    // direction, and far enough out that a drag cannot be a rounding artefact.
+    const QPointF outside[] = {
+        QPointF(60, 60),   // above and left
+        QPointF(60, 240),  // left
+        QPointF(350, 350), // below, past the image's bottom edge
+        QPointF(240, 60),  // above
+    };
+    const auto before = controller.selection();
+    if (!before.has_value()) {
+        expect(false, "the pin editor opens with the image selected");
+        return;
+    }
+    for (const QPointF &start : outside) {
+        controller.press(overlay, start, Qt::LeftButton, Qt::NoModifier);
+        controller.move(overlay, start + QPointF(24, 18), Qt::LeftButton, Qt::NoModifier);
+        controller.move(overlay, start + QPointF(48, 36), Qt::LeftButton, Qt::NoModifier);
+        controller.release(overlay, start + QPointF(48, 36), Qt::LeftButton, Qt::NoModifier);
+        QCoreApplication::processEvents();
+        const auto after = controller.selection();
+        expect(after.has_value() && after->x == before->x && after->y == before->y,
+               "a drag starting off the image leaves it where it was",
+               QStringLiteral("from (%1,%2): %3,%4 -> %5,%6")
+                   .arg(start.x())
+                   .arg(start.y())
+                   .arg(before->x)
+                   .arg(before->y)
+                   .arg(after.has_value() ? after->x : -1)
+                   .arg(after.has_value() ? after->y : -1));
+    }
+    expect(daemon.moves() == 0, "no move is sent for a drag off the image",
+           QStringLiteral("%1 move(s) sent").arg(daemon.moves()));
+
+    // A bare left drag on the image does nothing: the image is only moved by
+    // the middle button, the same rule the region selection's body follows.
+    // Without this the cursor over the picture would be a move cursor and every
+    // stray press on the image would shove the pin.
+    controller.press(overlay, QPointF(200, 200), Qt::LeftButton, Qt::NoModifier);
+    controller.move(overlay, QPointF(224, 218), Qt::LeftButton, Qt::NoModifier);
+    QCoreApplication::processEvents();
+    const auto unmoved = controller.selection();
+    expect(unmoved.has_value() && unmoved->x == before->x && unmoved->y == before->y,
+           "a drag on the image without the middle button leaves it where it was",
+           QStringLiteral("%1,%2").arg(unmoved.has_value() ? unmoved->x : -1)
+               .arg(unmoved.has_value() ? unmoved->y : -1));
+    controller.release(overlay, QPointF(224, 218), Qt::LeftButton, Qt::NoModifier);
+    QCoreApplication::processEvents();
+
+    // ... and a middle drag on the image still moves it, so the checks above are
+    // about the button and not about the drag being broken.
+    controller.press(overlay, QPointF(200, 200), Qt::MiddleButton, Qt::NoModifier);
+    controller.move(overlay, QPointF(224, 218), Qt::MiddleButton, Qt::NoModifier);
+    QCoreApplication::processEvents();
+    const auto dragged = controller.selection();
+    expect(dragged.has_value() && dragged->x != before->x,
+           "a drag on the image still moves it",
+           QStringLiteral("%1,%2").arg(dragged.has_value() ? dragged->x : -1)
+               .arg(dragged.has_value() ? dragged->y : -1));
+    controller.release(overlay, QPointF(224, 218), Qt::MiddleButton, Qt::NoModifier);
+}
+
+// The pin editor walks the same keyboard cursor the region editor does -- the
+// letters move the pointer, the arrows nudge the selected mark -- so it asks
+// for the same warp over the same pipe.  This is the half the helper owns: that
+// the walk writes the request at all from a pin-edit session, whose surface is
+// one output rather than the desktop.  What the CLI does with the position is
+// its own check (`the_pin_editor_is_answered_on_its_request_pipe_too`), and the
+// helper sends it in the same global logical pixels either way.
+void checkThePinEditorAsksForThePointerWarpToo()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    QTemporaryDir dir;
+    StubPinDaemon daemon(&dir);
+    if (!daemon.listening()) {
+        expect(false, "the stand-in daemon listens", daemon.error());
+        return;
+    }
+
+    fflush(stdout);
+    const int saved = dup(STDOUT_FILENO);
+    int pipeEnds[2] = {-1, -1};
+    if (saved < 0 || pipe(pipeEnds) != 0) {
+        expect(false, "the check can stand in for the CLI's pipe");
+        return;
+    }
+    dup2(pipeEnds[1], STDOUT_FILENO);
+    close(pipeEnds[1]);
+
+    {
+        vshot::OverlayController controller(pinEditSession());
+        controller.setPinEditMode(true);
+        controller.setPinTarget(1, daemon.path());
+        QString error;
+        vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+        if (overlay == nullptr) {
+            expect(false, "the controller accepts a pin-edit overlay", error);
+        } else {
+            overlay->show();
+            controller.beginPinEdit();
+            // The pin's own marks are the selection, so a press would move the
+            // image: no mark is selected, and the letters walk the cursor.
+            controller.enablePointerWarp();
+            controller.key(overlay, Qt::Key_D, Qt::NoModifier);
+            controller.key(overlay, Qt::Key_D, Qt::NoModifier);
+            // The second step lands inside the throttle's window and is sent by
+            // a timer, which needs the event loop.
+            QThread::msleep(80);
+            QCoreApplication::processEvents();
+        }
+    }
+    fflush(stdout);
+    dup2(saved, STDOUT_FILENO);
+    close(saved);
+
+    QByteArray written;
+    char buffer[4096];
+    const int flags = fcntl(pipeEnds[0], F_GETFL, 0);
+    fcntl(pipeEnds[0], F_SETFL, flags | O_NONBLOCK);
+    while (true) {
+        const ssize_t got = ::read(pipeEnds[0], buffer, sizeof(buffer));
+        if (got <= 0) {
+            break;
+        }
+        written.append(buffer, static_cast<int>(got));
+    }
+    close(pipeEnds[0]);
+
+    // The pin image is selected from the moment the editor opens, so the walk
+    // starts at the middle of the *image* -- 150+120, 150+90 -- and two steps
+    // right land on 272,240.  Asserted as a position rather than as "something
+    // was sent", because a request that always said 0,0 would pass that and put
+    // the pointer in the corner of the desktop.
+    const QByteArray expected =
+        QByteArrayLiteral("{\"request\":\"pointer\",\"x\":272,\"y\":240}");
+    expect(written.contains(expected),
+           "walking the cursor in the pin editor asks the CLI to move the pointer",
+           QStringLiteral("wanted %1 in %2").arg(QString::fromUtf8(expected),
+                                                 QString::fromUtf8(written)));
+}
+
+
+// The pin's own border is the pin: the daemon centres the stroke on the image's
+// edge, so half of it stands on the canvas beside the image, and a user aiming
+// at the rim means to move the pin.  A press there moves it, and takes no ink:
+// a mark placed outside the picture would be clipped away by the renderer.
+void checkThePinsBorderMovesItButTakesNoInk()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    QTemporaryDir dir;
+    StubPinDaemon daemon(&dir);
+    if (!daemon.listening()) {
+        expect(false, "the stand-in daemon listens", daemon.error());
+        return;
+    }
+
+    vshot::Session session = pinEditSession();
+    // A four-pixel border, so its outer band is two logical pixels wide: wide
+    // enough to aim at deliberately rather than by a rounding accident.
+    session.pinBorderWidth = 4;
+    vshot::OverlayController controller(std::move(session));
+    controller.setPinEditMode(true);
+    controller.setPinTarget(1, daemon.path());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPinEdit();
+    controller.chooseTool(std::nullopt);
+
+    const auto before = controller.selection();
+    if (!before.has_value()) {
+        expect(false, "the pin editor opens with the image selected");
+        return;
+    }
+    // The image is 150,150..390,330.  (148,240) is one pixel left of its left
+    // edge, i.e. inside the band the border's outer half occupies.  The drag
+    // goes left and up: the image may not leave the overlay's own surface, and
+    // there is room in that direction but none to the right.
+    constexpr int travelX = -24;
+    constexpr int travelY = -18;
+    controller.press(overlay, QPointF(148, 240), Qt::LeftButton, Qt::NoModifier);
+    for (int step = 1; step <= 3; ++step) {
+        controller.move(overlay, QPointF(148 + step * travelX / 3, 240 + step * travelY / 3),
+                        Qt::LeftButton, Qt::NoModifier);
+        QCoreApplication::processEvents();
+    }
+    // The daemon socket connects asynchronously, so the first positions queue
+    // behind it; give the round trip a moment before counting.
+    QElapsedTimer drain;
+    drain.start();
+    while (drain.elapsed() < 200) {
+        QCoreApplication::processEvents();
+    }
+    const auto dragged = controller.selection();
+    // The pin lands exactly where the pointer asked: the drag started two
+    // pixels off the image, and clamping either end of it would lose that.
+    expect(dragged.has_value() && dragged->x == before->x + travelX &&
+               dragged->y == before->y + travelY,
+           "a drag starting on the pin's border moves it by the pointer's own travel",
+           QStringLiteral("%1,%2 -> %3,%4 (wanted %5,%6)")
+               .arg(before->x)
+               .arg(before->y)
+               .arg(dragged.has_value() ? dragged->x : -1)
+               .arg(dragged.has_value() ? dragged->y : -1)
+               .arg(before->x + travelX)
+               .arg(before->y + travelY));
+    expect(daemon.moves() > 0, "the border drag asks the daemon to move the pin",
+           QStringLiteral("%1 move(s) sent").arg(daemon.moves()));
+    controller.release(overlay, QPointF(148 + travelX, 240 + travelY), Qt::LeftButton,
+                       Qt::NoModifier);
+
+    // A drawing tool on the border takes no ink: the mark would sit outside the
+    // picture, and the renderer clips it away, so the press must not start a
+    // stroke at all.  The border travelled with the pin, so these points are
+    // read off where the image now is rather than where it started.
+    const QPointF border{before->x + travelX - 2.0, before->y + travelY + 90.0};
+    const int marksBefore = controller.annotations().size();
+    controller.chooseTool(vshot::Tool::Pen);
+    controller.press(overlay, border, Qt::LeftButton, Qt::NoModifier);
+    controller.move(overlay, border + QPointF(-28, -20), Qt::LeftButton, Qt::NoModifier);
+    controller.release(overlay, border + QPointF(-28, -20), Qt::LeftButton, Qt::NoModifier);
+    expect(controller.annotations().size() == marksBefore,
+           "a pen on the pin's border leaves no mark",
+           QStringLiteral("%1 -> %2 marks")
+               .arg(marksBefore)
+               .arg(controller.annotations().size()));
+
+    // ... and a pen on the image itself still draws, so the check above is
+    // about the border and not about drawing being broken.
+    const QPointF onImage{before->x + travelX + 50.0, before->y + travelY + 50.0};
+    controller.press(overlay, onImage, Qt::LeftButton, Qt::NoModifier);
+    controller.move(overlay, onImage + QPointF(40, 30), Qt::LeftButton, Qt::NoModifier);
+    controller.release(overlay, onImage + QPointF(40, 30), Qt::LeftButton, Qt::NoModifier);
+    expect(controller.annotations().size() == marksBefore + 1,
+           "a pen on the image still draws",
+           QStringLiteral("%1 -> %2 marks")
+               .arg(marksBefore)
+               .arg(controller.annotations().size()));
+}
+
+// The editor's frame around the pin it is annotating is Qt chrome, and every
+// other pin on the screen is painted by a Wayland surface one layer below it.
+// The compositor orders a layer's surfaces by map time and offers no restack, so
+// a frame drawn for a pin the user has moved on from would be painted on top of
+// every other pin -- there is no ordering on the editor's side that could put it
+// back underneath. The daemon is the one that knows whose turn it is (the pin
+// holds the keyboard and the pointer is over it), so it says so and the frame
+// goes while the edit itself carries on.
+void checkThePinFrameGoesWhenAnotherPinTakesOver()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    QTemporaryDir dir;
+    StubPinDaemon daemon(&dir);
+    if (!daemon.listening()) {
+        expect(false, "the stand-in daemon listens", daemon.error());
+        return;
+    }
+
+    vshot::OverlayController controller(pinEditSession());
+    controller.setPinEditMode(true);
+    controller.setPinTarget(1, daemon.path());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPinEdit();
+    controller.chooseTool(std::nullopt);
+
+    const auto selection = controller.selection();
+    if (!selection.has_value()) {
+        expect(false, "the pin editor opens with the image selected");
+        return;
+    }
+    // Counted rather than sampled at one point: the frame is a two-pixel stroke
+    // centred on the image's edge, and the toolbar sits somewhere over the
+    // canvas, so which single pixel is on the stroke is not something this check
+    // should have to know.  White pixels in the band around the image can only
+    // be the stroke -- the image itself is a colour ramp, and the chrome's own
+    // ink is off-white.
+    const auto framePixels = [&] {
+        QImage painted(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+        paintOnce(overlay, &painted);
+        const QRect band(selection->x - 3, selection->y - 3, selection->width + 6,
+                         selection->height + 6);
+        int white = 0;
+        for (int y = std::max(0, band.top()); y <= std::min(painted.height() - 1, band.bottom());
+             ++y) {
+            for (int x = std::max(0, band.left());
+                 x <= std::min(painted.width() - 1, band.right()); ++x) {
+                const QColor pixel = painted.pixelColor(x, y);
+                if (pixel.red() > 240 && pixel.green() > 240 && pixel.blue() > 240) {
+                    ++white;
+                }
+            }
+        }
+        return white;
+    };
+    const auto frameIsDrawn = [&](bool wanted, const char *what) {
+        const int white = framePixels();
+        return expect((white > 200) == wanted, what,
+                      QStringLiteral("%1 white pixel(s) on the image's edge").arg(white));
+    };
+    // The editor dials the daemon as the session is set up, but the connect is
+    // asynchronous: give the event loop the turn it needs, or a report sent now
+    // would go nowhere and the check would pass or fail on a race rather than on
+    // the frame.
+    QElapsedTimer connected;
+    connected.start();
+    while (!daemon.hasClient() && connected.elapsed() < 500) {
+        QCoreApplication::processEvents();
+    }
+    expect(daemon.hasClient(), "the editor is connected to the daemon before anything moves");
+    frameIsDrawn(true, "the pin being edited draws its frame");
+
+    // Another pin takes the keyboard: the daemon says the live pin is no longer
+    // this one, and the frame goes with it.
+    daemon.reportActive(2);
+    QCoreApplication::processEvents();
+    frameIsDrawn(false, "... and loses it when another pin becomes the live one");
+
+    // The edit is still open -- the marks are the reason the editor is here, and
+    // losing the pointer to another pin is not the user ending it -- so the
+    // toolbar stays and the image is still the editable canvas.
+    expect(controller.isPinEdit() && controller.selection().has_value(),
+           "losing the frame does not end the edit");
+    const int marksBefore = controller.annotations().size();
+    controller.chooseTool(vshot::Tool::Pen);
+    const QPointF onImage(selection->x + 50.0, selection->y + 50.0);
+    drag(controller, overlay, onImage, onImage + QPointF(30, 20));
+    expect(controller.annotations().size() == marksBefore + 1,
+           "the image still takes ink while the frame is away");
+
+    // The pointer comes back to the pin being edited, and the frame comes with
+    // it.  Coming back is a click on the image, and a click on a pin means "this
+    // one": the pin has to go back on top of the stack as well as get its frame
+    // back, or the editor would be annotating a picture the other pins cover.
+    // The click cannot reach the pin's own surface to do it -- the editor's
+    // layer surface holds the keyboard and covers the output -- so the editor
+    // asks the daemon, and this is the ask.
+    // The ask travels asynchronously, so let the earlier press's reach the
+    // daemon before counting, or this would be counting two of them.
+    QCoreApplication::processEvents();
+    const int raisesBefore = daemon.raises();
+    controller.press(overlay, onImage, Qt::LeftButton, Qt::NoModifier);
+    controller.release(overlay, onImage, Qt::LeftButton, Qt::NoModifier);
+    QCoreApplication::processEvents();
+    expect(daemon.raises() == raisesBefore + 1,
+           "a press on the image asks the daemon to put the pin back on top",
+           QStringLiteral("%1 -> %2 raise(s)").arg(raisesBefore).arg(daemon.raises()));
+    daemon.reportActive(1);
+    QCoreApplication::processEvents();
+    frameIsDrawn(true, "the frame comes back when the pin is the live one again");
+}
+
+// A pin that comes back for a second edit opens on the marks the first edit
+// left, and those marks have to be as adjustable as ones drawn in this sitting:
+// the whole point of keeping them as data is that the user can pick one up and
+// move it rather than only look at it.
+void checkRestoredMarksCanBeSelected()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    QTemporaryDir dir;
+    StubPinDaemon daemon(&dir);
+    if (!daemon.listening()) {
+        expect(false, "the stand-in daemon listens", daemon.error());
+        return;
+    }
+
+    // First sitting: draw a rectangle and a pen path on the pin, then read back
+    // the document the daemon would have been handed.
+    QJsonArray marks;
+    {
+        vshot::OverlayController first(pinEditSession());
+        first.setPinEditMode(true);
+        first.setPinTarget(1, daemon.path());
+        QString error;
+        vshot::CaptureOverlay *overlay = first.addOverlay(0, screen, &error);
+        if (overlay == nullptr) {
+            expect(false, "the controller accepts an overlay", error);
+            return;
+        }
+        overlay->show();
+        first.beginPinEdit();
+        first.chooseTool(vshot::Tool::Rectangle);
+        drag(first, overlay, QPointF(180, 190), QPointF(300, 260));
+        first.chooseTool(vshot::Tool::Pen);
+        drag(first, overlay, QPointF(200, 300), QPointF(330, 310));
+        expect(first.annotations().size() == 2, "the first sitting leaves two marks",
+               QString::number(first.annotations().size()));
+        marks = first.marksDocument();
+    }
+    expect(marks.size() == 2, "the document carries both marks",
+           QString::number(marks.size()));
+    if (marks.size() != 2) {
+        return;
+    }
+
+    // Second sitting: the daemon hands the same marks back with the pristine
+    // image, exactly as `startEdit` does.
+    vshot::Session reopened = pinEditSession();
+    reopened.annotations = marks;
+    vshot::OverlayController second(std::move(reopened));
+    second.setPinEditMode(true);
+    second.setPinTarget(1, daemon.path());
+    QString error;
+    vshot::CaptureOverlay *overlay = second.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    second.beginPinEdit();
+    expect(second.annotations().size() == 2, "the second sitting opens on both marks",
+           QString::number(second.annotations().size()));
+    if (second.annotations().size() != 2) {
+        return;
+    }
+
+    // The rectangle is where it was drawn: 180,190..300,260 in the image's own
+    // coordinates, and the pin sits at 150,150, so a press in its middle lands
+    // on the restored mark.
+    second.chooseTool(std::nullopt);
+    second.press(overlay, QPointF(240, 225), Qt::LeftButton, Qt::NoModifier);
+    second.move(overlay, QPointF(270, 245), Qt::LeftButton, Qt::NoModifier);
+    second.release(overlay, QPointF(270, 245), Qt::LeftButton, Qt::NoModifier);
+
+    const QJsonArray moved = second.marksDocument();
+    expect(moved.size() == 2, "the marks survive the drag",
+           QString::number(moved.size()));
+    if (moved.size() != 2) {
+        return;
+    }
+    const QJsonObject rect = moved.at(0).toObject().value(QStringLiteral("rect")).toObject();
+    const auto field = [](const QJsonObject &object, const char *name) {
+        return object.value(QLatin1String(name)).toInt();
+    };
+    // Relative to the canvas (the image), so the drawn rect reads 30,40 and a
+    // drag of +30,+20 has to show up as 60,60.
+    expect(field(rect, "x") == 60 && field(rect, "y") == 60,
+           "a restored mark can be picked up and dragged",
+           QStringLiteral("rect at %1,%2 (wanted 60,60)")
+               .arg(field(rect, "x"))
+               .arg(field(rect, "y")));
+}
+
+// The pin editor's surface covers the whole output so the toolbar has somewhere
+// to sit beside the image, but the editor only owns the chrome it draws.  An
+// input region that covered the whole surface would take every click on the
+// screen, so the desktop behind the editor -- the pin daemon's own windows, the
+// user's other applications -- would never see one.
+void checkPinEditTakesInputOnlyOverItsChrome()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    QTemporaryDir dir;
+    StubPinDaemon daemon(&dir);
+    if (!daemon.listening()) {
+        expect(false, "the stand-in daemon listens", daemon.error());
+        return;
+    }
+
+    vshot::Session session = pinEditSession();
+    // A four-pixel border: the band outside the image is part of the pin.
+    session.pinBorderWidth = 4;
+    vshot::OverlayController controller(std::move(session));
+    controller.setPinEditMode(true);
+    controller.setPinTarget(1, daemon.path());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPinEdit();
+    // The mask is coalesced into the event loop, so let it run before asking.
+    QCoreApplication::processEvents();
+
+    const QRegion mask = overlay->windowHandle() != nullptr
+        ? overlay->windowHandle()->mask()
+        : QRegion();
+    // The image is 150,150..390,330 and the border reaches two pixels past it
+    // on each side.
+    expect(mask.contains(QPoint(270, 240)), "the pinned image takes a click");
+    expect(mask.contains(QPoint(148, 240)), "the pin's border takes a click");
+    expect(mask.contains(QPoint(150, 150)), "the image's corner takes a click");
+    // The toolbar is the other thing the editor owns, and it is what the
+    // surface was grown for.
+    QWidget *toolbar = nullptr;
+    for (QWidget *child : overlay->findChildren<QWidget *>()) {
+        if (child->objectName() == QStringLiteral("vshotToolbar") && child->isVisible()) {
+            toolbar = child;
+            break;
+        }
+    }
+    if (toolbar == nullptr) {
+        expect(false, "the editor shows a toolbar");
+        return;
+    }
+    expect(mask.contains(toolbar->geometry().center()), "the toolbar takes a click");
+
+    // Everything else on the screen belongs to whatever is behind the editor.
+    const QPoint outside[] = {
+        QPoint(20, 20),    // the far corner of the surface
+        QPoint(60, 240),   // level with the image, well to its left
+        QPoint(270, 370),  // below the image, past the border
+        QPoint(370, 20),   // above and to the right
+    };
+    for (const QPoint &point : outside) {
+        expect(!mask.contains(point), "the editor passes a click outside its chrome through",
+               QStringLiteral("point %1,%2").arg(point.x()).arg(point.y()));
+    }
+}
+
 // Every step of a pin-editor gesture has to repaint what it changed, on the
 // canvas as well as on the image: the marks are drawn against the image's
 // *current* rect, which is not the rect the session recorded.

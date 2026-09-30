@@ -1215,9 +1215,10 @@ private:
     QLocalSocket socket_;
     QStringList outputs_;
     // The pin stack the helper was last handed, so an unchanged one is not
-    // handed over again, and the look that went with it.
+    // handed over again, and the look and the live pin that went with it.
     std::optional<QJsonArray> sent_;
     QJsonObject sentStyle_;
+    quint64 sentActive_ = 0;
     bool attempted_ = false;
     bool mapped_ = false;
     quint64 sequence_ = 0;
@@ -1251,6 +1252,7 @@ public:
             connect(socket, &QLocalSocket::disconnected, socket, [this, socket] {
                 // The client is gone; whatever it left mid-request goes with it.
                 buffer_.remove(socket);
+                reportedActive_.remove(socket);
                 socket->deleteLater();
             });
         }
@@ -1288,7 +1290,8 @@ public:
         const QVector<Pin *> pins = pins_;
         pins_.clear();
         byId_.clear();
-        editingPin_ = nullptr;
+        editingPinId_ = 0;
+        notifyActive();
         destroySurfaces();
         for (Pin *pin : pins) {
             delete pin;
@@ -1345,19 +1348,103 @@ private:
             }
             const QJsonObject request = document.object();
             const QString command = request.value(QStringLiteral("cmd")).toString();
+            // A client that wants to be told which pin is the live one as it
+            // changes.  Only the pin editor asks, and only because its frame is
+            // Qt chrome drawn above every pin surface: a frame left up for a pin
+            // the user has moved on from would sit on top of every other pin,
+            // and the compositor offers no way to put it back underneath.  The
+            // answer is a line of its own -- no `ok`, so it is never mistaken
+            // for a move's reply by a client that reads the socket for those --
+            // and it goes out on every change, which is why it is asked for
+            // rather than pushed at everyone who connects.
+            if (command == QStringLiteral("watch-active")) {
+                const quint64 live = liveEditingPin();
+                reportedActive_.insert(socket, live);
+                respond(socket, activeNotice(live));
+                continue;
+            }
+            // The pin editor putting the pin it is annotating back on top.
+            //
+            // It has to ask because the pin's own surface cannot hear the click:
+            // the editor's layer surface holds the keyboard and covers the
+            // output, so the pointer never reaches the pin surface underneath,
+            // and that surface is where `bringToFront` is normally reached from.
+            // Clicking a pin that happens to be under the editor is the user
+            // saying which pin they mean, and for the one being edited that is
+            // exactly the gesture that has to bring it back to the front.
+            //
+            // Handled here rather than in `dispatch` because it has nothing to
+            // render: the stack it changes is `bringToFront`'s to hand over.
+            // The answer carries no `ok`, so a client reading this socket for
+            // its move replies never mistakes it for one.
+            if (command == QStringLiteral("raise")) {
+                const quint64 id = request.value(QStringLiteral("id")).toVariant().toULongLong();
+                Pin *pin = id != 0 ? byId_.value(id, nullptr) : nullptr;
+                if (pin != nullptr) {
+                    bringToFront(pin);
+                }
+                QJsonObject reply;
+                reply.insert(QStringLiteral("raised"), static_cast<qint64>(pin != nullptr ? id : 0));
+                respond(socket, reply);
+                continue;
+            }
+            // A client that asks to be told when its change is on the screen,
+            // not merely applied.  `ack` is that ask: the reply waits for the
+            // compositor's frame callback for the repaint this batch causes.
+            // Only ever set by a client that is about to stop drawing, and only
+            // on the request it is about to stop on -- a drag pipelined ahead of
+            // it carries the ask on that one move alone.
+            const bool ack = request.value(QStringLiteral("ack")).toBool();
             if (command == QStringLiteral("move")) {
                 quint64 id = 0;
                 const QJsonObject reply = movePin(request, &id);
                 if (reply.value(QStringLiteral("ok")).toBool()) {
-                    moved.append({socket, id});
+                    moved.append({socket, id, ack});
                 } else {
                     respond(socket, reply);
                     armIdleQuit();
                 }
                 continue;
             }
+            // An `add` whose HDR half the helper will refuse has to hear about
+            // it in the same reply, and the answer only exists once the stack
+            // has been handed over.  So the add is not answered here: it is
+            // answered below, after the render, like a move.  `addPin` itself
+            // does not render, so nothing is composed twice.
+            if (command == QStringLiteral("add")) {
+                const QJsonObject reply = addPin(request);
+                if (reply.value(QStringLiteral("ok")).toBool()) {
+                    added = true;
+                }
+                // Only an add that brought an HDR half has anything to wait for
+                // from the helper: its answer to the stack the pin lands in.
+                // Every other add is answered here -- unless the client asked
+                // for a frame, which is the pin editor handing over the picture
+                // it is still drawing, and then the answer waits for the stack
+                // below the same way a move's does.
+                const bool deferred =
+                    reply.value(QStringLiteral("ok")).toBool()
+                    && (!request.value(QStringLiteral("hdr")).toString().isEmpty() || ack);
+                if (deferred) {
+                    renders.append({socket, reply, ack});
+                } else {
+                    respond(socket, reply);
+                    if (!reply.value(QStringLiteral("ok")).toBool(true)) {
+                        armIdleQuit();
+                    }
+                }
+                continue;
+            }
             const bool quit = command == QStringLiteral("quit");
+            // The command is asked what it changed before it is asked to do it:
+            // only the two adds change the stack, and every other command
+            // renders for itself -- a show, a hide or a zoom does not wait for
+            // the batch to end, and must not be made to.
+            const bool adds = command == QStringLiteral("add-clipboard");
             const QJsonObject reply = dispatch(request);
+            if (adds && reply.value(QStringLiteral("ok")).toBool()) {
+                added = true;
+            }
             respond(socket, reply);
             // A daemon that owns nothing has no reason to stay resident, and a
             // failed first add (an empty clipboard, an unreadable file) would
@@ -1428,7 +1515,10 @@ private:
             const QVector<Pin *> pins = pins_;
             pins_.clear();
             byId_.clear();
-            editingPin_ = nullptr;
+            editingPinId_ = 0;
+            // An open editor is annotating a pin that no longer exists; its
+            // frame must go with the pin rather than stay over the desktop.
+            notifyActive();
             destroySurfaces();
             for (Pin *pin : pins) {
                 delete pin;
@@ -2005,11 +2095,45 @@ wl-clipboard package"));
         }
         session.insert(QStringLiteral("bounds"), bounds);
         session.insert(QStringLiteral("id"), static_cast<qint64>(pin->id));
+        // How wide this pin's border is drawn, so the editor can treat the rim
+        // as part of the pin: the stroke is centred on the image's edge and
+        // reaches half this far outside it, and a drag that starts there should
+        // move the pin rather than read as a click on the bare canvas.
+        session.insert(QStringLiteral("border_width"), static_cast<qint64>(style_.borderWidth));
         // The editor drives the real pin window while editing (moving it with
         // the pin's own code path instead of rendering a second copy of the
         // image), which it does over this daemon socket.
         session.insert(QStringLiteral("socket"), socketPath_);
+        // The marks the last edit left, so the editor opens on them and they
+        // stay editable.  Absent on a pin that has never been annotated, which
+        // is what makes the editor open blank for a first edit.
+        if (!pin->marks.isEmpty()) {
+            session.insert(QStringLiteral("annotations"), pin->marks);
+        }
         session.insert(QStringLiteral("outputs"), QJsonArray{output});
+
+        // The desktop, as the layout places every output.  The editor's
+        // keyboard cursor walks a pointer of its own and asks the CLI to move
+        // the real one there, and a pointer position is expressed in this
+        // space -- the CLI subtracts this origin and scales to this size.  The
+        // session's own `bounds` is the pin, which is not the screen, so the
+        // desktop has to travel separately or a warp on a multi-monitor layout
+        // would land at a fraction of where it belongs.
+        QRect desktop;
+        for (QScreen *each : QGuiApplication::screens()) {
+            if (each == nullptr) {
+                continue;
+            }
+            desktop = desktop.isNull() ? each->geometry() : desktop.united(each->geometry());
+        }
+        if (!desktop.isNull()) {
+            QJsonObject layout;
+            layout.insert(QStringLiteral("x"), static_cast<qint64>(desktop.x()));
+            layout.insert(QStringLiteral("y"), static_cast<qint64>(desktop.y()));
+            layout.insert(QStringLiteral("width"), static_cast<qint64>(desktop.width()));
+            layout.insert(QStringLiteral("height"), static_cast<qint64>(desktop.height()));
+            session.insert(QStringLiteral("desktop"), layout);
+        }
 
         const QString sessionPath = directory->filePath(QStringLiteral("session.json"));
         {
@@ -2320,7 +2444,15 @@ wl-clipboard package"));
             }
             hdrActiveId_ = id;
             syncHdr();
+            // The editor's frame follows the same answer: it is Qt chrome drawn
+            // above every pin surface, so it may only be up while its own pin is
+            // the live one.
+            notifyActive();
         });
+        // A frame this surface put on the screen.  A reply the daemon is
+        // holding until the change it carries is visible -- the pin editor's
+        // handoff -- is released by these.
+        surface->setPaintedCallback([this] { framePresented(); });
         surface->setDragCallback([this](quint64 id, QPoint topLeft) {
             Pin *pin = byId_.value(id, nullptr);
             if (pin == nullptr) {
@@ -2402,6 +2534,12 @@ wl-clipboard package"));
     // compositor orders the surfaces of a layer by map time and offers no
     // request to restack them, so with one surface per pin this would have to
     // be a remap — and remapping loses the keyboard focus a click just gave.
+    //
+    // A pin's own surface cannot do this while an edit is open on that pin: the
+    // editor's layer surface holds the keyboard and covers the output, so the
+    // pointer reaches the editor and never the pin surface underneath.  The
+    // editor asks instead, over the pin socket, which is what
+    // `{"cmd":"raise"}` is for.
     void bringToFront(Pin *pin)
     {
         if (pin == nullptr || pins_.isEmpty() || pins_.constLast() == pin) {
@@ -2489,9 +2627,63 @@ wl-clipboard package"));
         syncAll();
     }
 
+    // The pin an open edit session is annotating while it is still the live one,
+    // 0 otherwise.  A pin is live while its surface holds the keyboard and the
+    // pointer is over it -- the same answer `hdrActiveId_` already carries for
+    // the helper's rim.
+    //
+    // 0 is not "no live pin" here so much as "no pin surface has the keyboard",
+    // which is the ordinary state of an open editor: the editor's own surface is
+    // the one holding it.  Only another pin taking the keyboard -- a click on
+    // one -- says the edit has stopped being what the user is working on.
+    quint64 liveEditingPin() const
+    {
+        if (editingPinId_ == 0) {
+            return 0;
+        }
+        return hdrActiveId_ == 0 || hdrActiveId_ == editingPinId_ ? editingPinId_ : 0;
+    }
+
+    // Tells every client that asked which pin is the live one, when the answer
+    // changes.
+    //
+    // The editor draws its frame around the image in Qt, and every other pin is
+    // painted by a Wayland surface one layer below -- the compositor orders a
+    // layer's surfaces by map time and offers no restack, so a frame drawn for a
+    // pin that is no longer live would sit on top of every other pin on the
+    // screen.
+    //
+    // Only on a change, and only to clients in the map: `syncAll` runs on every
+    // motion event of a drag, and a line per client per event would put the
+    // editor's move replies behind a growing queue of answers it has no use for.
+    void notifyActive()
+    {
+        const quint64 live = liveEditingPin();
+        const QJsonObject notice = activeNotice(live);
+        for (auto it = reportedActive_.begin(); it != reportedActive_.end(); ++it) {
+            if (it.value() == live || it.key() == nullptr) {
+                continue;
+            }
+            it.value() = live;
+            respond(it.key(), notice);
+        }
+    }
+
+    static QJsonObject activeNotice(quint64 live)
+    {
+        QJsonObject notice;
+        notice.insert(QStringLiteral("active"), static_cast<qint64>(live));
+        return notice;
+    }
+
     // Hands every surface the whole stack, in paint order: the daemon owns the
     // order, and a surface only needs to be told which entries changed.
-    void syncAll()
+    //
+    // The answer is whether the helper was actually given something new to
+    // compose, and it is what decides whether a caller may wait for the helper's
+    // verdict: a stack the helper already has is nothing for it to answer, and
+    // waiting for a reply that is never coming is a stall, not a check.
+    bool syncAll()
     {
         QVector<PinSurface::Item> items;
         items.reserve(pins_.size());
@@ -2674,15 +2866,32 @@ wl-clipboard package"));
     // same style as the ones already up.
     PinSurface::Style style_;
     // The pin whose rim the helper should draw as the live one, 0 for none.
+    // The pin whose rim the helper should draw as the live one, 0 for none.
+    // Tracked here rather than inside the stack because it is what the pointer
+    // is doing: the surface that holds the keyboard is the only one that knows,
+    // and it reports every change.
     quint64 hdrActiveId_ = 0;
+    // The clients that asked to be told which pin is the live one, each with the
+    // answer it was last given.  Only the pin editor asks; keeping the last
+    // answer here is what makes a change a change, rather than a line written to
+    // every client on every sync of a drag.  Emptied with the connections it
+    // describes, on disconnect.
+    QHash<QLocalSocket *, quint64> reportedActive_;
     // The HDR half of the stack: the helper process that draws pinned HDR
     // images on surfaces of its own.  Started with the daemon, so it is always
     // under the Qt surfaces this daemon maps.
     PinHdr hdr_;
     quint64 nextId_ = 1;
-    Pin *editingPin_ = nullptr;
+    // The pin an edit session is open on, by id, or 0 for none.  An id rather
+    // than a pointer because the surfaces ask `itemFor` what to paint on every
+    // sync, and that question has to be answerable from a `const` daemon.
+    quint64 editingPinId_ = 0;
     bool allVisible_ = true;
     class QTimer *idleQuit_ = nullptr;
+    // Answers held until the frame that carries their change has been
+    // presented, and the backstop that releases them if it never is.
+    QVector<HeldReply> pendingReplies_;
+    class QTimer *frameDeadline_ = nullptr;
 };
 
 } // namespace

@@ -7443,8 +7443,49 @@ void OverlayController::requestPinMove(Point globalTopLeft)
     flushPinMove();
 }
 
+// Asks the daemon to put the pin being edited back on top of the stack.
+//
+// The click that means this cannot reach the pin's own surface: the editor's
+// layer surface holds the keyboard and covers the output, so the pointer lands
+// on the editor, and the pin surface underneath -- where a click normally raises
+// a pin -- never sees it.  A press on the image is the user saying which pin
+// they mean, and while an edit is open that is the only pin it can be, so the
+// editor asks on their behalf.
+void OverlayController::requestPinRaise()
+{
+    if (pinSocketPath_.isEmpty() || pinId_ == 0) {
+        return;
+    }
+    if (pinSocket_ == nullptr) {
+        // The pending raise goes out as soon as it connects; `pinRaisePending_`
+        // is what carries it across the connect.
+        pinRaisePending_ = true;
+        openPinSocket();
+        return;
+    }
+    if (pinSocket_->state() != QLocalSocket::ConnectedState) {
+        pinRaisePending_ = true;
+        return;
+    }
+    pinRaisePending_ = false;
+    QJsonObject request;
+    request.insert(QStringLiteral("cmd"), QStringLiteral("raise"));
+    request.insert(QStringLiteral("id"), static_cast<qint64>(pinId_));
+    QByteArray line = QJsonDocument(request).toJson(QJsonDocument::Compact);
+    line.append('\n');
+    pinSocket_->write(line);
+    pinSocket_->flush();
+}
+
 void OverlayController::flushPinMove()
 {
+    // A raise asked for before the connection was up goes first: it is what the
+    // press that also started this move meant, and it is a restack the daemon
+    // has to apply before the stack it paints for the move is composed.
+    // `requestPinRaise` is what decides whether the connection is ready for it.
+    if (pinRaisePending_) {
+        requestPinRaise();
+    }
     if (!pendingPinOrigin_.has_value() || pinSocketPath_.isEmpty() || pinId_ == 0) {
         return;
     }
@@ -7488,6 +7529,17 @@ void OverlayController::openPinSocket()
     pinSocket_ = socket;
     QObject::connect(socket, &QLocalSocket::connected, socket, [this] {
         pinMovesInFlight_ = 0;
+        // Asking for the live-pin answer is what puts this connection in the
+        // daemon's list of clients it writes to.  It is asked for rather than
+        // pushed: an ordinary drag's client has no use for the lines, and a
+        // daemon that wrote them to everyone would be answering the CLI's own
+        // socket with something that is not the reply it is waiting for.
+        QJsonObject watch;
+        watch.insert(QStringLiteral("cmd"), QStringLiteral("watch-active"));
+        QByteArray line = QJsonDocument(watch).toJson(QJsonDocument::Compact);
+        line.append('\n');
+        pinSocket_->write(line);
+        pinSocket_->flush();
         flushPinMove();
     });
     QObject::connect(socket, &QLocalSocket::readyRead, socket, [this] { readPinReplies(); });
@@ -7521,10 +7573,17 @@ void OverlayController::readPinReplies()
     while ((newline = pinReplyBuffer_.indexOf('\n')) >= 0) {
         const QByteArray line = pinReplyBuffer_.left(newline);
         pinReplyBuffer_.remove(0, newline + 1);
-        if (pinMovesInFlight_ > 0) {
+        // Only a move's own answer retires a move.  The daemon also says which
+        // pin is the live one, on this same connection and at any time, and
+        // counting that as a reply would free a slot the daemon has not
+        // answered yet and let the queue grow past the bound that keeps the
+        // marks from running ahead of the image.
+        const QJsonObject reply = QJsonDocument::fromJson(line).object();
+        const bool isMoveReply = reply.contains(QStringLiteral("ok"));
+        if (isMoveReply && pinMovesInFlight_ > 0) {
             --pinMovesInFlight_;
         }
-        if (pinDebug_) {
+        if (pinDebug_ && isMoveReply) {
             std::fprintf(stderr, "vshot-qt-ui: pin move round trip %lld ms\n",
                          static_cast<long long>(pinMoveClock_.elapsed()));
             pinMoveClock_.restart();
@@ -7540,7 +7599,19 @@ void OverlayController::applyPinReply(QByteArray line)
 {
     const QJsonDocument document = QJsonDocument::fromJson(line);
     const QJsonObject reply = document.object();
-    if (!reply.value(QStringLiteral("ok")).toBool()) {
+    // Not every line on this socket is a move's answer: the daemon also says
+    // which pin is the live one, on the same connection and at any time, so the
+    // frame can follow the user's attention rather than a drag.  A line with no
+    // `ok` is not a move's reply at all and must not retire one of the moves in
+    // flight -- reading it as a refusal would free a slot the daemon has not
+    // answered yet and let the queue grow past its bound.
+    if (!reply.contains(QStringLiteral("ok"))) {
+        const QJsonValue active = reply.value(QStringLiteral("active"));
+        if (active.isDouble()) {
+            notePinActive(active.toVariant().toULongLong());
+        }
+        return;
+    }    if (!reply.value(QStringLiteral("ok")).toBool()) {
         // The daemon refused (pin gone, bad request): keep editing locally.
         return;
     }
@@ -11131,6 +11202,38 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
                 }
             }
         }
+    }
+
+    // The pin editor's own frame around the image.  The daemon draws the pin's
+    // rim underneath, but that is the pin's identifying edge -- it says "this is
+    // a pin", not "this is what you are editing" -- and it is a different
+    // process besides, so it cannot say what the editor is doing.  The user's
+    // rule is that the editor draws the selection-style frame for whatever it is
+    // annotating, and the pin image is what this session annotates.
+    //
+    // No handles.  The eight handles a region selection carries resize it, and
+    // the CLI refuses any size change to a pin (`qt_overlay.rs`, "pin editing
+    // only moves it"), so handles here would be a promise the editor cannot
+    // keep.  What the pin can do is move, and the pointer already says so.
+    //
+    // Drawn after the marks clip is taken off -- the clip is the image rect, and
+    // a two-pixel stroke centred on the image's edge would otherwise lose its
+    // outer half -- and at `marksOrigin_`, the daemon-confirmed rect, so it stays
+    // in step with the image rather than running ahead of it during a drag.
+    //
+    // Only while this pin is the live one.  The frame is Qt chrome and every
+    // other pin is painted by a Wayland surface one layer below, so the moment
+    // the user's attention moves to another pin this frame would be drawn on
+    // top of it -- and the compositor orders a layer's surfaces by map time with
+    // no way to restack them, so no amount of ordering on this side can put it
+    // back underneath.  The daemon says which pin is live (`notePinActive`), and
+    // the pin being edited is the live one until the user picks another.
+    if (pinEdit_ && pinActive_ && marksOrigin_.has_value() && !session_.outputs.isEmpty()) {
+        const QRectF frame =
+            localRect(output, *marksOrigin_, overlay->size());
+        painter->setPen(QPen(Qt::white, 2.0, Qt::SolidLine));
+        painter->setBrush(Qt::NoBrush);
+        painter->drawRect(frame);
     }
 
     // Window picking previews a whole window before it is committed, so its
