@@ -191,6 +191,16 @@ QPushButton#saveButton:pressed { background: #c7cdf2; }
 QPushButton#swatch { text-align: left; padding-left: 8px; font-size: 12px;
             font-family: monospace; }
 
+/* A modal box opened from this dialog inherits the sheet, and the QDialog rule
+   above then forces its background dark.  Qt gives a box's own labels no object
+   name, so they match nothing and keep the palette's WindowText -- which on a
+   light system scheme is near-black, and near-black on the dark background is
+   unreadable.  The labels are named here instead, and given the same ink the
+   dialog's own text uses. */
+QMessageBox { background: %1; }
+QMessageBox QLabel, QMessageBox QLabel#qt_msgbox_label,
+            QMessageBox QLabel#qt_msgboxex_icon_label { color: %2; background: transparent; }
+
 QScrollArea { border: 0; background: transparent; }
 QScrollArea > QWidget > QWidget { background: transparent; }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px;
