@@ -76,6 +76,22 @@ namespace vshot {
 namespace {
 
 constexpr int kHandleRadius = 6;
+// How many pixels one cursor step covers while the step modifier is held. One
+// pixel is the point of walking the cursor at all -- a corner the mouse cannot
+// land on exactly -- and ten is the coarse half of the same trip.
+constexpr int kCoarseCursorStep = 10;
+// Whether `key` is one of the four arrow keys.  A cursor step is either a nudge
+// of the selected mark or a walk of the cursor, and which one it is hangs on
+// the key that was pressed rather than on which action it reached: an arrow
+// nudges a mark when there is one, a letter always walks.
+bool pressedArrow(int key)
+{
+    return key == Qt::Key_Left || key == Qt::Key_Right || key == Qt::Key_Up
+        || key == Qt::Key_Down;
+}
+// How far outside a mark's bounds the pointer still counts as being on its
+// border rather than on the canvas beyond it.
+constexpr int kBorderGrab = 3;
 constexpr int kMinimumSelection = 5;
 // Widest window label the picker's size pill shows before eliding it.
 constexpr int kPickerLabelWidth = 360;
@@ -4999,6 +5015,100 @@ void OverlayController::enableCandidateRefresh()
     candidateTimer_->start();
 }
 
+void OverlayController::enablePointerWarp()
+{
+    pointerWarpEnabled_ = true;
+}
+
+/// One request to the CLI, on the pipe the session path arrived on: a single
+/// JSON object and a newline, which is the shape the CLI reads.  Nothing is
+/// written unless the session said there is a CLI to read it -- a helper run by
+/// hand, or by a check, has a pipe nobody is on the other end of, and a request
+/// written into it would sit there until the pipe filled.
+bool OverlayController::writeCliRequest(const QByteArray &request)
+{
+    if (std::fwrite(request.constData(), 1, static_cast<std::size_t>(request.size()), stdout) !=
+        static_cast<std::size_t>(request.size())) {
+        return false;
+    }
+    return std::fflush(stdout) == 0;
+}
+
+/// Asks the CLI to put the real pointer at `point`, in global logical pixels.
+///
+/// The keyboard walks a cursor of the editor's own, which is enough for
+/// everything the editor draws -- the loupe reads it, a press uses it -- but it
+/// is not the pointer the compositor paints on the screen.  The user aiming at
+/// a pixel with a key needs to *see* where it went, and only the compositor can
+/// move what it draws, so the walk asks.  The CLI owns the injection backends
+/// (the compositor's virtual-pointer protocol, the portal, `/dev/uinput`) and
+/// the desktop geometry the request is expressed in, and the helper does not.
+///
+/// Throttled, and *coalescing* rather than dropping: a held key repeats far
+/// faster than a round trip through another process and a compositor, and
+/// throwing the later steps away would leave the pointer short of where the
+/// walk ended -- tap right five times quickly and the arrow moves one pixel.
+/// So a step inside the interval is remembered and sent when the interval is
+/// up, and only the newest one, because the position is absolute.
+void OverlayController::requestPointerWarp(Point point)
+{
+    if (!pointerWarpEnabled_ || finished_ || cancelled_) {
+        return;
+    }
+    if (pointerWarpClock_.isValid() && pointerWarpClock_.elapsed() < kPointerWarpIntervalMs) {
+        pointerWarpPending_ = point;
+        if (pointerWarpTimer_ == nullptr) {
+            pointerWarpTimer_ = new QTimer();
+            pointerWarpTimer_->setSingleShot(true);
+            QObject::connect(pointerWarpTimer_, &QTimer::timeout, pointerWarpTimer_, [this] {
+                if (!pointerWarpPending_.has_value()) {
+                    return;
+                }
+                const Point pending = *pointerWarpPending_;
+                pointerWarpPending_.reset();
+                requestPointerWarp(pending);
+            });
+        }
+        pointerWarpTimer_->start(kPointerWarpIntervalMs);
+        return;
+    }
+    pointerWarpClock_.restart();
+    // What the compositor is about to report back, so the motion it makes of
+    // this request is not mistaken for the user moving the mouse; see
+    // `isPointerWarpEcho`.
+    pointerWarpTarget_ = point;
+    const QByteArray request =
+        QByteArrayLiteral("{\"request\":\"pointer\",\"x\":")
+        + QByteArray::number(point.x) + QByteArrayLiteral(",\"y\":")
+        + QByteArray::number(point.y) + QByteArrayLiteral("}\n");
+    writeCliRequest(request);
+}
+
+/// Whether a motion event at `point` is the compositor reporting the pointer
+/// position VShot itself asked for, rather than the user moving the mouse.
+///
+/// The keyboard walks a cursor of its own and asks the CLI to put the real
+/// pointer there; the compositor then reports the moved pointer as an ordinary
+/// motion, which reaches this surface after the step that asked for it.  Read
+/// as a mouse move it would end the magnifier flash the step had just raised --
+/// so the loupe would blink on every step of a walk, and whether it survived
+/// the last one would depend on whether the echo happened to arrive before or
+/// after the step.
+///
+/// The test is the distance.  A warp puts the pointer exactly where the walk
+/// put its cursor, so the echo lands on `pointerWarpTarget_` to the pixel; a
+/// hand on the mouse covers a pixel or more, and a hand that covers none has
+/// not moved anything.  The window bounds how long that stays true, since a
+/// user who moves the pointer back onto the same pixel later means it.
+bool OverlayController::isPointerWarpEcho(Point point) const
+{
+    if (!pointerWarpTarget_.has_value() || !pointerWarpClock_.isValid() ||
+        pointerWarpClock_.elapsed() > kPointerWarpEchoMs) {
+        return false;
+    }
+    return pointerWarpTarget_->x == point.x && pointerWarpTarget_->y == point.y;
+}
+
 void OverlayController::requestCandidateRefresh()
 {
     if (!candidateRefreshEnabled_ || candidateRefreshPending_ || finished_ || cancelled_) {
@@ -6741,18 +6851,31 @@ void OverlayController::release(CaptureOverlay *overlay, const QPointF &local,
         return;
     }
     const Point point = globalPoint(overlay, local);
+    // The keyboard walks the cursor while a stroke is in progress, and the
+    // button is still down for the whole of it -- so the release arrives at
+    // wherever the mouse was when the press was made, which is the anchor.  The
+    // far end is the cursor's, not the release's: taking the release's position
+    // would throw away every step the keys just made.
+    const Point end = (gesture_->type == Gesture::Type::Drawing ||
+                       gesture_->type == Gesture::Type::Bezier)
+        ? gesture_->current
+        : point;
     switch (gesture_->type) {
     case Gesture::Type::Selecting:
         toolbarOutput_ = overlay->outputIndex();
         finishSelection(point);
         break;
     case Gesture::Type::Moving:
-        applySelectionMove(gesture_->origin, gesture_->anchor, point);
+        // The raw point, to match `move()`: a pin drag that started on the
+        // border would otherwise land a few pixels short of the pointer.
+        applySelectionMove(gesture_->origin, gesture_->anchor,
+                           pinEdit_ ? unclampedGlobalPoint(overlay, local) : point);
         gesture_->type = Gesture::Type::None;
         showToolbar();
         break;
     case Gesture::Type::Resizing:
-        selection_ = resizeSelection(gesture_->origin, gesture_->handle, clampPoint(point));
+        selection_ = resizeSelection(gesture_->origin, gesture_->handle, clampPoint(point),
+                                     gesture_->preserveAspect);
         gesture_->type = Gesture::Type::None;
         showToolbar();
         break;
@@ -6761,13 +6884,13 @@ void OverlayController::release(CaptureOverlay *overlay, const QPointF &local,
         finishAnnotationDrag(overlay, point);
         break;
     case Gesture::Type::Drawing:
-        finishDrawing(point);
+        finishDrawing(end);
         break;
     case Gesture::Type::Bezier:
         // A release only ends the handle drag that followed the last press.  The
         // path itself is not finished until it is closed or double-clicked, so
         // the gesture stays in progress and the preview stays on screen.
-        updateBezier(point, false);
+        updateBezier(end, false);
         break;
     case Gesture::Type::None:
         break;
@@ -7048,28 +7171,162 @@ void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifi
         // image (drag or arrow keys) and never resizes.
         return;
     }
-    const int step = (modifiers & Qt::ShiftModifier) ? 10 : 1;
-    int dx = 0;
-    int dy = 0;
-    switch (key) {
-    case Qt::Key_Left:
-        dx = -step;
-        break;
-    case Qt::Key_Right:
-        dx = step;
-        break;
-    case Qt::Key_Up:
-        dy = -step;
-        break;
-    case Qt::Key_Down:
-        dy = step;
-        break;
-    default:
+}
+
+void OverlayController::walkLiveGesture(int dx, int dy)
+{
+    // The far end is the gesture's own, not the pointer record's: the preview on
+    // screen is drawn from `gesture_->current`, so continuing from there is what
+    // makes the ink follow the keys even if the pointer never reported the press
+    // (a session driven without a mouse, or one whose press arrived on a surface
+    // whose motion never came).
+    const Point from = gesture_->current;
+    const Point moved = clampPoint(Point{from.x + dx, from.y + dy});
+    // The point the press set stays exactly where it was: a stroke is drawn
+    // from its anchor, and walking the cursor is choosing where the far end
+    // lands, not redrawing what is already there.  For the pen and the brush
+    // that is the whole of it -- they grow toward the cursor and the steps in
+    // between are the stroke -- so this is the pointer moving without a mouse.
+    if (gesture_->type == Gesture::Type::Bezier) {
+        // A pen path is anchors, not a trail: the last anchor has been placed
+        // and what the pointer does now is pull its outgoing handle out.  A
+        // path with nothing placed yet has no anchor to pull, and the step
+        // would have nowhere to land.
+        if (gesture_->points.size() < 2) {
+            return;
+        }
+        updateBezier(moved, true);
+        updateTouch(bezierTouch());
+    } else {
+        // A growing stroke stamps the segments the last step added, so the walk
+        // tells `updateDrawing` the same way a pointer motion would and lets it
+        // append the one point this step contributes.  The two-point tools
+        // replace their pair outright, which is what makes the far end follow.
+        const int pointsBefore = gesture_->points.size();
+        updateDrawing(moved);
+        updateTouch(drawingTouch(pointsBefore));
+    }
+    keyboardCursor_ = moved;
+    pointer_ = moved;
+    // The pointer is wherever the press left it -- the keyboard has not moved
+    // the mouse -- so the magnifier is the only thing on screen that says which
+    // pixel the far end is on, and the warp is what puts the arrow there too.
+    flashMagnifier();
+    requestPointerWarp(moved);
+}
+
+// The cursor the keyboard moves, in global logical pixels.  It starts wherever
+// the pointer last was, so a key press continues from what the user was
+// looking at rather than jumping to a corner of the screen.
+Point OverlayController::cursorPoint() const
+{
+    if (keyboardCursor_.has_value()) {
+        return *keyboardCursor_;
+    }
+    if (pointerOutput_ >= 0) {
+        return pointer_;
+    }
+    const LogicalRect &surface = session_.bounds;
+    return Point{static_cast<std::int32_t>(surface.x + static_cast<std::int64_t>(surface.width) / 2),
+                 static_cast<std::int32_t>(surface.y + static_cast<std::int64_t>(surface.height) / 2)};
+}
+
+void OverlayController::moveCursorBy(int dx, int dy)
+{
+    const Point moved = clampPoint(Point{cursorPoint().x + dx, cursorPoint().y + dy});
+    keyboardCursor_ = moved;
+    pointer_ = moved;
+    // The magnifier is the only way to see where the cursor went: it has not
+    // moved a mouse, so the pointer the compositor draws is wherever it was
+    // left, and the user is aiming at a pixel.  It comes up for a moment and
+    // goes again, so the frame is not permanently covered by it.
+    flashMagnifier();
+    // And the pointer itself, which is the other half of "where the cursor
+    // went": the loupe says which pixel, and the arrow on the screen says where
+    // on the desktop.  Only the CLI can move it, so the request goes over the
+    // pipe the session came in on.  A session with nobody listening is left
+    // alone -- the editor's own cursor has already moved either way.
+    requestPointerWarp(moved);
+    updateAll();
+}
+
+bool OverlayController::pickingMarks(int modifiers) const
+{
+    // Read through the binding table so a build that moves the modifier moves
+    // this with it.  `held` is the only reader that can see it: `matches` wants
+    // a key *and* a modifier, and this is held on its own while a press is
+    // made, with no key of its own to match.
+    return shortcuts_.held(ShortcutAction::SelectMark, modifiers);
+}
+
+void OverlayController::cycleAnnotationFocus(int step)
+{
+    if (annotations_.isEmpty()) {
         return;
     }
-    const Point anchor{selection_->x, selection_->y};
-    const Point current{selection_->x + dx, selection_->y + dy};
-    applySelectionMove(*selection_, anchor, current);
+    const int count = annotations_.size();
+    int index = selectedAnnotation_;
+    if (index < 0 || index >= count) {
+        // Nothing selected yet: Tab starts at the back of the list and Shift+
+        // Tab at the front, so the first press lands on the mark nearest the
+        // end the user is coming from.
+        index = step > 0 ? -1 : 0;
+    }
+    index = ((index + step) % count + count) % count;
+    selectAnnotation(index);
+    // The cursor follows the mark, so the magnifier and the colour readout
+    // point at the thing the keyboard just picked.
+    LogicalRect bounds;
+    if (annotationBounds(annotations_.at(index), &bounds)) {
+        keyboardCursor_ = Point{static_cast<std::int32_t>(bounds.x + static_cast<std::int64_t>(bounds.width) / 2),
+                                static_cast<std::int32_t>(bounds.y + static_cast<std::int64_t>(bounds.height) / 2)};
+        pointer_ = *keyboardCursor_;
+        if (pointerOutput_ < 0) {
+            pointerOutput_ = outputContaining(bounds);
+        }
+    }
+    updateAll();
+}
+
+void OverlayController::selectAllAnnotations()
+{
+    if (annotations_.isEmpty()) {
+        return;
+    }
+    selectAnnotation(annotations_.size() - 1);
+    allSelected_ = true;
+    updateAll();
+}
+
+void OverlayController::nudgeSelectedAnnotation(int dx, int dy)
+{
+    if (selectedAnnotation_ < 0 || selectedAnnotation_ >= annotations_.size()) {
+        return;
+    }
+    const Annotation original = annotations_.at(selectedAnnotation_);
+    LogicalRect bounds;
+    if (!annotationBounds(original, &bounds)) {
+        return;
+    }
+    // The same translation a drag makes, through the same clamp, so a mark
+    // walked to the edge of the image stops there rather than sliding off it.
+    const Annotation moved = translatedAnnotation(original, dx, dy);
+    LogicalRect after;
+    if (annotationBounds(moved, &after) && after.x == bounds.x && after.y == bounds.y) {
+        return; // already against the edge the nudge was pushing toward
+    }
+    // A run of nudges is one edit: the first one of the run is what undo comes
+    // back to, and the key's own auto-repeat does not bury the user's last real
+    // step under a hundred entries.  Any other edit or selection ends the run.
+    if (!nudgeBase_.has_value()) {
+        nudgeBase_ = annotations_;
+        undoStack_.push_back(*nudgeBase_);
+        if (undoStack_.size() > kMaxUndoSteps) {
+            undoStack_.removeFirst();
+        }
+        redoStack_.clear();
+    }
+    annotations_[selectedAnnotation_] = moved;
     updateAll();
 }
 

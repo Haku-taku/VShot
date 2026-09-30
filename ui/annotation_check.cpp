@@ -43,16 +43,21 @@
 #include <QLocalSocket>
 #include <QPainter>
 #include <QPointF>
+#include <QPointer>
 #include <QRegion>
 #include <QScreen>
 #include <QString>
 #include <QTemporaryDir>
+#include <QWindow>
 #include <Qt>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <fcntl.h>
 #include <functional>
+#include <QThread>
+#include <unistd.h>
 
 namespace {
 
