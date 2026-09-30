@@ -19,6 +19,7 @@
 
 #include <cstdio>
 #include <memory>
+#include <unistd.h>
 
 namespace {
 

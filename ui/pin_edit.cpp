@@ -15,6 +15,7 @@
 #include <QScreen>
 
 #include <cstdio>
+#include <unistd.h>
 
 namespace vshot {
 namespace {

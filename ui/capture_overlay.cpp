@@ -5247,11 +5247,9 @@ void OverlayController::requestCandidateRefresh()
     }
     candidateClock_.restart();
     const QByteArray request = QByteArrayLiteral("{\"request\":\"candidates\"}\n");
-    if (std::fwrite(request.constData(), 1, static_cast<std::size_t>(request.size()), stdout) !=
-        static_cast<std::size_t>(request.size())) {
+    if (!writeCliRequest(request)) {
         return;
     }
-    std::fflush(stdout);
     candidateRefreshPending_ = true;
 }
 

@@ -265,7 +265,14 @@ fn run_helper_dialogue(
         .ok_or_else(|| VshotError::Selection("the Qt helper has no answer pipe".into()))?;
     let mut responses = BufReader::new(responses);
 
-    let mut result = None;
+    // The pointer mover is opened lazily, on the first request that needs one:
+    // a session where the user never touches the keyboard cursor must not pay
+    // for a virtual-pointer connection, and on a compositor with no injection
+    // backend at all the walk simply moves the editor's own cursor.
+    let mut pointer: Option<crate::inject::Injector> = None;
+    let mut json: Option<Vec<u8>> = None;
+    let mut composite: Option<RenderedCapture> = None;
+    let mut handoff: Option<VshotError> = None;
     let mut line = String::new();
     loop {
         line.clear();
@@ -583,6 +590,13 @@ struct QtSession<'a> {
     // it and a newer one without it falls back to a temp file of its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     result_path: Option<String>,
+    // Pin-edit only: the bounding box of every output, which is the coordinate
+    // space the CLI's injection backend expresses an absolute pointer position
+    // in.  The session's own `bounds` is the pin, which is not the screen, so
+    // the editor's keyboard-cursor walk would have the pointer land a fraction
+    // of the way to where it belongs without this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    desktop: Option<WireRect>,
     outputs: Vec<QtOutput<'a>>,
 }
 

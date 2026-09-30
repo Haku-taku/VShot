@@ -676,6 +676,14 @@ private:
     QElapsedTimer candidateClock_;
     bool candidateRefreshEnabled_ = false;
     bool candidateRefreshPending_ = false;
+    /// Whether the CLI on the other end of this pipe moves the real pointer.
+    /// The keyboard walks a cursor of its own, and the pointer the compositor
+    /// draws is not it -- so the walk asks for a warp, and this says whether
+    /// there is anyone to ask.  Read from the session, which knows the output
+    /// geometry the request has to be expressed in; false for a helper driven
+    /// by hand or by a check, which is what keeps those from writing into a
+    /// pipe nobody is reading.
+    bool pointerWarpEnabled_ = false;
     QVector<QVector<Annotation>> undoStack_;
     QVector<QVector<Annotation>> redoStack_;
     std::optional<Annotation> cancelledText_;
