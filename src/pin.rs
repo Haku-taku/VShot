@@ -749,6 +749,12 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
         .get("bounds")
         .ok_or_else(|| VshotError::Pin("pin-edit session has no bounds".into()))?;
     let window = parse_json_rect(window)?;
+    // The desktop the editor's keyboard-cursor walk expresses a pointer move
+    // in.  The daemon stamps it because the session's own bounds are the pin,
+    // which is not the screen; a session without one leaves the pointer
+    // unmoved, which is the same outcome as a compositor with no injection
+    // backend.
+    let desktop = session.get("desktop").map(parse_json_rect).transpose()?;
     let id = session
         .get("id")
         .and_then(serde_json::Value::as_u64)
@@ -994,17 +1000,6 @@ fn decode_pq_half(path: &Path) -> Result<HdrHalf> {
     })
 }
 
-/// Device pixels per logical pixel for a pin-edit round trip: the pin's
-/// native width divided by its on-screen (logical) width. Plain pins and
-/// captures are 1:1 logical; text cards render at the output's pixel
-/// density (2x on HiDPI outputs). The renderer supports 1..=4.
-fn pin_edit_scale(frame_width: u32, window_width: u32) -> u32 {
-    if window_width == 0 {
-        return 1;
-    }
-    (frame_width / window_width).clamp(1, 4)
-}
-
 fn parse_json_rect(value: &serde_json::Value) -> Result<crate::geometry::Rect> {
     use crate::geometry::Rect;
     let as_i64 = |key: &str| -> Result<i64> {
@@ -1185,15 +1180,25 @@ mod tests {
     }
 
     #[test]
-    fn pin_edit_scale_follows_the_display_density() {
-        assert_eq!(pin_edit_scale(160, 160), 1);
-        assert_eq!(pin_edit_scale(320, 160), 2);
-        assert_eq!(pin_edit_scale(1120, 560), 2);
-        // Zoomed-in pins (screen rect larger than the image) stay at 1x.
-        assert_eq!(pin_edit_scale(80, 160), 1);
-        // Degenerate window falls back to 1x; density is capped at 4.
-        assert_eq!(pin_edit_scale(320, 0), 1);
-        assert_eq!(pin_edit_scale(4000, 500), 4);
+    fn the_pin_edit_scale_is_the_ratio_the_image_is_shown_at() {
+        use crate::edit::Scale;
+        // A plain pin, and a text card rendered at an output's density: whole
+        // numbers of device pixels per logical pixel, exactly as before.
+        assert_eq!(Scale::ratio(160, 160).factor(), 1.0);
+        assert_eq!(Scale::ratio(320, 160).factor(), 2.0);
+        assert_eq!(Scale::ratio(1120, 560).factor(), 2.0);
+        // A zoomed pin: the window is not a whole multiple of the image, and
+        // truncating the ratio to 1 is what made the editor refuse the session.
+        // The ratio is carried as it is, so the session's pixel dimensions and
+        // its logical size agree and the marks land where they were drawn.
+        assert!((Scale::ratio(160, 176).factor() - 0.909_09).abs() < 1e-4);
+        // Zoomed out: fewer device pixels than logical ones, which no whole
+        // number can express at all.
+        assert_eq!(Scale::ratio(160, 320).factor(), 0.5);
+        assert!((Scale::ratio(160, 144).factor() - 1.111_11).abs() < 1e-4);
+        // Degenerate window falls back to 1 rather than dividing by zero.
+        assert_eq!(Scale::ratio(320, 0).factor(), 1.0);
+        assert_eq!(Scale::ratio(0, 160).factor(), 1.0);
     }
 
     #[test]

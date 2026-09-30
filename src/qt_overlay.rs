@@ -633,7 +633,11 @@ struct QtOutput<'a> {
     // region capture, the whole output for pin editing (so the toolbar can
     // float on the canvas beside the pinned image).
     surface: WireRect,
-    scale: u32,
+    // Device pixels per logical pixel of this output.  A real output's density
+    // is a whole number; the pin editor's virtual output carries the zoom its
+    // image is shown at, which is not (a 160-pixel pin across 176 logical
+    // pixels is 0.909), so it is serialized as the number it is.
+    scale: f64,
     pixel_width: u32,
     pixel_height: u32,
     path: String,
@@ -1056,9 +1060,11 @@ pub(crate) struct PinEditSpec<'a> {
     pub(crate) output_name: &'a str,
     /// Global logical rect of the pinned image.
     pub(crate) window: Rect,
-    /// Device pixels per logical pixel between `frame` and `window`: 1 for
-    /// plain pins, the output's density for HiDPI-rendered text cards.
-    pub(crate) scale: u32,
+    /// Device pixels per logical pixel between `frame` and `window`: 1 for a
+    /// plain pin, the output's density for a HiDPI-rendered text card, and the
+    /// zoom the image is shown at for a pin the user has zoomed.  The last is
+    /// not a whole number, which is why it is a ratio rather than a density.
+    pub(crate) scale: crate::edit::Scale,
     /// Daemon socket the editor uses to move the pin live.
     pub(crate) socket: &'a Path,
     /// Id of this pin inside the daemon, echoed back in session JSON.
