@@ -117,26 +117,46 @@ pub(crate) struct PqImage {
     /// but the pin editor decodes the same file back to linear light and needs
     /// it.
     pub reference_nits: f32,
+    /// The gamut the codes are written in: the output the pin was taken from,
+    /// not BT.2020 unless that output really was BT.2020.  The editor decodes
+    /// the file back to linear light with this, and a reader that ignored it
+    /// would read a wide-gamut pin as if it were BT.2020 and shift its colours.
+    pub primaries: Primaries,
     pub words: Vec<u32>,
 }
 
-/// Reads one PQ file: the magic, the size, the white, and `width * height`
-/// ARGB2101010 words in little-endian order — the layout `HdrFrame::to_rgb10_pq`
-/// produces, as `pin::PqPin::encode` writes it.
+/// Reads one PQ file: the magic, the size, the white, the gamut, and
+/// `width * height` ARGB2101010 words in little-endian order — the layout
+/// `HdrFrame::to_rgb10_pq_in` produces, as `pin::PqPin::encode` writes it.
 pub(crate) fn read_pq_file(path: &Path) -> Result<PqImage> {
     let bytes = std::fs::read(path).map_err(|source| VshotError::HdrPin {
         path: path.to_path_buf(),
         reason: format!("cannot read the pinned HDR image: {source}"),
     })?;
-    if bytes.len() < 20 || &bytes[..8] != PQ_MAGIC {
+    if bytes.len() < PQ_HEADER || &bytes[..8] != PQ_MAGIC {
+        // The magic names the layout, so a file carrying another one is a pin
+        // written by a VShot whose format this build does not know -- an older
+        // helper against a newer daemon, which is what a stale binary beside a
+        // fresh one produces.  Naming both magics is what tells the two apart
+        // from a truncated or foreign file.
+        let found = if bytes.len() >= 8 {
+            String::from_utf8_lossy(&bytes[..8]).into_owned()
+        } else {
+            format!("{} bytes", bytes.len())
+        };
         return Err(VshotError::HdrPin {
             path: path.to_path_buf(),
-            reason: "not a vshot HDR pin image".into(),
+            reason: format!(
+                "not a vshot HDR pin image: it starts with `{found}` where this build writes \
+                 `{}`; the surface helper and the pin daemon are different builds",
+                String::from_utf8_lossy(PQ_MAGIC)
+            ),
         });
     }
     let width = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
     let height = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
     let reference_nits = f32::from_le_bytes(bytes[16..20].try_into().unwrap());
+    let primaries = read_primaries(&bytes[20..PQ_HEADER]);
     let count =
         usize::try_from(u64::from(width) * u64::from(height)).map_err(|_| VshotError::HdrPin {
             path: path.to_path_buf(),
@@ -144,7 +164,7 @@ pub(crate) fn read_pq_file(path: &Path) -> Result<PqImage> {
         })?;
     let expected = count
         .checked_mul(4)
-        .and_then(|bytes| bytes.checked_add(20))
+        .and_then(|bytes| bytes.checked_add(PQ_HEADER))
         .ok_or_else(|| VshotError::HdrPin {
             path: path.to_path_buf(),
             reason: "image size is out of range".into(),
@@ -158,7 +178,7 @@ pub(crate) fn read_pq_file(path: &Path) -> Result<PqImage> {
             ),
         });
     }
-    let words = bytes[20..]
+    let words = bytes[PQ_HEADER..]
         .as_chunks::<4>()
         .0
         .iter()
@@ -1283,6 +1303,12 @@ mod tests {
         bytes.extend_from_slice(&2u32.to_le_bytes());
         bytes.extend_from_slice(&1u32.to_le_bytes());
         bytes.extend_from_slice(&203.0f32.to_le_bytes());
+        // The gamut's own coordinates, as the protocol's millionth units.
+        for (x, y) in Primaries::Bt2020.chromaticities() {
+            bytes.extend_from_slice(&((x * 1_000_000.0).round() as i32).to_le_bytes());
+            bytes.extend_from_slice(&((y * 1_000_000.0).round() as i32).to_le_bytes());
+        }
+        assert_eq!(bytes.len(), PQ_HEADER);
         for word in [0x3ff00000u32, 0x00000000u32] {
             bytes.extend_from_slice(&word.to_le_bytes());
         }
@@ -1290,7 +1316,46 @@ mod tests {
         let image = read_pq_file(&path).unwrap();
         assert_eq!((image.width, image.height), (2, 1));
         assert_eq!(image.reference_nits, 203.0);
+        assert_eq!(image.primaries, Primaries::Bt2020);
         assert_eq!(image.words, vec![0x3ff00000, 0x00000000]);
+    }
+
+    #[test]
+    fn a_wide_gamut_pin_reads_back_in_the_gamut_it_names() {
+        // A pin taken from a P3-like output carries that output's own gamut, and
+        // the editor has to decode it in the same space: reading those codes as
+        // BT.2020 is what shifted every colour of a wide-gamut pin.
+        let output = Primaries::from_chromaticities(
+            (0.686523, 0.308594),
+            (0.223633, 0.689453),
+            (0.142578, 0.060547),
+        );
+        assert!(matches!(output, Primaries::Custom { .. }));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pin.pq");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(PQ_MAGIC);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&203.0f32.to_le_bytes());
+        for (x, y) in output.chromaticities() {
+            bytes.extend_from_slice(&((x * 1_000_000.0).round() as i32).to_le_bytes());
+            bytes.extend_from_slice(&((y * 1_000_000.0).round() as i32).to_le_bytes());
+        }
+        bytes.extend_from_slice(&0x3ff00000u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let image = read_pq_file(&path).unwrap();
+        // The coordinates survive the round trip, so the gamut is the one the
+        // capture had rather than a name this pipeline happened to prefer.
+        for (read, wrote) in image
+            .primaries
+            .chromaticities()
+            .iter()
+            .zip(output.chromaticities())
+        {
+            assert!((read.0 - wrote.0).abs() < 1e-3, "{read:?} vs {wrote:?}");
+            assert!((read.1 - wrote.1).abs() < 1e-3, "{read:?} vs {wrote:?}");
+        }
     }
 
     #[test]

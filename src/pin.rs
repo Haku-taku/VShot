@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, VshotError};
 use crate::geometry::Size;
-use crate::model::hdr::{Primaries, Transfer};
+use crate::model::hdr::Transfer;
 use crate::model::HdrFrame;
 use crate::output::HdrHalf;
 use crate::qt_overlay::helper_program;
@@ -469,25 +469,37 @@ fn read_reply(stream: &mut UnixStream) -> Result<PinReply> {
 
 /// The HDR half of a capture as a pin travels: PQ-encoded words at the frame's
 /// own device size, the exact shape a ten-bit surface buffer takes, with the
-/// light a code of `1.0` stands for.  The white travels with the pixels because
-/// a PQ code alone does not say what light it means, and both the surface
-/// helper and the pin editor have to read it back.
+/// light a code of `1.0` stands for and the gamut the codes are written in.  The
+/// white travels with the pixels because a PQ code alone does not say what light
+/// it means, and both the surface helper and the pin editor have to read it
+/// back; the gamut travels with them for the same reason, because a PQ signal is
+/// relative to the primaries it is written against and a wide-gamut capture read
+/// as BT.2020 shifts every colour.
 pub(crate) struct PqPin {
     pub words: Vec<u32>,
     pub width: u32,
     pub height: u32,
     pub reference_nits: f32,
+    /// The primaries the codes are in: the output's own, which is also the
+    /// description the surface carries.  [`crate::model::hdr::Primaries::Bt2020`]
+    /// only when the output really was BT.2020.
+    pub primaries: crate::model::hdr::Primaries,
 }
 
 impl PqPin {
     /// The file body the surface helper reads: the magic, the size, the white,
-    /// and the words in little-endian order.
+    /// the gamut's six chromaticity coordinates as the protocol's millionth-unit
+    /// integers, and the words in little-endian order.
     fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(20 + self.words.len() * 4);
-        bytes.extend_from_slice(b"VSHTPQ01");
+        let mut bytes = Vec::with_capacity(44 + self.words.len() * 4);
+        bytes.extend_from_slice(b"VSHTPQ02");
         bytes.extend_from_slice(&self.width.to_le_bytes());
         bytes.extend_from_slice(&self.height.to_le_bytes());
         bytes.extend_from_slice(&self.reference_nits.to_le_bytes());
+        for (x, y) in self.primaries.chromaticities() {
+            bytes.extend_from_slice(&((x * 1_000_000.0).round() as i32).to_le_bytes());
+            bytes.extend_from_slice(&((y * 1_000_000.0).round() as i32).to_le_bytes());
+        }
         for word in &self.words {
             bytes.extend_from_slice(&word.to_le_bytes());
         }
@@ -724,7 +736,8 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
 }
 
 /// Decodes one pin HDR file back to linear light: the same header the surface
-/// helper reads, PQ over BT.2020, and the white the file names as its own.
+/// helper reads, PQ over the gamut the file names, and the white the file names
+/// as its own.
 fn decode_pq_half(path: &Path) -> Result<HdrHalf> {
     let image = crate::pin_hdr::read_pq_file(path)?;
     Ok(HdrHalf {
@@ -732,7 +745,10 @@ fn decode_pq_half(path: &Path) -> Result<HdrHalf> {
             &image.words,
             Size::new(image.width, image.height),
             Transfer::Pq,
-            Primaries::Bt2020,
+            // The gamut the codes were written against, not a fixed BT.2020: a
+            // pin taken from a P3-like output decodes to the light it holds
+            // only when it is read back in that output's own primaries.
+            image.primaries,
             // The words carry real alpha bits, the way a surface buffer does.
             true,
             image.reference_nits,
@@ -774,6 +790,7 @@ fn parse_json_rect(value: &serde_json::Value) -> Result<crate::geometry::Rect> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::hdr::Primaries;
 
     #[test]
     fn socket_path_names_the_uid_socket_and_honours_override() {
@@ -981,6 +998,7 @@ mod tests {
             width: 2,
             height: 1,
             reference_nits: crate::model::hdr::REFERENCE_WHITE_NITS,
+            primaries: Primaries::Bt2020,
         };
         let directory = tempfile::tempdir().unwrap();
         let path = write_private_file(directory.path(), "x.pq", &pin.encode()).unwrap();
@@ -990,6 +1008,7 @@ mod tests {
             image.reference_nits,
             crate::model::hdr::REFERENCE_WHITE_NITS
         );
+        assert_eq!(image.primaries, Primaries::Bt2020);
         assert_eq!(image.words, pin.words);
         // And the words decode back to the light they were encoded from: SDR
         // white stays white, and the bright pixel stays well above it.

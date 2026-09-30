@@ -141,7 +141,9 @@ pub enum Primaries {
     Bt2020,
     /// A gamut with no name here: the matrix from its linear RGB to BT.709
     /// linear, built from the chromaticities the compositor reported.
-    Custom { to_bt709: [[f32; 3]; 3] },
+    Custom {
+        to_bt709: [[f32; 3]; 3],
+    },
 }
 
 impl Primaries {
@@ -175,6 +177,29 @@ impl Primaries {
     /// can be blended into a frame of this gamut.
     pub fn from_bt709(&self) -> [[f32; 3]; 3] {
         invert3(self.to_bt709())
+    }
+
+    /// Linear RGB in this gamut to linear RGB in `target` — the matrix a frame
+    /// needs before its PQ codes may be written against a description that names
+    /// `target`.
+    ///
+    /// Identity when the two are the same gamut, which is the case a
+    /// colour-managed surface is always in: the frame travels in the output's own
+    /// primaries and the description names those same primaries.  Composing two
+    /// named matrices through BT.709 instead would leave off-diagonal terms of
+    /// ~1e-6 behind, and PQ's toe turns a linear 1e-6 into a code of a few, so a
+    /// black pixel would come back faintly lit.
+    pub fn into_gamut(&self, target: Primaries) -> [[f32; 3]; 3] {
+        if *self == target {
+            return IDENTITY;
+        }
+        match (*self, target) {
+            (Primaries::Bt709, Primaries::Bt2020) => BT709_TO_BT2020,
+            (Primaries::Bt2020, Primaries::Bt709) => BT2020_TO_BT709,
+            (Primaries::DisplayP3, Primaries::Bt2020) => DISPLAY_P3_TO_BT2020,
+            (Primaries::DisplayP3, Primaries::Bt709) => DISPLAY_P3_TO_BT709,
+            (from, to) => multiply3(to.to_bt709(), from.to_bt709()),
+        }
     }
 
     /// The CIE xy chromaticities of the three primaries, for a file that has to
@@ -503,16 +528,24 @@ fn rgb_to_xyz(primaries: [(f32, f32); 3], white: (f32, f32)) -> [[f32; 3]; 3] {
     let xyz = |(x, y): (f32, f32)| [x / y, 1.0, (1.0 - x - y) / y];
     let [r, g, b] = primaries.map(xyz);
     // Columns are the primaries at unit scale.
-    let matrix = [
-        [r[0], g[0], b[0]],
-        [r[1], g[1], b[1]],
-        [r[2], g[2], b[2]],
-    ];
+    let matrix = [[r[0], g[0], b[0]], [r[1], g[1], b[1]], [r[2], g[2], b[2]]];
     let scale = solve3(matrix, xyz(white));
     [
-        [matrix[0][0] * scale[0], matrix[0][1] * scale[1], matrix[0][2] * scale[2]],
-        [matrix[1][0] * scale[0], matrix[1][1] * scale[1], matrix[1][2] * scale[2]],
-        [matrix[2][0] * scale[0], matrix[2][1] * scale[1], matrix[2][2] * scale[2]],
+        [
+            matrix[0][0] * scale[0],
+            matrix[0][1] * scale[1],
+            matrix[0][2] * scale[2],
+        ],
+        [
+            matrix[1][0] * scale[0],
+            matrix[1][1] * scale[1],
+            matrix[1][2] * scale[2],
+        ],
+        [
+            matrix[2][0] * scale[0],
+            matrix[2][1] * scale[1],
+            matrix[2][2] * scale[2],
+        ],
     ]
 }
 
@@ -1040,6 +1073,21 @@ impl HdrFrame {
     /// ignores them either way, which is why the decode side takes `alpha
     /// false` here.
     pub fn to_rgb10_pq(&self, reference_nits: f32) -> Vec<u32> {
+        self.to_rgb10_pq_in(Primaries::Bt2020, reference_nits)
+    }
+
+    /// The same, but written in `target` rather than BT.2020.
+    ///
+    /// A colour-managed surface is described in the output's **own** space, and
+    /// the compositor hands a buffer through untouched only when what the
+    /// description says and what the pixels hold are the same thing.  A
+    /// description whose primaries are not BT.2020 — an EDID-only one, or a
+    /// display whose gamut is merely P3-like — therefore needs its codes written
+    /// in that gamut rather than converted into BT.2020: the PQ *signal* is
+    /// relative to the primaries the description names, so converting the numbers
+    /// while declaring the output's own coordinates shifts every colour.  That is
+    /// what [`HdrFrame::to_rgb10_pq`]'s fixed BT.2020 did to a P3-like output.
+    pub fn to_rgb10_pq_in(&self, target: Primaries, reference_nits: f32) -> Vec<u32> {
         let reference = if reference_nits.is_finite() && reference_nits > 0.0 {
             reference_nits
         } else {
@@ -1050,11 +1098,12 @@ impl HdrFrame {
                 .round()
                 .clamp(0.0, 1023.0) as u32
         };
+        let matrix = self.primaries.into_gamut(target);
         let mut words = vec![0u32; self.pixels.len()];
         map_rows(&mut words, self.size.width as usize, |offset, row| {
             for (index, destination) in row.iter_mut().enumerate() {
                 let pixel = self.pixels[offset + index];
-                let rgb = multiply(self.primaries.to_bt2020(), [pixel[0], pixel[1], pixel[2]]);
+                let rgb = multiply(matrix, [pixel[0], pixel[1], pixel[2]]);
                 *destination =
                     (3 << 30) | (code(rgb[0]) << 20) | (code(rgb[1]) << 10) | code(rgb[2]);
             }
@@ -1793,8 +1842,7 @@ mod tests {
         );
         // A gamut that is none of them keeps its own matrix instead of being
         // read as BT.709, which is what shifted a monitor's colours.
-        let custom =
-            Primaries::from_chromaticities((0.700, 0.300), (0.200, 0.750), (0.140, 0.050));
+        let custom = Primaries::from_chromaticities((0.700, 0.300), (0.200, 0.750), (0.140, 0.050));
         assert!(matches!(custom, Primaries::Custom { .. }));
         // It shares the D65 white point, so a neutral stays neutral through it.
         let neutral = multiply(custom.to_bt709(), [0.5, 0.5, 0.5]);
@@ -1815,7 +1863,11 @@ mod tests {
             Primaries::Bt2020,
         )
         .unwrap();
-        let pixel = frame.tone_map_to_srgb().unwrap().pixel(Point::new(0, 0)).unwrap();
+        let pixel = frame
+            .tone_map_to_srgb()
+            .unwrap()
+            .pixel(Point::new(0, 0))
+            .unwrap();
         // Green stays the largest and red stays zero, but blue is not clamped
         // away: the result is the same hue at lower chroma, not sRGB's green.
         assert!(pixel[2] > 0, "blue was clipped away: {pixel:?}");
@@ -2062,47 +2114,155 @@ mod tests {
     }
 
     #[test]
-    fn tone_mapping_is_anchored_to_sdr_white_whatever_else_is_in_the_frame() {
-        // A sample inside SDR white keeps the code its own light deserves — the
-        // frame's peak is not a white point — so the same content tone-maps to
-        // the same bytes whether or not something brighter shares the frame.
-        let alone = HdrFrame::new(
-            Size::new(2, 1),
-            vec![[0.5, 0.25, 0.1, 1.0], [0.5, 0.25, 0.1, 1.0]],
+    fn a_wide_gamut_frame_encodes_back_through_its_own_description() {
+        // A colour-managed surface is described in the output's own primaries,
+        // and the compositor hands its buffer through untouched only when the
+        // codes are written in those same primaries.  A P3-like output — this
+        // machine's DP-6 — is not BT.2020, so encoding its light into BT.2020
+        // while declaring the output's own coordinates shifts every colour:
+        // the surface then reads a saturated red as a different red.
+        let output = OutputColor {
+            transfer: Transfer::Pq,
+            primaries: Primaries::from_chromaticities(
+                (0.686523, 0.308594),
+                (0.223633, 0.689453),
+                (0.142578, 0.060547),
+            ),
+            reference_nits: 203.0,
+        };
+        assert!(matches!(output.primaries, Primaries::Custom { .. }));
+        let words = vec![
+            rgb10(1023, 0, 0),
+            rgb10(0, 1023, 0),
+            rgb10(0, 0, 1023),
+            rgb10(300, 500, 800),
+        ];
+        let frame = HdrFrame::from_rgb10(
+            &words,
+            Size::new(4, 1),
+            output.transfer,
+            output.primaries,
+            false,
+            output.reference_nits,
         )
         .unwrap();
-        let beside = HdrFrame::new(
-            Size::new(2, 1),
-            vec![[0.5, 0.25, 0.1, 1.0], [4.0, 2.0, 1.0, 1.0]],
+        // Written against its own description, the codes come back as the light
+        // that went in.
+        for (before, after) in words
+            .iter()
+            .zip(&frame.to_rgb10_pq_in(output.primaries, output.reference_nits))
+        {
+            for shift in [20, 10, 0] {
+                let was = ((before >> shift) & 0x3ff) as i64;
+                let now = ((after >> shift) & 0x3ff) as i64;
+                assert!(
+                    (was - now).abs() <= 2,
+                    "{before:08x} -> {after:08x} (field {shift})"
+                );
+            }
+        }
+        // Written into BT.2020 instead, the same light lands somewhere else
+        // entirely — this is the shift the surface used to be shown with.  The
+        // sample is a mid-tone: the fully saturated primaries above clip to the
+        // top code either way, so they cannot show the difference.
+        let mid = rgb10(300, 500, 800);
+        let mid_frame = HdrFrame::from_rgb10(
+            &[mid],
+            Size::new(1, 1),
+            output.transfer,
+            output.primaries,
+            false,
+            output.reference_nits,
         )
         .unwrap();
-        for channel in 0..3 {
-            assert_eq!(
-                alone
-                    .tone_map_to_srgb()
-                    .unwrap()
-                    .pixel(Point::new(0, 0))
-                    .unwrap()[channel],
-                beside
-                    .tone_map_to_srgb()
-                    .unwrap()
-                    .pixel(Point::new(0, 0))
-                    .unwrap()[channel],
-                "channel {channel} moved with the frame's peak"
+        let right = mid_frame.to_rgb10_pq_in(output.primaries, output.reference_nits)[0];
+        let wrong = mid_frame.to_rgb10_pq(output.reference_nits)[0];
+        for shift in [20, 10, 0] {
+            let right = ((right >> shift) & 0x3ff) as i64;
+            let wrong = ((wrong >> shift) & 0x3ff) as i64;
+            assert!(
+                (right - wrong).abs() > 8,
+                "field {shift}: {right} vs {wrong} — BT.2020 did not shift it"
             );
         }
-        // SDR white lands where the map puts it — a fixed level, not
-        // the last code, so that light above white has somewhere to go.
+    }
+
+    #[test]
+    fn the_same_gamut_converts_by_the_identity() {
+        // The case a colour-managed surface is always in: the frame travels in
+        // the output's primaries and the description names those same primaries.
+        // Composing two named matrices through BT.709 would leave off-diagonal
+        // terms of ~1e-6, and PQ's toe turns a linear 1e-6 into a code of a few,
+        // so a black pixel would come back faintly lit.
+        for gamut in [
+            Primaries::Bt709,
+            Primaries::DisplayP3,
+            Primaries::Bt2020,
+            Primaries::Custom {
+                to_bt709: [[1.4, -0.4, 0.0], [-0.07, 1.06, 0.01], [-0.02, -0.04, 1.05]],
+            },
+        ] {
+            assert_eq!(gamut.into_gamut(gamut), IDENTITY);
+        }
+        // A black frame stays black in every pair of gamuts.
+        let black = HdrFrame::in_primaries(
+            Size::new(1, 1),
+            vec![[0.0, 0.0, 0.0, 1.0]],
+            Primaries::DisplayP3,
+        )
+        .unwrap();
+        for target in [Primaries::Bt709, Primaries::Bt2020] {
+            assert_eq!(
+                black.to_rgb10_pq_in(target, 203.0),
+                vec![3 << 30],
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_sdr_frame_is_shown_exactly_and_an_hdr_one_makes_room_for_its_highlights() {
+        // The white point is the frame's, and that is the trade: a frame with
+        // nothing above white is an SDR image, so it is shown as it was — white
+        // on the last code — while a frame that does hold highlights moves white
+        // down to leave them somewhere to go.  Nothing else can be exact *and*
+        // keep a highlight apart in eight bits.
         let white = one_pixel([1.0, 1.0, 1.0, 1.0]);
         let white_code = white
             .tone_map_to_srgb()
             .unwrap()
             .pixel(Point::new(0, 0))
             .unwrap()[0];
+        assert_eq!(white_code, 255, "SDR white did not land on white");
+
+        // The same white in a frame that also holds an 8× highlight: it moves
+        // down to `SDR_WHITE_LEVEL`, and the highlight lands above it.
+        let beside = HdrFrame::new(
+            Size::new(2, 1),
+            vec![[1.0, 1.0, 1.0, 1.0], [8.0, 8.0, 8.0, 1.0]],
+        )
+        .unwrap();
+        let mapped = beside.tone_map_to_srgb().unwrap();
+        let white_code = mapped.pixel(Point::new(0, 0)).unwrap()[0];
+        let highlight = mapped.pixel(Point::new(1, 0)).unwrap()[0];
+        assert_eq!(white_code, 231, "white did not make room for the highlight");
         assert!(
-            (215..=245).contains(&white_code),
-            "white landed on {white_code}"
+            highlight > white_code,
+            "the highlight ({highlight}) did not land above white ({white_code})"
         );
+
+        // SDR light keeps its own shape in either frame: below white the map is
+        // one straight scale, so the ratios inside the SDR range are what they
+        // were.  Only the level they are scaled by differs.
+        assert_eq!(
+            one_pixel([0.5, 0.5, 0.5, 1.0])
+                .tone_map_to_srgb()
+                .unwrap()
+                .pixel(Point::new(0, 0))
+                .unwrap()[0],
+            to_u8(srgb_oetf(0.5))
+        );
+
         // And a value with no light of its own stays black.
         let black = one_pixel([0.0, 0.0, 0.0, 1.0]);
         assert_eq!(

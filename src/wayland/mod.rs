@@ -17,7 +17,7 @@ use wayland_client::protocol::{
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
 use wayland_protocols::wp::color_management::v1::client::{
     wp_color_management_output_v1, wp_color_management_surface_v1, wp_color_manager_v1,
-    wp_image_description_v1,
+    wp_image_description_info_v1, wp_image_description_v1,
 };
 use wayland_protocols::wp::cursor_shape::v1::client::{
     wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
@@ -52,6 +52,13 @@ pub struct WaylandSession {
     event_queue: EventQueue<WaylandState>,
     state: WaylandState,
 }
+
+/// One output that was given a colour description, as the HDR pin helper needs
+/// it: the gamut the output's own description names, and the light one unit of
+/// content stands for there.  A surface shows codes written in that gamut and
+/// against that white, so a pin from elsewhere — or a plain sRGB one — has to be
+/// written in both before it goes on.
+pub type PinOutputColor = (String, Option<Primaries>, Option<f32>);
 
 /// One output's HDR half, as a backdrop surface needs it: the frozen frame and
 /// the light level its `1.0` stands for — the output's own SDR white — which is
@@ -94,6 +101,37 @@ struct PendingColor {
     description: wp_image_description_v1::WpImageDescriptionV1,
 }
 
+/// What one image description's `wp_image_description_info_v1` has said so far.
+/// The events arrive one field at a time and end with `done`, so this is what
+/// they are collected into.
+#[derive(Debug, Default)]
+struct ColorInfo {
+    /// The gamut read from the description's chromaticity coordinates.
+    primaries: Option<Primaries>,
+    /// The light one unit of content stands for, from the description's
+    /// `luminances`.  This is the level an SDR picture drawn on this output has
+    /// to be encoded against: its `1.0` is the output's own SDR white, not
+    /// BT.2408's 203 cd/m², and a code written against the wrong one comes out
+    /// at the wrong light.
+    reference_nits: Option<f32>,
+}
+
+/// The gamut a description's chromaticities describe, in the millionth-unit
+/// integers the protocol carries them as.
+///
+/// The coordinates are taken as they are: a set this pipeline has a name for
+/// reads as that name, and any other gamut keeps the matrix its coordinates
+/// imply instead of being read as BT.709, which would shift every colour of a
+/// Display P3 or EDID-only output.
+fn primaries_of(r_x: i32, r_y: i32, g_x: i32, g_y: i32, b_x: i32, b_y: i32) -> Primaries {
+    const SCALE: f32 = 1_000_000.0;
+    Primaries::from_chromaticities(
+        (r_x as f32 / SCALE, r_y as f32 / SCALE),
+        (g_x as f32 / SCALE, g_y as f32 / SCALE),
+        (b_x as f32 / SCALE, b_y as f32 / SCALE),
+    )
+}
+
 #[derive(Debug, Default)]
 struct WaylandState {
     topology: TopologyState,
@@ -113,6 +151,20 @@ struct WaylandState {
     /// query failed, between `get_image_description` and the flood of events.
     cm_ready: HashSet<u32>,
     cm_failed: HashSet<u32>,
+    /// The gamut each output's own description names, as its
+    /// `wp_image_description_info_v1` reported it, keyed by output global id.
+    /// A pin's codes are written in the gamut of the output they were captured
+    /// on, so this is what says whether a pin dragged onto another screen has
+    /// to be re-encoded before it is uploaded.
+    cm_gamut: HashMap<u32, Primaries>,
+    /// The light one unit of content stands for on each output, from the same
+    /// description.  A picture that is *not* HDR is drawn on this output's
+    /// surface, so its codes have to be written against this level rather than
+    /// a fixed one.
+    cm_white: HashMap<u32, f32>,
+    /// The description being read, between `get_information` and its `done`,
+    /// keyed by the output the answer belongs to.
+    cm_info: HashMap<u32, ColorInfo>,
     /// Descriptions that came back ready and are waiting for
     /// [`WaylandSession::apply_surface_color`] to commit them.
     pending_color: HashMap<u32, PendingColor>,
@@ -210,6 +262,8 @@ impl WaylandState {
         self.ready_outputs.clear();
         self.cm_ready.clear();
         self.cm_failed.clear();
+        self.cm_gamut.clear();
+        self.cm_info.clear();
         self.pending_color.clear();
     }
 
@@ -591,11 +645,20 @@ impl WaylandSession {
         for info in &infos {
             if let Some(frame) = frames.iter().find(|frame| frame.name == info.name) {
                 // Encoded once: a backdrop never re-renders, and the surface's
-                // two buffers share the words.
+                // two buffers share the words.  The codes are written in the
+                // frame's **own** primaries, which are the output's — the very
+                // ones the description this surface carries names — so a
+                // wide-gamut output's picture is not silently re-read as
+                // BT.2020.  Encoding into BT.2020 while declaring an EDID-only
+                // description is what shifted every colour on a P3-like panel.
                 wanted.insert(
                     info.global_id,
                     HdrBackdrop {
-                        words: Arc::new(frame.frame.to_rgb10_pq(frame.reference_nits)),
+                        words: Arc::new(
+                            frame
+                                .frame
+                                .to_rgb10_pq_in(frame.frame.primaries(), frame.reference_nits),
+                        ),
                     },
                 );
             }
@@ -617,6 +680,7 @@ impl WaylandSession {
         self.state.ready_outputs.clear();
         self.state.cm_ready.clear();
         self.state.cm_failed.clear();
+        self.state.cm_gamut.clear();
         self.state.error = None;
         let qh = self.event_queue.handle();
         let compositor = self
@@ -775,6 +839,12 @@ impl WaylandSession {
             VshotError::OverlayTimeout,
             |state| state.cm_ready.len() + state.cm_failed.len() >= expected,
         )?;
+        // The gamut each description names, read from the description itself:
+        // an output's own description is exactly what a pin surface is given,
+        // and a pin's codes are written in the gamut of the output they came
+        // from, so this is what a pin dragged onto another screen has to be
+        // re-encoded into.
+        self.read_description_gamuts(&pending);
         let debug = std::env::var_os("VSHOT_HDR_DEBUG").is_some();
         for (global_id, color_output, description) in pending {
             if !self.state.cm_ready.contains(&global_id) {
@@ -796,6 +866,47 @@ impl WaylandSession {
             ready.insert(global_id);
         }
         Ok(ready)
+    }
+
+    /// Asks every ready description what gamut it names and keeps the answer.
+    ///
+    /// A description that never says is left out rather than guessed at: the
+    /// caller then has no destination gamut to convert into and leaves the
+    /// codes as they are, which is right whenever the two outputs agree — the
+    /// case every pin is in unless the user drags one between screens.
+    fn read_description_gamuts(
+        &mut self,
+        pending: &[(
+            u32,
+            wp_color_management_output_v1::WpColorManagementOutputV1,
+            wp_image_description_v1::WpImageDescriptionV1,
+        )],
+    ) {
+        let qh = self.event_queue.handle();
+        self.state.cm_info.clear();
+        let mut descriptions = Vec::new();
+        for (global_id, _, description) in pending {
+            if !self.state.cm_ready.contains(global_id) {
+                continue;
+            }
+            self.state.cm_info.insert(*global_id, ColorInfo::default());
+            // `global_id` is the info object's user data, which is how the
+            // events below find the output they belong to.
+            descriptions.push(description.get_information(&qh, *global_id));
+        }
+        if descriptions.is_empty() {
+            return;
+        }
+        let expected = descriptions.len();
+        let _ = self.dispatch_until(
+            Instant::now() + Duration::from_secs(2),
+            VshotError::OverlayTimeout,
+            |state| state.cm_info.len() < expected,
+        );
+        // The objects are inert once their `done` has arrived, so they are
+        // dropped here rather than kept alive for the life of the session.
+        drop(descriptions);
+        self.state.cm_info.clear();
     }
 
     /// Sets the descriptions [`WaylandSession::request_surface_color`] kept on
@@ -1073,15 +1184,26 @@ impl WaylandSession {
     }
 
     /// Gives the pin surfaces their output's own colour description, now that
-    /// they have buffers.  Answers the names that were given one.
-    pub fn apply_pin_color(&mut self) -> Result<Vec<String>> {
+    /// they have buffers.  Answers each output that was given one, with the
+    /// gamut its own description names and the light one unit of content stands
+    /// for there: the surface shows codes written in that gamut and against
+    /// that white, so a picture captured elsewhere has to be re-encoded into
+    /// both.
+    pub fn apply_pin_color(&mut self) -> Result<Vec<PinOutputColor>> {
         let colored = self.apply_surface_color()?;
         Ok(self
             .state
             .pin_surfaces
             .iter()
             .filter(|id| colored.contains(id))
-            .filter_map(|id| self.state.topology.outputs.get(id)?.name.clone())
+            .filter_map(|id| {
+                let name = self.state.topology.outputs.get(id)?.name.clone()?;
+                Some((
+                    name,
+                    self.state.cm_gamut.get(id).copied(),
+                    self.state.cm_white.get(id).copied(),
+                ))
+            })
             .collect())
     }
 
@@ -1595,6 +1717,55 @@ impl Dispatch<wp_image_description_v1::WpImageDescriptionV1, u32> for WaylandSta
             }
             wp_image_description_v1::Event::Failed { .. } => {
                 state.cm_failed.insert(*data);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wp_image_description_info_v1::WpImageDescriptionInfoV1, u32> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _: &wp_image_description_info_v1::WpImageDescriptionInfoV1,
+        event: wp_image_description_info_v1::Event,
+        data: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(info) = state.cm_info.get_mut(data) else {
+            return;
+        };
+        match event {
+            wp_image_description_info_v1::Event::Primaries {
+                r_x,
+                r_y,
+                g_x,
+                g_y,
+                b_x,
+                b_y,
+                ..
+            } => info.primaries = Some(primaries_of(r_x, r_y, g_x, g_y, b_x, b_y)),
+            // The reference white is what a *non-HDR* picture on this output has
+            // to be encoded against, and the default BT.2408 suggests (203) is
+            // not what an output says about itself.  A level of zero is the
+            // protocol's way of saying it is unknown, and is left out rather
+            // than carried as a white of no light.
+            wp_image_description_info_v1::Event::Luminances { reference_lum, .. }
+                if reference_lum > 0 =>
+            {
+                info.reference_nits = Some(reference_lum as f32);
+            }
+            wp_image_description_info_v1::Event::Done => {
+                // Taking the entry out is what tells the wait above this
+                // output has answered.
+                if let Some(info) = state.cm_info.remove(data) {
+                    if let Some(primaries) = info.primaries {
+                        state.cm_gamut.insert(*data, primaries);
+                    }
+                    if let Some(white) = info.reference_nits {
+                        state.cm_white.insert(*data, white);
+                    }
+                }
             }
             _ => {}
         }
