@@ -179,7 +179,18 @@ public:
     {
         closeRequested_ = std::move(callback);
     }
-    // Invoked when the user presses Space while this surface has keyboard focus.
+    // Invoked when the user picks `Reset zoom` out of a pin's right-click menu:
+    // the pin goes back to the size it arrived at, one image pixel per logical
+    // pixel of its own density. The daemon owns the scale, so it is the one
+    // that has to be told.
+    void setResetZoomCallback(std::function<void(quint64)> callback)
+    {
+        resetZoomRequested_ = std::move(callback);
+    }
+    // Invoked when the user picks `Edit` or `Recognize text…` out of a pin's
+    // right-click menu, and when the user presses Space while this surface has
+    // keyboard focus. The editor runs in a helper process the daemon spawns, so
+    // nothing about its outcome comes back through this surface.
     void setEditCallback(std::function<void(quint64)> callback)
     {
         editRequested_ = std::move(callback);
@@ -191,6 +202,15 @@ public:
     void setCopyCallback(std::function<bool(quint64, const QString &)> callback)
     {
         copyRequested_ = std::move(callback);
+    }
+    // Invoked when the user picks `Copy image` out of a pin's right-click menu.
+    // The pixels belong to the daemon, so it is the one that encodes them and
+    // hands them to `wl-copy`; `false` means the copy did not reach the
+    // clipboard, which the surface reports in the badge instead of claiming
+    // success.
+    void setCopyImageCallback(std::function<bool(quint64)> callback)
+    {
+        copyImageRequested_ = std::move(callback);
     }
     // Invoked when the user picks `Save as…` out of a pin's right-click menu.
     // The write itself belongs to the daemon: it owns the image, and the file

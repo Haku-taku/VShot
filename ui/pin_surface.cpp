@@ -69,23 +69,37 @@ constexpr int kMenuHeadingPaddingY = 4;
 constexpr int kMenuCursorGap = 4;  // menu offset from the pointer
 
 // The action rows every pin's menu ends with, in paint order, after the
-// color-card rows: `Save as…` first, `Recognize text…` second. Naming the count
-// lets the layout, the painting and the hit-testing agree while a row is added
-// instead of each hard-coding "exactly one action row".
+// color-card rows: `Copy image` first and `Close` last, with the row that
+// throws the pin away at the bottom of a list where every other row is
+// reversible. Naming the count lets the layout, the painting and the
+// hit-testing agree while a row is added instead of each hard-coding "exactly
+// one action row".
 enum ActionRow {
-    kSaveAction = 0,
-    kRecognizeAction = 1,
-    kActionRowCount = 2,
+    kCopyImageAction = 0,
+    kSaveAction = 1,
+    kEditAction = 2,
+    kResetZoomAction = 3,
+    kRecognizeAction = 4,
+    kCloseAction = 5,
+    kActionRowCount = 6,
 };
 
 // The label of action row `index`, in the order the rows are painted.
 QString actionRowLabel(int index)
 {
     switch (index) {
+    case kCopyImageAction:
+        return uiTr("Copy image");
     case kSaveAction:
         return uiTr("Save as…");
+    case kEditAction:
+        return uiTr("Edit");
+    case kResetZoomAction:
+        return uiTr("Reset zoom");
     case kRecognizeAction:
         return uiTr("Recognize text…");
+    case kCloseAction:
+        return uiTr("Close");
     default:
         return QString();
     }
@@ -1190,7 +1204,12 @@ void PinSurface::paintMenu(QPainter &painter)
         const QRect action(menuRect_.left(),
                            menuRect_.top() + layout.actionTop + index * layout.rowHeight,
                            menuRect_.width(), layout.rowHeight);
-        if (index == kSaveAction && layout.copyRows > 0) {
+        // A separator above the first of the action rows, so they do not read
+        // as formats to copy, and a second above `Close`: the one row that
+        // throws the pin away sits apart from the rows that only do something
+        // to it. The first is drawn only when there are copy rows above it --
+        // at the very top of the box it would be a stray line.
+        if ((index == 0 && layout.copyRows > 0) || index == kCloseAction) {
             painter.setPen(QPen(QColor(0, 0, 0, 40), 1.0));
             painter.drawLine(menuRect_.left() + 1, action.top(), menuRect_.right() - 1,
                              action.top());
@@ -1241,16 +1260,38 @@ void PinSurface::activateRow(int row)
     }
     const int action = row - copyRows;
     const quint64 id = menuId_;
-    if (action == kSaveAction && saveRequested_) {
+    if (action == kCopyImageAction && copyImageRequested_) {
+        const std::function<bool(quint64)> copyImage = copyImageRequested_;
+        // The daemon owns the pixels and the clipboard; its answer decides
+        // whether the badge says the copy landed, exactly as a color row's
+        // does.
+        const bool copied = copyImage(id);
+        showBadge(id, copied ? uiTr("Copied image") : uiTr("Copy failed"));
+    } else if (action == kSaveAction && saveRequested_) {
         const std::function<void(quint64)> save = saveRequested_;
         // The daemon runs the dialog and writes the file; the badge that says
         // how it went arrives over showMessage() once that is known.
         save(id);
+    } else if (action == kEditAction && editRequested_) {
+        const std::function<void(quint64)> edit = editRequested_;
+        // The daemon spawns the editor, which opens on the pin's own marks.
+        edit(id);
+    } else if (action == kResetZoomAction && resetZoomRequested_) {
+        const std::function<void(quint64)> resetZoom = resetZoomRequested_;
+        // The daemon rescales the pin; the badge it shows is the zoom one, so
+        // the new factor is reported the way the wheel reports its own.
+        resetZoom(id);
+        showZoomBadge(id);
     } else if (action == kRecognizeAction && recognizeRequested_) {
         const std::function<void(quint64)> recognize = recognizeRequested_;
         // The daemon spawns the editor, which opens on the pin's text; unlike a
         // save, nothing about it comes back through this surface.
         recognize(id);
+    } else if (action == kCloseAction && closeRequested_) {
+        const std::function<void(quint64)> close = closeRequested_;
+        // Closing takes the pin out of this surface's stack, which clears the
+        // callback while it runs; invoke a copy.
+        close(id);
     }
 }
 

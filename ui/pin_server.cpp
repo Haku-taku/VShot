@@ -22,6 +22,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
+#include <QBuffer>
+#include <QIODevice>
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QMimeData>
@@ -103,6 +105,43 @@ bool runWlCopy(const QString &text)
         return false;
     }
     process.write(text.toUtf8());
+    process.closeWriteChannel();
+    const bool finished = process.waitForFinished(kClipboardTimeoutMs);
+    if (!finished) {
+        process.kill();
+        process.waitForFinished(kClipboardTimeoutMs);
+        return false;
+    }
+    return process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
+}
+
+// The same, for pixels: `wl-copy --type image/png` reads the encoding from the
+// bytes themselves, so nothing has to be declared beyond the type and the
+// result is an image a paste target can take.  The overlay has its own copy of
+// this; the two processes share no code.
+//
+// A pinned image is a few megabytes, and `wl-copy` reads it from the pipe while
+// it is being written, so the write has to happen with an event loop running --
+// which this process has, but a nested one inside a synchronous wait would
+// re-enter the pin stack's own handlers.  The bytes are small enough for a
+// single write on any image a pin can hold, and `wl-copy` keeps reading until
+// the channel closes, so closing it right after is what ends the transfer.
+bool runWlCopyImage(const QImage &image)
+{
+    QByteArray bytes;
+    QBuffer buffer(&bytes);
+    if (!buffer.open(QIODevice::WriteOnly) || !image.save(&buffer, "PNG")) {
+        return false;
+    }
+    buffer.close();
+    QProcess process;
+    process.setProgram(QStringLiteral("wl-copy"));
+    process.setArguments({QStringLiteral("--type"), QStringLiteral("image/png")});
+    process.start();
+    if (!process.waitForStarted(kClipboardTimeoutMs)) {
+        return false;
+    }
+    process.write(bytes);
     process.closeWriteChannel();
     const bool finished = process.waitForFinished(kClipboardTimeoutMs);
     if (!finished) {
@@ -2641,6 +2680,24 @@ wl-clipboard package"));
             }
             return copied;
         });
+        // `Copy image` puts the pin's own pixels on the clipboard -- the
+        // flattened result, marks and all, which is what the screen shows and
+        // what a save writes.  The surface holds a copy of those pixels for
+        // painting, but the pin is the only place the daemon's own is kept, so
+        // the encode happens here.
+        surface->setCopyImageCallback([this](quint64 id) {
+            const Pin *pin = byId_.value(id, nullptr);
+            if (pin == nullptr || pin->image.isNull()) {
+                return false;
+            }
+            const bool copied = runWlCopyImage(pin->image);
+            if (debug_ || !copied) {
+                qWarning("pin %llu: %s its image (%dx%d)", static_cast<unsigned long long>(id),
+                         copied ? "copied" : "could not copy", pin->image.width(),
+                         pin->image.height());
+            }
+            return copied;
+        });
         // `Save as…` runs the dialog and writes the file; the surface only
         // reports the outcome, through the same badge a copy uses.
         surface->setSaveCallback([this](quint64 id) {
@@ -2657,6 +2714,12 @@ wl-clipboard package"));
             if (Pin *pin = byId_.value(id, nullptr)) {
                 startEdit(pin, true);
             }
+        });
+        // `Reset zoom` puts a pin back at the size it arrived at, whatever the
+        // wheel has done to it since; the surface reports the new factor
+        // through the same badge the wheel uses.
+        surface->setResetZoomCallback([this](quint64 id) {
+            resetZoomPin(byId_.value(id, nullptr));
         });
         if (!surface->showLayerSurface()) {
             delete surface;
@@ -2721,8 +2784,10 @@ wl-clipboard package"));
         surface->setDragCallback({});
         surface->setZoomCallback({});
         surface->setCopyCallback({});
+        surface->setCopyImageCallback({});
         surface->setSaveCallback({});
         surface->setRecognizeCallback({});
+        surface->setResetZoomCallback({});
         QObject::disconnect(surface, nullptr, this, nullptr);
         surface->setPinnedVisible(false);
         surface->hide();
@@ -2981,6 +3046,28 @@ wl-clipboard package"));
             return;
         }
         const double next = std::clamp(pin->scale * factor, kMinScale, kMaxScale);
+        if (next == pin->scale) {
+            return;
+        }
+        const QRect previous(pin->origin, pin->displaySize());
+        const QPoint center = previous.center();
+        pin->scale = next;
+        const QSize resized = pin->displaySize();
+        pin->origin = clampOrigin(
+            *pin, center - QPoint(resized.width() / 2, resized.height() / 2));
+        syncAll();
+    }
+
+    // Back to the size the pin arrived at: one image pixel per logical pixel of
+    // an output with the pin's own density, which is what `addImage` set and
+    // what every wheel step since has multiplied.  Same center-keeping as a
+    // wheel step, so a pin that has been zoomed stays where the user put it.
+    void resetZoomPin(Pin *pin)
+    {
+        if (pin == nullptr) {
+            return;
+        }
+        const double next = 1.0 / std::max(1, pin->density);
         if (next == pin->scale) {
             return;
         }
