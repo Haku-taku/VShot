@@ -1280,33 +1280,17 @@ QPen penForAnnotation(const Annotation &annotation)
     return pen;
 }
 
-// The pen a wave is drawn with: always solid, whatever the style says.  The
-// Rust renderer's wave operation carries no dash -- it samples a solid sine --
-// so a dashed wave here would preview one thing and bake another.
+// The pen a wave is drawn with: always solid, whatever the style says.  A wave
+// is a sampled sine and has no dash to carry, so offering one would put a
+// control on the toolbar that changes nothing.
 QPen wavePen(const Annotation &annotation)
 {
     return QPen(annotation.color, static_cast<double>(annotation.width), Qt::SolidLine,
                 Qt::RoundCap, Qt::RoundJoin);
 }
 
-// Dashed rectangles are drawn along the stroke band centerline in the final
-// renderer, so the preview walks the same inset path instead of drawRect.
-QPolygonF insetRectPolygon(const QRectF &rect, double width)
-{
-    const double inset = std::max(0.0, (width - 1.0) / 2.0);
-    const double outer = std::max(0.0, width / 2.0);
-    const double left = rect.left() + inset;
-    const double top = rect.top() + inset;
-    const double right = std::max(left + 0.5, rect.right() - outer);
-    const double bottom = std::max(top + 0.5, rect.bottom() - outer);
-    QPolygonF polygon;
-    polygon << QPointF(left, top) << QPointF(right, top) << QPointF(right, bottom)
-            << QPointF(left, bottom) << QPointF(left, top);
-    return polygon;
-}
-
-// Computes the average color of one device-pixel block, mirroring the Rust
-// block averaging (4x4 subsampling, round-half-up per channel).
+// Computes the average color of one device-pixel block: a 4x4 subsample of the
+// block, rounded half up per channel.
 QColor averageBlockColor(const uchar *bits, qsizetype bytesPerLine,
                          int x, int y, int width, int height)
 {
@@ -10434,11 +10418,11 @@ protected:
         const QRectF rect = localRect(output, annotation.rect, size);
         if (annotation.tool == QStringLiteral("ellipse")) {
             painter->drawEllipse(rect);
-        } else if (annotation.dash != QStringLiteral("solid")) {
-            // Match the final renderer's band-centerline dash walk.
-            painter->drawPolyline(
-                insetRectPolygon(rect, static_cast<double>(annotation.width)));
         } else {
+            // Qt is the only renderer, so the dashed rectangle is the same
+            // `drawRect` as the solid one with a dashed pen: the two cannot
+            // disagree about where the band sits, because there is only one
+            // place it is decided.
             painter->drawRect(rect);
         }
     }
@@ -11063,9 +11047,6 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
             const QRectF rect = localRect(output, annotation.rect, overlay->size());
             if (annotation.tool == QStringLiteral("ellipse")) {
                 painter->drawEllipse(rect);
-            } else if (annotation.dash != QStringLiteral("solid")) {
-                // Match the final renderer's band-centerline dash walk.
-                painter->drawPolyline(insetRectPolygon(rect, annotation.width));
             } else {
                 painter->drawRect(rect);
             }
