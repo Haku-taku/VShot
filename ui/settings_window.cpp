@@ -38,16 +38,21 @@
 #include <QColorDialog>
 #include <QComboBox>
 #include <QDialog>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QFileInfo>
 #include <QFontDatabase>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QIcon>
+#include <QKeyEvent>
+#include <QKeySequence>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QMessageBox>
 #include <QMouseEvent>
+#include <QDoubleSpinBox>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPalette>
@@ -672,6 +677,344 @@ private:
     QColor color_{255, 64, 64, 255};
 };
 
+/// The button that captures a key: it shows the binding an action has, and
+/// while it is armed it takes the next key press as the new one.
+///
+/// A line edit cannot do this. Typing "Ctrl+K" into one is a spelling the user
+/// has to guess, and a wrong guess is silently stored as a binding that matches
+/// nothing -- which reads as "this action has no key" rather than as a mistake.
+/// Capturing the real key is both quicker and the only way the spelling is
+/// guaranteed to be one `QKeySequence` understands.
+///
+/// Escape while armed puts the binding back to what it was, and Backspace or
+/// Delete clears it, which is the one thing a capture widget has to offer that
+/// a key press cannot express.
+///
+/// The button shows what the *action* answers to -- several keys joined by
+/// commas -- but records one combination at a time: what it hands to
+/// `onKeysChanged` is the single key the user pressed, and the binding it is
+/// showing is the list the dialog around it keeps.
+class KeyCaptureButton final : public QPushButton {
+public:
+    explicit KeyCaptureButton(QWidget *parent = nullptr)
+        : QPushButton(parent)
+    {
+        setCursor(Qt::PointingHandCursor);
+        setMinimumWidth(150);
+        setFocusPolicy(Qt::StrongFocus);
+        connect(this, &QPushButton::clicked, this, [this] {
+            if (onActivated) {
+                onActivated();
+                return;
+            }
+            setArmed(true);
+        });
+    }
+
+    /// When set, a click calls this instead of arming the button.  The row on
+    /// the settings page opens the editor with it -- the action's keys are a
+    /// list there, and a list is not something a button can capture in place --
+    /// while the editor's own record button leaves it unset and arms.
+    std::function<void()> onActivated;
+
+    /// The key the user just recorded, or an empty sequence when they cleared
+    /// the binding.  Not a list: one press is one combination.
+    QKeySequence keys() const { return keys_; }
+    void setKeys(const QKeySequence &keys)
+    {
+        keys_ = keys;
+        updateText();
+    }
+
+    /// Fires with the binding the user pressed, or an empty sequence when they
+    /// cleared one.  Not fired by `setKeys`.
+    std::function<void(const QKeySequence &)> onKeysChanged;
+
+protected:
+    void keyPressEvent(QKeyEvent *event) override
+    {
+        if (!armed_) {
+            QPushButton::keyPressEvent(event);
+            return;
+        }
+        event->accept();
+        const int key = event->key();
+        // The two keys a capture has to answer that are not keys to bind:
+        // Escape means "never mind", and the delete keys mean "no key at all".
+        // Neither can be bound from here either, which is the price of that --
+        // both are still reachable by hand-editing the file.
+        if (key == Qt::Key_Escape) {
+            setArmed(false);
+            return;
+        }
+        if (key == Qt::Key_Backspace || key == Qt::Key_Delete) {
+            setArmed(false);
+            take(QKeySequence());
+            return;
+        }
+        // A modifier on its own is not a key press: the binding has to wait for
+        // the key it belongs to, or holding Ctrl would immediately bind "Ctrl".
+        // Tab is let through to the base class so the focus can still be moved
+        // with the keyboard while a button is armed.
+        if (key == Qt::Key_Tab || isModifier(key)) {
+            QPushButton::keyPressEvent(event);
+            return;
+        }
+        setArmed(false);
+        // The modifiers the event carries, minus the ones that are part of the
+        // key itself: `QKeySequence` wants them in its own bits, and an event
+        // for Shift+Backtab already has Shift in its modifiers.
+        take(QKeySequence(static_cast<int>(static_cast<int>(event->modifiers()) | key)));
+    }
+
+    void focusOutEvent(QFocusEvent *event) override
+    {
+        // Losing the focus while armed is the same as pressing Escape: a button
+        // left armed would swallow the next key wherever it landed, which is
+        // not a thing a user can be expected to notice has happened.
+        if (armed_) {
+            setArmed(false);
+        }
+        QPushButton::focusOutEvent(event);
+    }
+
+private:
+    static bool isModifier(int key)
+    {
+        switch (key) {
+        case Qt::Key_Shift:
+        case Qt::Key_Control:
+        case Qt::Key_Alt:
+        case Qt::Key_Meta:
+        case Qt::Key_AltGr:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    void setArmed(bool armed)
+    {
+        armed_ = armed;
+        updateText();
+        if (armed) {
+            setFocus(Qt::MouseFocusReason);
+        }
+    }
+
+    void take(const QKeySequence &keys)
+    {
+        keys_ = keys;
+        updateText();
+        if (onKeysChanged) {
+            onKeysChanged(keys);
+        }
+    }
+
+    void updateText()
+    {
+        if (armed_) {
+            setText(uiTr("Press the keys for this action"));
+            return;
+        }
+        setText(keys_.isEmpty() ? uiTr("None")
+                                : keys_.toString(QKeySequence::PortableText));
+    }
+
+    QKeySequence keys_;
+    bool armed_ = false;
+};
+
+/// The dialog one key-binding row opens: record a key at the top, one row per
+/// key the action already answers to below, each with the button that removes
+/// it.
+///
+/// The row on the page can only ever show *that* an action has several keys;
+/// this is where one of them can be taken away again, and where a new one can
+/// be added without throwing away the ones already there.  It edits a copy and
+/// hands the whole list back, so a dialog the user cancels leaves the action
+/// exactly as it was.
+///
+/// The conflict rule is the reason this is a dialog rather than a row of
+/// widgets: recording a key another action already owns has to *ask*, and the
+/// answer decides whether the other action loses the key.  A key the action
+/// being edited already owns is not a conflict -- it is the user pressing the
+/// same key twice -- so it is taken as the duplicate it is and nothing is
+/// added.
+class ShortcutEditorDialog final : public QDialog {
+public:
+    /// `action` is the one being edited, `preferences` the state to edit.  The
+    /// dialog reads and writes the preferences it is handed, so the page sees
+    /// every change the moment it is made and a Cancel only has to put back the
+    /// copy it took.  `ask` puts a conflict to the user and answers whether the
+    /// combination moves; empty means the ordinary message box.
+    ShortcutEditorDialog(ShortcutAction action, ShortcutPreferences *preferences,
+                         QWidget *parent, std::function<bool(const QString &)> ask)
+        : QDialog(parent)
+        , action_(action)
+        , preferences_(preferences)
+        , saved_(*preferences)
+        , ask_(std::move(ask))
+    {
+        setObjectName(QStringLiteral("shortcutEditor"));
+        setWindowTitle(shortcutBinding(action).label);
+        setModal(true);
+        setMinimumWidth(380);
+        // Its own copy of the sheet rather than the settings window's.  A
+        // child would inherit that one anyway, but the conflict prompt this
+        // dialog puts up is a `QMessageBox` -- and a box is only styled by
+        // rules the sheet it inherits actually carries.  Carrying the sheet
+        // here means the prompt is styled the same whether the editor was
+        // opened from the window or built on its own.
+        setStyleSheet(dialogStyleSheet());
+
+        auto *layout = new QVBoxLayout(this);
+        layout->setContentsMargins(16, 16, 16, 16);
+        layout->setSpacing(10);
+
+        auto *heading = new QLabel(shortcutBinding(action).label, this);
+        heading->setObjectName(QStringLiteral("rowLabel"));
+        layout->addWidget(heading);
+        auto *hint = new QLabel(shortcutBinding(action).hint, this);
+        hint->setObjectName(QStringLiteral("rowHint"));
+        hint->setWordWrap(true);
+        layout->addWidget(hint);
+
+        record_ = new KeyCaptureButton(this);
+        record_->setObjectName(QStringLiteral("shortcutRecord"));
+        record_->setToolTip(uiTr("Click, then press the key"));
+        record_->onKeysChanged = [this](const QKeySequence &keys) { record(keys); };
+        layout->addWidget(record_);
+
+        list_ = new QWidget(this);
+        list_->setObjectName(QStringLiteral("shortcutList"));
+        listLayout_ = new QVBoxLayout(list_);
+        listLayout_->setContentsMargins(0, 0, 0, 0);
+        listLayout_->setSpacing(6);
+        layout->addWidget(list_);
+
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, this);
+        auto *close = buttons->addButton(uiTr("Done"), QDialogButtonBox::AcceptRole);
+        close->setObjectName(QStringLiteral("shortcutDone"));
+        // Cancel is the one that undoes: everything recorded so far is dropped
+        // and the action goes back to the keys it opened with.
+        connect(buttons, &QDialogButtonBox::rejected, this, [this] {
+            *preferences_ = saved_;
+            reject();
+        });
+        connect(close, &QPushButton::clicked, this, &QDialog::accept);
+        layout->addWidget(buttons);
+
+        refresh();
+    }
+
+    /// The dialog's own copy of the bindings, so a check can read back what a
+    /// click left behind without a config file in the way.
+    const ShortcutPreferences &preferences() const { return *preferences_; }
+
+private:
+    /// The ordinary conflict prompt: a modal message box whose default is No,
+    /// so a stray Enter does not take a key off another action.
+    bool askMove(const QString &question)
+    {
+        return QMessageBox::question(this, uiTr("Key already in use"), question,
+                                     QMessageBox::Yes | QMessageBox::No,
+                                     QMessageBox::No) == QMessageBox::Yes;
+    }
+
+    /// Takes one recorded key: dedupes it, asks about a conflict, and puts it
+    /// on the list.
+    void record(const QKeySequence &keys)
+    {
+        if (keys.isEmpty()) {
+            // Backspace or Delete while armed: the whole binding goes, which is
+            // the same answer the row on the page has always given.
+            preferences_->setKeys(action_, QVector<QKeySequence>());
+            refresh();
+            return;
+        }
+        // Already this action's: the user pressed a key it already answers to.
+        // Adding it again would leave two rows for one combination, each with
+        // its own remove button, so it is taken as the no-op it is.
+        if (preferences_->keysFor(action_).contains(keys)) {
+            refresh();
+            return;
+        }
+        const ShortcutAction owner = preferences_->ownerOtherThan(action_, keys);
+        if (owner != ShortcutAction::kActionCount) {
+            const QString question = uiTr("%1 is already bound to \"%2\". "
+                                          "Move it to \"%3\"?")
+                                         .arg(keys.toString(QKeySequence::PortableText),
+                                              shortcutBinding(owner).label,
+                                              shortcutBinding(action_).label);
+            const bool move = ask_ ? ask_(question) : askMove(question);
+            if (!move) {
+                // Declined: nothing moves, and the key stays where it was.  The
+                // button still has to stop showing it as the action's own.
+                refresh();
+                return;
+            }
+            preferences_->removeKey(owner, keys);
+        }
+        preferences_->addKey(action_, keys);
+        refresh();
+    }
+
+    /// Rebuilds the list of keys and the record button from the preferences.
+    void refresh()
+    {
+        while (QLayoutItem *item = listLayout_->takeAt(0)) {
+            if (QWidget *widget = item->widget()) {
+                // Reparented before it is dropped: `deleteLater` leaves the row
+                // alive until the event loop comes back round, and a row that
+                // is still a child of the list is a row `findChild` still hands
+                // out -- which is a remove button that answers a click after
+                // the key it belonged to is gone.
+                widget->setParent(nullptr);
+                widget->deleteLater();
+            }
+            delete item;
+        }
+        const QVector<QKeySequence> keys = preferences_->keysFor(action_);
+        for (const QKeySequence &key : keys) {
+            auto *row = new QWidget(list_);
+            auto *rowLayout = new QHBoxLayout(row);
+            rowLayout->setContentsMargins(0, 0, 0, 0);
+            rowLayout->setSpacing(8);
+            auto *label = new QLabel(key.toString(QKeySequence::PortableText), row);
+            label->setObjectName(QStringLiteral("rowValue"));
+            rowLayout->addWidget(label, 1);
+            auto *remove = new QPushButton(uiTr("Remove"), row);
+            remove->setObjectName(QStringLiteral("shortcutRemove"));
+            remove->setCursor(Qt::PointingHandCursor);
+            connect(remove, &QPushButton::clicked, this, [this, key] {
+                preferences_->removeKey(action_, key);
+                refresh();
+            });
+            rowLayout->addWidget(remove);
+            listLayout_->addWidget(row);
+        }
+        if (keys.isEmpty()) {
+            auto *empty = new QLabel(uiTr("None"), list_);
+            empty->setObjectName(QStringLiteral("rowHint"));
+            listLayout_->addWidget(empty);
+        }
+        // The record button keeps the *first* key as its own text: it is the
+        // button the page's row shows, and a button that printed the whole list
+        // would be wider than the row it sits in.
+        record_->setKeys(keys.isEmpty() ? QKeySequence() : keys.constFirst());
+    }
+
+    ShortcutAction action_;
+    ShortcutPreferences *preferences_;
+    ShortcutPreferences saved_;
+    std::function<bool(const QString &)> ask_;
+    KeyCaptureButton *record_ = nullptr;
+    QWidget *list_ = nullptr;
+    QVBoxLayout *listLayout_ = nullptr;
+};
+
+
 /// One page of settings: a heading, a one-line explanation, and a stack of
 /// cards.  Cards are added through [`addCard`], rows through [`addRow`].
 ///
@@ -955,13 +1298,24 @@ QIcon sectionIcon(int index, const QColor &color)
         frame.closeSubpath();
         painter.drawPath(frame);
         painter.drawLine(QPointF(3.0, 7.0), QPointF(15.0, 7.0));
-    } else {
+    } else if (index == 6) {
         // A pushpin: the pin overlay, which is what this section configures.
         painter.drawLine(QPointF(9.0, 3.0), QPointF(15.0, 3.0));
         painter.drawLine(QPointF(12.0, 3.0), QPointF(12.0, 8.5));
         painter.drawLine(QPointF(12.0, 8.5), QPointF(15.0, 11.0));
         painter.drawLine(QPointF(15.0, 11.0), QPointF(9.0, 11.0));
         painter.drawLine(QPointF(9.0, 11.0), QPointF(9.0, 16.0));
+    } else {
+        // Three keys with a fourth pressed: the keyboard bindings.
+        painter.drawLine(QPointF(3.0, 3.5), QPointF(15.0, 3.5));
+        painter.drawLine(QPointF(3.0, 14.5), QPointF(15.0, 14.5));
+        painter.drawLine(QPointF(3.0, 3.5), QPointF(3.0, 14.5));
+        painter.drawLine(QPointF(15.0, 3.5), QPointF(15.0, 14.5));
+        painter.drawLine(QPointF(6.5, 3.5), QPointF(6.5, 14.5));
+        painter.drawLine(QPointF(11.5, 3.5), QPointF(11.5, 14.5));
+        painter.setBrush(color);
+        painter.drawRect(QRectF(4.0, 6.0, 2.0, 6.0));
+        painter.setBrush(Qt::NoBrush);
     }
     return QIcon(pixmap);
 }
@@ -971,8 +1325,14 @@ QIcon sectionIcon(int index, const QColor &color)
 /// hand in the file while it is open is not silently reverted by a Cancel.
 class SettingsDialog final : public QDialog {
 public:
-    SettingsDialog()
+    /// `ownedShortcuts` is null for the ordinary window, which reads and writes
+    /// the file; a caller that passes one gets the same pages over bindings of
+    /// its own, which is what lets the offline check read the multi-key editor
+    /// back without a config file standing in for it.
+    explicit SettingsDialog(ShortcutPreferences *ownedShortcuts = nullptr)
         : config_(loadConfig())
+        , shortcuts_(ownedShortcuts != nullptr ? *ownedShortcuts : loadShortcutPreferences())
+        , shortcutsOwner_(ownedShortcuts)
     {
         setWindowTitle(uiTr("vshot settings"));
         setStyleSheet(dialogStyleSheet());
@@ -1016,6 +1376,7 @@ public:
             uiTr("Recording"),
             uiTr("File dialogs"),
             uiTr("Pin appearance"),
+            uiTr("Keyboard"),
         };
         for (int row = 0; row < sections.size(); ++row) {
             sidebar_->addItem(new QListWidgetItem(sectionIcon(row, QColor(kInkDim)),
@@ -1037,6 +1398,7 @@ public:
         pages_->addWidget(buildRecordingPage());
         pages_->addWidget(buildDialogPage());
         pages_->addWidget(buildPinPage());
+        pages_->addWidget(buildKeyboardPage());
         bodyLayout->addWidget(pages_, 1);
 
         connect(sidebar_, &QListWidget::currentRowChanged, this, [this](int row) {
@@ -1792,6 +2154,118 @@ private:
         return scroll;
     }
 
+    /// What a row's button shows for `action`: every key it answers to, joined
+    /// by commas, or the word for "none".  A row that printed only the first
+    /// key would hide the rest of them behind a dialog the user has no reason
+    /// to open.
+    QString shortcutKeysText(ShortcutAction action) const
+    {
+        const QVector<QKeySequence> keys = shortcuts_.keysFor(action);
+        if (keys.isEmpty()) {
+            return uiTr("None");
+        }
+        QStringList parts;
+        parts.reserve(keys.size());
+        for (const QKeySequence &key : keys) {
+            parts.append(key.toString(QKeySequence::PortableText));
+        }
+        return parts.join(QStringLiteral(", "));
+    }
+
+    /// The dialog one key-binding row opens, built over the dialog's own
+    /// bindings.  It edits them in place, so a change is visible on the page the
+    /// moment it is made and there is nothing to copy back; Cancel is the
+    /// dialog's own job.
+    ///
+    /// Shown with `open` rather than `exec`: the editor is window-modal, which
+    /// is what a child of a settings window wants, but it does not spin a
+    /// nested event loop of its own.  A nested loop here would be a second
+    /// place for the application to be re-entered from, and the page would have
+    /// no way to redraw the row that lost a key while it ran.
+    void openShortcutEditor(ShortcutAction action)
+    {
+        QDialog *dialog = createShortcutEditorDialog(action, &shortcuts_, this);
+        connect(dialog, &QDialog::finished, this, [this, dialog] {
+            refreshShortcutRows();
+            // Off the parent before it is dropped: `deleteLater` leaves the
+            // dialog alive until the event loop comes back round, and one that
+            // is still a child is one `findChild` still hands out -- so the next
+            // row the user clicks would be answered by the editor they just
+            // closed.
+            dialog->setParent(nullptr);
+            dialog->deleteLater();
+        });
+        dialog->open();
+    }
+
+    /// Repaints every row's button from the bindings.  A dialog can move a key
+    /// off another action, so the row that lost it has to be redrawn too -- not
+    /// only the one that was opened.
+    void refreshShortcutRows()
+    {
+        for (QAbstractButton *button : findChildren<QAbstractButton *>()) {
+            const QString name = button->objectName();
+            if (!name.startsWith(QStringLiteral("shortcut_"))) {
+                continue;
+            }
+            const QString id = name.mid(QStringLiteral("shortcut_").size());
+            for (int index = 0; index < static_cast<int>(ShortcutAction::kActionCount);
+                 ++index) {
+                const ShortcutAction action = static_cast<ShortcutAction>(index);
+                if (shortcutBinding(action).id != id) {
+                    continue;
+                }
+                if (auto *capture = dynamic_cast<KeyCaptureButton *>(button)) {
+                    capture->setKeys(shortcutKeysText(action));
+                }
+                break;
+            }
+        }
+    }
+
+    QWidget *buildKeyboardPage()
+    {
+        QScrollArea *scroll = newScrollPage(pages_);
+        QWidget *page = newPage(scroll);
+        addPageHeading(page, uiTr("Keyboard"),
+                       uiTr("Which key does what, while a capture is on the screen. Every "
+                            "action here is also a toolbar button, so a key that is in the "
+                            "way can be cleared instead of moved."));
+        QWidget *card = addCard(page, QString());
+        bool first = true;
+        for (int index = 0; index < static_cast<int>(ShortcutAction::kActionCount);
+             ++index) {
+            const ShortcutAction action = static_cast<ShortcutAction>(index);
+            const ShortcutBinding &binding = shortcutBinding(action);
+            if (binding.label.isEmpty()) {
+                continue;
+            }
+            // The held modifiers are listed but not editable: a `QKeySequence`
+            // cannot say "Alt on its own" without also saying Alt+F4, so a row
+            // that offered to rebind one would be offering a binding the editor
+            // could never deliver.  A label with no button, rather than a button
+            // the user has to discover does nothing.
+            if (!binding.rebindable) {
+                auto *text = new QLabel(card);
+                text->setObjectName(QStringLiteral("rowValue"));
+                text->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+                text->setText(binding.defaultKeys);
+                addRow(card, binding.label, binding.hint, text, first);
+                first = false;
+                continue;
+            }
+            auto *button = new KeyCaptureButton(card);
+            button->setObjectName(QStringLiteral("shortcut_") + binding.id);
+            button->setToolTip(uiTr("Click to see and change this action's keys"));
+            button->setKeys(shortcutKeysText(action));
+            button->onActivated = [this, action] { openShortcutEditor(action); };
+            addRow(card, binding.label, binding.hint, button, first);
+            first = false;
+        }
+
+        return scroll;
+    }
+
     /// A colour button plus the button that gives it back to the built-in
     /// colour, laid out as one control for [`addRow`].
     QWidget *colorRow(ColorButton *button, QPushButton *clear)
@@ -2035,9 +2509,20 @@ private:
 
 } // namespace
 
+QDialog *createShortcutEditorDialog(ShortcutAction action, ShortcutPreferences *preferences,
+                                    QWidget *parent, std::function<bool(const QString &)> ask)
+{
+    return new ShortcutEditorDialog(action, preferences, parent, std::move(ask));
+}
+
 QDialog *createSettingsDialog()
 {
     return new SettingsDialog();
+}
+
+QDialog *createSettingsDialogForShortcuts(ShortcutPreferences *shortcuts)
+{
+    return new SettingsDialog(shortcuts);
 }
 
 int runSettingsWindow()
