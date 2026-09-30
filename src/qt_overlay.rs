@@ -555,6 +555,17 @@ struct QtSession<'a> {
     // nothing to scroll, so it leaves this out and the action stays away.
     #[serde(skip_serializing_if = "Option::is_none")]
     long_allowed: Option<bool>,
+    // Marks already drawn on this frame, in the shape the helper itself emits
+    // them, so re-entering an editing session opens on them instead of on a
+    // blank canvas.  The session a first edit runs under has none; the one a
+    // pin's second edit runs under carries the marks the first one committed,
+    // which is what makes them editable again rather than merely visible.
+    //
+    // Opaque here on purpose: the daemon holds what the helper wrote verbatim
+    // and hands it straight back, so the two ends of one protocol cannot drift
+    // apart by this side re-spelling the marks it was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    annotations: Option<serde_json::Value>,
     // Translate mode only: the language pair and provider the helper hands to
     // `vshot translate --stdin-ocr` while it works, so the overlay and the CLI
     // translate the same way.
@@ -641,7 +652,14 @@ struct QtResult {
     // Window-pick only: where the pointer was when the click committed, so the
     // caller can resolve the click against the windows that exist by then.
     point: Option<WirePoint>,
-    annotations: Option<Vec<QtAnnotation>>,
+    // The marks, in the shape a later session can hand straight back: the
+    // editor builds them without the transient parts of a render (a label's
+    // bitmap, a translation's pixels), so a daemon that stores them can reopen
+    // the pin for editing instead of only showing the flattened result.  This
+    // side never reads into them -- it stores them and hands them back -- so
+    // they stay the wire's own JSON.
+    #[serde(default)]
+    marks: Option<serde_json::Value>,
     // Region editing only: the user pressed the toolbar's scrolling-capture
     // action, so the selection names a region to scroll and stitch rather
     // than a still to keep.
@@ -1048,6 +1066,23 @@ pub(crate) struct PinEditSpec<'a> {
     /// Which part of the editor to open on, empty for the ordinary annotation
     /// editor the Space key opens. `"text"` opens it on the recognized text.
     pub(crate) action: &'a str,
+    /// The marks already on the pin, exactly as the helper last reported them,
+    /// so a second edit opens on them and they stay editable instead of having
+    /// been baked into the pixels the first one committed.  `None` on a pin
+    /// that has never been annotated.
+    pub(crate) annotations: Option<&'a serde_json::Value>,
+    /// How wide the pin's border is drawn, in logical pixels, so the editor can
+    /// count the rim as part of the pin: the stroke is centred on the image's
+    /// edge and reaches half this far outside it, and a drag there should move
+    /// the pin rather than read as a click on the bare canvas.
+    pub(crate) border_width: u32,
+    /// Bounding box of every output, or `None` when the caller has no way to
+    /// ask.  The editor's keyboard-cursor walk asks the CLI to move the real
+    /// pointer, and a pointer position is expressed in this space; `window` is
+    /// not it, because the pin is not the screen.  Left out, the pointer simply
+    /// is not moved, which is what happens on a compositor with no injection
+    /// backend anyway.
+    pub(crate) desktop: Option<Rect>,
 }
 
 /// Serializes a pin-edit session: one virtual output whose geometry is the
@@ -1069,12 +1104,15 @@ pub(crate) fn write_pin_edit_session(spec: &PinEditSpec<'_>) -> Result<(TempDir,
         window: Some(spec.window.into()),
         socket: Some(spec.socket.to_string_lossy().into_owned()),
         id: Some(spec.pin_id),
+        border_width: Some(spec.border_width),
         action: (!spec.action.is_empty()).then_some(spec.action),
         candidates: None,
         selection: None,
         long_allowed: None,
+        annotations: spec.annotations.cloned(),
         translate: None,
         result_path: None,
+        desktop: spec.desktop.map(WireRect::from),
         outputs: vec![QtOutput {
             id: 0,
             name: spec.output_name,
@@ -1232,13 +1270,10 @@ pub(crate) fn parse_edit_result(bytes: Vec<u8>, window: Rect) -> Result<Option<E
                     "Qt helper returned a pin selection smaller than 5x5".into(),
                 ));
             }
-            let annotations = result
-                .annotations
-                .unwrap_or_default()
-                .into_iter()
-                .map(parse_annotation)
-                .collect::<Result<Vec<_>>>()?;
-            Ok(Some((selection, annotations)))
+            let marks = result
+                .marks
+                .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+            Ok(Some(EditedPin { selection, marks }))
         }
         status => Err(VshotError::Pin(format!(
             "Qt helper returned unknown status `{status}`"

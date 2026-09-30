@@ -109,6 +109,16 @@ pub fn write_frame_with_hdr(
     // output.  Every other destination has no position to keep, and a
     // composed or synthetic image never had one.
     pin_origin: Option<Point>,
+    // The marks the editing session left on the image, when it left any.  Only
+    // the pin destination uses them: they are what lets the pin be reopened for
+    // editing on the user's own marks rather than on the pixels they were
+    // flattened into.  `None` for a capture nothing was drawn on, which is
+    // every route that never opened an editor.
+    pin_marks: Option<&serde_json::Value>,
+    // The capture `frame` was flattened from, before any mark was drawn on it,
+    // sent beside `pin_marks` so the daemon can keep the picture the marks
+    // belong to.  `None` whenever `pin_marks` is.
+    pin_base: Option<&[u8]>,
 ) -> Result<()> {
     match destination {
         Destination::File(path) => {
@@ -133,13 +143,31 @@ pub fn write_frame_with_hdr(
         // surface of its own so the image reaches the panel as the light it
         // stands for rather than as the SDR view of it.
         Destination::Pin => {
+            // The codes are written in the capture's own primaries, which are
+            // the output's: the surface that shows them carries that same
+            // description, so what it declares and what the words hold agree.
             let pq = hdr.map(|half| crate::pin::PqPin {
-                words: half.frame.to_rgb10_pq(half.reference_nits),
+                words: half
+                    .frame
+                    .to_rgb10_pq_in(half.frame.primaries(), half.reference_nits),
                 width: half.frame.size().width,
                 height: half.frame.size().height,
                 reference_nits: half.reference_nits,
+                primaries: half.frame.primaries(),
             });
-            crate::pin::pin_png(&frame.to_png()?, density, pin_origin, pq.as_ref())
+            crate::pin::pin_png(
+                &frame.to_png()?,
+                density,
+                pin_origin,
+                pq.as_ref(),
+                pin_marks,
+                pin_base,
+                // The editor's own handoff, and only that: a pin carrying the
+                // marks of the session that just drew them.  Every other route
+                // here has nobody drawing the capture, so there is no gap to
+                // close and no reason to make the daemon wait for a frame.
+                pin_marks.is_some(),
+            )
         }
     }
 }

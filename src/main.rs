@@ -1177,6 +1177,9 @@ fn finish_capture(
     // — a composed desktop, or a window the compositor drew itself, whose
     // rectangle this side never learns.
     capture_rect: Option<crate::geometry::Rect>,
+    // The marks an editing session left, for the Pin destination; see
+    // `finish_rendered_capture`.
+    marks: Option<&serde_json::Value>,
     request: &cli::Request,
     wayland: &mut WaylandSession,
     // The editor's Pin button: the image goes to the screen whatever the command

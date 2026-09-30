@@ -407,15 +407,147 @@ struct Pin {
     // This capture's HDR half, as PQ codes in a file this daemon owns, or empty
     // for a pin that has none.  The pixels above are the tone map of it, so the
     // pin's size and every hit test are unchanged; this file is what the surface
-    // helper shows instead, and it is drawn only while the helper has the pin's
-    // output.  A pin whose pixels are replaced from an SDR editor loses it.
+    // helper is handed as the pin's picture.  A pin whose pixels are replaced
+    // from an SDR editor loses it.
     QString hdrPath;
-    // The light the HDR half's `1.0` stands for, from its own header.  The
-    // surface helper draws the pin's rim in the terms that surface is described
-    // in, so it has to be told what one whole white is worth there; this is the
-    // only place that number is known, because the daemon never decodes the
-    // HDR half itself.
-    double hdrWhite = 203.0;
+    // The HDR half as it was before any edit, kept beside `original` and for the
+    // same reason: `hdrPath` becomes the *flattened* HDR once an edit lands, and
+    // that picture has the marks baked into it.  Drawing it under an open editor
+    // would put a duplicate of every mark behind the editable ones, and
+    // compositing the marks onto it again would draw each of them twice.  So the
+    // pristine file is kept and the editor and the helper are both handed it
+    // while an edit is open.
+    //
+    // It is the whole record of the HDR half -- the `VSHTPQ02` header names the
+    // white and the six chromaticity coordinates, and the words follow it -- so
+    // nothing has to be kept beside it for the picture to be shown exactly.
+    QString hdrBasePath;
+    // This pin's picture as the surface helper reads it, a PNG in the helper's
+    // own directory, or empty for a pin whose picture is its PQ half above.
+    //
+    // The helper draws every pin, not only the HDR ones -- see `PinHdr` -- and
+    // this is how a pin that is not HDR gets there: it reads the PNG and encodes
+    // it against the output's own reference white.  It holds `image`, the
+    // flattened result, because that is what the screen shows.
+    QString picturePath;
+    // The same for a pin whose pixels an edit is replacing: the pristine picture
+    // the editor's marks belong to.  Written when the edit opens and dropped when
+    // it lands, exactly as `hdrBasePath` is and for the same reason -- the editor
+    // draws its marks itself, so a helper painting the flattened picture
+    // underneath would put a duplicate of each mark behind the editable ones.
+    QString pictureBasePath;
+    // The pin's own pixels as they were before any edit, and the marks the last
+    // edit left on them, exactly as the editor reported them.
+    //
+    // The pin's `image` is the flattened result -- marks and all -- which is
+    // what the screen shows and what a save writes.  Re-editing it would mean
+    // drawing on top of the last edit's ink with no way back, so the daemon
+    // keeps both halves of what the editor needs to open again: the picture the
+    // marks were placed on, and the marks themselves as data.  `edited` is what
+    // says whether the two are worth sending; a pin that has never been
+    // annotated has neither and opens blank.
+    QImage original;
+    QJsonArray marks;
+    bool edited = false;
+    // A directory this pin owns for the pixels of the marks it holds, made on
+    // the first mark that has any.  A pasted image is its pixels and the marks
+    // name them by path, but the file the editor wrote lives in the directory
+    // that edit ran in -- gone by the time the pin is read back, and gone
+    // immediately for a pin added from a region session, whose session
+    // directory the CLI deletes as soon as the request is answered.  So every
+    // such file is copied here, where it lives as long as the pin does.
+    std::unique_ptr<QTemporaryDir> assets;
+    // Names the copies, so two marks cannot land on one file.
+    quint64 assetSequence = 0;
+
+    // Takes the marks an editor reported, copying the pixels they name into a
+    // directory this pin owns and re-pointing the marks at the copies.
+    //
+    // The editor writes each mark's pixels beside the session it was given, and
+    // that directory belongs to the edit: the CLI removes it the moment the
+    // request is answered.  The daemon keeps the marks, so the files have to
+    // move somewhere that outlives the request, and this is that somewhere.
+    // A mark with no `pixels` -- every kind but a pasted image -- is left as it
+    // is; the path is the only field that is rewritten.
+    QJsonArray keepMarks(const QJsonArray &marks)
+    {
+        QJsonArray kept;
+        for (const QJsonValue &value : marks) {
+            if (!value.isObject()) {
+                kept.push_back(value);
+                continue;
+            }
+            QJsonObject mark = value.toObject();
+            const QString path = mark.value(QStringLiteral("pixels")).toString();
+            if (path.isEmpty()) {
+                kept.push_back(mark);
+                continue;
+            }
+            const QString copy = assetPath();
+            if (copy.isEmpty() || !QFile::copy(path, copy)) {
+                // The pixels could not be taken.  The mark is dropped rather
+                // than kept naming a file that will not be there: a pasted
+                // image with no pixels is a mark the editor would refuse on the
+                // next open, and one refusal fails the whole session.
+                continue;
+            }
+            mark.insert(QStringLiteral("pixels"), copy);
+            kept.push_back(mark);
+        }
+        return kept;
+    }
+
+    // A fresh name inside this pin's asset directory, made on first use, or an
+    // empty string when no directory could be made.
+    QString assetPath()
+    {
+        if (assets == nullptr) {
+            auto directory = std::make_unique<QTemporaryDir>(
+                QDir::tempPath() + QStringLiteral("/vshot-pin-XXXXXX"));
+            if (!directory->isValid()) {
+                return QString();
+            }
+            assets = std::move(directory);
+        }
+        return assets->filePath(QStringLiteral("mark-%1.png").arg(++assetSequence));
+    }
+
+    // The pixels an edit should start from: the pristine capture on a pin that
+    // has been annotated before, its own image on one that has not.
+    const QImage &editBase() const { return edited && !original.isNull() ? original : image; }
+
+    // The HDR half an edit should start from, on the same rule.  Empty for a pin
+    // with no HDR half at all, which is every SDR pin and every pin whose capture
+    // carried no light above white.
+    const QString &editHdrBase() const
+    {
+        return edited && !hdrBasePath.isEmpty() ? hdrBasePath : hdrPath;
+    }
+
+    // The file the helper draws this pin from, empty when this side has none to
+    // hand it -- see `syncHdr`, which is where that is decided.
+    const QString &picture() const { return hdrPath.isEmpty() ? picturePath : hdrPath; }
+
+    // The picture the helper should draw for the pin an edit is open on.
+    //
+    // The editor draws every mark itself, live and editable, so the stack under
+    // it has to show the pristine picture those marks belong to: a flattened one
+    // would put a duplicate of each mark on screen, one that does not move when
+    // the mark is dragged and does not go when it is deleted.
+    //
+    // Which file that is depends on where the pristine pixels live.  A capture
+    // with an HDR half already has them in a file of their own -- `hdrPath` on
+    // the first edit, `hdrBasePath` on every one after.  Every other pin's are
+    // in `original`, which is not a file, so an edit writes one when it opens
+    // and names it here.  A pin with neither is one this side could not hand
+    // over at all, and the empty answer keeps it out of the stack.
+    const QString &editPicture() const
+    {
+        if (!hdrPath.isEmpty()) {
+            return edited && !hdrBasePath.isEmpty() ? hdrBasePath : hdrPath;
+        }
+        return pictureBasePath.isEmpty() ? picturePath : pictureBasePath;
+    }
 
     QSize displaySize() const
     {
@@ -1546,16 +1678,69 @@ wl-clipboard package"));
         reloadStyle();
         // `ensureSurfaces` has made the helper known, so its directory exists and
         // the HDR half can be taken; without a helper the pin is an SDR one.
+        //
+        // A half the CLI offered and this side cannot read is a mismatch between
+        // two builds, and it is refused rather than quietly dropped: letting it
+        // through would fall the pin back to its SDR copy in silence, which is
+        // the dim picture the user has no way to explain.  The check is the
+        // helper's to make -- it is the side that reads the file -- and its
+        // answer arrives with the stack below.
         if (!hdrSource.isEmpty()) {
-            pin->hdrPath = hdr_.takeImage(hdrSource);
-            pin->hdrWhite = pqWhiteNits(pin->hdrPath);
+            QString refused;
+            pin->hdrPath = hdr_.takeImage(hdrSource, &refused);
+            if (!refused.isEmpty()) {
+                delete pin;
+                armIdleQuit();
+                return error(QStringLiteral("cannot use the HDR half of `%1`: %2")
+                                 .arg(hdrSource)
+                                 .arg(refused));
+            }
+        }
+        // The helper draws this pin too -- the whole stack is its picture -- so a
+        // capture without an HDR half is handed over as a PNG.  The picture is
+        // what the screen shows, which is `image`: on a capture pinned from an
+        // editing session that is the flattening of its marks, and the marks
+        // themselves travel beside it for the next edit to open on.
+        //
+        // Written from the decoded pixels rather than copied from `sourcePath`,
+        // even when the request named a file: the helper reads PNG alone, and a
+        // pin made from a JPEG or from a rendered card has no PNG of its own at
+        // all.  One encode of the pixels is the same picture in every case.
+        if (pin->hdrPath.isEmpty()) {
+            pin->picturePath = hdr_.takePicture(pin->image);
+        }
+        // The marks the capture was pinned with, when it came out of an editing
+        // session that had any: they are what a second edit opens on, so the
+        // pin can be annotated again on the user's own marks rather than on the
+        // pixels they were flattened into.  A capture nothing was drawn on --
+        // a file, the clipboard, a bare region -- carries none, and the pin
+        // opens blank the way it always did.
+        //
+        // The picture the marks were drawn on comes with them, and is what the
+        // editor is handed: `image` is the flattening, so editing from it would
+        // paint every mark a second time over its own baked copy.  A request
+        // that carried marks without a base cannot be edited again, so the pin
+        // stays unannotated rather than opening on a picture the marks do not
+        // belong to.
+        const QJsonValue marks = request.value(QStringLiteral("annotations"));
+        const QString basePath = request.value(QStringLiteral("base")).toString();
+        if (marks.isArray() && !marks.toArray().isEmpty() && !basePath.isEmpty()) {
+            const QImage base(basePath);
+            if (!base.isNull()) {
+                pin->original = base;
+                pin->marks = pin->keepMarks(marks.toArray());
+                pin->edited = true;
+            }
         }
         // Appended, so it is painted last: a new pin lands in front of the pins
         // that were already there.
         pins_.push_back(pin);
         byId_.insert(pin->id, pin);
         idleQuit_->stop();
-        syncAll();
+        // The stack is rendered by `readRequest` once the whole batch has been
+        // read, the way a drag's positions are, so that a client pinning several
+        // images at once gets one composition of the output rather than one per
+        // image.
         return okReply();
     }
 
@@ -1582,6 +1767,12 @@ wl-clipboard package"));
         }
         const QString path = request.value(QStringLiteral("path")).toString();
         const QString hdr = request.value(QStringLiteral("hdr")).toString();
+        // Read before anything is replaced: whether this pin has been edited
+        // before is what decides, below, whether the HDR file being dropped is
+        // the pristine capture (keep it) or the previous edit's flattening (throw
+        // it away).  `edited` is set by the block that replaces the pixels, so it
+        // can no longer answer that question by the time the HDR half is handled.
+        const bool wasEdited = pin->edited;
         if (!path.isEmpty()) {
             const QImage image(path);
             if (image.isNull()) {
@@ -1590,29 +1781,82 @@ wl-clipboard package"));
             // Keep the on-screen size the user arranged, even though the new
             // pixels may have a different density.
             const QSize display = pin->displaySize();
+            // The picture the edit started from becomes the pin's pristine copy
+            // the first time its pixels are replaced; a later edit reuses the
+            // one already held, so the base stays the capture itself rather
+            // than the previous edit's flattening.
+            if (!pin->edited) {
+                pin->original = pin->image;
+            }
             pin->image = image;
+            // The marks the editor reports, relative to the image it was given.
+            // They are what a later edit opens on; the flattened pixels above
+            // are what the screen shows and what a save writes.  Their own
+            // pixels are taken into this pin's directory as they arrive, since
+            // the editor's session directory goes with the request.
+            pin->marks = pin->keepMarks(request.value(QStringLiteral("annotations")).toArray());
+            pin->edited = true;
             if (image.width() > 0) {
                 pin->scale = std::clamp(static_cast<double>(display.width()) / image.width(),
                                         kMinScale, kMaxScale);
             }
             // The pixels were replaced, so whatever HDR half the pin had is no
             // longer theirs -- unless this same request brings its replacement
-            // along, which is what an HDR pin's edit does.
+            // along, which is what an HDR pin's edit does.  The file being
+            // dropped is the *pristine* one the first time, and it is kept
+            // rather than removed: it is what the next edit draws on and what an
+            // open editor shows behind its marks.  The file the previous edit
+            // left, if any, is the one that goes.
             if (hdr.isEmpty() && !pin->hdrPath.isEmpty()) {
-                QFile::remove(pin->hdrPath);
+                if (wasEdited) {
+                    QFile::remove(pin->hdrPath);
+                } else {
+                    pin->hdrBasePath = pin->hdrPath;
+                }
                 pin->hdrPath.clear();
             }
         }
         if (!hdr.isEmpty()) {
-            // An unreadable half clears the pin's own, so a pin whose pixels
-            // changed is never left showing a stale HDR image: it falls back to
-            // the SDR picture it was given.
-            const QString taken = hdr_.takeImage(hdr);
+            // A half this side cannot read is left off rather than refused here:
+            // the helper is the side that reads it, and its answer to the stack
+            // -- which is what the move reply carries -- is the one that counts.
+            // Keeping the pristine file while the edit's own flattening replaces
+            // it is what lets the pin be edited again on the capture rather than
+            // on the last edit's ink; only the flattening from the edit before
+            // this one is discarded.
             if (!pin->hdrPath.isEmpty()) {
-                QFile::remove(pin->hdrPath);
+                if (wasEdited) {
+                    QFile::remove(pin->hdrPath);
+                } else {
+                    pin->hdrBasePath = pin->hdrPath;
+                }
             }
-            pin->hdrPath = taken;
-            pin->hdrWhite = pqWhiteNits(taken);
+            pin->hdrPath = hdr_.takeImage(hdr);
+        }
+        // A pin that ends this request with no HDR half has nothing left for the
+        // pristine one to be the base *of*: an edit that replaced the pixels from
+        // the SDR editor only -- which is what a pin whose capture turned out to
+        // hold no light above white sends -- takes the whole half away, base and
+        // all.  Leaving it behind would keep a file alive for a pin that no
+        // longer shows one.
+        if (pin->hdrPath.isEmpty() && !pin->hdrBasePath.isEmpty()) {
+            QFile::remove(pin->hdrBasePath);
+            pin->hdrBasePath.clear();
+        }
+        // The helper draws this pin too, and its pixels have just been replaced.
+        // The editor wrote the flattened result as a PNG of its own, so the
+        // daemon takes that file rather than re-encoding the image it just read
+        // from it.  `pictureBasePath` is left alone: while an edit is open the
+        // stack shows the pristine picture the marks belong to -- the editor
+        // draws every mark itself, and a flattened one underneath would put a
+        // baked copy of each behind the live one -- and it is the file that
+        // `picturePath` takes over from once the edit ends.
+        if (!path.isEmpty() && pin->hdrPath.isEmpty()) {
+            const QString written = hdr_.takePictureFile(path);
+            if (!written.isEmpty()) {
+                QFile::remove(pin->picturePath);
+                pin->picturePath = written;
+            }
         }
         pin->origin = clampOrigin(*pin, QPoint(x, y));
         if (movedId != nullptr) {
@@ -1633,6 +1877,39 @@ wl-clipboard package"));
         return reply;
     }
 
+    // The picture the helper draws for a pin, for as long as this pin is the one
+    // an edit is open on: the pristine pixels the editor's marks belong to.
+    //
+    // The helper draws every pin, so this is the file the stack names for it
+    // while `editingPinId_` is its id.  It is written when the edit opens and
+    // dropped when it ends, exactly as `hdrBasePath` is and for the same reason:
+    // the editor draws every mark itself, and a helper painting the flattened
+    // picture underneath would put a duplicate of each mark on screen -- one that
+    // does not move when the mark is dragged and does not go when it is deleted.
+    //
+    // A capture with an HDR half needs nothing written: its pristine pixels are
+    // already a file, and `editHdrBase` is what the stack names for it.
+    void openEditPicture(Pin *pin)
+    {
+        if (pin == nullptr || !pin->hdrPath.isEmpty()) {
+            return;
+        }
+        closeEditPicture(pin);
+        pin->pictureBasePath = hdr_.takePicture(pin->editBase());
+    }
+
+    // The edit is over: the pin's flattened pixels are the ones to draw again, so
+    // the pristine PNG has no reader left.  Called on every path an edit can end
+    // by -- the apply child exiting, and the pin going away under an open editor.
+    void closeEditPicture(Pin *pin)
+    {
+        if (pin == nullptr || pin->pictureBasePath.isEmpty()) {
+            return;
+        }
+        QFile::remove(pin->pictureBasePath);
+        pin->pictureBasePath.clear();
+    }
+
     // One edit round: export the pin's pixels, describe the pin-edit session,
     // and run `vshot pin --apply` in the background. That process shows the
     // annotation editor, renders the result in Rust, and sends `move` back to
@@ -1641,7 +1918,7 @@ wl-clipboard package"));
     // menu's `Recognize text…` row for the text one.
     void startEdit(Pin *pin, bool textMode)
     {
-        if (editingPin_ != nullptr) {
+        if (editingPinId_ != 0) {
             return; // one edit session at a time
         }
         // The editor draws its own overlay above the pins but leaves the image
@@ -1666,7 +1943,12 @@ wl-clipboard package"));
             return;
         }
         const QString imagePath = directory->filePath(QStringLiteral("pin.png"));
-        if (!pin->image.save(imagePath, "PNG")) {
+        // What the editor draws on: the pin's own pixels the first time, and the
+        // pristine capture the marks were placed on every time after.  Editing
+        // the flattened result would put new marks on top of old ink with no way
+        // back to either.
+        const QImage base = pin->editBase();
+        if (!base.save(imagePath, "PNG")) {
             delete directory;
             return;
         }
@@ -1689,16 +1971,21 @@ wl-clipboard package"));
         output.insert(QStringLiteral("surface"), surface);
         output.insert(QStringLiteral("scale"), 1);
         output.insert(QStringLiteral("pixel_width"),
-                      static_cast<qint64>(pin->image.width()));
+                      static_cast<qint64>(base.width()));
         output.insert(QStringLiteral("pixel_height"),
-                      static_cast<qint64>(pin->image.height()));
+                      static_cast<qint64>(base.height()));
         output.insert(QStringLiteral("path"), imagePath);
         // An HDR pin carries a second file, and the editor has to put its marks
         // on that half too or the pin would drop back to SDR the moment it is
         // annotated.  The path stays valid for the whole edit: the file lives in
         // the helper's directory, which the daemon owns.
-        if (!pin->hdrPath.isEmpty()) {
-            output.insert(QStringLiteral("hdr"), pin->hdrPath);
+        //
+        // The *pristine* half, not the one the last edit flattened: the editor
+        // composites the marks it was handed onto this file, so handing it a
+        // picture that already carries them would draw every mark a second time.
+        const QString &hdrBase = pin->editHdrBase();
+        if (!hdrBase.isEmpty()) {
+            output.insert(QStringLiteral("hdr"), hdrBase);
         }
 
         QJsonObject bounds;
@@ -1734,7 +2021,12 @@ wl-clipboard package"));
             file.write(QJsonDocument(session).toJson(QJsonDocument::Compact));
         }
 
-        editingPin_ = pin;
+        editingPinId_ = pin->id;
+        // The editor opens on a pin that has just been brought to the front and
+        // is about to take the keyboard, so it starts live: the frame is drawn
+        // from the first paint rather than after the surface's first report.
+        // Nothing has to be told -- the editor's connection is not up yet, and
+        // the answer is written to it the moment it is.
 
         QString cliPath = QString::fromLocal8Bit(qgetenv("VSHOT_BIN"));
         if (cliPath.isEmpty()) {
@@ -1767,7 +2059,7 @@ wl-clipboard package"));
             std::fprintf(stderr, "vshot-qt-ui: cannot locate the vshot CLI for pin editing; \
                                   set VSHOT_BIN\n");
             std::fflush(stderr);
-            editingPin_ = nullptr;
+            editingPinId_ = 0;
             delete directory;
             return;
         }
@@ -1775,8 +2067,24 @@ wl-clipboard package"));
         // QProcess handle only as a watcher so we can drop the editing flag
         // when it exits; the temp dir dies right after.
         QProcess *watcher = new QProcess(this);
-        connect(watcher, &QProcess::finished, watcher, [this, watcher, directory] {
-            editingPin_ = nullptr;
+        // The id rather than the pin: a pin the user closed while the editor was
+        // open is deleted by the time this fires, and a pointer to it would be
+        // dangling.  Clearing the flag on an id that is no longer editing is
+        // harmless, and the pin being gone already cleared it.
+        const quint64 editing = pin->id;
+        connect(watcher, &QProcess::finished, watcher, [this, watcher, directory, editing] {
+            if (editingPinId_ == editing) {
+                editingPinId_ = 0;
+            }
+            // The editor has drawn its marks into the pin's pixels by now, so
+            // the surface goes back to painting the pin itself rather than the
+            // picture the marks were placed on -- and the helper back to the file
+            // that holds those pixels rather than the pristine one.  The pristine
+            // PNG has no reader left either way, whether or not this was the edit
+            // that was still open.
+            closeEditPicture(byId_.value(editing, nullptr));
+            syncAll();
+            notifyActive();
             delete directory;
             watcher->deleteLater();
         });
@@ -1784,6 +2092,13 @@ wl-clipboard package"));
         watcher->setArguments({QStringLiteral("pin"), QStringLiteral("--apply"), sessionPath});
         watcher->setStandardInputFile(QProcess::nullDevice());
         watcher->start();
+        // The editor draws the marks live from here on, so the stack under it
+        // stops drawing the pin's flattened pixels and shows the picture they
+        // were placed on instead -- for the helper as much as for the Qt surface.
+        // Done after the child is started so a failure to start it does not leave
+        // the pin showing its base with nobody drawing the marks.
+        openEditPicture(pin);
+        syncAll();
     }
 
     // What the save dialog opens with: the file the pin came from, so a re-save
@@ -2138,16 +2453,26 @@ wl-clipboard package"));
         if (pin == nullptr) {
             return;
         }
-        if (editingPin_ == pin) {
-            editingPin_ = nullptr;
+        if (editingPinId_ == pin->id) {
+            editingPinId_ = 0;
         }
+        // The pin that was being annotated is gone, so the editor is annotating
+        // nothing the daemon knows about and must stop drawing its frame.
+        notifyActive();
+        closeEditPicture(pin);
         pins_.removeAll(pin);
         if (byId_.value(pin->id, nullptr) == pin) {
             byId_.remove(pin->id);
         }
-        // The HDR half is a file of ours; the pin going away takes it.
-        if (!pin->hdrPath.isEmpty()) {
-            QFile::remove(pin->hdrPath);
+        // The halves are files of ours; the pin going away takes every one of
+        // them -- the HDR half, the pristine one an edit would have started
+        // from, and the two PNGs the helper is handed.
+        const QStringList owned = {pin->hdrPath, pin->hdrBasePath, pin->picturePath,
+                                   pin->pictureBasePath};
+        for (const QString &path : owned) {
+            if (!path.isEmpty()) {
+                QFile::remove(path);
+            }
         }
         delete pin;
         if (pins_.isEmpty()) {

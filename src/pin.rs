@@ -59,6 +59,32 @@ pub(crate) enum PinCommand {
         /// images have no such place and leave this out.
         #[serde(skip_serializing_if = "Option::is_none")]
         at: Option<WirePoint>,
+        /// The marks the pinned pixels carry, in the shape the editor reports
+        /// them, when the pin came out of an editing session that had any.
+        /// The daemon keeps them so the pin can be opened for editing again
+        /// with the user's marks still on it: they are the marks as data, which
+        /// the flattened pixels no longer are.  Absent for a pin made from a
+        /// file, the clipboard or a capture nothing was drawn on.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        annotations: Option<serde_json::Value>,
+        /// The capture `path` was flattened from, before any mark was drawn on
+        /// it: the pristine picture the marks belong to.  Only sent beside
+        /// `annotations`, and it is what makes the marks editable a second
+        /// time -- an editor handed the flattened pixels and the marks would
+        /// draw every one of them again on top of its own baked copy, which is
+        /// the duplicate the user sees.  The daemon shows `path` and edits
+        /// `base`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        base: Option<PathBuf>,
+        /// Ask for the reply to wait until the pin is really on the screen
+        /// rather than merely applied.  Only a client that is about to stop
+        /// drawing asks for it: the pin editor unmaps its own surface as soon
+        /// as it has the answer, and without this it would do that over a
+        /// picture the compositor has not drawn yet, which the user sees as the
+        /// marks vanishing for a moment.  Absent means "answer as soon as the
+        /// change is applied", which is what every other caller wants.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        ack: bool,
     },
     #[serde(rename = "add-clipboard")]
     AddClipboard {
@@ -85,6 +111,16 @@ pub(crate) enum PinCommand {
         /// SDR editor sends neither and becomes an ordinary SDR pin.
         #[serde(skip_serializing_if = "Option::is_none")]
         hdr: Option<PathBuf>,
+        /// The marks the new pixels carry, in the shape the editor reports
+        /// them.  The daemon keeps them so the pin can be opened for editing
+        /// again: they are the marks as data, which the flattened pixels above
+        /// no longer are.  Absent on a plain move, which replaces nothing.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        annotations: Option<serde_json::Value>,
+        /// Ask for the reply to wait until the new pixels are on the screen;
+        /// see `Add::ack`.  The pin editor's own handoff uses it.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        ack: bool,
     },
     Toggle,
     Show,
@@ -306,6 +342,11 @@ pub(crate) fn run(invocation: PinInvocation) -> Result<()> {
             output,
             output_name: output_name.clone(),
             at: None,
+            annotations: None,
+            base: None,
+            // Nothing is drawing this pin, so there is no handoff to make
+            // seamless and nothing to wait for.
+            ack: false,
         })?;
     }
     if clipboard {
@@ -608,6 +649,12 @@ pub(crate) fn pin_png(
             VshotError::Pin(format!("failed to create pin temp directory: {error}"))
         })?;
     let path = write_private_file(directory.path(), "capture.png", png)?;
+    // The pristine picture the marks were drawn on, when there are marks.  It
+    // travels as its own file because the daemon loads it later, per edit.
+    let base_path = match (marks, base_png) {
+        (Some(_), Some(base)) => Some(write_private_file(directory.path(), "base.png", base)?),
+        _ => None,
+    };
     // The helper reads this file by path, so it has to be a file and not a pipe:
     // the daemon copies it before this directory goes.
     let hdr_path = match hdr {
@@ -628,10 +675,22 @@ pub(crate) fn pin_png(
         output,
         output_name,
         at: at.map(WirePoint::from),
+        annotations: marks.cloned(),
+        base: base_path.clone(),
+        // A capture pinned with the marks still drawn over it on the screen: the
+        // editor's surface is about to go, and the reply is what tells it that
+        // it may.  So it waits for the pin to be on the screen rather than for
+        // the daemon to have applied it, and the marks do not blink out between
+        // the two.  Without a session there is nothing drawing them, so nothing
+        // to wait for.
+        ack: handoff,
     });
     // The daemon has copied the pixels by the time it replied; the temp files
     // are ours to remove even when the reply said no.
     remove_pin_temp(&path);
+    if let Some(base_path) = &base_path {
+        remove_pin_temp(base_path);
+    }
     if let Some(hdr_path) = &hdr_path {
         remove_pin_temp(hdr_path);
     }
@@ -745,7 +804,28 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
         None => None,
     };
 
-    let scale = pin_edit_scale(frame.size().width, window.size.width);
+    // The marks the daemon holds, exactly as the editor last reported them, so
+    // a second edit opens on them.  Read as JSON rather than re-parsed into
+    // `Annotation`s: this side has no use for them beyond handing them back, and
+    // re-spelling them would be a second place for the wire shape to drift.
+    let marks = session.get("annotations").cloned();
+
+    // The ratio between the pin's pixels and the rect it is shown in: the pin
+    // editor's virtual output declares it as its scale, so the session's pixel
+    // dimensions and its logical size agree exactly, and the editor's own
+    // marks are drawn at the size the image is really shown at. A zoomed pin is
+    // not a whole number of device pixels per logical pixel, which is why the
+    // ratio is carried as it is rather than rounded: rounding a 1.1x zoom to 1
+    // drew every mark at the wrong size and in the wrong place.
+    let scale = crate::edit::Scale::ratio(frame.size().width, window.size.width);
+    // How wide the daemon draws this pin's border. The rim is centred on the
+    // image's edge, so half of it stands outside the image, and the editor has
+    // to know that band to treat a drag on the rim as a drag on the pin. Absent
+    // from a session an older daemon wrote, which means no border.
+    let border_width = session
+        .get("border_width")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u32;
     let (_editor_dir, editor_session) =
         crate::qt_overlay::write_pin_edit_session(&crate::qt_overlay::PinEditSpec {
             frame: &frame,
@@ -878,6 +958,12 @@ fn apply_edit_result(
         y: selection.origin.y,
         path: Some(rendered_path.clone()),
         hdr: hdr_path.clone(),
+        annotations: Some(annotations),
+        // The editor is still drawing the marks the daemon is being handed, and
+        // it stops as soon as this answers.  Waiting for the pin's own frame is
+        // what makes the two pictures one: the compositor has drawn the pin
+        // before the editor takes its copy away.
+        ack: true,
     });
     let _ = std::fs::remove_file(&rendered_path);
     if let Some(hdr_path) = &hdr_path {
@@ -972,6 +1058,50 @@ mod tests {
         assert!(!keep_daemon_stderr());
     }
 
+    // A pin made from an annotated capture carries the marks and the picture
+    // they were drawn on, or the pin can only ever be edited once: a second
+    // edit would be handed the flattening and draw every mark again on top of
+    // its own baked copy.
+    #[test]
+    fn a_pin_carries_the_marks_and_the_base_they_were_drawn_on() {
+        let marks = serde_json::json!([
+            {"kind": "shape", "tool": "rect", "rect": {"x": 4, "y": 6, "width": 20, "height": 10}}
+        ]);
+        let encoded = serde_json::to_vec(&PinCommand::Add {
+            path: PathBuf::from("/tmp/x.png"),
+            hdr: None,
+            density: Some(2),
+            output: None,
+            output_name: None,
+            at: None,
+            annotations: Some(marks.clone()),
+            base: Some(PathBuf::from("/tmp/base.png")),
+            ack: false,
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(value["annotations"], marks);
+        assert_eq!(value["base"], "/tmp/base.png");
+
+        // A capture nothing was drawn on carries neither, so the daemon opens
+        // it blank rather than on a base that is not there.
+        let encoded = serde_json::to_vec(&PinCommand::Add {
+            path: PathBuf::from("/tmp/x.png"),
+            hdr: None,
+            density: None,
+            output: None,
+            output_name: None,
+            at: None,
+            annotations: None,
+            base: None,
+            ack: false,
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert!(value.get("annotations").is_none(), "{value}");
+        assert!(value.get("base").is_none(), "{value}");
+    }
+
     #[test]
     fn add_command_encodes_the_wire_shape() {
         let encoded = serde_json::to_vec(&PinCommand::Add {
@@ -981,6 +1111,9 @@ mod tests {
             output: None,
             output_name: None,
             at: None,
+            annotations: None,
+            base: None,
+            ack: false,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -1001,6 +1134,9 @@ mod tests {
             ))),
             output_name: Some("DP-2".into()),
             at: None,
+            annotations: None,
+            base: None,
+            ack: false,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -1017,6 +1153,9 @@ mod tests {
             output: None,
             output_name: Some("DP-2".into()),
             at: None,
+            annotations: None,
+            base: None,
+            ack: false,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -1111,6 +1250,9 @@ mod tests {
             output: None,
             output_name: None,
             at: Some(WirePoint { x: 100, y: 240 }),
+            annotations: None,
+            base: None,
+            ack: false,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -1128,6 +1270,9 @@ mod tests {
             output: None,
             output_name: None,
             at: None,
+            annotations: None,
+            base: None,
+            ack: false,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
