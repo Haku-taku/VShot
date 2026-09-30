@@ -13,6 +13,7 @@
 
 #include <QAbstractButton>
 #include <QApplication>
+#include <QBuffer>
 #include <QCloseEvent>
 #include <QConicalGradient>
 #include <QCoreApplication>
@@ -2523,6 +2524,37 @@ bool runWlCopy(const QString &text)
     return process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
 }
 
+// The same, for pixels.  `wl-copy --type image/png` reads the encoding from the
+// bytes themselves, so nothing has to be declared beyond the type, and the
+// result is an image a paste target can take rather than a file it has to be
+// told about.
+bool runWlCopyImage(const QImage &image)
+{
+    constexpr int kTimeoutMs = 5000;
+    QByteArray bytes;
+    QBuffer buffer(&bytes);
+    if (!buffer.open(QIODevice::WriteOnly) || !image.save(&buffer, "PNG")) {
+        return false;
+    }
+    buffer.close();
+    QProcess process;
+    process.setProgram(QStringLiteral("wl-copy"));
+    process.setArguments({QStringLiteral("--type"), QStringLiteral("image/png")});
+    process.start();
+    if (!process.waitForStarted(kTimeoutMs)) {
+        return false;
+    }
+    process.write(bytes);
+    process.closeWriteChannel();
+    const bool finished = process.waitForFinished(kTimeoutMs);
+    if (!finished) {
+        process.kill();
+        process.waitForFinished(kTimeoutMs);
+        return false;
+    }
+    return process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
+}
+
 // The image encodings worth asking for, best first; any other `image/*` the
 // clipboard offers is taken after these.
 constexpr const char *kClipboardImageTypes[] = {
@@ -4517,8 +4549,9 @@ private:
     Finished finished_;
 };
 
-OverlayController::OverlayController(Session session)
-    : session_(std::move(session))
+OverlayController::OverlayController(Session session, QObject *parent)
+    : QObject(parent)
+    , session_(std::move(session))
     , gesture_(new Gesture)
 {
     // Whether the toolbar offers the scrolling-capture action.  Read from
@@ -5858,15 +5891,24 @@ constexpr int kInfoPillSlack = 64;
 } // namespace
 
 // The magnifier the editor follows the pointer with while a gesture is dragging
-// something, plus the coordinate pill that hangs under it.  The loupe sits a
-// little past the pointer and flips to the other side near an edge, so the box
-// is the pointer plus the whole reach on every side: half a diameter in x, and
-// enough in y for the pill below the circle.
+// something, plus the coordinate and colour pills that hang off it.  The loupe
+// sits a little past the pointer and flips to the other side near an edge, so
+// the box is the pointer plus the whole reach on every side: half a diameter in
+// x, and enough in y for both pills stacked below the circle.
 LogicalRect OverlayController::pointerTouch() const
 {
+    return pointerTouchAt(pointer_);
+}
+
+// The same box around an arbitrary point.  The magnifier follows the pointer
+// while the right button is held, so a step has to be able to name the rect the
+// *previous* position's loupe covered -- which is not `pointer_` by the time
+// the step asks, because the pointer has already moved.
+LogicalRect OverlayController::pointerTouchAt(Point point) const
+{
     constexpr int kReachX = kLoupeDiameter + kLoupeMargin;
-    constexpr int kReachY = kLoupeDiameter + kInfoPillSlack + kLoupeMargin;
-    return LogicalRect{pointer_.x - kReachX, pointer_.y - kReachY, 2 * kReachX, 2 * kReachY};
+    constexpr int kReachY = kLoupeDiameter + 2 * kInfoPillSlack + kLoupeMargin;
+    return LogicalRect{point.x - kReachX, point.y - kReachY, 2 * kReachX, 2 * kReachY};
 }
 
 LogicalRect OverlayController::selectionTouch() const
@@ -6433,13 +6475,50 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
 void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::MouseButtons buttons,
                              Qt::KeyboardModifiers modifiers)
 {
-    Q_UNUSED(modifiers);
     if (finished_ || cancelled_) {
         return;
     }
     const Point point = globalPoint(overlay, local);
     pointer_ = point;
     pointerOutput_ = overlay->outputIndex();
+    lastModifiers_ = static_cast<int>(modifiers);
+    // A real pointer motion takes the cursor back from the keyboard, and the
+    // magnifier a key press put up has nothing left to point at -- but the
+    // motion VShot's own warp makes is not the user moving anything, and
+    // treating it as one would end the flash on the step that raised it.  See
+    // `isPointerWarpEcho`; the echo is left to the walk that asked for it.
+    if (!isPointerWarpEcho(point)) {
+        keyboardCursor_.reset();
+        endMagnifierFlash();
+    }
+    if (magnifierHeld_) {
+        // The magnifier the right button holds is a colour picker, and a picker
+        // is aimed *by* moving: it follows the pointer for as long as the
+        // button is down, so what the pill says is always the pixel under the
+        // cursor rather than the one the button went down on.  It is also the
+        // one step that has to repaint without a gesture: no drag is under way,
+        // so nothing else here would ask for the frame to be redrawn.
+        //
+        // No test on which buttons are down: the motion event that carries a
+        // held button names it in `buttons`, so the right button is still
+        // reported on every step of the very drag it is holding, and asking for
+        // `NoButton` here -- as this once did -- made the whole step a no-op.
+        // The loupe stayed where the button went down and the pill read the
+        // pixel that was under the cursor when it did.
+        const LogicalRect previous = pointerTouchAt(lastMagnifierPointer_);
+        lastMagnifierPointer_ = point;
+        updateTouch(uniteLogical(previous, pointerTouchAt(point)));
+        // ...but the loupe is a *second* reading of the same motion, not a
+        // replacement for it.  The right button is how the user aims at a pixel
+        // while a gesture is already under way -- a rectangle being drawn, a
+        // pin being dragged -- and returning here swallowed every step of that
+        // gesture: the preview froze at the point the button went down and only
+        // moved again once it was released.  Only a step with no gesture to
+        // serve ends here.
+        if (gesture_->type == Gesture::Type::None) {
+            return;
+        }
+    }
     if (textMode_) {
         // The mode has the pointer to itself: no candidate hover, no gesture.
         // A drag widens the range to the character nearest the pointer, which
@@ -11581,6 +11660,10 @@ void OverlayController::drawLoupe(CaptureOverlay *overlay, QPainter *painter)
     painter->drawLine(center, center - QPointF(0, radius / 2.5));
     painter->drawLine(center, center + QPointF(0, radius / 2.5));
     const QString coordinates = QStringLiteral("%1, %2").arg(centerX).arg(centerY);
+    // The pixel's own colour, as the picker's own reading of it.  The circle
+    // and the pill sample the same pixel, so what the pill says is what the
+    // magnifier shows.
+    const QColor pixelColor = frame->pixelColor(centerX, centerY);
     painter->restore();
     // The pill hangs just under the loupe.  When there is no room below -- a
     // cursor near the bottom edge -- hanging it "above the anchor" would drop it
@@ -11593,6 +11676,348 @@ void OverlayController::drawLoupe(CaptureOverlay *overlay, QPainter *painter)
     }
     drawInfoPill(painter, pillAnchor, coordinates,
                  QRectF(0, 0, overlay->width(), overlay->height()));
+    if (colorPickerVisible() && pixelColor.isValid()) {
+        // The colour readout goes on the other side of the loupe from the
+        // coordinates, so the two never overlap and neither covers the circle.
+        QPointF colourAnchor = center + QPointF(0, radius + 2.0);
+        if (pillAnchor.y() > center.y()) {
+            colourAnchor = center + QPointF(0, radius + 2.0 + pillHeight + 2.0);
+            if (colourAnchor.y() + 10.0 + 2 * pillHeight > overlay->height()) {
+                colourAnchor.setY(center.y() - radius - 12.0);
+            }
+        } else {
+            colourAnchor.setY(center.y() - radius - 12.0);
+        }
+        drawColorPill(overlay, painter, colourAnchor, pixelColor);
+    }
+}
+
+// The picker's readout: the pixel's code on a swatch of the pixel itself, with
+// the keys that act on it on a line of their own below.
+//
+// Two lines rather than one, because the two halves are not the same kind of
+// thing.  The top line is a *reading* -- it is the colour, shown, and it has to
+// change as the cursor moves or the user is reading a swatch of where the
+// pointer used to be -- while the bottom line is a fixed hint about the keys.
+// Run together they made the swatch as wide as the hint, which put a band of
+// the sampled colour across the screen; split, the swatch is only as wide as
+// the code it prints.
+//
+// The text on the swatch is black or white, whichever the swatch's own
+// luminance is further from: a fixed white would vanish on a white pixel, which
+// is exactly the pixel a colour picker gets pointed at.
+void OverlayController::drawColorPill(CaptureOverlay *overlay, QPainter *painter,
+                                      const QPointF &anchor, const QColor &color)
+{
+    const QRectF bounds(0, 0, overlay->width(), overlay->height());
+    const QFontMetrics metrics(pillFont());
+    const QString code = color.name(QColor::HexRgb).toUpper();
+    const QString hint = QStringLiteral("%1  %2")
+                             .arg(shortcutHint(ShortcutAction::CopyColor, uiTr("copy")),
+                                  shortcutHint(ShortcutAction::AdoptColor, uiTr("use")));
+
+    const int codeWidth = metrics.horizontalAdvance(code);
+    const int hintWidth = metrics.horizontalAdvance(hint);
+    const int width = std::max(codeWidth, hintWidth) + 16;
+    const int lineHeight = metrics.height() + 4;
+    const int height = 2 * lineHeight;
+
+    qreal x = anchor.x() - width / 2.0;
+    x = std::clamp(x, bounds.left() + 2.0,
+                   std::max(bounds.left() + 2.0, bounds.right() - width - 2.0));
+    qreal y = anchor.y() + 10.0;
+    if (y + height > bounds.bottom()) {
+        y = anchor.y() - height - 10.0;
+    }
+    y = std::clamp(y, bounds.top() + 2.0,
+                   std::max(bounds.top() + 2.0, bounds.bottom() - height - 2.0));
+    const QRectF pill(x, y, width, height);
+
+    // The swatch is opaque whatever the pixel's alpha: the readout is the
+    // colour as it appears on screen, and the compositor has already put it
+    // over whatever was behind it.
+    QColor ground = color;
+    ground.setAlpha(255);
+    // Rec. 601 luma, which is what "how bright does this look" means for a
+    // background: at 0.299/0.587/0.114 the crossover sits at the point where
+    // black and white text are equally readable, so the choice is never a
+    // guess.  The ink is pure black or pure white rather than a tint, because
+    // the code has to stay legible at pill size.
+    const double luma = (0.299 * ground.redF() + 0.587 * ground.greenF() +
+                         0.114 * ground.blueF()) *
+        255.0;
+    const QColor ink = luma > 140.0 ? QColor(0, 0, 0) : QColor(255, 255, 255);
+
+    painter->setFont(pillFont());
+    painter->setPen(Qt::NoPen);
+    painter->setBrush(ground);
+    painter->drawRoundedRect(pill, 4, 4);
+    painter->setPen(QPen(QColor(120, 120, 120), 1.0));
+    painter->setBrush(Qt::NoBrush);
+    painter->drawRoundedRect(pill.adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
+
+    painter->setPen(ink);
+    painter->drawText(QRectF(pill.left(), pill.top(), pill.width(), lineHeight),
+                      Qt::AlignCenter, code);
+    // The hint keeps the pill's dark ground rather than the swatch: it is a
+    // caption, and a caption on the sampled colour would move and change
+    // contrast every time the cursor did.
+    const QRectF hintRect(pill.left(), pill.top() + lineHeight, pill.width(), lineHeight);
+    painter->setPen(Qt::NoPen);
+    painter->setBrush(QColor(20, 20, 20, 225));
+    painter->drawRect(hintRect);
+    painter->setPen(QPen(QColor(120, 120, 120), 1.0));
+    painter->setBrush(Qt::NoBrush);
+    painter->drawRect(hintRect.adjusted(0.5, 0.0, -0.5, -0.5));
+    painter->setPen(Qt::white);
+    painter->drawText(hintRect, Qt::AlignCenter, hint);
+}
+
+// The frame the magnifier and the colour readout sample: the frozen image of
+// the output, which is what the overlay is showing.
+const QImage *OverlayController::outputFrame(const OutputSession &output) const
+{
+    return output.image.isNull() ? nullptr : &output.image;
+}
+
+QByteArray OverlayController::loupeCompositeKey(const OutputSession &output) const
+{
+    QByteArray key;
+    QDataStream stream(&key, QIODevice::WriteOnly);
+    // The frame itself, and where it sits.  `geometry` is here rather than in
+    // the marks' own caches: the composite is a picture of a *place*, so
+    // sliding the pin's image under the marks has to move the marks with it
+    // and a stale composite would leave them where they were.
+    stream << output.id << output.image.cacheKey() << output.geometry.x << output.geometry.y
+           << output.geometry.width << output.geometry.height << output.scale
+           << (pinEdit_ && marksOrigin_.has_value());
+    if (pinEdit_ && marksOrigin_.has_value()) {
+        stream << marksOrigin_->x << marksOrigin_->y << marksOrigin_->width
+               << marksOrigin_->height;
+    }
+    stream << annotations_.size();
+    // Every mark's own identity, as the raster caches compute it: a mark that
+    // has not changed contributes the same bytes, and one that has contributes
+    // different ones.  This is what makes a style change or a drag rebuild the
+    // composite without the editor having to remember to say so.
+    for (const Annotation &annotation : annotations_) {
+        if (annotation.raster == nullptr) {
+            annotation.raster = makeAnnotationRaster(annotation);
+        }
+        stream << annotation.raster->key(annotation, output, output.image.size());
+    }
+    return key;
+}
+
+void OverlayController::invalidateLoupeComposite()
+{
+    loupeCompositeKey_.clear();
+    loupeComposite_ = QImage();
+    loupeCompositeOutput_ = -1;
+}
+
+const QImage *OverlayController::loupeFrame(const OutputSession &output)
+{
+    const QImage *frame = outputFrame(output);
+    if (frame == nullptr) {
+        return nullptr;
+    }
+    if (annotations_.isEmpty()) {
+        // Nothing has been drawn, so the picture *is* the frame.  The loupe
+        // then reads the capture's own pixels, which is the one reading that
+        // cannot be wrong.
+        return frame;
+    }
+    const QByteArray key = loupeCompositeKey(output);
+    if (!loupeComposite_.isNull() && key == loupeCompositeKey_ &&
+        static_cast<uint32_t>(loupeCompositeOutput_) == output.id) {
+        return &loupeComposite_;
+    }
+    // Where the frame sits on the screen.  In the pin editor that is the
+    // daemon-confirmed rect rather than the session's own record of it, which
+    // is what the rest of the editor counts from too; the two agree once the
+    // daemon has answered, and before that the confirmed one is the one the
+    // picture is actually drawn at.
+    const LogicalRect picture =
+        pinEdit_ && marksOrigin_.has_value() ? *marksOrigin_ : output.geometry;
+    // The frame's own size, so the composite is the picture pixel for pixel: a
+    // mark lands on exactly the device pixels it lands on in the render.  The
+    // cost is that a mark overhanging the picture is cut off at its edge --
+    // which is also what the screen does, so the two agree.
+    QImage composite(frame->size(), QImage::Format_ARGB32_Premultiplied);
+    if (composite.isNull()) {
+        return frame;
+    }
+    composite.fill(Qt::transparent);
+    {
+        QPainter painter(&composite);
+        painter.drawImage(0, 0, *frame);
+        // The marks were measured against the picture, so this is the record
+        // they are drawn through: `surface` is the picture's own rect and the
+        // size handed to the painter is its device size, which together make
+        // every global coordinate land on the frame's own pixels.  The pixels
+        // stay the *frame's*, not the composite's, so a mosaic samples the
+        // capture rather than the marks already painted over it -- exactly as
+        // the render does.
+        OutputSession placed;
+        placed.id = output.id;
+        placed.scale = output.scale;
+        placed.geometry = picture;
+        placed.surface = picture;
+        placed.image = *frame;
+        for (const Annotation &annotation : annotations_) {
+            if (annotation.raster == nullptr) {
+                annotation.raster = makeAnnotationRaster(annotation);
+            }
+            annotation.raster->drawInto(&painter, annotation, placed, composite.size());
+        }
+    }
+    loupeComposite_ = composite;
+    loupeCompositeKey_ = key;
+    loupeCompositeOutput_ = static_cast<int>(output.id);
+    return &loupeComposite_;
+}
+
+bool OverlayController::magnifierVisible() const
+{
+    return magnifierHeld_ || magnifierTyped_;
+}
+
+bool CaptureOverlay::magnifierVisible() const
+{
+    return controller_ != nullptr && controller_->magnifierVisible();
+}
+
+bool CaptureOverlay::colorPickerVisible() const
+{
+    return controller_ != nullptr && controller_->colorPickerVisible();
+}
+
+bool OverlayController::colorPickerVisible() const
+{
+    // Only the right button's magnifier.  The loupe a drag brings up, and the
+    // one a keyboard step flashes, are coordinate readouts for placing a mark:
+    // they are there to say *where* the cursor is, and the colour under it is
+    // not what the user is aiming at.  The right button is the one press whose
+    // whole purpose is the pixel, so it is the one that carries the picker.
+    return magnifierHeld_;
+}
+
+void OverlayController::flashMagnifier()
+{
+    magnifierTyped_ = true;
+    if (magnifierTimer_ == nullptr) {
+        magnifierTimer_ = new QTimer(this);
+        magnifierTimer_->setSingleShot(true);
+        QObject::connect(magnifierTimer_, &QTimer::timeout, this,
+                         [this] { endMagnifierFlash(); });
+    }
+    // Two seconds: long enough to read a coordinate and step again, short
+    // enough that a frame left up by a stray key press goes away on its own.
+    magnifierTimer_->start(2000);
+}
+
+void OverlayController::endMagnifierFlash()
+{
+    if (!magnifierTyped_) {
+        return;
+    }
+    magnifierTyped_ = false;
+    if (magnifierTimer_ != nullptr) {
+        magnifierTimer_->stop();
+    }
+    if (!magnifierHeld_) {
+        updateAll();
+    }
+}
+
+// The pixel the magnifier is centred on, in the output's own device pixels.
+// The image pixel under the cursor is what the user is aiming at: the pill's
+// coordinates, the hex code, and the circle all read from this one place, so
+// they cannot disagree about which pixel is "under the cursor".
+QColor OverlayController::pixelUnderCursor(int *pixelIndexX, int *pixelIndexY) const
+{
+    if (pixelIndexX != nullptr) {
+        *pixelIndexX = -1;
+    }
+    if (pixelIndexY != nullptr) {
+        *pixelIndexY = -1;
+    }
+    if (pointerOutput_ < 0 || pointerOutput_ >= session_.outputs.size()) {
+        return QColor();
+    }
+    const OutputSession &output = session_.outputs.at(pointerOutput_);
+    const QImage *frame = outputFrame(output);
+    if (frame == nullptr || frame->isNull()) {
+        return QColor();
+    }
+    const double scale = outputScale(output);
+    const LogicalRect &image =
+        pinEdit_ && marksOrigin_.has_value() ? *marksOrigin_ : output.geometry;
+    const int x = std::clamp(
+        static_cast<int>(std::floor((pointer_.x - image.x) * scale)), 0, frame->width() - 1);
+    const int y = std::clamp(
+        static_cast<int>(std::floor((pointer_.y - image.y) * scale)), 0, frame->height() - 1);
+    if (pixelIndexX != nullptr) {
+        *pixelIndexX = x;
+    }
+    if (pixelIndexY != nullptr) {
+        *pixelIndexY = y;
+    }
+    return frame->pixelColor(x, y);
+}
+
+void OverlayController::copyColorUnderCursor()
+{
+    const QColor color = pixelUnderCursor(nullptr, nullptr);
+    if (!color.isValid()) {
+        return;
+    }
+    // The code as it is written in a stylesheet or a config file: the same
+    // `#RRGGBB` the pill prints, so the copy and the readout cannot disagree.
+    if (!writeClipboard(color.name(QColor::HexRgb).toUpper())) {
+        std::fprintf(stderr, "vshot-qt-ui: could not copy the colour code\n");
+        std::fflush(stderr);
+    }
+}
+
+void OverlayController::adoptColorUnderCursor()
+{
+    const QColor color = pixelUnderCursor(nullptr, nullptr);
+    if (!color.isValid()) {
+        return;
+    }
+    // Only where there is a palette to take it: a tool with no colour of its
+    // own -- the mosaic, whose look is its strength -- has nothing to set, and
+    // silently restyling some other tool would be worse than doing nothing.
+    const QString target = styleTargetTool();
+    if (target == QStringLiteral("mosaic")) {
+        return;
+    }
+    // Opaque, because the pixel is: the alpha a tool happens to be carrying is
+    // the user's choice about the ink, not about this colour.
+    QColor adopted = color;
+    adopted.setAlpha(255);
+    setCurrentColor(adopted);
+}
+
+void OverlayController::copyToClipboard()
+{
+    QImage composite;
+    QString error;
+    if (!produceComposite(&composite, nullptr, &error)) {
+        // A session that has framed nothing has nothing to copy, and that is
+        // not a failure worth a diagnostic; anything else is.
+        if (!error.isEmpty()) {
+            std::fprintf(stderr, "vshot-qt-ui: %s\n", error.toUtf8().constData());
+            std::fflush(stderr);
+        }
+        return;
+    }
+    if (!runWlCopyImage(composite)) {
+        std::fprintf(stderr, "vshot-qt-ui: could not copy the capture\n");
+        std::fflush(stderr);
+    }
 }
 
 CaptureOverlay::CaptureOverlay(int outputIndex, OverlayController *controller, QScreen *screen)

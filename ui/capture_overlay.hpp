@@ -286,9 +286,9 @@ enum class TextOutcome {
     Failed,
 };
 
-class OverlayController final {
+class OverlayController final : public QObject {
 public:
-    explicit OverlayController(Session session);
+    explicit OverlayController(Session session, QObject *parent = nullptr);
     ~OverlayController();
 
     OverlayController(const OverlayController &) = delete;
@@ -559,7 +559,60 @@ private:
     std::uint32_t textEditPixels_ = 0;
     Point pointer_;
     int pointerOutput_ = -1;
-    Tool tool_ = Tool::Select;
+    // The tool the next press will draw with, or nothing while none is armed.
+    // An unarmed session is the state the old Select tool used to be: a press
+    // adjusts the selection and the marks rather than drawing a new one, and
+    // that is where a region capture starts -- its first step is framing, not
+    // inking.
+    std::optional<Tool> tool_;
+    // The right button held: the magnifier is up for as long as it is, and the
+    // pixel it shows can be copied (C) or taken as the current colour (A).
+    //
+    // Only the right button puts the colour picker in the magnifier: it is the
+    // button the user presses *because* they are aiming at a pixel, while the
+    // loupe a drag brings up is a coordinate readout for placing a mark, and a
+    // colour pill under it would be answering a question nobody asked.
+    bool magnifierHeld_ = false;
+    // Where the pointer was on the last motion, for the magnifier the right
+    // button holds: its own rect has to be invalidated on the way out as well
+    // as the one it is moving to, or a picker dragged across the screen leaves
+    // a trail of loupes behind it.
+    Point lastMagnifierPointer_{};
+    // The magnifier shown for a moment after the cursor was moved with the
+    // keyboard, with the timer that ends it.  A keypress is a deliberate act,
+    // and the pointer has not moved for it, so the user has nothing to aim
+    // with unless the magnifier says where the cursor went.
+    bool magnifierTyped_ = false;
+    QTimer *magnifierTimer_ = nullptr;
+    // Where the keyboard last put the cursor, in global logical pixels, or
+    // nothing while the pointer is the one in charge.  The arrow keys and WASD
+    // move it; any real pointer motion takes it over again.
+    std::optional<Point> keyboardCursor_;
+    /// When the last pointer-warp request went out, for the throttle in
+    /// `requestPointerWarp`.  Invalid until the first one.
+    QElapsedTimer pointerWarpClock_;
+    /// The newest position the throttle held back, sent when its timer fires.
+    /// Only the newest: the request carries an absolute position, so an older
+    /// one has nowhere to land that the newer one does not overwrite.
+    std::optional<Point> pointerWarpPending_;
+    /// The position the last warp asked for, and the clock that says how long
+    /// ago: together they identify the motion the compositor reports back, so a
+    /// step of a keyboard walk is not read as the user moving the mouse.  See
+    /// `isPointerWarpEcho`.
+    std::optional<Point> pointerWarpTarget_;
+    /// Parentless and deleted with the controller's other timers, like the
+    /// magnifier flash's.
+    QTimer *pointerWarpTimer_ = nullptr;
+    // The mark the pick-up modifier is holding the pointer over, or -1.  See
+    // `markUnderPointer`.
+    int markHovered_ = -1;
+    // The modifiers the last pointer event carried.  A move handler has them in
+    // hand; the painter, which runs from `paintEvent` with nothing but the
+    // widget, does not, and the hover frame it draws depends on whether the
+    // pick-up modifier is held.  There is no query for the live state that does
+    // not go through the window system, and the overlay is a layer surface with
+    // no focus of its own.
+    int lastModifiers_ = 0;
     QString currentFont_;
     // Per-tool colour and numeric parameters, keyed by `toolName`.  A painter
     // path reads the tool it is drawing with; the style row reads and writes
@@ -786,6 +839,10 @@ private:
     // The magnifier the editor draws around the pointer while a gesture drags
     // something, in session coordinates.
     LogicalRect pointerTouch() const;
+    // The same, around a point that is not the current pointer: the magnifier
+    // the right button holds follows the pointer, so a move has to name the
+    // rect the loupe has just left as well as the one it is about to cover.
+    LogicalRect pointerTouchAt(Point point) const;
     // True for the tools whose preview builds up through the incremental raster
     // rather than being redrawn whole from the anchor every step.
     bool drawsGrowingStroke() const;
@@ -910,6 +967,15 @@ public:
     // window left painting through a dead controller is a crash waiting for the
     // next turn of the event loop.
     void detachController();
+
+    // Whether the magnifier in front of the user is the colour picker's, and
+    // whether any magnifier is up at all.  Public because the two are a
+    // distinction the offline checks have to make and cannot see from the
+    // pixels alone: the picker's loupe and the drag loupe are the same widget
+    // drawn the same way, and the only difference is whether the pill under it
+    // says a colour or a coordinate.
+    bool colorPickerVisible() const;
+    bool magnifierVisible() const;
 
 protected:
     void paintEvent(QPaintEvent *event) override;

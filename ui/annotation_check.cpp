@@ -2109,6 +2109,584 @@ void checkLoupeShowsTheCursorPixelEverywhere()
     run(scaledCoordinateSession(), &ok);
 }
 
+// The colour picker: the right button's magnifier, and only the right button's.
+//
+// The loupe is drawn the same way whichever press brought it up, so the pixels
+// alone cannot tell a picker from a coordinate readout -- and the difference
+// matters, because the picker carries two keys that act on the colour under the
+// cursor.  A drag loupe that also carried them would be a loupe that answered
+// "A" while the user was drawing, and "A" is cursor-left.  So the state is asked
+// for directly, and the two presses are put side by side.
+void checkOnlyTheRightButtonBringsUpTheColourPicker()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+
+    const QPointF spot(200, 200);
+    expect(!overlay->colorPickerVisible() && !overlay->magnifierVisible(),
+           "nothing is up before a button goes down");
+
+    // A left drag: the loupe comes up to say where the cursor is, and the
+    // picker does not.  The loupe here is drawn off the gesture rather than
+    // from `magnifierVisible`, so the flag stays false while it is on screen --
+    // which is exactly the distinction the colour keys are gated on.
+    controller.press(overlay, spot, Qt::LeftButton, Qt::NoModifier);
+    controller.move(overlay, spot + QPointF(4, 4), Qt::LeftButton, Qt::NoModifier);
+    expect(!overlay->colorPickerVisible(), "a drag's loupe is not the colour picker");
+    QImage dragFrame(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &dragFrame);
+    expect(dragFrame.pixelColor(static_cast<int>(spot.x() + 66),
+                                static_cast<int>(spot.y() + 66))
+               != QColor(Qt::transparent),
+           "a drag still brings a loupe up, it just is not the picker");
+    controller.release(overlay, spot + QPointF(4, 4), Qt::LeftButton, Qt::NoModifier);
+    expect(!overlay->colorPickerVisible(), "letting the button go puts the picker away");
+
+    // The right button: the picker, and the picker follows the pointer for as
+    // long as it is held.  What it is aimed at is the pixel under the cursor
+    // *now*, not the one the button went down on, so a step has to repaint.
+    controller.press(overlay, spot, Qt::RightButton, Qt::NoModifier);
+    expect(overlay->colorPickerVisible(), "the right button brings the picker up");
+    expect(overlay->magnifierVisible(), "the picker is a magnifier");
+
+    // Incrementally, the way the widget is actually driven: the loupe's old
+    // place has to be *erased* and the new one painted, and a full render after
+    // every step cannot tell that from a step that did nothing at all.  That is
+    // exactly how a follow that never fired passed this check once -- the
+    // handler asked for `Qt::NoButton`, which a motion carrying a held button
+    // never reports, so the whole branch was dead and only the full re-render
+    // kept the loupe looking right.
+    //
+    // So: a full render at the new position, then the same step driven the way
+    // the widget drives it, and the two have to agree.  A loupe left behind at
+    // the old place, or one that never arrived, is a difference either way.
+    const QPointF moved = spot + QPointF(100, 100);
+    controller.move(overlay, moved, Qt::RightButton, Qt::NoModifier);
+    QImage full(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &full);
+
+    // Back to the start, rendered in full so the incremental run below begins
+    // from pixels that are certainly right, then forward again a step at a time.
+    controller.move(overlay, spot, Qt::RightButton, Qt::NoModifier);
+    QImage backing(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &backing);
+    controller.move(overlay, moved, Qt::RightButton, Qt::NoModifier);
+    const QRect claimed = controller.lastInteractiveUpdate();
+    expect(!claimed.isNull() && !claimed.isEmpty(),
+           "a step of the held picker asks for a repaint of its own",
+           QStringLiteral("claimed %1x%2").arg(claimed.width()).arg(claimed.height()));
+    renderIncremental(controller, overlay, &backing);
+    const int strayed = differingPixelsOutside(childAreas(overlay), full, backing);
+    expect(strayed == 0,
+           "a step of the held picker leaves the picture a full repaint would",
+           QStringLiteral("%1 pixel(s) differ -- the loupe is not keeping up").arg(strayed));
+
+    controller.release(overlay, moved, Qt::RightButton, Qt::NoModifier);
+    expect(!overlay->colorPickerVisible() && !overlay->magnifierVisible(),
+           "letting the right button go puts the picker away");
+}
+
+// A tool whose press picks a start and whose release picks an end holds the
+// button for the whole of the stroke, so the mouse cannot place the far end
+// exactly -- which is the one situation the keyboard cursor exists for.  The
+// walk has to reach the *live* gesture: a step that moved only the editor's own
+// cursor would leave the preview behind, and one that nudged a committed mark
+// would move the wrong thing entirely (there is no committed mark yet).
+//
+// The anchor is the part that must not move.  A stroke is drawn from where the
+// press landed, and walking the cursor chooses where the other end goes; an
+// implementation that moved both would drag the whole shape across the canvas,
+// which is a different edit from the one the pointer would have made.
+void checkAStrokeInProgressFollowsTheCursorKeys()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+    controller.chooseTool(vshot::Tool::Rectangle);
+
+    // The press anchors, and the button stays down from here on -- the whole
+    // point of the check is that the keys work while it is.
+    const QPointF anchor(100, 100);
+    controller.press(overlay, anchor, Qt::LeftButton, Qt::NoModifier);
+    controller.key(overlay, Qt::Key_D, Qt::NoModifier);
+    controller.key(overlay, Qt::Key_S, Qt::NoModifier);
+
+    // The walk starts from the pointer, which the press left at the anchor, so
+    // one step right and one down puts the far corner on 101,101 -- and the
+    // shape is the box between it and the anchor that has not moved.
+    const QVector<vshot::Annotation> marks = controller.annotations();
+    expect(marks.isEmpty(), "a stroke in progress is not a mark yet",
+           QString::number(marks.size()));
+
+    // The release carries the pointer position like any other event, and the
+    // button has not moved the mouse -- so it lands where the press left it,
+    // and the far corner the keys chose is what the release commits.
+    controller.release(overlay, anchor, Qt::LeftButton, Qt::NoModifier);
+    const QVector<vshot::Annotation> committed = controller.annotations();
+    expect(committed.size() == 1, "the release commits the stroke the keys shaped",
+           QString::number(committed.size()));
+    if (committed.size() != 1) {
+        return;
+    }
+    const vshot::Annotation &mark = committed.constFirst();
+    expect(mark.rect.x == 100 && mark.rect.y == 100,
+           "the anchor stays where the press put it",
+           QStringLiteral("%1,%2").arg(mark.rect.x).arg(mark.rect.y));
+    expect(mark.rect.width == 2 && mark.rect.height == 2,
+           "the far corner followed the cursor keys",
+           QStringLiteral("%1x%2").arg(mark.rect.width).arg(mark.rect.height));
+}
+
+// The motion the compositor reports after VShot warps the pointer is VShot's
+// own request coming back, not the user moving the mouse -- and reading it as a
+// move ends the magnifier flash the step just raised, so the loupe blinks on
+// every step of a walk and whether it survives the last one is a race.
+//
+// The echo is recognised by where it lands: a warp puts the pointer exactly
+// where the walk put the cursor, so the motion arrives on that very pixel.  The
+// check drives both halves -- the walk, and then the motion the compositor
+// would report for it -- and requires the flash to still be up afterwards.
+void checkThePointerWarpEchoDoesNotPutTheMagnifierOut()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+    // A session with no CLI behind it writes no request and remembers no
+    // target, so the echo would have nothing to be recognised against.
+    controller.enablePointerWarp();
+
+    // The session has no pointer of its own, so the walk starts at the middle
+    // of its bounds: 200,200 in a 400x400 scene, and one step right lands on
+    // 201,200 -- the pixel the compositor will report the pointer at.
+    controller.key(overlay, Qt::Key_Right, Qt::NoModifier);
+    expect(overlay->magnifierVisible(), "a step of the walk puts the magnifier up");
+
+    const QPointF echoed(201, 200);
+    controller.move(overlay, echoed, Qt::NoButton, Qt::NoModifier);
+    expect(overlay->magnifierVisible(),
+           "the motion the warp's own request produces leaves the magnifier up");
+
+    // A hand on the mouse is the other case, and it still takes the cursor back
+    // and puts the loupe away -- otherwise the flash would follow the pointer
+    // around and never go out.
+    controller.move(overlay, echoed + QPointF(3, 0), Qt::NoButton, Qt::NoModifier);
+    expect(!overlay->magnifierVisible(),
+           "a motion that is not the echo puts the magnifier out");
+}
+
+// The magnifier's own key, on its own.  Every other way the loupe comes up ends
+// by repainting -- a cursor step draws the frame it moved to, a press redraws
+// for its gesture -- so this is the one path where raising the flag is the
+// whole of the work, and leaving the repaint out made the key look dead: the
+// loupe was up, and nothing on screen said so until the next event redrew.
+//
+// What is asserted is the repaint itself, not the pixels: `render` paints from
+// the state whenever it is called, so a frame read back through it shows the
+// loupe whether or not anything asked for one.  Only the widget's own paint
+// event tells the two apart, and that is what the filter below counts.
+class PaintCounter : public QObject {
+public:
+    explicit PaintCounter(QObject *parent) : QObject(parent) {}
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (event->type() == QEvent::Paint) {
+            ++paints;
+        }
+        return QObject::eventFilter(watched, event);
+    }
+
+public:
+    int paints = 0;
+};
+
+void checkTheMagnifierKeyDrawsTheMagnifier()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+    controller.chooseTool(std::nullopt);
+
+    PaintCounter counter(overlay);
+    overlay->installEventFilter(&counter);
+
+    expect(!overlay->magnifierVisible(), "nothing is up before the key is pressed");
+
+    // Whatever the window and the tool change queued is drained first, so the
+    // count below is the key's own doing and not the open's.
+    QCoreApplication::processEvents();
+    counter.paints = 0;
+
+    controller.key(overlay, Qt::Key_M, Qt::NoModifier);
+    expect(overlay->magnifierVisible(), "the magnifier key puts the magnifier up");
+
+    // The repaint is what the key owes the screen, and it arrives through the
+    // event loop rather than during the call.
+    QCoreApplication::processEvents();
+    expect(counter.paints > 0, "the magnifier key asks for a repaint",
+           QStringLiteral("%1 paint event(s)").arg(counter.paints));
+}
+
+// The magnifier reads the *picture*, not the bare capture: a mark on the screen
+// has to be in it, or the one place the user goes to see a pixel at 8x would be
+// the one place that disagrees with everything else.
+//
+// A solid green rectangle over a black frame is the case that cannot be argued
+// with: the frame under it is black everywhere, so a loupe showing the capture
+// alone is black wherever it is aimed, and a loupe showing the picture is green
+// wherever the cursor is over the mark.  Both readings are taken, so a check
+// that only ever saw green -- a loupe painted flat, say -- would fail too.
+void checkTheMagnifierShowsTheMarks()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(blackSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+    controller.chooseTool(vshot::Tool::Rectangle);
+    controller.setWidth(4);
+    controller.setCurrentColor(QColor(0, 255, 0));
+    // 160,160..240,240, so its own centre is far from the frame's.
+    drag(controller, overlay, QPointF(160, 160), QPointF(240, 240));
+    controller.chooseTool(std::nullopt);
+    expect(controller.annotations().size() == 1, "the rectangle lands as one mark");
+    if (controller.annotations().size() != 1) {
+        return;
+    }
+
+    // The loupe hangs below and to the right of the cursor, so the cursor's own
+    // pixel is at its centre and the samples around it are the neighbours.
+    const auto loupeAt = [&](const QPointF &pointer, QImage *frame) {
+        controller.press(overlay, pointer, Qt::LeftButton, Qt::NoModifier);
+        controller.move(overlay, pointer, Qt::LeftButton, Qt::NoModifier);
+        *frame = QImage(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+        paintOnce(overlay, frame);
+        controller.release(overlay, pointer, Qt::LeftButton, Qt::NoModifier);
+    };
+    constexpr int radius = 60; // (2 * kLoupeRadius + 1) * kLoupeZoom / 2
+    const auto greenInLoupe = [&](const QPointF &pointer) {
+        QImage frame;
+        loupeAt(pointer, &frame);
+        const QPointF center(pointer.x() + radius * 1.1, pointer.y() + radius * 1.1);
+        // A small square around the centre, inside the circle and clear of the
+        // crosshair the loupe draws over it.
+        for (int dy = -20; dy <= 20; dy += 4) {
+            for (int dx = -20; dx <= 20; dx += 4) {
+                const QColor pixel =
+                    frame.pixelColor(static_cast<int>(center.x()) + dx,
+                                     static_cast<int>(center.y()) + dy);
+                if (pixel.green() > 200 && pixel.red() < 60 && pixel.blue() < 60) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    // Over the mark: the rim is the ink, and the cursor sits on it.
+    expect(greenInLoupe(QPointF(200, 160)), "the magnifier shows the mark under the cursor");
+    // Over the bare frame, well outside the mark: the picture there *is* the
+    // capture, so the loupe must not be green -- otherwise the reading above
+    // would prove nothing about what the loupe samples.
+    expect(!greenInLoupe(QPointF(80, 80)), "and shows the capture where no mark is");
+}
+
+// The pill under the picker's loupe: the colour on one line and the shortcut
+// hint on another, and the colour line *is* the colour.
+//
+// That last part is the whole point of the two lines.  One line carrying both
+// meant the hint had to be legible on whatever colour the cursor happened to be
+// over, which is a background the pill cannot choose; splitting them lets the
+// colour line be the sampled colour itself, with ink picked to read on it.  So
+// the check samples the pill's ground and requires it to be the pixel under the
+// cursor, and samples the ink over it and requires it to be black or white --
+// a tint would fail on some colour, which is the failure this exists to catch.
+// The keyboard cursor has to move the *real* pointer, not only the editor's own
+// idea of where it is.  Everything the editor draws reads the editor's cursor,
+// so a walk that never asked the compositor would look perfect and still leave
+// the arrow on the screen where it started -- which is exactly the bug: the
+// user steps ten pixels, the loupe says so, and the pointer they can see has
+// not moved.
+//
+// The request goes to the CLI over the pipe the session arrived on, because
+// moving a pointer is the CLI's job (it holds the injection backends).  This
+// checks the helper's half of that: that a walk writes the request, with the
+// position the editor moved to, and that a session which was never told there
+// is a CLI behind it writes nothing.
+void checkWalkingTheCursorAsksTheCliToMoveThePointer()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+
+    // The helper writes to stdout, so the check has to stand in for the CLI by
+    // reading it.  A pipe of the check's own, made the process's stdout for the
+    // duration: the controller writes with `fwrite(stdout)`, and there is no
+    // seam to pass a stream through.
+    const auto capture = [screen](bool tellTheHelperThereIsACli) {
+        fflush(stdout);
+        const int saved = dup(STDOUT_FILENO);
+        int pipeEnds[2] = {-1, -1};
+        if (saved < 0 || pipe(pipeEnds) != 0) {
+            return QByteArray();
+        }
+        dup2(pipeEnds[1], STDOUT_FILENO);
+        close(pipeEnds[1]);
+
+        {
+            vshot::OverlayController controller(editingSession());
+            QString error;
+            vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+            if (overlay != nullptr) {
+                overlay->show();
+                controller.beginPresetEdit();
+                if (tellTheHelperThereIsACli) {
+                    controller.enablePointerWarp();
+                }
+                controller.key(overlay, Qt::Key_Right, Qt::NoModifier);
+                controller.key(overlay, Qt::Key_Down, Qt::NoModifier);
+                // The second step is inside the throttle's window, so it is
+                // held back and sent by a timer -- which needs the event loop.
+                // A held key repeats the same way, so this is what the real
+                // session does; without it the check would only ever see the
+                // first step and the pointer would be left a pixel behind.
+                QThread::msleep(80);
+                QCoreApplication::processEvents();
+            }
+        }
+        fflush(stdout);
+        dup2(saved, STDOUT_FILENO);
+        close(saved);
+
+        QByteArray written;
+        char buffer[4096];
+        const int flags = fcntl(pipeEnds[0], F_GETFL, 0);
+        fcntl(pipeEnds[0], F_SETFL, flags | O_NONBLOCK);
+        while (true) {
+            const ssize_t got = ::read(pipeEnds[0], buffer, sizeof(buffer));
+            if (got <= 0) {
+                break;
+            }
+            written.append(buffer, static_cast<int>(got));
+        }
+        close(pipeEnds[0]);
+        return written;
+    };
+
+    const QByteArray asked = capture(true);
+    // The session has no pointer of its own, so the walk starts at the middle of
+    // its bounds -- 200,200 in a 400x400 scene -- and one step right and one
+    // down lands on 201,201.  Asserted as a number rather than as "some
+    // position was sent", because a request that always said 0,0 would pass
+    // that and move the pointer to the corner of the desktop.
+    const QByteArray expected = QByteArrayLiteral(
+        "{\"request\":\"pointer\",\"x\":201,\"y\":201}");
+    expect(asked.contains(expected),
+           "walking the cursor asks the CLI to move the pointer where it went",
+           QStringLiteral("wanted %1 in %2").arg(QString::fromUtf8(expected),
+                                                 QString::fromUtf8(asked)));
+
+    const QByteArray silent = capture(false);
+    expect(silent.isEmpty(),
+           "a helper that was not told there is a CLI writes nothing to its stdout",
+           QString::fromUtf8(silent));
+}
+
+void checkTheColourPillShowsTheColourAndReadsOnIt()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+
+    // The darkest and the brightest pixel the session has, so the ink has to go
+    // both ways: a rule that only ever chose black would pass on one and fail on
+    // the other.
+    const auto run = [screen](const QColor &ground) {
+        vshot::Session session = coordinateSession();
+        // A canvas that is *not* the sampled colour, with the sampled colour on
+        // the one pixel under the cursor.  Filling the frame with it instead
+        // would make the swatch and the canvas the same colour, and the check
+        // could not tell the pill from the picture behind it.
+        session.outputs[0].image.fill(QColor(90, 120, 150));
+        session.outputs[0].image.setPixelColor(60, 60, ground);
+        vshot::OverlayController controller(std::move(session));
+        QString error;
+        vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+        if (overlay == nullptr) {
+            expect(false, "the controller accepts an overlay", error);
+            return;
+        }
+        overlay->show();
+        controller.beginPresetEdit();
+
+        const QPointF spot(60, 60);
+        controller.press(overlay, spot, Qt::RightButton, Qt::NoModifier);
+        controller.move(overlay, spot, Qt::NoButton, Qt::NoModifier);
+        QImage frame(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+        paintOnce(overlay, &frame);
+        controller.release(overlay, spot, Qt::RightButton, Qt::NoModifier);
+
+        // The pill is found rather than placed.  Its exact geometry is the
+        // renderer's business, and a check that recomputed it would be testing
+        // its own arithmetic against itself; what matters is that the pill is on
+        // screen at all, carrying the sampled colour with the code written on
+        // it.
+        //
+        // The swatch is opaque and the canvas around the overlay is not, so the
+        // colour under the cursor *is* the swatch wherever it appears -- nothing
+        // else on the overlay paints a solid field of it.  The row is chosen by
+        // how much ink it carries rather than by how wide its band is: the
+        // widest band is the row above the glyphs, which has none.
+        const double groundLuma = (ground.red() + ground.green() + ground.blue()) / 3.0;
+        // The end the swatch is further from is the one that reads on it: a
+        // fixed white would vanish on a white pixel, which is the pixel a
+        // colour picker gets pointed at.
+        const bool wantLight = groundLuma < 127.5;
+        const auto isGround = [&ground](const QColor &pixel) {
+            return std::max({std::abs(pixel.red() - ground.red()),
+                             std::abs(pixel.green() - ground.green()),
+                             std::abs(pixel.blue() - ground.blue())}) <= 2;
+        };
+
+        // Below the loupe's disc, which is where the pill hangs.  The scan has
+        // to start there: the loupe magnifies the sampled pixel to fill a large
+        // part of the disc, so a search over the whole frame finds *that* first
+        // and reads the code off the magnified crop.
+        constexpr int radius = 60;
+        const QPointF center(spot.x() + radius * 1.1, spot.y() + radius * 1.1);
+        int bestRow = -1;
+        int bestLeft = 0;
+        int bestRight = 0;
+        int bestBand = 0;
+        int inkPixels = 0;
+        int wrong = 0;
+        for (int py = static_cast<int>(center.y() + radius) + 2; py < frame.height(); ++py) {
+            // The row's swatch, as the span between its first and last pixel of
+            // the colour.  A *run* will not do: the code is written across the
+            // middle of the band, so the longest unbroken run is one glyph's
+            // gap rather than the swatch.  The span is the swatch, and what is
+            // inside it that is not the swatch is the ink.
+            int first = -1;
+            int last = -1;
+            int band = 0;
+            for (int px = 0; px < frame.width(); ++px) {
+                if (!isGround(frame.pixelColor(px, py))) {
+                    continue;
+                }
+                if (first < 0) {
+                    first = px;
+                }
+                last = px;
+                ++band;
+            }
+            if (band < 20) {
+                continue;
+            }
+            int ink = 0;
+            int bad = 0;
+            for (int px = first; px <= last; ++px) {
+                const QColor pixel = frame.pixelColor(px, py);
+                const double luma = (pixel.red() + pixel.green() + pixel.blue()) / 3.0;
+                if (std::abs(luma - groundLuma) < 60.0) {
+                    continue; // the swatch, or close enough to be antialiasing
+                }
+                ++ink;
+                if ((luma > groundLuma) != wantLight) {
+                    ++bad;
+                }
+            }
+            if (ink > inkPixels) {
+                inkPixels = ink;
+                wrong = bad;
+                bestRow = py;
+                bestLeft = first;
+                bestRight = last;
+                bestBand = band;
+            }
+        }
+
+        expect(bestBand > 20, "the colour line is a band of the colour under the cursor",
+               QStringLiteral("no run of %1,%2,%3 wider than 20px")
+                   .arg(ground.red())
+                   .arg(ground.green())
+                   .arg(ground.blue()));
+        expect(inkPixels > 0, "the colour line has the code written on it",
+               QStringLiteral("ground %1,%2,%3")
+                   .arg(ground.red())
+                   .arg(ground.green())
+                   .arg(ground.blue()));
+        expect(wrong == 0, "the code is written in whichever of black and white reads on it",
+               QStringLiteral("%1 of %2 inked pixels at row %3 (%4..%5) went the wrong way")
+                   .arg(wrong)
+                   .arg(inkPixels)
+                   .arg(bestRow)
+                   .arg(bestLeft)
+                   .arg(bestRight));
+    };
+
+    run(QColor(0, 0, 0));
+    run(QColor(255, 255, 255));
+}
+
 // Where the label is typed has to be where it lands.  The inline editor is a
 // QLineEdit child widget; whatever frame or padding it carries shifts its
 // glyphs away from the origin the committed label is drawn at, so the label
