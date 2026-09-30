@@ -2979,18 +2979,23 @@ public:
         endsGrid->setVerticalSpacing(2);
         endsGrid->setHorizontalSpacing(kEndsSpacing);
         undo_ = makeToolButton(uiTr("Undo"), historyIcon(false, QColor(QStringLiteral("#dfe4ec"))),
-                               uiTr("Undo last change (Ctrl+Z)"), QStringLiteral("undoButton"));
+                               controller_->shortcutHint(ShortcutAction::Undo,
+                                                         uiTr("Undo last change")),
+                               QStringLiteral("undoButton"));
         connect(undo_, &QToolButton::clicked, [controller = controller_] { controller->undo(); });
         redo_ = makeToolButton(uiTr("Redo"), historyIcon(true, QColor(QStringLiteral("#dfe4ec"))),
-                               uiTr("Redo last change (Ctrl+Y)"), QStringLiteral("redoButton"));
+                               controller_->shortcutHint(ShortcutAction::Redo,
+                                                         uiTr("Redo last change")),
+                               QStringLiteral("redoButton"));
         connect(redo_, &QToolButton::clicked, [controller = controller_] { controller->redo(); });
         auto *ok = addActionButton(uiTr("OK"));
         ok->setObjectName(QStringLiteral("confirmButton"));
-        ok->setToolTip(uiTr("Confirm capture (Enter)"));
+        ok->setToolTip(controller_->shortcutHint(ShortcutAction::Confirm, uiTr("Confirm capture")));
         connect(ok, &QPushButton::clicked, [controller = controller_] { controller->confirm(); });
         auto *cancel = addActionButton(uiTr("Cancel"));
         cancel->setObjectName(QStringLiteral("cancelButton"));
-        cancel->setToolTip(uiTr("Discard capture (Esc)"));
+        cancel->setToolTip(controller_->shortcutHint(ShortcutAction::Cancel,
+                                                     uiTr("Discard capture")));
         connect(cancel, &QPushButton::clicked, [controller = controller_] { controller->cancel(); });
         // The width of the whole block: the wider of the two ends' own hints,
         // which the style already sizes to its label plus the padding the rule
@@ -4537,8 +4542,9 @@ OverlayController::OverlayController(Session session)
     // No toolbar is ever shown, so the flag that draws one is never set for it.
     translateMode_ = session_.mode == QStringLiteral("translate");
     resultPath_ = session_.resultPath;
-    // The style the user last left the editor in.
+    // The style the user last left the editor in, and the keys they bound.
     const EditorPreferences preferences = loadEditorPreferences();
+    shortcuts_ = loadShortcutPreferences();
     currentFont_ = preferences.font;
     textSize_ = preferences.textSize;
     currentDash_ = preferences.dash;
@@ -6019,6 +6025,19 @@ QRect OverlayController::lastInteractiveUpdate() const
     return lastTouchLocal_;
 }
 
+QString OverlayController::shortcutText(ShortcutAction action) const
+{
+    // Nothing for a binding the user cleared: a tooltip that named a key the
+    // editor will not act on would be a lie the settings page itself told.
+    return shortcuts_.hasKeys(action) ? shortcuts_.textFor(action) : QString();
+}
+
+QString OverlayController::shortcutHint(ShortcutAction action, const QString &label) const
+{
+    const QString keys = shortcutText(action);
+    return keys.isEmpty() ? label : QStringLiteral("%1 (%2)").arg(label, keys);
+}
+
 // Repaints the overlays' part of `region`, nothing else.  Unlike `updateTouch`
 // this leaves the "last touch" bookkeeping alone: it exists for damage that is
 // not a gesture step (the pin editor's daemon confirmation), which must not
@@ -6476,7 +6495,7 @@ void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifi
         }
         return;
     }
-    if (key == Qt::Key_Return || key == Qt::Key_Enter) {
+    if (is(ShortcutAction::Confirm)) {
         if (translateMode_) {
             // Enter keeps its two stages: it translates a frame nothing has
             // translated yet -- the drag that drew it normally has, so this is
@@ -6508,46 +6527,156 @@ void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifi
     if (translateMode_) {
         // Only the copy and the step back reach the translate overlay; every
         // other key is swallowed so nothing moves the frame under it.
-        if ((modifiers & Qt::ControlModifier) && key == Qt::Key_C && translated_) {
+        if (is(ShortcutAction::CopyText) && translated_) {
             writeClipboard(translatedText_);
         }
         return;
     }
     if (textMode_) {
-        // The mode owns the keys: Ctrl+C copies the range and Ctrl+A selects
-        // it all, and every other key is swallowed so the arrow keys cannot
-        // move the capture's selection out from under the text.
-        if (modifiers & Qt::ControlModifier) {
-            if (key == Qt::Key_C) {
-                copyTextSelection();
-            } else if (key == Qt::Key_A) {
-                textSelectAll();
-            }
+        // The mode owns the keys: copying the range and selecting it all are
+        // the two it answers, and every other key is swallowed so the arrow
+        // keys cannot move the capture's selection out from under the text.
+        if (is(ShortcutAction::CopyText)) {
+            copyTextSelection();
+        } else if (is(ShortcutAction::SelectAll)) {
+            textSelectAll();
         }
         return;
     }
-    if (modifiers & Qt::ControlModifier) {
-        if (key == Qt::Key_Z && !(modifiers & Qt::ShiftModifier)) {
-            undo();
-        } else if (key == Qt::Key_Z || key == Qt::Key_Y) {
-            redo();
-        } else if (key == Qt::Key_V) {
-            // Paste is the one action here that can fail for a reason the user
-            // needs told: an empty clipboard, or `wl-paste` missing. There is
-            // no status line on a frozen overlay, so the message goes to stderr
-            // where the CLI's own diagnostics already land.
-            QString error;
-            if (!pasteFromClipboard(&error)) {
-                std::fprintf(stderr, "vshot-qt-ui: %s\n", error.toUtf8().constData());
-                std::fflush(stderr);
-            }
+    if (is(ShortcutAction::Undo)) {
+        undo();
+        return;
+    }
+    if (is(ShortcutAction::Redo)) {
+        redo();
+        return;
+    }
+    if (is(ShortcutAction::Paste)) {
+        // Paste is the one action here that can fail for a reason the user
+        // needs told: an empty clipboard, or `wl-paste` missing. There is
+        // no status line on a frozen overlay, so the message goes to stderr
+        // where the CLI's own diagnostics already land.
+        QString error;
+        if (!pasteFromClipboard(&error)) {
+            std::fprintf(stderr, "vshot-qt-ui: %s\n", error.toUtf8().constData());
+            std::fflush(stderr);
         }
         return;
     }
-    if ((key == Qt::Key_Delete || key == Qt::Key_Backspace) &&
-        gesture_->type == Gesture::Type::None && selectedAnnotation_ >= 0) {
+    if (is(ShortcutAction::Copy)) {
+        // Copy the capture with its marks, through the same composite the
+        // Copy button makes.
+        copyToClipboard();
+        return;
+    }
+    if (is(ShortcutAction::SelectAll)) {
+        // Every mark, so a style or a delete reaches all of them at once.
+        selectAllAnnotations();
+        return;
+    }
+    if (is(ShortcutAction::SelectNone)) {
+        selectAnnotation(-1);
+        return;
+    }
+    if (is(ShortcutAction::NextMark) || is(ShortcutAction::PreviousMark)) {
+        // Tab and Shift+Tab walk the marks; Ctrl+Tab does the same, so a run
+        // of them can be walked in either direction without Shift.
+        const int step = is(ShortcutAction::PreviousMark) ? -1 : 1;
+        cycleAnnotationFocus(step);
+        return;
+    }
+    if (colorPickerVisible()) {
+        // The picker owns its two colour keys while it is up: the user is
+        // looking at a pixel through it, and those are the two things to do
+        // with one.  They are bound only here so the letters stay free for the
+        // keyboard cursor below when no picker is up.  Neither is a letter the
+        // cursor walk wants -- `C` and `V` are not among the WASD keys -- and
+        // that matters most here: the picker is up while the right button is
+        // held, which is the one moment the pointer is still being moved, so
+        // the cursor keys have to keep working underneath it.
+        if (is(ShortcutAction::CopyColor)) {
+            copyColorUnderCursor();
+            return;
+        }
+        if (is(ShortcutAction::AdoptColor)) {
+            adoptColorUnderCursor();
+            return;
+        }
+    }
+    if (is(ShortcutAction::ShowMagnifier)) {
+        // The magnifier on demand: the same two seconds a cursor step gives
+        // the user, asked for directly.  A cursor step is what usually raises
+        // it, and a step ends by repainting -- so `flashMagnifier` on its own
+        // here set the flag and left the frame alone, and the key looked dead
+        // until something else happened to redraw.
+        flashMagnifier();
+        updateAll();
+        return;
+    }
+    if (is(ShortcutAction::Delete) && gesture_->type == Gesture::Type::None
+        && selectedAnnotation_ >= 0) {
         deleteSelectedAnnotation();
         return;
+    }
+    if (gesture_->type == Gesture::Type::None || gesture_->type == Gesture::Type::Selecting ||
+        gesture_->type == Gesture::Type::Drawing || gesture_->type == Gesture::Type::Bezier) {
+        // Walking the cursor with the keyboard.  The point of it is to pick a
+        // spot the mouse cannot reach exactly -- the corner of a region, the
+        // end of an arrow -- and a step of one pixel is what makes that worth
+        // doing; the step modifier takes ten at a time for the coarse part of
+        // the trip.
+        //
+        // The arrow keys nudge the mark the keyboard has selected, when there
+        // is one, and walk the cursor when there is not -- which is the state
+        // framing is in.  WASD always walks the cursor, so the two are both
+        // reachable without letting go of a mark.  Which of the two a key is
+        // comes from the binding: an arrow is a nudge, a letter is a walk.
+        // The step modifier is read as part of the step's *size*, so it is not
+        // part of the key the step is bound to: Shift+Left is "left, ten
+        // pixels", not a key of its own.  Every comparison below therefore
+        // matches with those bits taken out of both sides.
+        //
+        // A stroke in progress is walked too.  Its press chose the start and
+        // its release will choose the end, so the button is held for the whole
+        // of it -- and that is precisely when the mouse cannot place the end
+        // exactly, which is what the walk is for.  The step moves the *live*
+        // gesture rather than the committed marks: the anchor the press set
+        // stays where it is and the far end follows, which is the same edit the
+        // pointer would have made, made a pixel at a time.
+        const int coarse = shortcuts_.held(ShortcutAction::CoarseStep, static_cast<int>(modifiers))
+            ? static_cast<int>(Qt::ShiftModifier)
+            : 0;
+        const int step = coarse != 0 ? kCoarseCursorStep : 1;
+        const auto steps = [this, &pressed, coarse](ShortcutAction action) {
+            return shortcuts_.matches(action, pressed, coarse);
+        };
+        int dx = 0;
+        int dy = 0;
+        bool nudge = false;
+        if (steps(ShortcutAction::CursorLeft)) {
+            dx = -step;
+            nudge = pressedArrow(key);
+        } else if (steps(ShortcutAction::CursorRight)) {
+            dx = step;
+            nudge = pressedArrow(key);
+        } else if (steps(ShortcutAction::CursorUp)) {
+            dy = -step;
+            nudge = pressedArrow(key);
+        } else if (steps(ShortcutAction::CursorDown)) {
+            dy = step;
+            nudge = pressedArrow(key);
+        }
+        if (dx != 0 || dy != 0) {
+            if (gesture_->type == Gesture::Type::Drawing ||
+                gesture_->type == Gesture::Type::Bezier) {
+                walkLiveGesture(dx, dy);
+            } else if (nudge && selectedAnnotation_ >= 0) {
+                nudgeSelectedAnnotation(dx, dy);
+            } else {
+                moveCursorBy(dx, dy);
+            }
+            return;
+        }
     }
     if (!selection_.has_value() || !editing_ || gesture_->type != Gesture::Type::None) {
         return;

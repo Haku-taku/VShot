@@ -29,6 +29,7 @@
 #include "settings_window.hpp"
 
 #include "config.hpp"
+#include "shortcuts.hpp"
 #include "text_size.hpp"
 #include "i18n.hpp"
 
@@ -1927,7 +1928,27 @@ private:
         pin.borderColor = pinBorderColor_;
         pin.activeBorderColor = pinActiveColorColor_;
 
+        if (shortcutsOwner_ != nullptr) {
+            // A caller that handed the dialog its own bindings reads them back
+            // itself; there is no file in that arrangement to write, and the
+            // status line has nothing to report about one.
+            *shortcutsOwner_ = shortcuts_;
+            status_->setText(uiTr("Saved"));
+            return;
+        }
         if (!saveConfig(config)) {
+            status_->setProperty("error", true);
+            status_->setText(uiTr("Could not write the config file."));
+            status_->style()->unpolish(status_);
+            status_->style()->polish(status_);
+            return;
+        }
+        // The bindings are their own section, which `Config` does not carry:
+        // the editor reads them out of the file on every start rather than out
+        // of a capture process that has to be told.  Written after the config,
+        // so a failure there leaves the file with the bindings it already had
+        // instead of half of one save.
+        if (!saveShortcutPreferences(shortcuts_)) {
             status_->setProperty("error", true);
             status_->setText(uiTr("Could not write the config file."));
             status_->style()->unpolish(status_);
@@ -1947,6 +1968,12 @@ private:
     }
 
     Config config_;
+    ShortcutPreferences shortcuts_;
+    /// The caller's bindings when the dialog was handed some, and null for the
+    /// ordinary window, which reads and writes the file.
+    ShortcutPreferences *shortcutsOwner_ = nullptr;
+    /// The session's audio inputs, asked for once and shared by both cards.
+    MicrophoneProbe microphones_;
     QListWidget *sidebar_ = nullptr;
     QStackedWidget *pages_ = nullptr;
     QComboBox *toolBox_ = nullptr;

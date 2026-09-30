@@ -21,6 +21,7 @@
 #include "config.hpp"
 #include "i18n.hpp"
 #include "settings_window.hpp"
+#include "shortcuts.hpp"
 
 #include <QApplication>
 #include <QAbstractButton>
@@ -34,19 +35,29 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
+#include <QKeyEvent>
+#include <QKeySequence>
+#include <QLabel>
 #include <QLayout>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QMessageBox>
 #include <QMouseEvent>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QScrollArea>
+#include <QDoubleSpinBox>
 #include <QSpinBox>
+
+#include <cmath>
+#include <cstring>
+#include <chrono>
 #include <QStackedWidget>
 #include <QTemporaryDir>
 #include <QVBoxLayout>
 
 #include <cstdio>
+#include <functional>
 #include <memory>
 
 namespace {

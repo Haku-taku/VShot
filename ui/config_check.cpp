@@ -20,6 +20,7 @@
 // Built only with `-DVSHOT_BUILD_CHECKS=ON`.
 
 #include "config.hpp"
+#include "shortcuts.hpp"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -28,9 +29,11 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
+#include <QKeySequence>
 #include <QString>
 #include <QTemporaryDir>
 
+#include <cmath>
 #include <cstdio>
 
 namespace {
@@ -785,6 +788,210 @@ void checkTheLegacyTextSizeIsMigrated()
            QString::number(vshot::loadConfig().editor.textSize));
 }
 
+// The editor's key bindings are the one part of the config file a user is
+// likely to edit by hand and the one part whose mistakes are invisible: a
+// binding that does not parse reads as "the default", so a typo costs the user
+// the key they asked for and gives them back one they did not. What is checked
+// here is that a binding the file spells is the one the editor reads, that
+// clearing one is not the same as never having set it, and that a save leaves
+// everything else in the file alone.
+void checkTheShortcutDefaultsAreReachable()
+{
+    std::printf("--- every default binding is reachable -----------------------------\n");
+    QFile::remove(configPath());
+    const vshot::ShortcutPreferences keys = vshot::loadShortcutPreferences();
+    // One press per action, built the way a key event carries it. The point is
+    // not that the spelling round-trips -- it is that the key a user presses
+    // for an action is the one the editor hears, which is a different claim
+    // from "the string came back unchanged".
+    struct Probe {
+        vshot::ShortcutAction action;
+        int modifiers;
+        int key;
+    };
+    const Probe probes[] = {
+        {vshot::ShortcutAction::Confirm, 0, Qt::Key_Return},
+        {vshot::ShortcutAction::Confirm, 0, Qt::Key_Enter},
+        {vshot::ShortcutAction::Cancel, 0, Qt::Key_Escape},
+        {vshot::ShortcutAction::Undo, Qt::ControlModifier, Qt::Key_Z},
+        {vshot::ShortcutAction::Redo, Qt::ControlModifier, Qt::Key_Y},
+        {vshot::ShortcutAction::Redo, Qt::ControlModifier | Qt::ShiftModifier, Qt::Key_Z},
+        {vshot::ShortcutAction::Copy, Qt::ControlModifier, Qt::Key_S},
+        {vshot::ShortcutAction::CopyText, Qt::ControlModifier, Qt::Key_C},
+        {vshot::ShortcutAction::Paste, Qt::ControlModifier, Qt::Key_V},
+        {vshot::ShortcutAction::SelectAll, Qt::ControlModifier, Qt::Key_A},
+        {vshot::ShortcutAction::SelectNone, Qt::ControlModifier, Qt::Key_D},
+        {vshot::ShortcutAction::NextMark, 0, Qt::Key_Tab},
+        // Shift+Tab arrives as Key_Backtab with Shift still set, which is the
+        // whole reason this one is worth checking rather than assuming.
+        {vshot::ShortcutAction::PreviousMark, Qt::ShiftModifier, Qt::Key_Backtab},
+        {vshot::ShortcutAction::PreviousMark, Qt::ControlModifier | Qt::ShiftModifier,
+         Qt::Key_Backtab},
+        {vshot::ShortcutAction::Delete, 0, Qt::Key_Delete},
+        {vshot::ShortcutAction::Delete, 0, Qt::Key_Backspace},
+        {vshot::ShortcutAction::CopyColor, 0, Qt::Key_C},
+        {vshot::ShortcutAction::AdoptColor, 0, Qt::Key_V},
+        {vshot::ShortcutAction::ShowMagnifier, 0, Qt::Key_M},
+        {vshot::ShortcutAction::CursorLeft, 0, Qt::Key_Left},
+        {vshot::ShortcutAction::CursorLeft, 0, Qt::Key_A},
+        {vshot::ShortcutAction::CursorRight, 0, Qt::Key_D},
+        {vshot::ShortcutAction::CursorUp, 0, Qt::Key_W},
+        {vshot::ShortcutAction::CursorDown, 0, Qt::Key_S},
+    };
+    for (const Probe &probe : probes) {
+        const QKeySequence pressed(
+            static_cast<int>(static_cast<int>(probe.modifiers) | static_cast<int>(probe.key)));
+        expect(keys.matches(probe.action, pressed),
+               "the default binding hears the key it is bound to",
+               QStringLiteral("%1 <- %2").arg(vshot::shortcutBinding(probe.action).id,
+                                              pressed.toString()));
+    }
+    // The two held modifiers are read from the state of the keyboard rather
+    // than from a key press, and Qt will not parse a lone "Alt" -- so they get
+    // their own reader and their own check.  There used to be a third, the
+    // drag-selection modifier, but the drag it gated is the middle button's
+    // now: a button cannot be read from the keyboard's state at all, so there
+    // is nothing left here for it to be.
+    expect(keys.held(vshot::ShortcutAction::PreserveAspect, Qt::AltModifier),
+           "the aspect-ratio modifier is read while it is held");
+    expect(keys.held(vshot::ShortcutAction::CoarseStep, Qt::ShiftModifier),
+           "the coarse step modifier is read while it is held");
+    // A modifier that is *not* the one an action wants must not count as held:
+    // Ctrl+Alt is a Ctrl drag to the compositor, not an Alt-resize.
+    expect(!keys.held(vshot::ShortcutAction::PreserveAspect, Qt::ControlModifier),
+           "a modifier that is not the bound one does not count as held");
+    expect(keys.held(vshot::ShortcutAction::PreserveAspect,
+                     Qt::ControlModifier | Qt::AltModifier),
+           "the bound modifier still counts when another is down beside it");
+}
+
+void checkAnUnrelatedKeyIsNotABinding()
+{
+    std::printf("--- a key that is bound to nothing hears nothing -------------------\n");
+    QFile::remove(configPath());
+    const vshot::ShortcutPreferences keys = vshot::loadShortcutPreferences();
+    // Ctrl+F is bound to nothing. It has to stay that way, or every unbound key
+    // would fire some action's default.
+    const QKeySequence find(static_cast<int>(Qt::ControlModifier | Qt::Key_F));
+    bool any = false;
+    for (int index = 0; index < static_cast<int>(vshot::ShortcutAction::kActionCount); ++index) {
+        any = any || keys.matches(static_cast<vshot::ShortcutAction>(index), find);
+    }
+    expect(!any, "Ctrl+F is bound to nothing and fires nothing", find.toString());
+
+    // And the modifiers alone -- a key event's bits without a key behind them.
+    const QKeySequence ctrlOnly(static_cast<int>(Qt::ControlModifier));
+    bool anyModifier = false;
+    for (int index = 0; index < static_cast<int>(vshot::ShortcutAction::kActionCount); ++index) {
+        anyModifier = anyModifier
+            || keys.matches(static_cast<vshot::ShortcutAction>(index), ctrlOnly);
+    }
+    expect(!anyModifier, "pressing a modifier on its own fires nothing");
+}
+
+void checkAReboundKeyIsTheOneHeard()
+{
+    std::printf("--- a rebound binding is the one the editor hears ------------------\n");
+    writeConfig(QStringLiteral(R"({"shortcuts": {"copy": "Ctrl+K", "undo": "F2"}})"));
+    const vshot::ShortcutPreferences keys = vshot::loadShortcutPreferences();
+    const auto pressed = [](int modifiers, int key) {
+        return QKeySequence(static_cast<int>(modifiers | key));
+    };
+    expect(keys.matches(vshot::ShortcutAction::Copy,
+                        pressed(Qt::ControlModifier, Qt::Key_K)),
+           "the new key for copy is heard", keys.textFor(vshot::ShortcutAction::Copy));
+    expect(!keys.matches(vshot::ShortcutAction::Copy,
+                         pressed(Qt::ControlModifier, Qt::Key_S)),
+           "the key it replaced is not heard any more");
+    expect(keys.matches(vshot::ShortcutAction::Undo, pressed(0, Qt::Key_F2)),
+           "a plain letter can be bound on its own", keys.textFor(vshot::ShortcutAction::Undo));
+    // Everything the file did not mention keeps its default.
+    expect(keys.matches(vshot::ShortcutAction::Redo,
+                        pressed(Qt::ControlModifier, Qt::Key_Y)),
+           "an action the file does not name keeps its default");
+
+    // A binding that does not parse is not "unbind" -- it is a typo, and the
+    // user is better off with the default than with nothing.
+    writeConfig(QStringLiteral(R"({"shortcuts": {"copy": "Ctrl+Thumbprint"}})"));
+    const vshot::ShortcutPreferences typo = vshot::loadShortcutPreferences();
+    expect(typo.matches(vshot::ShortcutAction::Copy,
+                        pressed(Qt::ControlModifier, Qt::Key_S)),
+           "an unreadable binding falls back to the default rather than to nothing");
+
+    // A value of the wrong type is the same story.
+    writeConfig(QStringLiteral(R"({"shortcuts": {"copy": 7}})"));
+    const vshot::ShortcutPreferences wrong = vshot::loadShortcutPreferences();
+    expect(wrong.matches(vshot::ShortcutAction::Copy,
+                         pressed(Qt::ControlModifier, Qt::Key_S)),
+           "a binding that is not a string falls back to the default");
+
+    // An action this build has never heard of is simply not read; it must not
+    // disturb the ones beside it.
+    writeConfig(QStringLiteral(R"({"shortcuts": {"future-action": "Ctrl+S", "copy": "Ctrl+K"}})"));
+    const vshot::ShortcutPreferences future = vshot::loadShortcutPreferences();
+    expect(future.matches(vshot::ShortcutAction::Copy,
+                          pressed(Qt::ControlModifier, Qt::Key_K)),
+           "an unknown action's key does not shadow a known one's");
+}
+
+void checkClearingABindingIsNotTheSameAsDefaulting()
+{
+    std::printf("--- clearing a binding leaves the action with no key ---------------\n");
+    // The one pair of states the file has to keep apart: an absent key means
+    // "the default stands", an empty one means "the user wants no key".
+    writeConfig(QStringLiteral(R"({"shortcuts": {"copy": ""}})"));
+    const vshot::ShortcutPreferences cleared = vshot::loadShortcutPreferences();
+    expect(!cleared.hasKeys(vshot::ShortcutAction::Copy) && !cleared.matches(
+               vshot::ShortcutAction::Copy,
+               QKeySequence(static_cast<int>(Qt::ControlModifier | Qt::Key_S))),
+           "an empty binding is no key at all, not the default back again");
+    expect(cleared.matches(vshot::ShortcutAction::Undo,
+                           QKeySequence(static_cast<int>(Qt::ControlModifier | Qt::Key_Z))),
+           "clearing one action leaves every other one alone");
+
+    // And it survives a round trip: the empty string has to be written, because
+    // omitting the key would read back as the default.
+    const QJsonObject root = afterSave([&] { vshot::saveShortcutPreferences(cleared); });
+    expect(containsAt(root, "shortcuts/copy") && textAt(root, "shortcuts/copy").isEmpty(),
+           "a cleared binding is written as an empty string, not omitted");
+    const vshot::ShortcutPreferences again = vshot::loadShortcutPreferences();
+    expect(!again.hasKeys(vshot::ShortcutAction::Copy), "it reads back as still cleared");
+}
+
+void checkTheShortcutsSaveKeepsTheRestOfTheFile()
+{
+    std::printf("--- saving the shortcuts keeps everything else ---------------------\n");
+    writeConfig(QStringLiteral(R"({
+        "editor": {"tool": "arrow", "color": "#00ff00"},
+        "cli": {"png-compression": "high"},
+        "shortcuts": {"copy": "Ctrl+K", "an-action-of-the-future": "Ctrl+J"},
+        "some-future-section": {"keep": true}
+    })"));
+    vshot::ShortcutPreferences keys = vshot::loadShortcutPreferences();
+    keys.setText(vshot::ShortcutAction::Undo, QStringLiteral("Ctrl+Backspace"));
+    const QJsonObject root = afterSave([&] { vshot::saveShortcutPreferences(keys); });
+
+    expect(textAt(root, "editor/tool") == QStringLiteral("arrow"),
+           "the editor's style is still there", textAt(root, "editor/tool"));
+    expect(textAt(root, "cli/png-compression") == QStringLiteral("high"),
+           "the CLI defaults are still there");
+    expect(containsAt(root, "some-future-section/keep"), "an unknown section is kept whole");
+    expect(textAt(root, "shortcuts/copy") == QStringLiteral("Ctrl+K"),
+           "a binding the save did not touch is still there", textAt(root, "shortcuts/copy"));
+    expect(textAt(root, "shortcuts/undo") == QStringLiteral("Ctrl+Backspace"),
+           "the rebound key was written", textAt(root, "shortcuts/undo"));
+    expect(textAt(root, "shortcuts/an-action-of-the-future") == QStringLiteral("Ctrl+J"),
+           "an action this build does not know is left in the file");
+
+    // A binding put back to its default disappears from the file again: writing
+    // twenty-two lines the user never asked for is not what a save is for.
+    keys.setText(vshot::ShortcutAction::Undo, QStringLiteral("Ctrl+Z"));
+    const QJsonObject back = afterSave([&] { vshot::saveShortcutPreferences(keys); });
+    expect(!containsAt(root, "shortcuts/select-all"), "a default binding is not written");
+    expect(!containsAt(back, "shortcuts/undo"),
+           "a binding put back to its default is removed from the file");
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -816,6 +1023,11 @@ int main(int argc, char **argv)
     checkClearingAValueRemovesIt();
     checkTheLookNumbersKeepTheLargestValueTheyAreOffered();
     checkRoundTripOfEveryField();
+    checkTheShortcutDefaultsAreReachable();
+    checkAnUnrelatedKeyIsNotABinding();
+    checkAReboundKeyIsTheOneHeard();
+    checkClearingABindingIsNotTheSameAsDefaulting();
+    checkTheShortcutsSaveKeepsTheRestOfTheFile();
 
     std::printf("--- result ---------------------------------------------------------\n");
     std::printf("%s (%d failure(s))\n", failures == 0 ? "ALL PASS" : "FAILURES", failures);

@@ -4,17 +4,21 @@
 #pragma once
 
 #include "session_protocol.hpp"
+#include "shortcuts.hpp"
 #include "text_layer.hpp"
 #include "translation_layer.hpp"
 
 #include <QByteArray>
 #include <QColor>
 #include <QElapsedTimer>
+#include <QEnterEvent>
 #include <QHash>
 #include <QImage>
 #include <QJsonDocument>
+#include <QObject>
 #include <QPointF>
 #include <QRect>
+#include <QRegion>
 #include <QString>
 #include <QVector>
 #include <QWidget>
@@ -296,6 +300,16 @@ public:
     // inside it; it runs a single output, so the last overlay the step reached
     // is the one that matters.
     QRect lastInteractiveUpdate() const;
+
+    /// The spelling of one action's binding, for a tooltip: "Ctrl+S", "Tab",
+    /// and so on.  A button that does something the keyboard also does has to
+    /// say which key that is, and the key is the user's to change.
+    QString shortcutText(ShortcutAction action) const;
+    /// `label` with the binding of `action` in parentheses after it, which is
+    /// what a toolbar button's tooltip reads.  `label` is already translated,
+    /// so the key -- which is not a word in any language -- is appended in the
+    /// form every other program spells it in.
+    QString shortcutHint(ShortcutAction action, const QString &label) const;
 
     void paint(CaptureOverlay *overlay, QPainter *painter);
     void press(CaptureOverlay *overlay, const QPointF &local, Qt::MouseButton button,
@@ -592,12 +606,20 @@ private:
     QRect lastTouchLocal_;
     bool editing_ = false;
     bool pinEdit_ = false;
+    // Where a mark's pixels are written when the session gives somewhere to put
+    // them.  Empty means the document carries no mark that has no other form.
+    QString markAssetDirectory_;
     // Set by the Pin button and reported in the result document.
     bool pinResult_ = false;
     /// `region-only`: a finished drag ends the session with the rectangle
     /// instead of opening the editor.  Scrolling capture asks for this, since
     /// the pixels it will annotate do not exist until the stitch is done.
     bool selectOnly_ = false;
+    /// The keyboard bindings, read out of the config file once at start-up.
+    /// Every key the editor acts on is looked up here rather than compared
+    /// against a hard-coded `Qt::Key_`, so a binding the user has changed is
+    /// the one the editor honours.
+    ShortcutPreferences shortcuts_;
     bool finished_ = false;
     bool cancelled_ = false;
     std::function<void()> terminalCallback_;

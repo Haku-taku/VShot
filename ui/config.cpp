@@ -2,6 +2,7 @@
 // Copyright (C) 2026 VShot contributors
 
 #include "config.hpp"
+#include "shortcuts.hpp"
 
 #include "text_size.hpp"
 
@@ -12,6 +13,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
+#include <QKeySequence>
 #include <QSaveFile>
 #include <QStandardPaths>
 #include <QStringList>
@@ -887,6 +889,60 @@ Config loadConfig()
     config.dialog = readDialog(root.value(QStringLiteral("dialog")).toObject());
     config.pin = readPin(root.value(QStringLiteral("pin")).toObject());
     return config;
+}
+
+ShortcutPreferences loadShortcutPreferences()
+{
+    ShortcutPreferences preferences;
+    // One key per action, every one of them optional: a file that says nothing
+    // leaves the built-in binding, and so does a file that names an action this
+    // build has never heard of -- which is what an older vshot's file looks
+    // like to a newer one reading it.
+    const QJsonObject shortcuts = readRoot().value(QStringLiteral("shortcuts")).toObject();
+    for (int index = 0; index < shortcutBindings().size(); ++index) {
+        const ShortcutBinding &binding = shortcutBindings().at(index);
+        const QJsonValue value = shortcuts.value(binding.id);
+        if (!value.isString()) {
+            continue;
+        }
+        preferences.setText(static_cast<ShortcutAction>(index), value.toString());
+    }
+    return preferences;
+}
+
+bool saveShortcutPreferences(const ShortcutPreferences &preferences)
+{
+    if (configFilePath().isEmpty()) {
+        return false;
+    }
+    QJsonObject root = readRoot();
+    QJsonObject shortcuts = root.value(QStringLiteral("shortcuts")).toObject();
+    const ShortcutPreferences defaults;
+    for (int index = 0; index < shortcutBindings().size(); ++index) {
+        const ShortcutBinding &binding = shortcutBindings().at(index);
+        const ShortcutAction action = static_cast<ShortcutAction>(index);
+        if (!preferences.hasKeys(action)) {
+            // Cleared: written as an empty string rather than omitted, because
+            // an absent key means "the default stands" -- and the user asked
+            // for no key at all, which is the opposite.
+            shortcuts.insert(binding.id, QString());
+            continue;
+        }
+        const QString text = preferences.textFor(action);
+        // The default is not written: an entry that spells what the built-in
+        // table already says is a promise the file keeps whether or not it is
+        // there, and a user rebinding one key should not find twenty-two lines
+        // of file they never asked for beside it.
+        if (text == defaults.textFor(action)) {
+            shortcuts.remove(binding.id);
+            continue;
+        }
+        shortcuts.insert(binding.id, text);
+    }
+    // Wholesale, like `editor`: an action the user put back to its default has
+    // to disappear from the file rather than be merged back in from it.
+    root.insert(QStringLiteral("shortcuts"), shortcuts);
+    return writeRoot(root);
 }
 
 bool saveConfig(const Config &config)
