@@ -37,9 +37,82 @@ pub const PQ_PEAK_NITS: f32 = 10_000.0;
 /// The nominal peak of an HLG signal (BT.2100).
 pub const HLG_PEAK_NITS: f32 = 1_000.0;
 
-/// Content above SDR white by this much (about 2 %) counts as HDR: a flat SDR
-/// frame decodes to at most 1.0, so anything over the threshold really is over.
-const HDR_WHITE_EPSILON: f32 = 0.02;
+/// Content above SDR white by this much counts as light the frame carries above
+/// white.
+///
+/// It has to clear ten-bit PQ quantization, which is what the old 2 % did not.
+/// At a 203 cd/m² reference one code is about 0.0094 of white, and the codes
+/// around white decode to 0.99958 (594), 1.00897 (595), 1.01845 (596) and
+/// 1.02801 (597) — so three codes of round-trip slop sit under 3 %.  A real
+/// highlight is nowhere near this: 1.5× white decodes to 1.5.
+///
+/// Raising it is not on its own enough — a handful of pixels can still pass any
+/// threshold this low, which is why [`HdrFrame::carries_hdr`] weighs the *share*
+/// of the frame that is over it.
+const HDR_WHITE_EPSILON: f32 = 0.05;
+
+/// How [`HdrFrame::carries_hdr`] decides whether a capture holds HDR content.
+///
+/// The three states the settings offer fall out of the two fields:
+///
+/// * `always` — the area test's ratio is zero: on an output that can show HDR at
+///   all, every capture is treated as HDR content.
+/// * `always` false, `ratio` zero — the area test is off: one pixel over the
+///   threshold is enough, which is what VShot did before the test existed.
+/// * `always` false, `ratio` positive — the share of the frame over the
+///   threshold has to reach `ratio`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HdrDecision {
+    pub always: bool,
+    /// The share of the frame that has to be over the threshold, in 0..=1.
+    pub ratio: f32,
+}
+
+impl Default for HdrDecision {
+    fn default() -> Self {
+        // The area test on, at a floor that clears the quantization noise
+        // measured on a real desktop (17 489 pixels of 3.7 M is 0.47 %, so this
+        // sits an order of magnitude below it) while a genuine highlight patch
+        // is orders above.
+        Self {
+            always: false,
+            ratio: 0.0005,
+        }
+    }
+}
+
+impl HdrDecision {
+    /// The largest share that means anything: past a whole frame there is no
+    /// share left to weigh.
+    pub const MAX_RATIO: f32 = 1.0;
+
+    /// Reads a configured ratio.  A value that is not a finite number, or is
+    /// outside 0..=1, falls back to the default rather than deciding every
+    /// capture by accident.
+    pub fn clamp_ratio(ratio: f32) -> f32 {
+        if !ratio.is_finite() {
+            return Self::default().ratio;
+        }
+        ratio.clamp(0.0, Self::MAX_RATIO)
+    }
+
+    /// The decision a config spells: the area test's switch and its floor.
+    /// `area` off is the one-pixel test; `area` on with a zero floor is "always
+    /// HDR".
+    pub fn from_config(area: bool, ratio: f32) -> Self {
+        let ratio = Self::clamp_ratio(ratio);
+        if !area {
+            return Self {
+                always: false,
+                ratio: 0.0,
+            };
+        }
+        Self {
+            always: ratio <= 0.0,
+            ratio,
+        }
+    }
+}
 
 /// The transfer function an HDR buffer is encoded with.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -822,9 +895,11 @@ impl HdrFrame {
         self.pixels.get(index).copied()
     }
 
-    /// The brightest linear component anywhere in the frame.  An SDR frame
-    /// never exceeds 1.0, so a peak above it is what "this content is HDR"
-    /// means.
+    /// The brightest linear component anywhere in the frame.
+    ///
+    /// This is what the *tone map* needs — where the top of the range goes —
+    /// and not what decides whether the frame is HDR content: see
+    /// [`Self::carries_hdr`] for why a single bright pixel cannot answer that.
     pub fn peak(&self) -> f32 {
         self.pixels
             .iter()
@@ -832,9 +907,60 @@ impl HdrFrame {
             .fold(0.0f32, f32::max)
     }
 
-    /// Whether the frame actually carries light beyond SDR white.
-    pub fn is_hdr(&self) -> bool {
-        self.peak() > 1.0 + HDR_WHITE_EPSILON
+    /// [`Self::highlight_share_with`] by the margin VShot itself uses.
+    pub fn highlight_share(&self) -> f32 {
+        self.highlight_share_with(HDR_WHITE_EPSILON)
+    }
+
+    /// The share of the frame's pixels carrying light more than `epsilon` above
+    /// SDR white, in 0..=1.
+    ///
+    /// [`Self::peak`] alone cannot tell a highlight from a rounding error.  A
+    /// ten-bit PQ buffer puts SDR white on a code that decodes a little either
+    /// side of 1.0 — codes 594, 595 and 597 decode to 0.9996, 1.009 and 1.028
+    /// against a 203 cd/m² reference — so an ordinary SDR desktop holds
+    /// thousands of pixels a few thousandths over white without carrying any
+    /// light above it at all.  Measured on one: 17 489 pixels over 1.02, of
+    /// which 35 passed 1.1, and that handful was enough to reclassify the whole
+    /// 3.7-megapixel frame.
+    ///
+    /// What separates the two is how much of the frame is over, not how far one
+    /// pixel got: a real highlight is a patch, a quantization artefact is
+    /// scattered.  The share is what [`Self::carries_hdr`] weighs against a
+    /// configured floor.
+    pub fn highlight_share_with(&self, epsilon: f32) -> f32 {
+        if self.pixels.is_empty() {
+            return 0.0;
+        }
+        let limit = 1.0 + epsilon;
+        let over = self
+            .pixels
+            .iter()
+            .filter(|pixel| pixel[0].max(pixel[1]).max(pixel[2]) > limit)
+            .count();
+        over as f32 / self.pixels.len() as f32
+    }
+
+    /// Whether this frame carries light above SDR white, by `decision`.
+    ///
+    /// This is the one place "this capture is HDR content" is decided, so every
+    /// consumer — whether the HDR half is kept, whether a pin gets one, whether
+    /// the tag goes up — answers alike.  The output's own declaration has
+    /// already had its say by the time a frame exists at all: only an output the
+    /// compositor describes as PQ or HLG ever hands out a buffer that decodes to
+    /// light, so what is left to decide is whether *this* rectangle of it holds
+    /// any.
+    pub fn carries_hdr(&self, decision: HdrDecision) -> bool {
+        if decision.always {
+            return true;
+        }
+        let share = self.highlight_share();
+        // A floor of zero is "any pixel at all", which is the test that stood
+        // before the area one — the switch that turns the area test off.
+        if decision.ratio <= 0.0 {
+            return share > 0.0;
+        }
+        share >= decision.ratio
     }
 
     /// Decodes 10-bit RGB packed the way DRM's `XRGB2101010`/`ARGB2101010`
@@ -1606,7 +1732,7 @@ mod tests {
         )
         .unwrap();
         assert!((frame.pixel(0, 0).unwrap()[0] - 1.0).abs() < 0.02);
-        assert!(!frame.is_hdr());
+        assert!(!frame.carries_hdr(HdrDecision::default()));
 
         // The top signal is the nominal 1000-nit peak, 1000 / 203 of white.
         let frame = HdrFrame::from_rgb10(
@@ -1720,9 +1846,98 @@ mod tests {
     #[test]
     fn a_sdr_white_pixel_is_not_hdr_but_a_brighter_one_is() {
         let sdr = one_pixel([1.0, 1.0, 1.0, 1.0]);
-        assert!(!sdr.is_hdr());
+        assert!(!sdr.carries_hdr(HdrDecision::default()));
         let hdr = one_pixel([4.0, 3.0, 2.0, 1.0]);
-        assert!(hdr.is_hdr());
+        assert!(hdr.carries_hdr(HdrDecision::default()));
+    }
+
+    /// A frame of `count` pixels, the first `bright` of them at `light`.
+    fn frame_with(light: f32, bright: usize, count: usize) -> HdrFrame {
+        let mut pixels = vec![[1.0, 1.0, 1.0, 1.0]; count];
+        for pixel in pixels.iter_mut().take(bright) {
+            *pixel = [light, light, light, 1.0];
+        }
+        HdrFrame::new(Size::new(count as u32, 1), pixels).unwrap()
+    }
+
+    #[test]
+    fn an_all_white_frame_carries_no_hdr_at_any_setting() {
+        // SDR white is where the scale puts it, so a frame that is nothing but
+        // white is not light above white however the decision is configured —
+        // not even the one-pixel test may call it HDR.  (A zero floor with the
+        // switch on is the one state that does not read the frame at all; it is
+        // covered by `a_zero_floor_with_the_switch_on_is_always_hdr`.)
+        let frame = frame_with(1.0, 10_000, 10_000);
+        for ratio in [0.0005, 0.5, 1.0] {
+            for area in [false, true] {
+                assert!(
+                    !frame.carries_hdr(HdrDecision::from_config(area, ratio)),
+                    "area={area} ratio={ratio}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quantization_noise_alone_does_not_make_a_frame_hdr() {
+        // The measurement that started this: a plain SDR desktop decodes to
+        // codes a few thousandths over white — 35 pixels past 1.1 out of 3.7 M,
+        // with thousands more just over 1.0.  Those are rounding, not light.
+        let frame = frame_with(1.1, 35, 3_700_000);
+        assert!(frame.highlight_share() > 0.0);
+        assert!(
+            !frame.carries_hdr(HdrDecision::default()),
+            "a handful of rounding pixels reclassified the frame"
+        );
+        // A ratio of zero is the other half of the switch: "any pixel at all"
+        // is what the test before the area one did, and it does say HDR.
+        assert!(frame.carries_hdr(HdrDecision::from_config(true, 0.0)));
+    }
+
+    #[test]
+    fn a_highlight_patch_makes_a_frame_hdr() {
+        // A real highlight is a patch, not a scatter: one percent of a frame
+        // well above white is a window's worth of light.
+        let frame = frame_with(2.0, 10_000, 1_000_000);
+        assert!(frame.carries_hdr(HdrDecision::default()));
+
+        // Just under the floor is not, which is what makes the floor mean
+        // something: the same light in a smaller patch stays SDR content.
+        let frame = frame_with(2.0, 100, 1_000_000);
+        assert!(!frame.carries_hdr(HdrDecision::default()));
+        // …until the floor is lowered to meet it.
+        assert!(frame.carries_hdr(HdrDecision::from_config(true, 0.00005)));
+    }
+
+    #[test]
+    fn the_area_test_can_be_switched_off_for_the_one_pixel_rule() {
+        // The fallback the settings offer: one pixel over the threshold is
+        // enough.  It is what VShot did before the area test, kept for a
+        // capture that has to err towards keeping its highlights.
+        let frame = frame_with(2.0, 1, 1_000_000);
+        assert!(!frame.carries_hdr(HdrDecision::default()));
+        assert!(frame.carries_hdr(HdrDecision::from_config(false, 0.0005)));
+    }
+
+    #[test]
+    fn a_zero_floor_with_the_switch_on_is_always_hdr() {
+        // The user's third state: the test is on but the ratio is zero, so the
+        // output's own declaration is the only question left and every capture
+        // of it is HDR content — even one that is entirely SDR white.
+        let decision = HdrDecision::from_config(true, 0.0);
+        assert!(decision.always);
+        assert!(one_pixel([1.0, 1.0, 1.0, 1.0]).carries_hdr(decision));
+    }
+
+    #[test]
+    fn a_ratio_outside_the_range_falls_back_instead_of_deciding_everything() {
+        assert_eq!(HdrDecision::clamp_ratio(0.25), 0.25);
+        assert_eq!(HdrDecision::clamp_ratio(-1.0), 0.0);
+        assert_eq!(HdrDecision::clamp_ratio(4.0), HdrDecision::MAX_RATIO);
+        assert_eq!(
+            HdrDecision::clamp_ratio(f32::NAN),
+            HdrDecision::default().ratio
+        );
     }
 
     #[test]
@@ -1743,7 +1958,7 @@ mod tests {
         )
         .unwrap();
         assert!((frame.pixel(0, 0).unwrap()[0] - 1.0).abs() < 0.01);
-        assert!(!frame.is_hdr());
+        assert!(!frame.carries_hdr(HdrDecision::default()));
 
         // The same word against the default reference white is light above it.
         let frame = HdrFrame::from_rgb10(
@@ -1755,7 +1970,7 @@ mod tests {
             REFERENCE_WHITE_NITS,
         )
         .unwrap();
-        assert!(frame.is_hdr());
+        assert!(frame.carries_hdr(HdrDecision::default()));
     }
 
     fn hdr_output() -> OutputColor {
@@ -1791,7 +2006,7 @@ mod tests {
         // 10 000 cd/m² against a 203-nit reference white is about 49 units;
         // an sRGB read of the same word would have given 1.0.
         assert!(frame.pixel(0, 0).unwrap()[0] > 45.0);
-        assert!(frame.is_hdr());
+        assert!(frame.carries_hdr(HdrDecision::default()));
     }
 
     #[test]

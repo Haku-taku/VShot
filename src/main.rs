@@ -330,7 +330,7 @@ fn run() -> Result<()> {
         match &request.target {
             CaptureTarget::RegionFixed(geometry) => {
                 let (frame, density) = crop_native(&scene, *geometry)?;
-                hdr_frame = hdr_for_region(&hdr_outputs, &scene, *geometry);
+                hdr_frame = hdr_for_region(&hdr_outputs, &scene, *geometry, request.tone_map.hdr);
                 capture_rect = Some(*geometry);
                 wayland.show_frozen(false)?;
                 (frame, density)
@@ -400,9 +400,15 @@ fn run() -> Result<()> {
                 let density = scene
                     .output(output_id)
                     .map_or(scene.scale(), |output| output.scale);
-                hdr_frame = scene
-                    .output(output_id)
-                    .and_then(|output| hdr_for_name(&hdr_outputs, &output.name));
+                hdr_frame = scene.output(output_id).and_then(|output| {
+                    hdr_for_name(
+                        &hdr_outputs,
+                        &scene,
+                        &output.name,
+                        None,
+                        request.tone_map.hdr,
+                    )
+                });
                 (selection::crop_output(&scene, output_id)?, density)
             }
             CaptureTarget::Monitor(name) => {
@@ -411,7 +417,7 @@ fn run() -> Result<()> {
                 let density = scene
                     .output_by_name(name)
                     .map_or(scene.scale(), |output| output.scale);
-                hdr_frame = hdr_for_name(&hdr_outputs, name);
+                hdr_frame = hdr_for_name(&hdr_outputs, &scene, name, None, request.tone_map.hdr);
                 (frame, density)
             }
             CaptureTarget::All => {
@@ -428,7 +434,8 @@ fn run() -> Result<()> {
                 if let Some(geometry) = metadata_window.and_then(|window| window.geometry) {
                     wayland.show_frozen(false)?;
                     let geometry = selection::validate_selection(&scene, geometry)?;
-                    hdr_frame = hdr_for_region(&hdr_outputs, &scene, geometry);
+                    hdr_frame =
+                        hdr_for_region(&hdr_outputs, &scene, geometry, request.tone_map.hdr);
                     capture_rect = Some(geometry);
                     // The window's own pixels at its own output's density — cropping
                     // the composed scene would hand back a nearest-upscale of a
@@ -460,7 +467,8 @@ fn run() -> Result<()> {
                         }
                     };
                     let geometry = selection::validate_selection(&scene, geometry)?;
-                    hdr_frame = hdr_for_region(&hdr_outputs, &scene, geometry);
+                    hdr_frame =
+                        hdr_for_region(&hdr_outputs, &scene, geometry, request.tone_map.hdr);
                     capture_rect = Some(geometry);
                     crop_native(&scene, geometry)?
                 }
@@ -1239,11 +1247,13 @@ fn capture_hdr_outputs(
 }
 
 /// The HDR half of one rectangle, cropped from the output that wholly contains
-/// it, or `None` when no such output offered HDR.
+/// it, or `None` when no such output offered HDR or the rectangle holds no light
+/// above SDR white.
 fn hdr_for_region(
     hdr_outputs: &[HdrOutput],
     scene: &SceneSnapshot,
     geometry: Rect,
+    decision: HdrDecision,
 ) -> Option<HdrHalf> {
     let output = scene.outputs().iter().find(|output| {
         output
@@ -1251,29 +1261,50 @@ fn hdr_for_region(
             .clamp_to(geometry)
             .is_some_and(|clamped| clamped == geometry)
     })?;
-    let scale = i32::try_from(output.scale).ok()?;
-    let local = Rect::new(
-        (geometry.left() - output.geometry.left()).checked_mul(scale)?,
-        (geometry.top() - output.geometry.top()).checked_mul(scale)?,
-        geometry.size.width.checked_mul(output.scale)?,
-        geometry.size.height.checked_mul(output.scale)?,
-    );
-    let half = hdr_for_name(hdr_outputs, &output.name)?;
-    Some(HdrHalf {
-        frame: half.frame.crop(local).ok()?,
-        reference_nits: half.reference_nits,
-    })
+    hdr_for_name(hdr_outputs, scene, &output.name, Some(geometry), decision)
 }
 
-/// The HDR half of a whole output, or `None` when it offered none.
-fn hdr_for_name(hdr_outputs: &[HdrOutput], name: &str) -> Option<HdrHalf> {
-    hdr_outputs
-        .iter()
-        .find(|output| output.name == name)
-        .map(|output| HdrHalf {
-            frame: output.frame.clone(),
-            reference_nits: output.reference_nits,
-        })
+/// The HDR half of one output — all of it, or the part `region` covers — or
+/// `None` when it offered none, or when that rectangle holds no light above SDR
+/// white.
+///
+/// `region` is in global logical pixels, the same space the scene's output
+/// geometries are in; `None` asks about the whole output.  The test is the same
+/// [`HdrFrame::carries_hdr`] the file gates use, so an output whose rectangle is
+/// an ordinary SDR desktop is not handed to the backdrop — and the frozen frame
+/// behind the selection is the SDR one, exactly as it is on a monitor with no
+/// HDR at all.  Without this the overlay would be told to leave the frame out
+/// for a backdrop that is not dimmer or brighter but *different*: the HDR read
+/// of an SDR desktop is not the same image the compositor draws.
+fn hdr_for_name(
+    hdr_outputs: &[HdrOutput],
+    scene: &SceneSnapshot,
+    name: &str,
+    region: Option<Rect>,
+    decision: HdrDecision,
+) -> Option<HdrHalf> {
+    let output = hdr_outputs.iter().find(|output| output.name == name)?;
+    let frame = match region {
+        Some(region) => {
+            let scene_output = scene
+                .outputs()
+                .iter()
+                .find(|scene_output| scene_output.name == name)?;
+            let scale = i32::try_from(scene_output.scale).ok()?;
+            let local = Rect::new(
+                (region.left() - scene_output.geometry.left()).checked_mul(scale)?,
+                (region.top() - scene_output.geometry.top()).checked_mul(scale)?,
+                region.size.width.checked_mul(scene_output.scale)?,
+                region.size.height.checked_mul(scene_output.scale)?,
+            );
+            output.frame.crop(local).ok()?
+        }
+        None => output.frame.clone(),
+    };
+    frame.carries_hdr(decision).then_some(HdrHalf {
+        frame,
+        reference_nits: output.reference_nits,
+    })
 }
 
 /// Puts the frozen HDR half of each output on a backdrop surface below the Qt
@@ -1287,6 +1318,7 @@ fn show_hdr_backdrop(
     wayland: &mut WaylandSession,
     scene: &SceneSnapshot,
     hdr_outputs: &[HdrOutput],
+    decision: HdrDecision,
 ) -> Vec<String> {
     if hdr_outputs.is_empty() {
         return Vec::new();
@@ -1296,18 +1328,26 @@ fn show_hdr_backdrop(
     wayland.set_scene(scene.clone());
     let frames = hdr_outputs
         .iter()
-        // The surface declares the output's own description while the buffer is
-        // written as PQ over BT.2020 (`HdrFrame::to_rgb10_pq`), so only an
-        // output whose description is exactly that can be shown this way; any
-        // other pair would declare one encoding and carry another, and the
-        // helper draws the SDR frame there instead.
-        .filter(|output| {
-            output.color.transfer == Transfer::Pq && output.color.primaries == Primaries::Bt2020
-        })
-        .map(|output| BackdropFrame {
-            name: output.name.clone(),
-            frame: output.frame.clone(),
-            reference_nits: output.reference_nits,
+        // The surface declares the output's own description and the buffer is
+        // written in the output's own primaries, so what the description says and
+        // what the pixels hold are the same thing and the compositor hands them
+        // through untouched.  The one thing that still has to match is the
+        // transfer: the words are PQ codes, so an output described with any other
+        // curve — HLG, say — would be handed a buffer it would decode wrongly, and
+        // the helper draws the SDR frame there instead.
+        .filter(|output| output.color.transfer == Transfer::Pq)
+        // And only when the frame really carries light above SDR white: an
+        // output handed a backdrop it does not need is handed one that is not
+        // the picture the compositor draws, so the frozen frame behind the
+        // selection would be a different image rather than a brighter one.
+        .filter_map(|output| {
+            hdr_for_name(hdr_outputs, scene, &output.name, None, decision).map(|half| {
+                BackdropFrame {
+                    name: output.name.clone(),
+                    frame: half.frame,
+                    reference_nits: half.reference_nits,
+                }
+            })
         })
         .collect::<Vec<_>>();
     if frames.is_empty() {
@@ -1523,10 +1563,9 @@ fn crop_native(scene: &SceneSnapshot, geometry: Rect) -> Result<(Frame, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::edit::{ArrowStyle, BezierFill, LineDash};
     use crate::geometry::{Point, Rect, Size};
+    use crate::model::hdr::Primaries;
     use crate::model::Frame;
-    use crate::wayland::input::{Annotation, EditorTool};
 
     #[test]
     fn another_compositor_is_never_asked_through_niri() {
@@ -1807,13 +1846,40 @@ mod tests {
         // screen's doubles into its own native pixels, exactly as the SDR crop
         // does.
         let (scene, hdr) = hdr_scene();
-        let plain = hdr_for_region(&hdr, &scene, Rect::new(2, 3, 5, 4)).unwrap();
+        let hdr_only = HdrDecision::default();
+        let plain = hdr_for_region(&hdr, &scene, Rect::new(2, 3, 5, 4), hdr_only).unwrap();
         assert_eq!(plain.frame.size(), Size::new(5, 4));
         assert_eq!(plain.frame.pixel(0, 0), Some([2.0, 2.0, 2.0, 1.0]));
 
-        let dense = hdr_for_region(&hdr, &scene, Rect::new(66, 3, 5, 4)).unwrap();
+        let dense = hdr_for_region(&hdr, &scene, Rect::new(66, 3, 5, 4), hdr_only).unwrap();
         assert_eq!(dense.frame.size(), Size::new(10, 8));
         assert_eq!(dense.frame.pixel(0, 0), Some([4.0, 4.0, 4.0, 1.0]));
+    }
+
+    #[test]
+    fn a_region_of_plain_sdr_gets_no_hdr_half_even_on_an_hdr_output() {
+        // The other half of the classification, and the one the user hit: an
+        // output the compositor describes as HDR still holds ordinary SDR
+        // content most of the time, and that content must keep the SDR path --
+        // no second file, no HDR pin, no backdrop, and above all no white point
+        // moved down over a handful of rounding pixels.
+        let (scene, _) = hdr_scene();
+        let sdr = vec![hdr_output_half("DP-2", 32, 32, 1.0)];
+        let sdr_region = Rect::new(66, 3, 5, 4);
+        assert!(hdr_for_region(&sdr, &scene, sdr_region, HdrDecision::default()).is_none());
+        // The switches still reach it: one pixel is enough with the area test
+        // off, and the output's own declaration is the whole answer when the
+        // ratio is zero.
+        assert!(hdr_for_region(
+            &sdr,
+            &scene,
+            sdr_region,
+            HdrDecision::from_config(true, 0.0)
+        )
+        .is_some());
+        // And a frame that really does carry highlights is kept either way.
+        let bright = vec![hdr_output_half("DP-2", 32, 32, 4.0)];
+        assert!(hdr_for_region(&bright, &scene, sdr_region, HdrDecision::default()).is_some());
     }
 
     #[test]
@@ -1821,7 +1887,9 @@ mod tests {
         // Straddling the boundary between the two screens, there is no one
         // 10-bit buffer to read: the SDR scene is the only picture of it.
         let (scene, hdr) = hdr_scene();
-        assert!(hdr_for_region(&hdr, &scene, Rect::new(63, 3, 5, 4)).is_none());
+        assert!(
+            hdr_for_region(&hdr, &scene, Rect::new(63, 3, 5, 4), HdrDecision::default()).is_none()
+        );
     }
 
     #[test]
@@ -1829,19 +1897,33 @@ mod tests {
         let (scene, _) = hdr_scene();
         // Only the dense screen produced an HDR half this time.
         let hdr = vec![hdr_output_half("DP-2", 32, 32, 4.0)];
-        assert!(hdr_for_region(&hdr, &scene, Rect::new(2, 3, 5, 4)).is_none());
+        assert!(
+            hdr_for_region(&hdr, &scene, Rect::new(2, 3, 5, 4), HdrDecision::default()).is_none()
+        );
         // The one that did still answers for its own screen.
-        assert!(hdr_for_region(&hdr, &scene, Rect::new(66, 3, 5, 4)).is_some());
+        assert!(
+            hdr_for_region(&hdr, &scene, Rect::new(66, 3, 5, 4), HdrDecision::default()).is_some()
+        );
     }
 
     #[test]
     fn hdr_for_name_finds_only_a_named_output() {
-        let hdr = vec![hdr_output_half("DP-2", 4, 4, 4.0)];
+        let (scene, _) = hdr_scene();
+        let hdr = vec![hdr_output_half("DP-2", 32, 32, 4.0)];
+        let decision = HdrDecision::default();
         assert_eq!(
-            hdr_for_name(&hdr, "DP-2").unwrap().frame.size(),
-            Size::new(4, 4)
+            hdr_for_name(&hdr, &scene, "DP-2", None, decision)
+                .unwrap()
+                .frame
+                .size(),
+            Size::new(32, 32)
         );
-        assert!(hdr_for_name(&hdr, "eDP-1").is_none());
+        assert!(hdr_for_name(&hdr, &scene, "eDP-1", None, decision).is_none());
+        // The whole output is tested too, so a named output holding nothing
+        // above SDR white answers `None` rather than handing the backdrop an
+        // image the compositor would have drawn differently.
+        let sdr = vec![hdr_output_half("DP-2", 32, 32, 1.0)];
+        assert!(hdr_for_name(&sdr, &scene, "DP-2", None, decision).is_none());
     }
 
     #[test]

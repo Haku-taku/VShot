@@ -832,9 +832,9 @@ impl WlrCapture {
             let hdr = decode_output_rgb10(name, &buffer, y_invert, color)?;
             if debug {
                 eprintln!(
-                    "vshot: hdr shm {name}: peak={} is_hdr={}",
+                    "vshot: hdr shm {name}: peak={} over_white={:.5}",
                     hdr.peak(),
-                    hdr.is_hdr()
+                    hdr.highlight_share()
                 );
             }
             return Ok(Some(hdr));
@@ -883,12 +883,12 @@ impl WlrCapture {
         )?;
         if std::env::var_os("VSHOT_HDR_DEBUG").is_some() {
             eprintln!(
-                "vshot: hdr decoded {name}: {}x{} fourcc=0x{:08x} peak={} is_hdr={}",
+                "vshot: hdr decoded {name}: {}x{} fourcc=0x{:08x} peak={} over_white={:.5}",
                 frame.width,
                 frame.height,
                 frame.fourcc,
                 hdr.peak(),
-                hdr.is_hdr()
+                hdr.highlight_share()
             );
         }
         Ok(Some(hdr))
