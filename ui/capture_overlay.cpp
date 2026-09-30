@@ -5551,6 +5551,10 @@ void OverlayController::mutateAnnotations(QVector<Annotation> next)
     if (selectedAnnotation_ >= annotations_.size()) {
         selectedAnnotation_ = -1;
     }
+    // An edit is not the keyboard's walk any more: the run of nudges ends here,
+    // and the selection is no longer "all of them" unless the caller says so.
+    nudgeBase_.reset();
+    allSelected_ = false;
     updateAll();
 }
 
@@ -8842,6 +8846,32 @@ const ToolStyle &OverlayController::toolStyle(const QString &tool) const
 void OverlayController::applyStyleToSelected(
     const std::function<void(Annotation &)> &mutate)
 {
+    if (allSelected_ && !annotations_.isEmpty()) {
+        // Ctrl+A picked every mark up, so a style change is a change to all of
+        // them.  A mark the change does not touch (a font on a stroke) is left
+        // exactly as it was, so this cannot count as an edit on its own.
+        QVector<Annotation> next = annotations_;
+        bool changed = false;
+        for (int index = 0; index < next.size(); ++index) {
+            mutate(next[index]);
+            if (!annotationEquals(next.at(index), annotations_.at(index))) {
+                changed = true;
+            }
+        }
+        if (!changed) {
+            return;
+        }
+        if (styleAdjustmentActive_) {
+            annotations_ = std::move(next);
+            styleAdjustmentChanged_ = true;
+            updateAll();
+            return;
+        }
+        const bool everyMark = allSelected_;
+        mutateAnnotations(std::move(next));
+        allSelected_ = everyMark; // the style change is not a new selection
+        return;
+    }
     if (selectedAnnotation_ < 0 || selectedAnnotation_ >= annotations_.size()) {
         return;
     }

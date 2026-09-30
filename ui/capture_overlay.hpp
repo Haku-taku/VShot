@@ -641,6 +641,13 @@ private:
     bool toolbarAnchorValid_ = false;
     // Selected annotation adjustment (move/resize under the Select tool).
     int selectedAnnotation_ = -1;
+    /// The mark list as it was before the run of keyboard nudges in progress,
+    /// so the whole run is one undo step.  Cleared by anything else that edits
+    /// or reselects.
+    std::optional<QVector<Annotation>> nudgeBase_;
+    /// Ctrl+A: every mark is picked up at once.  The style row and the delete
+    /// key then reach all of them, and any other selection clears it.
+    bool allSelected_ = false;
     /// `editor.selectMode == "loose"`: a press that is not on a handle or
     /// another mark is held back until it moves, and then moves the selected
     /// mark from wherever it started.  The point is the one the button went
