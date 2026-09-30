@@ -1443,6 +1443,16 @@ impl WaylandSession {
         self.clear_overlays();
         self.event_queue
             .flush()
+            .map_err(|error| VshotError::WaylandProtocol(error.to_string()))?;
+        // Flushing only puts the destroy requests on the wire; the compositor
+        // has not acted on them yet, and the next thing the caller may do is
+        // read the desktop back through the compositor -- a scrolling capture,
+        // which would otherwise grab the very surfaces being torn down.  A
+        // round trip is what makes "destroyed" mean the compositor has already
+        // re-rendered without them.
+        self.event_queue
+            .roundtrip(&mut self.state)
+            .map(|_| ())
             .map_err(|error| VshotError::WaylandProtocol(error.to_string()))
     }
 }

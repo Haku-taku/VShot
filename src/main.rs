@@ -390,6 +390,16 @@ fn run() -> Result<()> {
                 // to land.  This route has no flags of its own, so the options
                 // are the ones the settings window remembers.
                 if outcome.long {
+                    // The scrolling capture reads the desktop through the
+                    // compositor, so every surface VShot is holding has to be
+                    // gone first or the grab returns VShot's own frozen
+                    // picture: the HDR backdrop sits on the Top layer, below
+                    // the helper's overlay but above the window being
+                    // scrolled, and the helper's own overlay is already gone
+                    // (its process has exited by the time this returns).  On an
+                    // HDR output that is the whole capture -- the stitch would
+                    // be rows of the freeze, identical every time.
+                    wayland.destroy_overlays()?;
                     let (options, backend) =
                         longshot::options_from_defaults(&crate::config::load().long)?;
                     let desktop = longshot::desktop_bounds(&output_infos)?;
