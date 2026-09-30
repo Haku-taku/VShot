@@ -538,6 +538,13 @@ struct QtSession<'a> {
     // Pin-edit only: id of the pinned image inside the daemon.
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<u64>,
+    // Pin-edit only: how wide the pin's own border is drawn, in logical pixels.
+    // The border is centred on the image's edge, so it reaches half this far
+    // outside the image on every side; the editor counts that band as part of
+    // the pin, so a drag that starts on the rim moves the pin rather than
+    // landing on the bare canvas beside it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    border_width: Option<u32>,
     // Pin-edit only: which part of the editor to open on, absent for the
     // ordinary annotation editor.
     #[serde(skip_serializing_if = "Option::is_none")]

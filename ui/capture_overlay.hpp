@@ -733,14 +733,54 @@ private:
     // cannot grow it without end.
     std::optional<Point> pendingPinOrigin_;
     int pinMovesInFlight_ = 0;
+    // A raise asked for while the socket was down, sent as soon as it is up.
+    // The editor connects before the first drag now, so this is only ever the
+    // race between a press and the connect, but a dropped connection puts it
+    // back in play.
+    bool pinRaisePending_ = false;
+    // A pin-edit session's handoff: the wait between asking the CLI to be let
+    // go and being told the pin's own frame is on the screen.  The editor has
+    // stopped being useful but keeps drawing until then, so the pin's frame and
+    // the editor's copy of it overlap and the marks do not blink out between
+    // the two.  `handoffReader_` watches the CLI's answer on stdin;
+    // `handoffTimer_` is the backstop for a CLI that never answers at all,
+    // which is a hang rather than a gap.
+    QSocketNotifier *handoffReader_ = nullptr;
+    QTimer *handoffTimer_ = nullptr;
+    QElapsedTimer handoffClock_;
+    bool resultSent_ = false;
     // Set from VSHOT_PIN_DEBUG: traces the drag's round trip to stderr.
     bool pinDebug_ = false;
     QElapsedTimer pinMoveClock_;
+    // Pin-edit: the coalescing timer behind `applyPinEditInputMask`.  The mask
+    // is a round trip to the compositor, and a drag would otherwise issue one
+    // per motion event.
+    QTimer *inputMaskTimer_ = nullptr;
     // The position the marks are anchored to in pin-edit mode: the last
     // confirmed reply from the daemon, not the optimistic cursor position.  The
     // FP16 helper surface shows the image at this same position, so clipping
     // marks to it keeps them in sync with the image rather than ahead of it.
     std::optional<LogicalRect> marksOrigin_;
+    // Pin-edit mode: whether a point is on the pinned image itself, or on the
+    // band its own border occupies just outside it. The border is drawn by the
+    // daemon, centred on the image's edge, so half of it stands outside the
+    // image; both bands move the pin, but only the image takes ink. `inside`
+    // reports the image and `border` the band around it, and both are false
+    // everywhere else on the canvas.
+    bool insidePinImage(Point point) const;
+    bool onPinBorder(Point point) const;
+    // The band the pin's border occupies: the image grown by half the border's
+    // width. Zero-sized when the session named no border.
+    LogicalRect pinBorderBand() const;
+    // Pin-edit only: cuts the surface's input region down to the chrome the
+    // editor actually owns -- the pinned image, its border, the toolbar and
+    // anything open over them.  The surface covers the whole output so the
+    // toolbar has somewhere to sit, and without this every click on the rest of
+    // the screen would land on the editor instead of on the desktop behind it.
+    // A no-op outside pin-edit mode, where the surface is the capture itself
+    // and owning the whole output is the point.
+    void applyPinEditInputMask();
+    void scheduleInputMask();
 
     Point globalPoint(CaptureOverlay *overlay, const QPointF &local) const;
     Point unclampedGlobalPoint(CaptureOverlay *overlay, const QPointF &local) const;
@@ -1018,6 +1058,12 @@ public:
     int outputIndex() const;
     const OutputSession &output() const;
     QPointF localFromGlobal(Point point) const;
+    // Restricts which parts of this surface take pointer input.  Wayland has no
+    // empty-region request -- Qt sends nothing for an empty mask, which the
+    // compositor reads as "the whole surface is interactive" -- so an empty
+    // region is turned into one parked outside the surface, which is the same
+    // click-through the pin daemon's own surfaces use.
+    void setInputMask(const QRegion &mask);
     bool showLayerSurface();
     // Floating layer surface carved to a specific global logical rect
     // (top-left anchored + margins): used by the pin editor.

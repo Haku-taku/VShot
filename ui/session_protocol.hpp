@@ -78,6 +78,13 @@ struct Session {
     // socket instead of drawing a second copy of the image.
     std::uint64_t pinId = 0;
     QString pinSocket;
+    // Pin-edit only: how wide the pin's own border is drawn, in logical pixels.
+    // The stroke is centred on the image's edge, so it reaches half this far
+    // outside the image; the editor counts that band as part of the pin, so a
+    // drag that starts on the rim moves the pin instead of reading as a click
+    // on the bare canvas beside it. Zero when the session says nothing, which
+    // is also what a pin with no border wants.
+    std::uint32_t pinBorderWidth = 0;
     // Pin-edit only: which part of the editor to open on, absent for the
     // ordinary annotation editor. `"text"` opens it in the text-selection mode.
     QString action;

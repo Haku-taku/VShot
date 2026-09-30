@@ -2113,12 +2113,24 @@ public:
 
     void setOpener(QWidget *opener) { opener_ = opener; }
 
+    // Told when the picker opens and closes so the pin editor can widen its
+    // input region over it: the popup reaches past the toolbar's own rect, and
+    // a region that stopped at the toolbar would paint the picker but send its
+    // clicks to the desktop behind.
+    void setVisibilityCallback(std::function<void()> callback)
+    {
+        visibilityChanged_ = std::move(callback);
+    }
+
     void openAt(const QColor &color, const QPoint &topLeft)
     {
         setHsvFrom(color);
         move(topLeft);
         show();
         raise();
+        if (visibilityChanged_) {
+            visibilityChanged_();
+        }
     }
 
     QColor pickedColor() const
@@ -2171,6 +2183,9 @@ protected:
         if (QCoreApplication *application = QCoreApplication::instance()) {
             application->removeEventFilter(this);
         }
+        if (visibilityChanged_) {
+            visibilityChanged_();
+        }
     }
 
     // Click-outside dismissal: any press that lands outside the popup (and on
@@ -2188,6 +2203,7 @@ protected:
     }
 
 private:
+    std::function<void()> visibilityChanged_;
     void setHsvFrom(const QColor &color)
     {
         float hue = -1.0f;
@@ -2326,6 +2342,13 @@ public:
 
     void setOpener(QWidget *opener) { opener_ = opener; }
 
+    // Told when the picker opens and closes so the pin editor can widen its
+    // input region over it; see the colour picker's own.
+    void setVisibilityCallback(std::function<void()> callback)
+    {
+        visibilityChanged_ = std::move(callback);
+    }
+
     void openAt(const QString &currentFamily, const QPoint &topLeft)
     {
         const QString family = currentFamily.isEmpty() ? QApplication::font().family() : currentFamily;
@@ -2340,6 +2363,9 @@ public:
         move(topLeft);
         show();
         raise();
+        if (visibilityChanged_) {
+            visibilityChanged_();
+        }
     }
 
 protected:
@@ -2380,6 +2406,9 @@ protected:
         if (QCoreApplication *application = QCoreApplication::instance()) {
             application->removeEventFilter(this);
         }
+        if (visibilityChanged_) {
+            visibilityChanged_();
+        }
     }
 
     bool eventFilter(QObject *watched, QEvent *event) override
@@ -2397,6 +2426,7 @@ protected:
 private:
     QListWidget *list_ = nullptr;
     std::function<void(const QString &)> apply_;
+    std::function<void()> visibilityChanged_;
     QWidget *opener_ = nullptr;
 };
 
@@ -3485,11 +3515,32 @@ public:
             controller->setCurrentFont(family);
         }, parent);
         fontPopup_->setOpener(fontButton_);
+        // An open picker is part of the chrome the pin editor has to keep
+        // clickable, and it reaches past the toolbar's own rect.
+        const auto popupVisibility = [controller = controller_] { controller->scheduleInputMask(); };
+        pickerPopup_->setVisibilityCallback(popupVisibility);
+        fontPopup_->setVisibilityCallback(popupVisibility);
         // The tooltips are drawn by the panel itself, not by Qt (see
         // `HoverTip`), so every event in this process is filtered to catch the
         // hover and turn it into one.
         qApp->installEventFilter(this);
         syncState();
+    }
+
+    // The windows this panel owns that are not part of its own rect: the two
+    // pickers, which are parented to the overlay so they can reach past the
+    // panel's clipped box.  The pin editor's input region has to include them
+    // or an open picker would be painted but not clickable.
+    QVector<QWidget *> popups() const
+    {
+        QVector<QWidget *> result;
+        for (QWidget *popup : {static_cast<QWidget *>(pickerPopup_),
+                               static_cast<QWidget *>(fontPopup_)}) {
+            if (popup != nullptr) {
+                result.push_back(popup);
+            }
+        }
+        return result;
     }
 
     void syncState()
@@ -3951,6 +4002,9 @@ protected:
             const int y = std::clamp(local.y(), 0,
                                      std::max(0, parentWidget()->height() - height()));
             move(x, y);
+            // The panel is the pin editor's chrome, so its input region travels
+            // with it as it is dragged.
+            controller_->scheduleInputMask();
             event->accept();
             return;
         }
@@ -4658,6 +4712,8 @@ OverlayController::~OverlayController()
     delete pinSocket_;
     delete candidateReader_;
     delete candidateTimer_;
+    delete inputMaskTimer_;
+    delete pointerWarpTimer_;
     // The overlays are the caller's to delete (see `main`), so they are not
     // owned here -- but they must stop painting through a controller that is
     // gone.  Detach them, which hides them too.
@@ -5570,6 +5626,42 @@ bool OverlayController::canDrawAt(Point point) const
            point.y >= limits.y && point.y < limits.bottom();
 }
 
+// The band the pin's own border occupies, as the image grown by half the
+// stroke's width. `PinSurface` centres the stroke on the image's edge, so that
+// is exactly how far outside the image it reaches; with no border the band is
+// the image itself and nothing more.
+LogicalRect OverlayController::pinBorderBand() const
+{
+    const LogicalRect &image = annotationLimits();
+    const std::uint32_t half = session_.pinBorderWidth / 2;
+    if (half == 0) {
+        return image;
+    }
+    return LogicalRect{image.x - static_cast<std::int32_t>(half),
+                       image.y - static_cast<std::int32_t>(half), image.width + 2 * half,
+                       image.height + 2 * half};
+}
+
+bool OverlayController::insidePinImage(Point point) const
+{
+    if (!pinEdit_) {
+        return canDrawAt(point);
+    }
+    const LogicalRect &image = annotationLimits();
+    return point.x >= image.x && point.x < image.right() &&
+           point.y >= image.y && point.y < image.bottom();
+}
+
+bool OverlayController::onPinBorder(Point point) const
+{
+    if (!pinEdit_ || insidePinImage(point)) {
+        return false;
+    }
+    const LogicalRect band = pinBorderBand();
+    return point.x >= band.x && point.x < band.right() &&
+           point.y >= band.y && point.y < band.bottom();
+}
+
 void OverlayController::placeNumber(Point point)
 {
     Annotation annotation;
@@ -5709,6 +5801,10 @@ void OverlayController::startTextEditor(CaptureOverlay *overlay, int index, Poin
     if (!initial.isEmpty()) {
         textEdit_->selectAll();
     }
+    // The editor is chrome like the toolbar: the surface has to take clicks on
+    // it, or the user could see the box they are typing into but not click in
+    // it.
+    scheduleInputMask();
     updateAll();
 }
 
@@ -5726,6 +5822,7 @@ void OverlayController::finishText(bool accept)
     textEdit_->deleteLater();
     textEdit_ = nullptr;
     textEditPixels_ = 0;
+    scheduleInputMask();
     if (accept && !value.isEmpty()) {
         Annotation annotation;
         annotation.kind = Annotation::Kind::Text;
@@ -5799,6 +5896,7 @@ void OverlayController::showToolbar()
     toolbar_->raise();
     toolbar_->syncState();
     updateToolbarGeometry();
+    scheduleInputMask();
 }
 
 // The output that currently hosts the selection (by its center point).
@@ -5852,6 +5950,7 @@ void OverlayController::settlePanelAtGlobal(QPoint topLeft)
     const int x = std::clamp(local.x(), 0, std::max(0, target->width() - toolbar_->width()));
     const int y = std::clamp(local.y(), 0, std::max(0, target->height() - toolbar_->height()));
     toolbar_->move(x, y);
+    scheduleInputMask();
 }
 
 void OverlayController::hideToolbar()
@@ -5860,6 +5959,7 @@ void OverlayController::hideToolbar()
     if (toolbar_ != nullptr) {
         toolbar_->hide();
     }
+    scheduleInputMask();
 }
 
 void OverlayController::updateToolbarGeometry()
@@ -5944,13 +6044,21 @@ void OverlayController::updateToolbarGeometry()
     toolbarAnchorBelow_ = below;
     toolbarAnchorValid_ = true;
     toolbar_->setGeometry(x, y, width, height);
+    // The panel moved, so the strip of the surface that takes input moved with
+    // it.
+    scheduleInputMask();
 }
 
 int OverlayController::sceneScale() const
 {
+    // The density the helper rasterized its bitmaps at: the highest one any
+    // output declares.  A pin-edit session's single output carries the pin's
+    // zoom rather than a density, and its text is composited from the helper's
+    // own bitmap, so the whole-number part is what the bitmap was drawn at --
+    // a zoom below 1 is one bitmap pixel per logical pixel, which is 1.
     int scale = 1;
     for (const OutputSession &output : session_.outputs) {
-        scale = std::max(scale, static_cast<int>(output.scale));
+        scale = std::max(scale, static_cast<int>(std::lround(outputScale(output))));
     }
     return scale;
 }
@@ -5971,7 +6079,83 @@ void OverlayController::updateAll()
     // A full repaint erases whatever the narrow ones left, so the rect they were
     // tracking stops being the record of what is on the surface.
     hasLastTouch_ = false;
+    // The hover frame is not drawn by a full repaint, and the mark it named may
+    // not even be there any more -- a delete, an undo, a tool change all land
+    // here.  Forgetting it means the next motion re-derives it against whatever
+    // the mark list is now, rather than framing a stale index.
+    markHovered_ = -1;
     repaintEverything();
+}
+
+void OverlayController::scheduleInputMask()
+{
+    if (!pinEdit_) {
+        return;
+    }
+    if (inputMaskTimer_ == nullptr) {
+        // Parentless and deleted explicitly, like the controller's other timers:
+        // the controller is not a QObject, so there is no parent to hang it on.
+        inputMaskTimer_ = new QTimer();
+        inputMaskTimer_->setSingleShot(true);
+        inputMaskTimer_->setInterval(0);
+        QObject::connect(inputMaskTimer_, &QTimer::timeout, inputMaskTimer_, [this] {
+            applyPinEditInputMask();
+        });
+    }
+    // Applied now as well as on the timer.  The first call is the one that has
+    // to be in force before the event loop runs -- the surface is born taking
+    // the whole output -- and every later one is cheap, because a mask that has
+    // not changed is not re-sent.
+    applyPinEditInputMask();
+    inputMaskTimer_->start();
+}
+
+// The editor's surface covers the whole output so the toolbar has somewhere to
+// sit beside the image, but the editor only owns the chrome it draws: the
+// pinned image, the band its border occupies, the toolbar and anything open
+// over them.  Everything else on the screen belongs to the desktop underneath,
+// and an input region that said otherwise is what made a click far from the pin
+// land on the editor instead of on the window behind it.
+void OverlayController::applyPinEditInputMask()
+{
+    if (!pinEdit_ || overlays_.isEmpty()) {
+        return;
+    }
+    // The band is where the daemon last confirmed the image to be, not where
+    // the session put it: a pin that has been dragged since would otherwise
+    // leave its input region behind at the old spot.
+    const LogicalRect band = pinBorderBand();
+    QRegion mask;
+    for (CaptureOverlay *overlay : overlays_) {
+        // `pinBorderBand` already falls back to the image when the session named
+        // no border, so this is the whole of what the pin occupies.
+        const LogicalRect &visible = band;
+        if (visible.width == 0 || visible.height == 0) {
+            continue;
+        }
+        mask += localRect(overlay->output(), visible, overlay->size()).toAlignedRect();
+        // The toolbar and its popups are children of the overlay, so their own
+        // geometry is already in overlay coordinates.
+        const auto addWidget = [&mask, overlay](const QWidget *widget) {
+            if (widget == nullptr || !widget->isVisible() || widget->parentWidget() != overlay) {
+                return;
+            }
+            mask += QRegion(widget->geometry());
+        };
+        addWidget(toolbar_);
+        addWidget(textEdit_);
+        if (toolbar_ != nullptr) {
+            for (const QWidget *popup : toolbar_->popups()) {
+                addWidget(popup);
+            }
+        }
+        // No mask was asked for: leave the surface whole rather than cutting
+        // the editor down to nothing and making it unreachable.
+        if (mask.isEmpty()) {
+            continue;
+        }
+        overlay->setInputMask(mask);
+    }
 }
 
 // How far outside a mark's own rect its pixels can reach.  The answer lives in
@@ -6733,7 +6917,10 @@ void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::
         }
         return;
     }
-    const bool insideImage = canDrawAt(point);
+    const Point raw = unclampedGlobalPoint(overlay, local);
+    // The pin's border counts as the pin for the pointer's own sake: aiming at
+    // the rim is aiming at the image, so the cursor says "drag me" there too.
+    const bool insideImage = insidePinImage(raw) || onPinBorder(raw);
     if (pinEdit_ && !insideImage && buttons == Qt::NoButton &&
         gesture_->type == Gesture::Type::None) {
         // Bare canvas around the pin image: the toolbar lives there, so the
@@ -7659,12 +7846,15 @@ void OverlayController::applyPinRect(const LogicalRect &rect)
     // A full repaint here was a whole output's worth of work on every motion
     // event's confirmation.
     invalidateLogicalRegion(uniteLogical(previous, *marksOrigin_));
+    // The input region follows the image, or the editor would take clicks on
+    // the band it just left and pass through clicks on the band it just took.
+    scheduleInputMask();
     if (toolbar_ != nullptr && toolbar_->isVisible()) {
         updateToolbarGeometry();
     }
 }
 
-void OverlayController::chooseTool(Tool tool)
+void OverlayController::chooseTool(std::optional<Tool> tool)
 {
     // Any tool change invalidates the recognized layer: the marks are about to
     // be drawn over the text, and the pointer is no longer selecting it.
@@ -7971,6 +8161,7 @@ void OverlayController::setNumberStyle(NumberStyle style)
 void OverlayController::notifyPanelDragged()
 {
     panelPinned_ = true;
+    scheduleInputMask();
 }
 
 bool OverlayController::pasteImage(const QImage &image, const QString &source)
@@ -12670,9 +12861,32 @@ QPointF CaptureOverlay::localFromGlobal(Point point) const
     return localPoint(output(), point, size());
 }
 
-bool CaptureOverlay::showLayerSurface()
+// Wayland has no "no input here" request: an unset input region means the whole
+// surface is interactive, and Qt sends no request at all for an empty mask,
+// which is exactly that default.  A region parked outside the surface is the
+// portable way to say "click straight through", the same trick `PinSurface`
+// uses.
+//
+// The mask is a round trip to the compositor and a pin drag recomputes it every
+// frame, so an unchanged one is not re-sent.
+void CaptureOverlay::setInputMask(const QRegion &mask)
 {
-    if (layerWindow_ == nullptr) {
+    static const QRegion clickThrough(QRect(-8, -8, 1, 1));
+    const QRegion wanted = mask.isEmpty() ? clickThrough : mask;
+    if (wanted == inputMask_) {
+        return;
+    }
+    winId();
+    QWindow *window = windowHandle();
+    if (window == nullptr) {
+        return;
+    }
+    inputMask_ = wanted;
+    window->setMask(wanted);
+}
+
+bool CaptureOverlay::showLayerSurface()
+{    if (layerWindow_ == nullptr) {
         winId();
         layerWindow_ = windowHandle();
         if (layerWindow_ == nullptr) {

@@ -250,6 +250,18 @@ bool loadSession(const QString &sessionPath, Session *session, QString *error)
         if (!parsed.pinSocket.startsWith(QLatin1Char('/'))) {
             return fail(error, QStringLiteral("pin-edit session `socket` must be an absolute path"));
         }
+        // Optional: how wide the pin's border is drawn. Absent means zero, which
+        // is the right answer both for a pin with no border and for a session
+        // from a helper that does not carry the field yet.
+        const QJsonValue borderValue = root.value(QStringLiteral("border_width"));
+        if (!borderValue.isUndefined() && !borderValue.isNull()) {
+            std::int64_t border = 0;
+            if (!jsonInteger(borderValue, 0, 64, &border)) {
+                return fail(error, QStringLiteral("pin-edit session `border_width` must be an "
+                                                  "integer between 0 and 64"));
+            }
+            parsed.pinBorderWidth = static_cast<std::uint32_t>(border);
+        }
         // Optional: which part of the editor to open on. Absent for the
         // ordinary annotation editor; unknown values are left for the editor to
         // fall back on, so they do not fail the session here.
