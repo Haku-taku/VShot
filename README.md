@@ -137,6 +137,10 @@ vshot replay stop                               # 结束回录会话
 | `-c, --cursor` | 请求合成器把光标画进每个输出帧。**`long` 不支持**（见[「已知不稳定点」](#已知不稳定点)）；截图里没有光标最常见的原因见[「光标（`--cursor`）」](#光标--cursor) |
 | `--png-compression LEVEL` | `none` / `fastest` / `fast`（默认）/ `balanced` / `high`，全部无损，区别只在耗时与体积 |
 | `--hdr-format FORMAT` | 截图带 HDR 内容时 PNG 旁第二份的格式：`avif`（默认）或 `hdr`。见 [HDR](#hdr) |
+| `--tone-map MODE` | SDR 那一份怎么从 HDR 内容映射下来：`auto`（默认）/ `fixed` / `normalize`。见 [HDR](#hdr) |
+| `--tone-map-white LEVEL` | SDR 白落在输出范围的哪个位置，0.5–0.95，默认 0.8。`fixed` 与 `auto` 使用 |
+| `--hdr-area-test BOOL` | 是否按**面积**判定 HDR 内容（默认 `true`）。关掉退回「有一个像素超过就算」 |
+| `--hdr-area-ratio SHARE` | 超过 SDR 白的像素要占画面的多少才算 HDR 内容，0–1，默认 0.0005。`0` 表示总是 HDR。只在开关打开时读取 |
 
 每次捕获必须且只能给一个输出目标。`region --geometry` 与 `--interactive` 互斥，不给 geometry 时默认交互选择（`--interactive` 用于显式声明这一意图）。路径格式示例：
 
@@ -513,15 +517,25 @@ bind = SUPER SHIFT, A, exec, vshot annotate quit
 **落在单个输出内的矩形一律从那块输出自己那份原生帧裁剪，并按那块屏的 scale 写密度**：`region` 的 `--geometry` 与交互选择、`window active`、`window pick` 以及像素识别给出的矩形都走这条路，只有**跨接缝**的矩形才回落到合成场景；`all` 是整块桌面，只能由场景给出。内部帧统一为 RGBA8、top-left origin，多输出合成支持负 logical origin 和输出间空隙（场景画布用最高输出 scale，较低 scale 的输出用 nearest-neighbor 放大）。当前要求正整数 scale、`transform=normal` 以及可安全证明的 logical/pixel 映射；fractional scale、旋转和无法证明的映射会清晰失败，而不是生成疑似错误的截图。这个校验只在**需要把输出合成为场景**的路径上生效，所以 KWin 与 niri 直接给窗口像素的两条路在旋转/翻转输出上仍然可用。
 
 ### HDR
-输出自己被合成器描述为 HDR（PQ 或 HLG）时，一次截图产出**两份**：`<name>.png` 是同一份内容的 SDR 色调映射，第二份是 HDR 内容本身，与 PNG 同名、只有后缀不同（默认 `<name>.avif`；`--hdr-format hdr` 改成 Radiance RGBE 的 `<name>.hdr`）。有标注时标注在**线性光**里合成到 HDR 那一份上，SDR 那一份再由它映射而来，两份因此描述同一束光、同一批标记。SDR 那一份**不用合成器给普通客户端准备的那张画面**：Hyprland 把它按 `DEFAULT_SRGB_IMAGE_DESCRIPTION`（峰值 80 cd/m²）写出，而一张 SDR 图里「白」的含义是这块输出自己的参考白（这里是 203），于是普通 SDR 内容会被压到白以下而不是落在白上——实测取到的是 sRGB 220 而非 255（145 cd/m²），整幅画面一起变暗，而不只是高光。VShot 因此自己映射，且**以输出的 SDR 白为准、不以画面的峰值为准**：峰值做白点会让同一扇窗的成品随画面里还有没有更亮的东西而变，pin 出来的副本也就和它来源的画面不一致。SDR 白以内的光按 `SDR_WHITE_LEVEL`（0.8）等比落码，白落在 sRGB 231，比例原样保留、色相不变；超过 SDR 白的光再按 Reinhard 滚降到 `ROLL_OFF_PEAK`（10 倍 SDR 白）处的满量程，单调且分离，一块更亮的高光不会被抹成纯白（8 倍 SDR 白落在 252，与白相差 21 个码值）——这正是过去按峰值归一那套做不到的：它把超过白的一切压成同一个码，testufo 的 HDR 测试里 `HDR`/`WCG` 字样于是与周围的 SDR 再也分不出来。代价是 SDR 内容比理想值低 10%，这是 8-bit 图要显示比白更亮的光时必然要付的，合成器自己也付（它把白放在 220），VShot 付得更少。**色域按输出自己报的色度坐标换算**：Hyprland 对一块 P3 面板报出的坐标既不是 BT.709 也不是 BT.2020，按「更接近哪个」去猜会把整幅画面的颜色算错；落在 BT.709 之外的颜色按**朝白点去饱和**映射进去，而不是把负分量截成 0——截断会挪动色相，去饱和只丢装不下的彩度。内容本身没有超过 SDR 白（`is_hdr()` 为假）时不会写第二份。
+输出自己被合成器描述为 HDR（PQ 或 HLG）时，一次截图产出**两份**：`<name>.png` 是同一份内容的 SDR 色调映射，第二份是 HDR 内容本身，与 PNG 同名、只有后缀不同（默认 `<name>.avif`；`--hdr-format hdr` 改成 Radiance RGBE 的 `<name>.hdr`）。有标注时标注在**线性光**里合成到 HDR 那一份上，SDR 那一份再由它映射而来，两份因此描述同一束光、同一批标记。SDR 那一份**不用合成器给普通客户端准备的那张画面**：Hyprland 把它按 `DEFAULT_SRGB_IMAGE_DESCRIPTION`（峰值 80 cd/m²）写出，而一张 SDR 图里「白」的含义是这块输出自己的参考白（这里是 203），于是普通 SDR 内容会被压到白以下而不是落在白上——实测取到的是 sRGB 220 而非 255（145 cd/m²），整幅画面一起变暗，而不只是高光。VShot 因此自己映射。**画面里没有超过 SDR 白的东西时，它就是一整幅 SDR 图，按原样显示**：白落在 255，白以下的每个码值都保持它自己的光。只有画面里确实有超过白的光时，白点才下移——移到 `SDR_WHITE_LEVEL`（0.8），把白以上的码值腾出来装高光——这时 SDR 白以内的光按这个系数等比落码，比例原样保留、色相不变；超过 SDR 白的光再按 Reinhard 滚降到 `ROLL_OFF_PEAK`（10 倍 SDR 白）处的满量程，单调且分离，一块更亮的高光不会被抹成纯白（8 倍 SDR 白落在 252，与白相差 21 个码值）——这正是过去按峰值归一那套做不到的：它把超过白的一切压成同一个码，testufo 的 HDR 测试里 `HDR`/`WCG` 字样于是与周围的 SDR 再也分不出来。代价是白点成了画面的属性而非固定值：同一束光会因为画面里有没有高光而落在不同的码上。这是与另一种取舍相反的取舍——固定白点会把 HDR 输出上**每一次** SDR 截图都压暗到 sRGB 231，也就是一张 SDR 窗口的截图出来是错的。**色域按输出自己报的色度坐标换算**：Hyprland 对一块 P3 面板报出的坐标既不是 BT.709 也不是 BT.2020，按「更接近哪个」去猜会把整幅画面的颜色算错；落在 BT.709 之外的颜色按**朝白点去饱和**映射进去，而不是把负分量截成 0——截断会挪动色相，去饱和只丢装不下的彩度。内容本身没有超过 SDR 白时不会写第二份——这一判定见下一段。
+
+**「画面里有超过 SDR 白的东西」怎么判定**：判定发生在程序内部，看的是 daemon 手里那份帧本身，而不是任何一个外部文件，所以标签、第二份文件、pin 的走法三者永远同进同退。外层的闸门是**输出的声明**：只有合成器把这块输出描述成 PQ 或 HLG 才会拿到 10-bit 缓冲区，SDR 输出上根本不存在第二份可写。声明之后要答的是另一个问题——**这个矩形里有没有超过白的光**——而声明答不了它：同一块 HDR 输出上的一个 SDR 窗口和一段 HDR 视频，声明完全一样。于是按**面积**判定：超过 SDR 白 `HDR_WHITE_EPSILON` 的像素占画面的比例达到 `--hdr-area-ratio`（默认 0.0005，万分之五）才算 HDR 内容。为什么不看最亮的那一个像素：10-bit PQ 会把**普通的 SDR 白**落在略高于 1.0 的码上（203 cd/m² 参考白下，码 594/595/596/597 解出 0.99958/1.00897/1.01845/1.02801），所以一张再普通不过的 SDR 桌面也散着几千个「超过白」的像素——实测一幅 3.7 MP 的桌面有 17 489 个像素超过 1.02；老判据是「峰值超过 1.02 就算 HDR」，只要有**一个**这样的像素，整幅画面就被判成 HDR，白点随之下移，**整幅截图暗约 18 %**（实测均值 49573 对 60606）。把阈值抬到 0.05 也救不了：同一幅画面仍有约 37 个像素在它之上（实测占比 0.00001），照样超过任何「有就行」的判据。真正的 HDR 是一块**成片**的高光，量化噪声是**散落**的，所以判据是占比而不是峰值。两个开关可以把它调回原样：`--hdr-area-test false` 退回「有一个像素超过就算」（老行为）；`--hdr-area-test true --hdr-area-ratio 0` 则是「只要是 HDR 输出就一律按 HDR 处理」，不做任何区域判定。阈值本身（`HDR_WHITE_EPSILON`，0.05）不是配置项：它要跨过 10-bit PQ 的量化台阶，而 1.5 倍白的高光解出来就是 1.5，离它很远。
 
 第二份的格式由 `--hdr-format`（或配置文件里的 `cli.hdr-format`）决定，默认 `avif`：10-bit、BT.2020 + PQ，AV1 序列头与容器的 `colr` box 声明同一个 CICP 三元组，所以任何懂 AVIF 的读取器都能正确显示，代价是**有损**。`hdr` 则是 Radiance RGBE，**原样保留截取时的色域**（不做任何转换，广色域留给它），色域写在 `PRIMARIES=` 头里——RGBE 本身没有色度字段，而 ffmpeg 与 ImageMagick 都会忽略这一行、按 Rec.709 解读，所以用这类工具看广色域内容会偏艳；为它们转换过的是旁边的 SDR 那一份。要无损归档就选它。AVIF 走 `rav1e` + `avif-serialize`：`image` 自带的 AVIF 编码器写不了 HDR（它固定 8-bit，且色彩描述固定为 sRGB / BT.709），详见 `src/model/avif.rs`。
 
 颜色一律问显示器，不猜像素：10-bit 缓冲区在 HDR 输出上就是那块输出自己的像素，按它宣告的传递函数与参考白解码（`wp_color_manager_v1` 的输出描述，参考白即该输出的 SDR 白）。Hyprland 上这是 `misc:screencopy_hdr` 打开时**才**成立的约定——关掉时合成器只交 8-bit sRGB，此时不会写第二份。
 
+上面那套映射的行为由 `--tone-map`（或配置文件里的 `cli.tone-map`）选择，三种：
+
+- **`auto`（默认）**——白点由画面决定，也就是上一段描述的：没有超过 SDR 白的东西就按原样显示，有高光才把白下移。「有没有高光」问的就是上面那套面积判定，与决定要不要写第二份的是同一个答案，所以一张 SDR 窗口的截图是**精确**的。
+- **`fixed`**——白点永远是 `--tone-map-white`（默认 0.8），不看画面。代价是 HDR 输出上**每一次** SDR 截图都会略暗（白落在 sRGB 231），换来的是**同一个像素的码值不随画面里还有什么而变**——pin 出来的一份因此和它截自的内容一致。
+- **`normalize`**——按画面自己的峰值归一，即 SDR 白落在 `1/峰值`，最亮的那一点正好落在白上。高光之间**仍有先后，但没有间隔**：白以上的一切都被压进这个倒数腾出来的空间里，一条亮渐变会摊平。只在画面峰值确实是一个值得归一的高光时才合适。
+
+`--tone-map-white` 是 SDR 白在输出范围里落点，0.5 到 0.95，超出这个范围会被**夹到边界**而不是报错（它是用户写下的数字，映射对它有一个明确的答案）。它被 `fixed`（永远用）和 `auto`（只在画面确实有高光时用）读取，`normalize` 自己算，忽略它。设置窗口里这一项是一个百分数输入框（默认 80 %），选中 `normalize` 时置灰。
+
 冻结帧在交互界面上也按原样显示：VShot 在 overlay 下面另起一层 surface，挂的是**那块输出自己的 image description**（不是照着它造一个像的），所以合成器既不转换也不做色调映射，选中的区域就是屏幕上原本的光；overlay 自己只画遮罩（选区挖空）、标注与工具条。别的路线是造一份“像”的描述，那不够：compositor 会把它当成另一个空间，往面板自己的范围里做一次色调映射，整幅画面会一起变暗。
 
-**pin 到屏幕上的 HDR 图也是 HDR 的**，走的是同一条道理：pin daemon 随自己启动一个小进程（`vshot --pin-hdr-server`），它在每块输出上铺一张 overlay 层的 surface，挂上和冻结帧一样的那块输出自己的 image description，把标注后重新按 PQ 编码的十位像素写进去，于是合成器不转换、不色调映射，贴上去的就是原来那束光。Qt 的 pin 浮层做不到这一点——它是 Qt 窗口，描述由 `QColorSpace` 造出，没有亮度信息，合成器会当成另一个空间压暗。所以**图像由这个 helper 画**，Qt 浮层只留边框、角标和右键菜单，并把图像那块挖空留给它；helper 的 surface 必须在 Qt 的之前映射（同一层按映射顺序堆叠，协议没有 restack），因此它在 daemon 启动时就被拉起、在 daemon 的第一张 surface 之前报过到。截下来的内容没有超过 SDR 白（不写第二份）时没有 HDR 那一份，pin 就是普通 SDR pin；合成器不提供 `wp_color_manager_v1` 时 helper 干脆不铺 surface，同样退回 SDR。像素只在内存里读一次，拖动时 daemon 只发坐标，而同一批里只合成最后一条位置，所以快速拖动不会每个鼠标事件都重画一遍。
+**pin 到屏幕上的 HDR 图也是 HDR 的**，走的是同一条道理：pin daemon 随自己启动一个小进程（`vshot --pin-hdr-server`），它在每块输出上铺一张 overlay 层的 surface，挂上和冻结帧一样的那块输出自己的 image description，把标注后重新按 PQ 编码的十位像素写进去，于是合成器不转换、不色调映射，贴上去的就是原来那束光。Qt 的 pin 浮层做不到这一点——它是 Qt 窗口，描述由 `QColorSpace` 造出，没有亮度信息，合成器会当成另一个空间压暗。所以**每一张贴图都由这个 helper 画**，不只是 HDR 的那些——原因不是 HDR 本身，而是堆叠顺序：同一层的 surface 按**映射顺序**堆叠，协议没有 restack 请求，而 helper 的那张必须在 daemon 的第一张 surface 之前映射（它先报过到），于是它永远在所有 Qt surface 之下，Qt 浮层上画的任何东西都会盖到 helper 画的每一张贴图上，包括本该盖住它的、排在它前面的贴图——一条边框也会压过挡在它前面的那张图。所以整摞图（图像、阴影、边框）都是 helper 的，一张 surface、一次 commit：HDR 贴图按自己的 PQ 直通，SDR 贴图由 daemon 写成 PNG 交给它、由它按该输出自己的参考白编码成 PQ（见下），Qt 浮层只留**角标、右键菜单、`HDR` 标签和输入遮罩**，并把图像那块挖空留给它。顺带修掉的是 SDR 贴图在 HDR 输出上被合成器色调映射压暗的问题：交给 helper 的是一束光，而不是一张等着被转换的 sRGB 图。helper 必须在 daemon 的第一张 surface 之前映射，所以它在 daemon 启动时就被拉起。截下来的内容没有超过 SDR 白（按上面的面积判定，不写第二份）时没有 HDR 那一份，pin 就是普通 SDR pin，走的就是上面那条 PNG 的路；合成器不提供 `wp_color_manager_v1` 时 helper 干脆不铺 surface，整摞退回 Qt 浮层自己画（图像、阴影、边框都在它这边）。每个图片文件只读一次（按路径缓存），拖动时 daemon 每批只发最后一条位置，所以快速拖动不会每个鼠标事件都重画一遍。
 
 ## 截图后端与 KDE 授权
 启动时探测一次：先连 `wlr-screencopy-unstable-v1`，只有它以「缺少 `zwlr_screencopy_manager_v1`」失败时才说明这个合成器不提供该协议；再试 **KWin ScreenShot2**——KWin 的私有会话总线服务 `org.kde.KWin.ScreenShot2`（KWin 既没有 screencopy，也没有 `ext-image-copy-capture`）。vshot 传一根管道的写端，KWin 把像素写进管道并在回复里给出 `width` / `height` / `stride` / `format` / `scale`；像素是预乘 alpha 的 BGRA，输出截图把 alpha 归一为 255，窗口截图原样保留。
@@ -604,6 +618,9 @@ vshot settings
   "cli": {
     "png-compression": "high",
     "hdr-format": "hdr",
+    "tone-map": "fixed",
+    "tone-map-white": 0.75,
+    "hdr-area-test": false,
     "monitor": "DP-2",
     "long": { "notches": 2, "max-height": 20000, "timeout": 60 },
     "pin": { "density": 2 },
@@ -652,6 +669,10 @@ vshot settings
 | --- | --- | --- |
 | `png-compression` | `--png-compression` | `fast` |
 | `hdr-format` | `--hdr-format` | `avif` |
+| `tone-map` | `--tone-map` | `auto` |
+| `tone-map-white` | `--tone-map-white` | `0.8` |
+| `hdr-area-test` | `--hdr-area-test` | `true` |
+| `hdr-area-ratio` | `--hdr-area-ratio` | `0.0005` |
 | `monitor` | `monitor [NAME]` 的输出名 | `current` |
 | `long.notches` | `long --notches` | `1` |
 | `long.max-height` | `long --max-height` | `30000` |
