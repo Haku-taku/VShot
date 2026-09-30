@@ -2698,6 +2698,10 @@ struct OverlayController::Gesture {
     Point current;
     LogicalRect origin;
     int handle = 0;
+    // Alt was down when the handle was grabbed.  It is read once, at the press:
+    // a resize that changed its mind halfway through would jump, and the key is
+    // held for the whole drag in practice anyway.
+    bool preserveAspect = false;
     QVector<Point> points;
     // The in-progress freehand stroke, rasterized incrementally.  Re-stroking
     // the whole path on every paint is O(points) each time -- quadratic over a
@@ -4830,7 +4834,8 @@ LogicalRect OverlayController::moveSelection(LogicalRect origin, Point anchor, P
     return rectFromEdges(x, y, x + origin.width, y + origin.height);
 }
 
-LogicalRect OverlayController::resizeSelection(LogicalRect origin, int handle, Point current) const
+LogicalRect OverlayController::resizeSelection(LogicalRect origin, int handle, Point current,
+                                              bool preserveAspect) const
 {
     // Region capture resizes the selection inside the frozen scene; in the pin
     // editor the same helper resizes a mark inside the image (which may have
@@ -4844,8 +4849,50 @@ LogicalRect OverlayController::resizeSelection(LogicalRect origin, int handle, P
     std::int64_t top = origin.y;
     std::int64_t rightEdge = origin.right();
     std::int64_t bottomEdge = origin.bottom();
-    const std::int64_t x = current.x;
-    const std::int64_t y = current.y;
+    std::int64_t x = current.x;
+    std::int64_t y = current.y;
+    if (preserveAspect && handle != 0 && handle != 9) {
+        // Alt: the corner the pointer is not on stays put and the other follows
+        // the pointer, but pulled onto the box's own diagonal so the two edges
+        // keep the ratio they started with.  The corner that is dragged is the
+        // one the handle names, so it is the one that has to be derived.
+        const bool movesLeft = handle == 1 || handle == 7 || handle == 8;
+        const bool movesRight = handle == 3 || handle == 4 || handle == 5;
+        const bool movesTop = handle == 1 || handle == 2 || handle == 3;
+        const bool movesBottom = handle == 5 || handle == 6 || handle == 7;
+        const double ratio = static_cast<double>(origin.width) /
+            static_cast<double>(std::max<std::int64_t>(1, origin.height));
+        // Which way the pointer went, measured from the corner that is anchored.
+        const std::int64_t anchorX = movesLeft ? origin.right() : origin.x;
+        const std::int64_t anchorY = movesTop ? origin.bottom() : origin.y;
+        double width = static_cast<double>(std::abs(x - anchorX));
+        double height = static_cast<double>(std::abs(y - anchorY));
+        // The wider travel wins, so the box tracks whichever axis the pointer is
+        // actually pushing on instead of collapsing when one of them stalls.
+        if (width < height * ratio) {
+            width = height * ratio;
+        } else {
+            height = width / ratio;
+        }
+        const std::int64_t limitX = movesLeft ? anchorX - boundsLeft
+                                              : boundsRight - anchorX;
+        const std::int64_t limitY = movesTop ? anchorY - boundsTop
+                                             : boundsBottom - anchorY;
+        width = std::min(width, static_cast<double>(std::max<std::int64_t>(0, limitX)));
+        height = std::min(height, static_cast<double>(std::max<std::int64_t>(0, limitY)));
+        // Both edges are taken from the same clamped pair, so the ratio survives
+        // the limits rather than being applied before them.
+        const std::int64_t edgeX = movesLeft ? anchorX - static_cast<std::int64_t>(width)
+                                             : anchorX + static_cast<std::int64_t>(width);
+        const std::int64_t edgeY = movesTop ? anchorY - static_cast<std::int64_t>(height)
+                                            : anchorY + static_cast<std::int64_t>(height);
+        if (movesLeft || movesRight) {
+            x = edgeX;
+        }
+        if (movesTop || movesBottom) {
+            y = edgeY;
+        }
+    }
     switch (handle) {
     case 1:
         left = std::clamp<std::int64_t>(x, boundsLeft, rightEdge - 1);
@@ -5225,7 +5272,7 @@ void OverlayController::applyCandidates(QVector<WindowCandidate> candidates)
     updateAll();
 }
 
-void OverlayController::beginSelectionGesture(Point point)
+void OverlayController::beginSelectionGesture(Point point, bool preserveAspect)
 {
     const int handle = hitHandle(point);
     if (selection_.has_value() && handle != 0 && handle != 9) {
@@ -9225,7 +9272,8 @@ void OverlayController::updateAnnotationDrag(Point point)
         if (!annotationBounds(dragAnnotation_, &originalBounds)) {
             return;
         }
-        const LogicalRect newBounds = resizeSelection(originalBounds, gesture_->handle, current);
+        const LogicalRect newBounds = resizeSelection(originalBounds, gesture_->handle, current,
+                                                      gesture_->preserveAspect);
         annotations_[selectedAnnotation_] = scaledAnnotation(dragAnnotation_, newBounds);
     }
 }
