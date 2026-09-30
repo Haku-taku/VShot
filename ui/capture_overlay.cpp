@@ -208,14 +208,25 @@ QRectF localRect(const OutputSession &output, const LogicalRect &rect, const QSi
                   static_cast<double>(rect.height) * sy);
 }
 
+// Device pixels per logical pixel of an output, as the number it is. A real
+// output's density is a whole number, but the pin editor's virtual output
+// carries the zoom its image is shown at, which is not -- a 160-pixel pin
+// across 176 logical pixels is 0.909 -- so it is never narrowed to an int
+// before it is used. Narrowing it to 1 is what drew a zoomed pin's marks at
+// the wrong size and in the wrong place.
+double outputScale(const OutputSession &output)
+{
+    return output.scale > 0.0 ? output.scale : 1.0;
+}
+
 QRect sourceRect(const OutputSession &output, const LogicalRect &rect)
 {
-    const std::int64_t x = (static_cast<std::int64_t>(rect.x) - output.geometry.x) * output.scale;
-    const std::int64_t y = (static_cast<std::int64_t>(rect.y) - output.geometry.y) * output.scale;
-    const std::int64_t width = static_cast<std::int64_t>(rect.width) * output.scale;
-    const std::int64_t height = static_cast<std::int64_t>(rect.height) * output.scale;
-    return QRect(static_cast<int>(x), static_cast<int>(y), static_cast<int>(width),
-                 static_cast<int>(height));
+    const double scale = outputScale(output);
+    const double x = (static_cast<double>(rect.x) - output.geometry.x) * scale;
+    const double y = (static_cast<double>(rect.y) - output.geometry.y) * scale;
+    return QRect(static_cast<int>(std::lround(x)), static_cast<int>(std::lround(y)),
+                 static_cast<int>(std::lround(static_cast<double>(rect.width) * scale)),
+                 static_cast<int>(std::lround(static_cast<double>(rect.height) * scale)));
 }
 
 // The exact inverse of `sourceRect`: a rect in one output's captured device
@@ -226,7 +237,7 @@ QRect sourceRect(const OutputSession &output, const LogicalRect &rect)
 // box, so a rect that was mapped out and back comes home.
 LogicalRect logicalFromSource(const OutputSession &output, const QRect &rect)
 {
-    const double scale = output.scale > 0 ? static_cast<double>(output.scale) : 1.0;
+    const double scale = outputScale(output);
     const double x = static_cast<double>(output.geometry.x) + static_cast<double>(rect.x()) / scale;
     const double y = static_cast<double>(output.geometry.y) + static_cast<double>(rect.y()) / scale;
     const double width = static_cast<double>(rect.width()) / scale;
@@ -1224,9 +1235,11 @@ void drawInfoPill(QPainter *painter, const QPointF &anchor, const QString &text,
 
 // Mosaic strength levels: block size in device pixels for a given output
 // scale (P1 fine, P2 standard, P3 coarse) — mirrors edit::mosaic_block_size.
-int mosaicBlockForStrength(std::uint32_t strength, int scale)
+// The scale is the ratio it is, not a whole number: a zoomed pin's is 0.909,
+// and rounding that to 1 would pixelate at a different block than the renderer.
+int mosaicBlockForStrength(std::uint32_t strength, double scale)
 {
-    const int base = std::max(1, 12 * scale);
+    const int base = std::max(1, static_cast<int>(std::lround(12.0 * scale)));
     switch (strength) {
     case 1:
         return std::max(4, base / 2);
@@ -1370,14 +1383,17 @@ bool fillRectDirect(QPainter *painter, const QRectF &logical, const QColor &colo
 }
 
 void fillLogicalBlock(QPainter *painter, const OutputSession &output, const LogicalRect &bounds,
-                      const QSize &size, const QRect &source, int scale, int x, int y, int width,
+                      const QSize &size, const QRect &source, double scale, int x, int y, int width,
                       int height, const QColor &color)
 {
+    // The block is in device pixels and the rect is logical, so the division is
+    // the ratio it is: a zoomed pin's scale is 0.909, and a block mapped back
+    // through a rounded 1 would land on the wrong part of the picture.
     LogicalRect blockLogical;
-    blockLogical.x = bounds.x + static_cast<std::int32_t>((x - source.x()) / scale);
-    blockLogical.y = bounds.y + static_cast<std::int32_t>((y - source.y()) / scale);
-    blockLogical.width = static_cast<std::uint32_t>(width / scale);
-    blockLogical.height = static_cast<std::uint32_t>(height / scale);
+    blockLogical.x = bounds.x + static_cast<std::int32_t>(std::lround((x - source.x()) / scale));
+    blockLogical.y = bounds.y + static_cast<std::int32_t>(std::lround((y - source.y()) / scale));
+    blockLogical.width = static_cast<std::uint32_t>(std::lround(width / scale));
+    blockLogical.height = static_cast<std::uint32_t>(std::lround(height / scale));
     const QRectF logical = localRect(output, blockLogical, size);
     if (fillRectDirect(painter, logical, color)) {
         return;
@@ -1403,12 +1419,13 @@ void drawMosaicAnnotation(QPainter *painter, const OutputSession &output,
     if (clipped.isEmpty()) {
         return;
     }
-    const int scale = static_cast<int>(output.scale > 0 ? output.scale : 1);
+    const double scale = outputScale(output);
     const int block = mosaicBlockForStrength(strength, scale);
     const uchar *bits = image.constBits();
     const qsizetype bytesPerLine = image.bytesPerLine();
     const bool ellipse = mask == QStringLiteral("ellipse");
-    // Mirrors the Rust integer midline ellipse (center = left + size/2).
+    // An integer midline ellipse: the centre is `left + size/2`, which is what
+    // keeps an odd-sized rect's ellipse on the pixel the user drew around.
     const std::int64_t left = source.x();
     const std::int64_t top = source.y();
     const std::int64_t rectWidth = source.width();
@@ -1475,7 +1492,7 @@ void drawMosaicAnnotation(QPainter *painter, const OutputSession &output,
                         continue;
                     }
                     fillLogicalBlock(painter, output, bounds, size, source, scale, x + xx,
-                                     y + yy, scale, scale, average);
+                                     y + yy, 1, 1, average);
                 }
             }
         }
@@ -1579,8 +1596,7 @@ void drawMosaicBrush(QPainter *painter, const OutputSession &output, const QVect
     if (output.image.isNull() || points.isEmpty()) {
         return;
     }
-    const std::uint32_t scaleValue = output.scale > 0 ? output.scale : 1;
-    const double scale = static_cast<double>(scaleValue);
+    const double scale = outputScale(output);
     const int baseRadius = std::clamp(static_cast<int>(widthLogical * scale / 2.0), 1, 512);
     const int radius = std::clamp(brushRadiusForStrength(strength, baseRadius), 1, 512);
     // The same spacing the live preview uses (`paintLiveStroke`), so a previewed
@@ -6229,14 +6245,20 @@ LogicalRect growBy(LogicalRect rect, int margin)
 // by half its width; the mosaic brush stamps a block whose radius comes from the
 // strength and can be far wider than the cursor.  `paintLiveStroke` builds its
 // own padding out of the same two numbers, so the two move together.
-double liveStrokeMargin(bool brush, int widthLogical, int scale, std::uint32_t strength)
+double liveStrokeMargin(bool brush, int widthLogical, double scale, std::uint32_t strength)
 {
     if (!brush) {
         return widthLogical / 2.0 + 2.0;
     }
+    // The ratio is a real number, not a whole one: a zoomed pin shows 160
+    // pixels across 176 logical ones, so a scale rounded to a whole number
+    // would be zero here and the division below would be by zero.
+    const double ratio = scale > 0.0 ? scale : 1.0;
     const double deviceRadius = std::clamp(
-        brushRadiusForStrength(strength, std::clamp(widthLogical * scale / 2, 1, 512)), 1, 512);
-    return deviceRadius / scale + 2.0;
+        brushRadiusForStrength(
+            strength, std::clamp(static_cast<int>(widthLogical * ratio / 2), 1, 512)),
+        1, 512);
+    return deviceRadius / ratio + 2.0;
 }
 
 /// How far a wave's pixels reach from the line its two points describe.
@@ -6326,16 +6348,18 @@ LogicalRect OverlayController::drawingTouch(int pointsBefore) const
     }
     // The preview is stamped on the output the stroke started on, and that
     // output's scale is what turns the device-space brush radius back into
-    // logical pixels.
-    int scale = 1;
+    // logical pixels.  It is the ratio itself, not a rounded one: the pin
+    // editor's output is zoomed, and rounding 0.909 to a whole number is zero.
+    double scale = 1.0;
     for (CaptureOverlay *overlay : overlays_) {
         if (overlay->outputIndex() == gesture_->liveOutput) {
-            scale = static_cast<int>(overlay->output().scale > 0 ? overlay->output().scale : 1);
+            scale = outputScale(overlay->output());
             break;
         }
     }
     const bool brush = tool_ == Tool::Mosaic;
-    const ToolStyle &style = toolStyle(toolName(tool_));
+    const QString liveTool = tool_.has_value() ? toolName(*tool_) : QStringLiteral("pen");
+    const ToolStyle &style = toolStyle(liveTool);
     // A wave is the one two-point tool whose pixels leave the box its endpoints
     // describe, so it is measured by its own reach rather than by the half-width
     // margin every other straight tool fits inside.
@@ -8958,7 +8982,7 @@ bool OverlayController::acceptTranslation(QString *error)
     // through the same painter the preview uses, so the file matches the screen.
     QImage composite =
         output.image.copy(source).convertToFormat(QImage::Format_ARGB32_Premultiplied);
-    const double scale = output.scale > 0 ? static_cast<double>(output.scale) : 1.0;
+    const double scale = outputScale(output);
     {
         QPainter painter(&composite);
         painter.setRenderHint(QPainter::Antialiasing, true);
@@ -10491,13 +10515,13 @@ protected:
                            static_cast<int>(annotation.width));
             return;
         }
-        const double scale = output.scale > 0 ? static_cast<double>(output.scale) : 1.0;
+        const double scale = outputScale(output);
         QPolygonF polygon;
         QPen pen = penForAnnotation(annotation);
         if (annotation.tool == QStringLiteral("wave") && annotation.points.size() >= 2) {
             // A wave is the sine sample of the segment between its two points,
             // not the segment itself: sample it here the same way the live
-            // preview and the Rust renderer do, and draw it solid.
+            // preview does, and draw it solid.
             // The crest offset and the period are logical pixels like every
             // other number here, and the painter is the logical one: the `scale`
             // argument only says how finely to sample, one point per device

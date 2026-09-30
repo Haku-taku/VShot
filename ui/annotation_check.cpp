@@ -4191,11 +4191,16 @@ void checkMovedPinLoupeFollowsTheImage()
     if (center.y() + radius > size.height() - margin) {
         center.setY(pointer.y() - radius * 1.1);
     }
-    // The image's current rect is the session bounds, not output.geometry.
+    // The image's current rect is the session bounds, not output.geometry: the
+    // sample counts from the image's origin, which is where the pin actually is.
     const int centerX = std::clamp(pointer.x() - controller.session().bounds.x, 0,
                                    source.width() - 1);
     const int centerY = std::clamp(pointer.y() - controller.session().bounds.y, 0,
                                    source.height() - 1);
+    // The disc is placed in *overlay* logical pixels -- the surface is the whole
+    // output and the image sits inside it -- while the sample indices above are
+    // in the image's own pixels.  Reading one against the other is what the
+    // sample below has to keep apart.
     const QPointF origin(center.x() - radius, center.y() - radius);
 
     int wrong = 0;
@@ -4214,6 +4219,207 @@ void checkMovedPinLoupeFollowsTheImage()
     }
     expect(wrong == 0, "the magnifier follows an image that has been dragged",
            QStringLiteral("%1 of 4 samples wrong").arg(wrong));
+}
+
+// Writes a pin-edit session whose image is `pixels` wide and `logical` wide on
+// screen, with a raw frame beside it, and returns the path to the session JSON.
+// The image is 90 device pixels tall across 99 logical ones, and its output
+// covers exactly the image, as the pin editor's widened surface does.
+QString writeZoomedPinSession(const QString &dir, int pixels, int logical,
+                              double declaredScale)
+{
+    const QString raw = dir + QStringLiteral("/pin.rgba");
+    const QString path = dir + QStringLiteral("/session.json");
+    QImage frame(pixels, 90, QImage::Format_RGBA8888);
+    for (int y = 0; y < 90; ++y) {
+        for (int x = 0; x < pixels; ++x) {
+            frame.setPixelColor(x, y, QColor(x % 256, y % 256, (x * 3 + y * 5) % 256, 255));
+        }
+    }
+    QFile rawFile(raw);
+    if (!rawFile.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+        rawFile.write(reinterpret_cast<const char *>(frame.constBits()),
+                      static_cast<qint64>(frame.sizeInBytes())) !=
+            static_cast<qint64>(frame.sizeInBytes())) {
+        return QString();
+    }
+
+    QJsonObject rect;
+    rect.insert(QStringLiteral("x"), 300);
+    rect.insert(QStringLiteral("y"), 200);
+    rect.insert(QStringLiteral("width"), logical);
+    rect.insert(QStringLiteral("height"), 99);
+    QJsonObject output;
+    output.insert(QStringLiteral("id"), 0);
+    output.insert(QStringLiteral("name"), QStringLiteral("DP-1"));
+    output.insert(QStringLiteral("x"), 300);
+    output.insert(QStringLiteral("y"), 200);
+    output.insert(QStringLiteral("width"), logical);
+    output.insert(QStringLiteral("height"), 99);
+    QJsonObject surface = output;
+    surface.remove(QStringLiteral("id"));
+    surface.remove(QStringLiteral("name"));
+    output.insert(QStringLiteral("surface"), surface);
+    // The ratio the pin's own pixels are shown at, as the Rust side writes it:
+    // a real number, not a whole one.
+    output.insert(QStringLiteral("scale"), declaredScale);
+    output.insert(QStringLiteral("pixel_width"), pixels);
+    output.insert(QStringLiteral("pixel_height"), 90);
+    output.insert(QStringLiteral("path"), raw);
+    QJsonArray outputs;
+    outputs.append(output);
+
+    QJsonObject session;
+    session.insert(QStringLiteral("version"), 1);
+    session.insert(QStringLiteral("mode"), QStringLiteral("pin-edit"));
+    session.insert(QStringLiteral("bounds"), rect);
+    session.insert(QStringLiteral("id"), 7);
+    session.insert(QStringLiteral("socket"), QStringLiteral("/tmp/vshot-check.sock"));
+    session.insert(QStringLiteral("outputs"), outputs);
+
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+        file.write(QJsonDocument(session).toJson(QJsonDocument::Compact)) < 0) {
+        return QString();
+    }
+    return path;
+}
+
+// The daemon hands a re-edit the marks it kept and the width of the pin's own
+// border, and both have to survive the session reader: the marks are what the
+// editor opens on, and the border width is what tells it the rim is part of the
+// pin.  Both are optional, so a first edit -- a session with neither -- still
+// has to load.
+void checkPinEditSessionCarriesItsMarksAndBorder()
+{
+    QTemporaryDir dir;
+    if (!dir.isValid()) {
+        expect(false, "a temporary directory for a pin-edit session");
+        return;
+    }
+    const QString path = writeZoomedPinSession(dir.path(), 160, 176, 160.0 / 176.0);
+    if (path.isEmpty()) {
+        expect(false, "the pin-edit session is written");
+        return;
+    }
+
+    // The same session with the two optional fields added, as `startEdit`
+    // writes them for a pin that has been annotated before.
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        expect(false, "the session can be read back");
+        return;
+    }
+    QJsonObject session = QJsonDocument::fromJson(file.readAll()).object();
+    file.close();
+    const QJsonObject mark{{QStringLiteral("kind"), QStringLiteral("shape")},
+                           {QStringLiteral("tool"), QStringLiteral("rectangle")},
+                           {QStringLiteral("color"), QStringLiteral("#ff4040")},
+                           {QStringLiteral("width"), 2},
+                           {QStringLiteral("dash"), QStringLiteral("solid")},
+                           {QStringLiteral("mask"), QStringLiteral("rect")},
+                           {QStringLiteral("strength"), 2},
+                           {QStringLiteral("rect"),
+                            QJsonObject{{QStringLiteral("x"), 10},
+                                        {QStringLiteral("y"), 12},
+                                        {QStringLiteral("width"), 40},
+                                        {QStringLiteral("height"), 30}}}};
+    session.insert(QStringLiteral("annotations"), QJsonArray{mark});
+    session.insert(QStringLiteral("border_width"), 6);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+        file.write(QJsonDocument(session).toJson(QJsonDocument::Compact)) < 0) {
+        expect(false, "the session with marks can be written");
+        return;
+    }
+    file.close();
+
+    vshot::Session loaded;
+    QString error;
+    expect(vshot::loadSession(path, &loaded, &error),
+           "a session carrying marks loads", error);
+    expect(loaded.annotations.size() == 1, "the marks reach the editor",
+           QString::number(loaded.annotations.size()));
+    expect(loaded.pinBorderWidth == 6, "the pin's border width reaches the editor",
+           QString::number(loaded.pinBorderWidth));
+
+    // And a session that names neither -- a pin's very first edit -- is still a
+    // session: the fields are optional, not required.
+    QJsonObject bare = session;
+    bare.remove(QStringLiteral("annotations"));
+    bare.remove(QStringLiteral("border_width"));
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+        file.write(QJsonDocument(bare).toJson(QJsonDocument::Compact)) < 0) {
+        expect(false, "the bare session can be written");
+        return;
+    }
+    file.close();
+    vshot::Session plain;
+    QString plainError;
+    expect(vshot::loadSession(path, &plain, &plainError),
+           "a pin's first edit needs neither field", plainError);
+    expect(plain.annotations.isEmpty() && plain.pinBorderWidth == 0,
+           "and reads them as absent rather than as a failure");
+}
+
+// A pin the user has zoomed is annotated on an image that is not a whole number
+// of device pixels per logical pixel: a 160-pixel pin shown across 176 logical
+// pixels is 0.909.  The session used to declare that ratio rounded to 1, so its
+// pixel dimensions no longer matched its logical size and the editor refused
+// the session outright -- clicking a zoomed pin did nothing at all, and the
+// marks the editor did manage to make were rasterized at the wrong size and in
+// the wrong place, which is what read as the annotation jumping when the pin
+// was clicked.  The ratio is now carried as it is, so the session loads and the
+// marks are drawn at the size the image is really shown at.
+void checkZoomedPinEditSessionLoads()
+{
+    QTemporaryDir dir;
+    if (!dir.isValid()) {
+        expect(false, "a temporary directory for a zoomed pin-edit session");
+        return;
+    }
+    // The 1.1x zoom the wheel's first notch gives on a 160-pixel pin.
+    constexpr int kPixels = 160;
+    constexpr int kLogical = 176;
+    const double scale = static_cast<double>(kPixels) / kLogical;
+    const QString path = writeZoomedPinSession(dir.path(), kPixels, kLogical, scale);
+    if (path.isEmpty()) {
+        expect(false, "the zoomed pin-edit session and its frame are written");
+        return;
+    }
+
+    vshot::Session session;
+    QString error;
+    const bool loaded = vshot::loadSession(path, &session, &error);
+    expect(loaded, "a zoomed pin's session loads rather than being refused", error);
+    if (!loaded) {
+        return;
+    }
+    expect(std::abs(session.outputs.at(0).scale - scale) < 1e-9,
+           "and keeps the ratio it declared rather than rounding it to a whole one",
+           QStringLiteral("scale %1").arg(session.outputs.at(0).scale));
+    expect(session.outputs.at(0).image.size() == QSize(kPixels, 90),
+           "and loads the frame at its own pixel size, not the logical one");
+    expect(session.bounds.x == 300 && session.bounds.y == 200 &&
+               session.bounds.width == kLogical && session.bounds.height == 99,
+           "and keeps the image's logical rect as the session bounds",
+           QStringLiteral("bounds %1,%2 %3x%4")
+               .arg(session.bounds.x)
+               .arg(session.bounds.y)
+               .arg(session.bounds.width)
+               .arg(session.bounds.height));
+
+    // The same session with the ratio truncated to 1 is the one that used to be
+    // written, and it must still be refused: the dimensions it declares no
+    // longer agree with the frame it names, so drawing it would place every
+    // mark against the wrong pixels.
+    const QString truncated =
+        writeZoomedPinSession(dir.path(), kPixels, kLogical, 1.0);
+    vshot::Session refused;
+    QString refusal;
+    expect(!vshot::loadSession(truncated, &refused, &refusal) &&
+               refusal.contains(QStringLiteral("do not match")),
+           "a zoomed pin's session with the ratio rounded away is still refused",
+           refusal);
 }
 
 // A drag's latency is dominated by how it talks to the daemon.  A fresh socket
