@@ -24,12 +24,14 @@
 // section.
 
 #include "capture_overlay.hpp"
+#include "config.hpp"
 
 #include <QApplication>
 #include <QColor>
 #include <QCoreApplication>
 #include <QDir>
 #include <QElapsedTimer>
+#include <QEvent>
 #include <QFile>
 #include <QFileInfo>
 #include <QImage>
@@ -737,6 +739,125 @@ void checkLiveStrokeMatchesTheCommittedMark()
         expect(diff < tolerance, "the incremental preview matches the committed mosaic brush",
                QStringLiteral("%1 pixels differ").arg(diff));
     }
+}
+
+// The configured default tool belongs to *annotation* mode, and a fresh region
+// capture has a step before that: framing.  Arming the tool at the open made
+// the region's very first press draw a mark instead of starting the rectangle,
+// which reads as "region capture is broken" -- the frame never appears and the
+// click inks a shape onto a live desktop.  The tool is not dropped: it is armed
+// the moment the frame is finished, which is when annotation mode really
+// begins.
+//
+// Both halves are asserted here, because either one alone is a different bug:
+// unarmed at the open is what keeps framing working, and armed at
+// `finishSelection` is what keeps the setting from doing nothing.
+void checkTheDefaultToolIsArmedWhenAnnotationBegins()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    // The config the controller reads at construction, written the way the
+    // settings window would leave it.
+    const QString path = vshot::configFilePath();
+    QDir().mkpath(QFileInfo(path).absolutePath());
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        expect(false, "the probe config is written");
+        return;
+    }
+    file.write(QByteArrayLiteral(R"({"editor": {"tool": "ellipse"}})"));
+    file.close();
+
+    // A region session with no selection: the state a fresh capture is in, where
+    // the first press has to start the frame.
+    {
+        vshot::Session session = editingSession();
+        session.selection.reset();
+        vshot::OverlayController controller(std::move(session));
+        QString error;
+        vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+        if (overlay == nullptr) {
+            expect(false, "the controller accepts an overlay", error);
+            file.remove();
+            return;
+        }
+        overlay->show();
+
+        // Nothing armed yet, so the drag frames.  `finishSelection` is reached
+        // through the press/move/release a real framing drag makes.
+        drag(controller, overlay, QPointF(60, 60), QPointF(300, 260));
+        expect(controller.selection().has_value(),
+               "the region's first drag frames rather than drawing");
+        expect(controller.annotations().isEmpty(), "and it leaves no mark behind",
+               QStringLiteral("%1 mark(s)").arg(controller.annotations().size()));
+        // The configured tool is *not* armed now the frame is made.  Opening
+        // armed here would make the very next click ink, so the one gesture a
+        // user makes after framing -- adjusting the frame they just drew --
+        // would put a mark down instead.
+        expect(controller.armedToolName().isEmpty(),
+               "the frame being done does not arm the configured tool",
+               controller.armedToolName());
+        const auto framed = *controller.selection();
+        // The next drag re-frames, and leaves nothing behind: the same drag
+        // that made the first frame makes the second.
+        drag(controller, overlay, QPointF(100, 100), QPointF(200, 180));
+        expect(controller.annotations().isEmpty(),
+               "an unarmed drag over a fresh frame re-frames rather than inking",
+               QStringLiteral("%1 mark(s)").arg(controller.annotations().size()));
+        expect(controller.selection().has_value() && controller.selection()->x == 100 &&
+                   controller.selection()->y == 100 && controller.selection()->width <= 101 &&
+                   controller.selection()->height <= 81 && controller.selection()->width >= 100 &&
+                   controller.selection()->height >= 80,
+               "and the frame it draws is the one the drag described",
+               controller.selection().has_value()
+                   ? QStringLiteral("%1,%2 %3x%4")
+                         .arg(controller.selection()->x)
+                         .arg(controller.selection()->y)
+                         .arg(controller.selection()->width)
+                         .arg(controller.selection()->height)
+                   : QStringLiteral("no frame"));
+        Q_UNUSED(framed);
+    }
+
+    // A session that opens with its selection already made -- the window
+    // picker's follow-up and a pin re-entered for editing -- has no frame left
+    // to drag, so it is the one case that does open on the configured tool.
+    {
+        vshot::Session session = editingSession();
+        vshot::OverlayController controller(std::move(session));
+        QString error;
+        vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+        if (overlay == nullptr) {
+            expect(false, "the controller accepts a preset-edit overlay", error);
+            file.remove();
+            return;
+        }
+        overlay->show();
+        controller.beginPresetEdit();
+        expect(controller.armedToolName() == QStringLiteral("ellipse"),
+               "a session that opens with a frame arms the configured tool",
+               controller.armedToolName());
+        // And the frame it opened on is the one it keeps: arming must not
+        // re-frame the capture.
+        const auto framed = *controller.selection();
+        drag(controller, overlay, QPointF(100, 100), QPointF(200, 180));
+        expect(controller.annotations().size() == 1,
+               "and the drag draws with it rather than framing again",
+               QStringLiteral("%1 mark(s)").arg(controller.annotations().size()));
+        if (controller.annotations().size() == 1) {
+            expect(controller.annotations().constFirst().tool == QStringLiteral("ellipse"),
+                   "and the mark is the tool the config named",
+                   controller.annotations().constFirst().tool);
+        }
+        expect(controller.selection()->x == framed.x && controller.selection()->y == framed.y &&
+                   controller.selection()->width == framed.width &&
+                   controller.selection()->height == framed.height,
+               "arming the tool does not move the frame the session opened on");
+    }
+    file.remove();
 }
 
 // A pure translation must not invalidate a cached raster: the mark's pixels do

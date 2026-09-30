@@ -4567,22 +4567,27 @@ OverlayController::OverlayController(Session session)
         style.wavelength = std::max(6u * preferences.width, 18u);
         toolStyles_.insert(toolName(entry), style);
     }
-    // The remembered tool is restored only where a tool is already meaningful:
-    // a session that starts in editing state -- one that arrives with its
-    // selection made (`beginPresetEdit`, the window picker's follow-up) and the
-    // pin editor, whose whole image is preselected in `beginPinEdit`.  A fresh
-    // region session must open on Select no matter what the file says -- its
-    // first step is dragging the rectangle, and opening on Text means the first
-    // click starts a label instead, which reads as "region capture is broken".
-    // Scrolling capture (`selectOnly_`) and picking (`pickMode_`) have their
-    // own reasons to stay on Select either way.
+    // The remembered tool is restored where a tool is already meaningful, and
+    // *not* at the open of a session whose first gesture is the frame itself.
+    //
+    // A session that arrives with its selection made -- the window picker's
+    // follow-up (`beginPresetEdit`) and the pin editor, whose whole image is
+    // preselected in `beginPinEdit` -- has nothing left to frame, so it opens
+    // on the user's tool.  A fresh region session does not: its first step is
+    // dragging the rectangle, and arming a tool there would make that first
+    // click start a mark instead, which reads as "region capture is broken".
+    // Nor does it arm one when the frame is done.  The frame is a frame, and
+    // the tool the config remembers is a default for a *new* mark, not a
+    // decision the session gets to make for the user: opening armed meant the
+    // first click inside a fresh region inked instead of letting the user
+    // adjust the frame they had just drawn.  Region stays unarmed until a tool
+    // is picked, and an unarmed drag re-frames.  Scrolling capture
+    // (`selectOnly_`) and picking (`pickMode_`) stay unarmed either way: they
+    // have no annotation step for a tool to belong to.
     const bool startsInEdit =
         session_.selection.has_value() || session_.mode == QStringLiteral("pin-edit");
-    if (startsInEdit && !selectOnly_ && !pickMode_) {
-        const Tool remembered = toolForName(preferences.tool);
-        if (remembered != Tool::Select) {
-            tool_ = remembered;
-        }
+    if (!selectOnly_ && !pickMode_ && !translateMode_ && startsInEdit) {
+        tool_ = toolForName(preferences.tool);
     }
 }
 
