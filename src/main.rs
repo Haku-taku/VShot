@@ -19,6 +19,7 @@ mod parallel;
 mod pin;
 mod pin_hdr;
 mod pin_hdr_fp16;
+mod pixel_fd;
 mod qt_overlay;
 mod record;
 mod selection;

@@ -258,6 +258,8 @@ if(VSHOT_BUILD_CHECKS)
     add_executable(vshot-paste-check
         ui/paste_check.cpp
         ui/capture_overlay.cpp
+        ui/pixel_fd.cpp
+        ui/pixel_fd.hpp
         ui/capture_overlay.hpp
         ui/text_layer.cpp
         ui/text_layer.hpp
@@ -293,6 +295,8 @@ if(VSHOT_BUILD_CHECKS)
     add_executable(vshot-backdrop-check
         ui/backdrop_check.cpp
         ui/capture_overlay.cpp
+        ui/pixel_fd.cpp
+        ui/pixel_fd.hpp
         ui/capture_overlay.hpp
         ui/text_layer.cpp
         ui/text_layer.hpp
@@ -327,6 +331,8 @@ if(VSHOT_BUILD_CHECKS)
     add_executable(vshot-toolbar-check
         ui/toolbar_check.cpp
         ui/capture_overlay.cpp
+        ui/pixel_fd.cpp
+        ui/pixel_fd.hpp
         ui/capture_overlay.hpp
         ui/text_layer.cpp
         ui/text_layer.hpp
@@ -360,6 +366,8 @@ if(VSHOT_BUILD_CHECKS)
     add_executable(vshot-annotation-check
         ui/annotation_check.cpp
         ui/capture_overlay.cpp
+        ui/pixel_fd.cpp
+        ui/pixel_fd.hpp
         ui/capture_overlay.hpp
         ui/text_layer.cpp
         ui/text_layer.hpp
@@ -394,6 +402,8 @@ if(VSHOT_BUILD_CHECKS)
     add_executable(vshot-dpr-check
         ui/dpr_check.cpp
         ui/capture_overlay.cpp
+        ui/pixel_fd.cpp
+        ui/pixel_fd.hpp
         ui/capture_overlay.hpp
         ui/text_layer.cpp
         ui/text_layer.hpp
@@ -508,6 +518,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/translation_layer.cpp
         ui/translation_layer.hpp
         ui/capture_overlay.cpp
+        ui/pixel_fd.cpp
+        ui/pixel_fd.hpp
         ui/capture_overlay.hpp
         ui/text_layer.cpp
         ui/text_layer.hpp

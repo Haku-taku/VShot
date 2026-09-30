@@ -3,6 +3,8 @@
 
 #include "session_protocol.hpp"
 
+#include "pixel_fd.hpp"
+
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -96,6 +98,33 @@ bool loadRawImage(OutputSession *output, QString *error)
         return fail(error, QStringLiteral("output %1 raw dimensions are too large").arg(output->name));
     }
     const std::uint64_t expected = pixels * 4U;
+
+    // The pixels come over the pixel channel when there is one -- a shared
+    // mapping rather than a file -- and the frame is the size of a screen, so
+    // that is the path every real session takes.  The file is the fallback for
+    // a helper started by hand against a session someone wrote out.
+    if (pixelChannelAvailable()) {
+        PixelBuffer buffer;
+        if (!receivePixelBuffer(kPixelKindSource, &buffer, error)) {
+            return false;
+        }
+        if (!buffer.isValid() || buffer.width != output->pixelWidth ||
+            buffer.height != output->pixelHeight) {
+            return fail(error,
+                        QStringLiteral("output %1 received %2x%3 pixels of an unusable format, "
+                                       "expected %4x%5 RGBA8")
+                            .arg(output->name)
+                            .arg(buffer.width)
+                            .arg(buffer.height)
+                            .arg(output->pixelWidth)
+                            .arg(output->pixelHeight));
+        }
+        output->image = buffer.toImage();
+        if (output->image.isNull()) {
+            return fail(error, QStringLiteral("cannot build an image for output %1").arg(output->name));
+        }
+        return true;
+    }
 
     QFile file(output->path);
     if (!file.open(QIODevice::ReadOnly)) {

@@ -844,9 +844,6 @@ pub(crate) fn write_pin_edit_session(spec: &PinEditSpec<'_>) -> Result<(TempDir,
                 "failed to create pin-edit session directory: {error}"
             ))
         })?;
-    let raw_path = directory.path().join("pin.rgba");
-    write_private_file(&raw_path, spec.frame.pixels())?;
-
     let session = QtSession {
         version: 1,
         mode: "pin-edit",
@@ -871,10 +868,13 @@ pub(crate) fn write_pin_edit_session(spec: &PinEditSpec<'_>) -> Result<(TempDir,
             // helper widens it to the screen the pin sits on so the toolbar
             // lives on the canvas beside the image.
             surface: spec.window.into(),
-            scale: spec.scale,
+            scale: spec.scale.factor(),
             pixel_width: spec.frame.size().width,
             pixel_height: spec.frame.size().height,
-            path: raw_path.to_string_lossy().into_owned(),
+            // The image travels over the pixel channel, not as a file beside
+            // the session: it is a screenful of pixels, and the channel is what
+            // the two sides already share for exactly that.
+            path: String::new(),
             // A pinned image is its own SDR picture, with no frozen screen
             // behind it to show better.
             backdrop: false,
@@ -1002,10 +1002,6 @@ fn write_session_full(
 
     let mut outputs = Vec::with_capacity(scene.outputs().len());
     for output in scene.outputs() {
-        let raw_path = directory
-            .path()
-            .join(format!("output-{}.rgba", output.global_id));
-        write_private_file(&raw_path, output.frame.pixels())?;
         outputs.push(QtOutput {
             id: output.global_id,
             name: &output.name,
@@ -1014,10 +1010,13 @@ fn write_session_full(
             width: output.geometry.size.width,
             height: output.geometry.size.height,
             surface: output.geometry.into(),
-            scale: output.scale,
+            scale: f64::from(output.scale),
             pixel_width: output.frame.size().width,
             pixel_height: output.frame.size().height,
-            path: raw_path.to_string_lossy().into_owned(),
+            // The frame itself travels over the pixel channel rather than as a
+            // file beside the session: it is a screenful of pixels, and the
+            // channel carries exactly that.
+            path: String::new(),
             backdrop: backdrop.iter().any(|name| name == &output.name),
         });
     }
