@@ -695,13 +695,22 @@ private:
     void readCandidateReplies();
     LogicalRect selectionBetween(Point first, Point second) const;
     LogicalRect moveSelection(LogicalRect origin, Point anchor, Point current) const;
-    LogicalRect resizeSelection(LogicalRect origin, int handle, Point current) const;
+    // Alt (`preserveAspect`) keeps the box's own width-to-height ratio while a
+    // handle drags it: the corner the handle is not on stays put and the other
+    // follows the pointer along the box's diagonal.
+    LogicalRect resizeSelection(LogicalRect origin, int handle, Point current,
+                                bool preserveAspect = false) const;
     int hitHandle(Point point) const;
-    // What a press on the Select tool does when it is not aimed at an
-    // annotation: resize the selection by its handle, move it from inside, or
-    // start a new one.  Shared with the loose drag's click path, which has to
-    // reach the same selection logic once it has let go of the mark.
-    void beginSelectionGesture(Point point);
+    // What a press on the bare canvas does: resize the selection by its handle,
+    // or start a new one.  The body of the selection is not a target -- dragging
+    // it is `beginSelectionMove`, which only the middle button reaches.  Shared
+    // with the loose drag's click path, which has to reach the same selection
+    // logic once it has let go of the mark.
+    void beginSelectionGesture(Point point, bool preserveAspect = false);
+    // Middle-drag: the selection is dragged whole, from wherever the press
+    // landed inside it.  The pin editor reaches it through the same call: a
+    // pin's image is moved, not resized, so its whole area is this target.
+    void beginSelectionMove(Point point);
     void startSelection(Point point);
     void updateSelection(Point point);
     void finishSelection(Point point);

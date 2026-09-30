@@ -1191,12 +1191,16 @@ void checkInteractiveUpdateCoversTheChange()
     // mark, so the gesture is a move of the selection rather than a resize or a
     // mark pick-up.
     const QPointF grip(350, 350);
-    controller.press(overlay, grip, Qt::LeftButton, Qt::NoModifier);
-    expectStepCovered(controller, overlay, grip - QPointF(20, 20),
-                      "moving the capture selection invalidates where it drew");
-    expectStepCovered(controller, overlay, grip - QPointF(40, 40),
-                      "a moving capture selection invalidates where it drew");
-    controller.release(overlay, grip - QPointF(40, 40), Qt::LeftButton, Qt::NoModifier);
+    controller.press(overlay, grip, Qt::MiddleButton, Qt::NoModifier);
+    expectStepCoveredBy(
+        controller, overlay,
+        [&] { controller.move(overlay, grip - QPointF(20, 20), Qt::MiddleButton, Qt::NoModifier); },
+        "moving the capture selection invalidates where it drew");
+    expectStepCoveredBy(
+        controller, overlay,
+        [&] { controller.move(overlay, grip - QPointF(40, 40), Qt::MiddleButton, Qt::NoModifier); },
+        "a moving capture selection invalidates where it drew");
+    controller.release(overlay, grip - QPointF(40, 40), Qt::MiddleButton, Qt::NoModifier);
     const vshot::LogicalRect shifted = *controller.selection();
     expect(shifted.x == shrunk.x - 40 && shifted.y == shrunk.y - 40 &&
                shifted.width == shrunk.width && shifted.height == shrunk.height,
@@ -1672,6 +1676,13 @@ void writeSelectMode(const QString &mode)
 // it from anywhere on screen, and a press that never travels is a click that
 // lets the mark go.  The stroke here is two pixels wide, so a second press
 // landing on it would be luck: that is what the mode is for.
+//
+// Either way the drag is the middle button's: a left press that lands on
+// nothing is otherwise how the capture's own selection is drawn, which is what
+// a session with no tool armed is for.  The mark follows the *press*, not where
+// the pointer travelled to, so the drag is started with the middle button and
+// the motion that follows is plain -- which is also how the editor is actually
+// used, since the button goes down before anything else happens.
 void checkSelectModeDecidesWhatAPressPicksUp()
 {
     QScreen *screen = QGuiApplication::primaryScreen();
@@ -1740,9 +1751,9 @@ void checkSelectModeDecidesWhatAPressPicksUp()
         // where the first drag left it.
         controller.press(overlay, nowhere, Qt::LeftButton, Qt::NoModifier);
         controller.release(overlay, nowhere, Qt::LeftButton, Qt::NoModifier);
-        controller.press(overlay, nowhere, Qt::LeftButton, Qt::NoModifier);
-        controller.move(overlay, nowhere + QPointF(20, 20), Qt::LeftButton, Qt::NoModifier);
-        controller.release(overlay, nowhere + QPointF(20, 20), Qt::LeftButton, Qt::NoModifier);
+        controller.press(overlay, nowhere, Qt::MiddleButton, Qt::NoModifier);
+        controller.move(overlay, nowhere + QPointF(20, 20), Qt::MiddleButton, Qt::NoModifier);
+        controller.release(overlay, nowhere + QPointF(20, 20), Qt::MiddleButton, Qt::NoModifier);
         const vshot::Point dropped = controller.annotations().at(0).points.constFirst();
         expect(dropped.x == after.x && dropped.y == after.y,
                "a click on nothing drops the mark, so the next drag leaves it alone",
@@ -2080,10 +2091,11 @@ void checkMovedPinLoupeFollowsTheImage()
     constexpr int margin = 10;
 
     // A pointer whose whole magnifier lands inside the image (and so inside the
-    // image clip the overlay draws it through).
+    // image clip the overlay draws it through).  The middle button is held: the
+    // loupe rides a drag, and a bare left press on the image starts none.
     const QPoint pointer(200, 200);
-    controller.press(overlay, QPointF(pointer), Qt::LeftButton, Qt::NoModifier);
-    controller.move(overlay, QPointF(pointer), Qt::LeftButton, Qt::NoModifier);
+    controller.press(overlay, QPointF(pointer), Qt::MiddleButton, Qt::NoModifier);
+    controller.move(overlay, QPointF(pointer), Qt::MiddleButton, Qt::NoModifier);
     QImage frame(size, QImage::Format_ARGB32_Premultiplied);
     paintOnce(overlay, &frame);
 
@@ -2187,19 +2199,20 @@ void checkPinDragKeepsOneConnection()
     }
     overlay->show();
     controller.beginPinEdit();
-    controller.chooseTool(vshot::Tool::Select);
+    controller.chooseTool(std::nullopt);
 
     // Drag the pin up and to the left, inside its clamp, one motion event at a
     // time with the event loop turning between them so the socket can breathe.
+    // The middle button is held because that is what starts a move of the image.
     const QPointF from(200, 200);
-    controller.press(overlay, from, Qt::LeftButton, Qt::NoModifier);
+    controller.press(overlay, from, Qt::MiddleButton, Qt::NoModifier);
     QPointF to = from;
     for (int step = 1; step <= 12; ++step) {
         to = from + QPointF(-step * 4, -step * 2);
-        controller.move(overlay, to, Qt::LeftButton, Qt::NoModifier);
+        controller.move(overlay, to, Qt::MiddleButton, Qt::NoModifier);
         QCoreApplication::processEvents();
     }
-    controller.release(overlay, to, Qt::LeftButton, Qt::NoModifier);
+    controller.release(overlay, to, Qt::MiddleButton, Qt::NoModifier);
     QElapsedTimer drain;
     drain.start();
     while (drain.elapsed() < 300) {

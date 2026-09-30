@@ -5081,16 +5081,27 @@ void OverlayController::beginSelectionGesture(Point point)
         gesture_->current = point;
         gesture_->origin = *selection_;
         gesture_->handle = handle;
+        gesture_->preserveAspect = preserveAspect;
         gesture_->type = Gesture::Type::Resizing;
-    } else if (selection_.has_value() && handle == 9) {
-        gesture_->anchor = point;
-        gesture_->current = point;
-        gesture_->origin = *selection_;
-        gesture_->handle = handle;
-        gesture_->type = Gesture::Type::Moving;
     } else {
+        // A press that landed on no handle draws a new frame.  The body of the
+        // selection is deliberately not a target here: dragging it is Ctrl's,
+        // which is what keeps an ordinary press meaning "frame this instead".
         startSelection(point);
     }
+}
+
+void OverlayController::beginSelectionMove(Point point)
+{
+    if (!selection_.has_value()) {
+        startSelection(point);
+        return;
+    }
+    gesture_->anchor = point;
+    gesture_->current = point;
+    gesture_->origin = *selection_;
+    gesture_->handle = 9;
+    gesture_->type = Gesture::Type::Moving;
 }
 
 void OverlayController::startSelection(Point point)
@@ -6065,7 +6076,6 @@ void OverlayController::invalidateLogicalRegion(const LogicalRect &region)
 void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
                               Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
-    Q_UNUSED(modifiers);
     if (finished_ || cancelled_) {
         return;
     }
@@ -6073,7 +6083,77 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
     // arrived (a grab lost mid-drag); this press replaces it either way.
     looseDrag_.reset();
     if (button == Qt::RightButton) {
-        cancel();
+        // The right button is the magnifier's, not a cancel: it is the button
+        // the user holds while aiming at a pixel.  Escape is the cancel, and
+        // always was the one the overlay's own text offered.
+        magnifierHeld_ = true;
+        endMagnifierFlash();
+        pointer_ = globalPoint(overlay, local);
+        pointerOutput_ = overlay->outputIndex();
+        lastMagnifierPointer_ = pointer_;
+        updateAll();
+        return;
+    }
+    if (button == Qt::MiddleButton) {
+        // The middle button is the drag's: it moves a framed region by its body
+        // or slides the pin's image under the marks.  It is a button rather than
+        // a held modifier because the gesture is a *drag* -- the state has to be
+        // on for as long as the pointer travels -- and a modifier made the user
+        // hold a key down through the whole move while the left button did the
+        // work.  A middle drag on a mark's rim still picks the mark up, exactly
+        // as a left one does: the rim is a deliberate target on its own, and
+        // taking it away under this button would make the one affordance the
+        // pointer promises there the one that does not work.
+        const Point grab = globalPoint(overlay, local);
+        if (selection_.has_value() && editing_) {
+            const int annotationHandle =
+                selectedAnnotation_ >= 0 ? annotationHandleAt(grab) : 0;
+            const int hit = annotationHitAt(grab);
+            if (annotationHandle != 0) {
+                beginAnnotationDrag(grab, true,
+                                    shortcuts_.held(ShortcutAction::PreserveAspect,
+                                                    static_cast<int>(modifiers)));
+                updateAll();
+                return;
+            }
+            if (hit >= 0 && annotationBorderOf(hit, grab) != 0) {
+                selectAnnotation(hit);
+                beginAnnotationDrag(grab, false);
+                updateAll();
+                return;
+            }
+            // The mark the pick-up modifier has already put under the pointer
+            // is the one this press takes, wherever it lands -- the same
+            // promise the left button makes, and the reason the mark follows a
+            // drag that started nowhere near it.  Asking the selection's body
+            // first would swallow that: the body covers nearly the whole
+            // picture, so almost every loose drag starts inside it.
+            if (looseSelect_ && selectedAnnotation_ >= 0 && !pinEdit_) {
+                looseDrag_ = grab;
+                updateAll();
+                return;
+            }
+            // The eight resize handles are the region selection's: the CLI
+            // refuses any size change to a pin, so a pin has only its body to
+            // drag.  Handle 9 is that body, and it is the one that matters
+            // here.
+            const int handle = hitHandle(grab);
+            if (!pinEdit_ && handle != 0 && handle != 9) {
+                // A handle is the one thing that stretches, and a middle press
+                // on it means the same as a left one.
+                selectAnnotation(-1);
+                beginSelectionGesture(grab, shortcuts_.held(ShortcutAction::PreserveAspect,
+                                                            static_cast<int>(modifiers)));
+                updateAll();
+                return;
+            }
+            if (handle == 9) {
+                selectAnnotation(-1);
+                beginSelectionMove(grab);
+                updateAll();
+                return;
+            }
+        }
         return;
     }
     if (button != Qt::LeftButton) {
@@ -6427,21 +6507,81 @@ void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::
         }
     } else if (pinEdit_) {
         // Inside the image the pointer announces the drag that moves it;
-        // anywhere else with a drawing tool it is the crosshair.
-        overlay->setCursor(insideImage ? Qt::SizeAllCursor : Qt::ArrowCursor);
-    } else if (tool_ == Tool::Select && selection_.has_value() && editing_) {
-        // Handles map to resize arrows; anywhere else inside the selection
-        // (hitHandle returns 9) means the selection itself can be dragged.
-        overlay->setCursor(cursorForHandle(hitHandle(point)));
+        // anywhere else with a drawing tool it is the crosshair.  A mark's own
+        // rim answers first, exactly as it does on the canvas: a press there
+        // picks the mark up rather than starting a stroke, so the pointer has to
+        // say so -- otherwise the one target that stays live with a tool armed
+        // is the one the cursor lies about.
+        const int border = insideImage ? annotationBorderAt(point) : 0;
+        if (border != 0) {
+            overlay->setCursor(Qt::SizeAllCursor);
+        } else if (insideImage && pickingMarks(static_cast<int>(modifiers))
+                   && annotationHitAt(point) >= 0) {
+            overlay->setCursor(Qt::SizeAllCursor);
+        } else {
+            // The bare image says "drag me" only while the middle button is
+            // down, exactly as the region selection's body does: that button is
+            // the only way the drag can start, so without it the pointer is
+            // promising a drag the press will not make.
+            const bool drags = (buttons & Qt::MiddleButton) != 0;
+            overlay->setCursor(insideImage && drags ? Qt::SizeAllCursor : Qt::ArrowCursor);
+        }
+        // The hover frame and the pick-up selection follow the pointer in here
+        // too.  The pin editor opens on marks already on the canvas -- that is
+        // the whole point of a re-edit -- so leaving this out made the one
+        // session with marks to pick up the one session where picking them up
+        // did nothing.
+        if (insideImage) {
+            refreshMarkHover();
+        }
+    } else {
+        // The selection's chrome is live whatever is armed, so the pointer says
+        // what each part of it does.  Its handles map to their resize arrows;
+        // its body says "drag me" only while the middle button is down, because
+        // that is the only way it can be dragged -- without it the press draws
+        // a new frame instead, and a move cursor there would be a promise the
+        // editor does not keep.
+        const int handle = selection_.has_value() && editing_ ? hitHandle(point) : 0;
+        if (handle != 0) {
+            const bool drags = (buttons & Qt::MiddleButton) != 0;
+            overlay->setCursor(handle == 9 ? (drags ? Qt::SizeAllCursor : Qt::CrossCursor)
+                                           : cursorForHandle(handle));
+        } else {
+            // Not the selection: a mark's own rim answers next.  It is live on
+            // its own -- a press there picks the mark up and drags it, with
+            // nothing held and nothing armed -- so the pointer says "drag me"
+            // rather than promising the stroke the press will not make.  The
+            // handles are the mark's own and are drawn only once it is selected,
+            // so before that the rim is all there is to aim at.
+            const int border = annotationBorderAt(point);
+            if (border != 0) {
+                overlay->setCursor(Qt::SizeAllCursor);
+            } else if (pickingMarks(static_cast<int>(modifiers))
+                       && annotationHitAt(point) >= 0) {
+                overlay->setCursor(Qt::SizeAllCursor);
+            } else {
+                overlay->setCursor(Qt::CrossCursor);
+            }
+        }
+        // The mark the pick-up modifier has put under the pointer wears a frame
+        // of its own, which is the feedback that the press would take it and not
+        // draw.  Repainted only where it changed: the whole point of it is that
+        // it appears and disappears as the pointer crosses a mark, and a full
+        // repaint per motion would make hovering cost what drawing costs.
+        refreshMarkHover();
     }
     if (gesture_->type == Gesture::Type::Selecting) {
         updateSelection(point);
         updateTouch(selectionTouch());
     } else if (gesture_->type == Gesture::Type::Moving) {
-        applySelectionMove(gesture_->origin, gesture_->anchor, point);
+        // The raw point again: a pin drag may have started on the border, and
+        // clamping the motion would hold the pin still until the pointer had
+        // travelled all the way onto the image.
+        applySelectionMove(gesture_->origin, gesture_->anchor, pinEdit_ ? raw : point);
         updateTouch(selectionTouch());
     } else if (gesture_->type == Gesture::Type::Resizing) {
-        selection_ = resizeSelection(gesture_->origin, gesture_->handle, clampPoint(point));
+        selection_ = resizeSelection(gesture_->origin, gesture_->handle, clampPoint(point),
+                                     gesture_->preserveAspect);
         updateTouch(selectionTouch());
     } else if (gesture_->type == Gesture::Type::MovingAnnotation ||
                gesture_->type == Gesture::Type::ResizingAnnotation) {
@@ -6466,7 +6606,33 @@ void OverlayController::release(CaptureOverlay *overlay, const QPointF &local,
                                 Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
     Q_UNUSED(modifiers);
-    if (finished_ || cancelled_ || button != Qt::LeftButton) {
+    if (finished_ || cancelled_) {
+        return;
+    }
+    if (button == Qt::RightButton) {
+        // Letting the right button go puts the magnifier away; the gesture it
+        // was held over is untouched, which is the whole point of the button
+        // being the magnifier's rather than a cancel.
+        if (magnifierHeld_) {
+            magnifierHeld_ = false;
+            updateAll();
+        }
+        return;
+    }
+    if (button == Qt::MiddleButton) {
+        // The middle button owns the two drags that move rather than draw, and
+        // both of them are started and finished by the left button's own code
+        // paths -- the gesture is the same gesture either way, only the button
+        // that began it differs.  So the release is the ordinary one, and the
+        // left button's guard below is simply not applied to it.  A loose drag
+        // is the exception: it is a press held back until it travels, so it is
+        // still a click while the button is down and has to reach the code
+        // below that lets the mark go.
+        if (!looseDrag_.has_value() && gesture_->type != Gesture::Type::Moving &&
+            gesture_->type != Gesture::Type::MovingAnnotation) {
+            return;
+        }
+    } else if (button != Qt::LeftButton) {
         return;
     }
     if (textMode_) {
