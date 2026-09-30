@@ -799,7 +799,43 @@ private:
     void finishText(bool accept);
     int annotationHitAt(Point point) const;
     int annotationHandleAt(Point point) const;
-    void beginAnnotationDrag(Point point, bool resize);
+    // The mark the pick-up modifier has put under the pointer, or -1.  This is
+    // what the *hover* frame is drawn around: holding the modifier is the user
+    // asking "what is under here?", and a mark that answers the press with a
+    // drag has to say so before the press -- the pointer's shape alone is not
+    // enough, because the shape says a drag is possible, not *which* mark.
+    // Remembered rather than recomputed so the frame can be erased again: the
+    // pointer's last position is not the same as the mark's rect.
+    int markUnderPointer() const;
+    // Repaints the hover frame where it has just moved, and nothing where it has
+    // not: the mark the pointer is over changes on a motion, and the modifier
+    // that decides whether there *is* one changes on a key.  Both call this.
+    void refreshMarkHover();
+    // One JSON request to the CLI, written to the pipe the session arrived on.
+    // False when it could not be written whole.
+    bool writeCliRequest(const QByteArray &request);
+    // Asks the CLI to put the real pointer at `point`, in global logical
+    // pixels.  See the definition for why this is not something the editor can
+    // do itself.
+    void requestPointerWarp(Point point);
+    // Whether a motion event at `point` is the compositor reporting the warp
+    // VShot asked for rather than the user moving the mouse.  Such a motion
+    // must not take the keyboard cursor back or end the magnifier flash, or a
+    // walk's own echo would blink the loupe on every step.
+    bool isPointerWarpEcho(Point point) const;
+    // Which way the selected mark's own border can be stretched at `point`, in
+    // the same handle numbering as `annotationHandleAt` but with the whole edge
+    // answering rather than only the eight handles.  0 where the pointer is not
+    // on the border at all.  Used for the pointer's shape.
+    int annotationBorderAt(Point point) const;
+    // The same question about a named mark rather than the selected one, which
+    // is what a *press* needs: it lands on a mark before that mark is selected,
+    // so a rim has to be recognisable on a mark that has no handles on screen.
+    // That is what makes a mark draggable by its border with a tool armed --
+    // there are no handles to aim at until it is picked up, and the border is
+    // the one part of it that cannot be read as "start a stroke here".
+    int annotationBorderOf(int index, Point point) const;
+    void beginAnnotationDrag(Point point, bool resize, bool preserveAspect = false);
     void updateAnnotationDrag(Point point);
     void finishAnnotationDrag(CaptureOverlay *overlay, Point point);
     Annotation translatedAnnotation(const Annotation &original, int dx, int dy) const;

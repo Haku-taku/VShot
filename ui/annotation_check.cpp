@@ -1973,7 +1973,283 @@ void checkSelectModeDecidesWhatAPressPicksUp()
     run(QStringLiteral("precise"), false);
 }
 
-// The live stroke has to survive the narrow repaint the widget actually does.
+// The state the removed Select tool left behind: a modifier held *while* a press
+// is made, which lets an existing mark be picked up without the armed tool being
+// put down.
+//
+// The two halves of that are separate claims and both have to hold.  A mark has
+// to move under the modifier even though a drawing tool is armed -- otherwise
+// there is no way to adjust a mark without first disarming, which is the tool
+// switch the user asked not to have.  And the tool has to still be armed
+// afterwards: a pen that stopped drawing because the user nudged a mark with
+// Shift would be a pen the user has to re-arm, and the modifier is supposed to
+// be invisible to everything but the press it was held for.
+//
+// The handles are the exception, and are checked here too: they are small,
+// deliberate targets that can only mean one thing, so they stretch whether or
+// not the modifier is down, and whether or not a tool is armed.  A handle that
+// needed the modifier would be unreachable in exactly the state where the user
+// is drawing and wants to nudge the mark they just made.
+void checkHoldingShiftPicksAMarkUpWithoutArmingATool()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+
+    // The mark, as it was drawn: 180,190..300,260 in the session's own
+    // coordinates, which are the overlay's too (the selection is 0,0..400,400).
+    const QPointF corner(180, 190);
+    const QPointF opposite(300, 260);
+    // A point on the rectangle's rim rather than in its hollow middle: the
+    // press has to land on the mark itself, and the middle of a hollow rect is
+    // where the armed tool would be asked to draw.  Clear of the right edge's
+    // own midpoint handle, which is a deliberate target of its own and would
+    // answer the press as a stretch.
+    const QPointF onTheRim(300, 205);
+    const QPointF bodyMiddle(240, 225);
+    const QPointF travel(30, 20);
+
+    const auto rectOf = [](const vshot::OverlayController &controller) {
+        return controller.annotations().constFirst().rect;
+    };
+
+    {
+        vshot::OverlayController controller(editingSession());
+        QString error;
+        vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+        if (overlay == nullptr) {
+            expect(false, "the controller accepts an overlay", error);
+            return;
+        }
+        overlay->show();
+        controller.beginPresetEdit();
+        controller.chooseTool(vshot::Tool::Rectangle);
+        drag(controller, overlay, corner, opposite);
+        expect(controller.annotations().size() == 1, "the rectangle lands as one mark");
+        if (controller.annotations().size() != 1) {
+            return;
+        }
+
+        // The tool stays armed across the whole of this: that is the state the
+        // user is in when they reach for a mark they drew a moment ago.
+        controller.chooseTool(vshot::Tool::Pen);
+        controller.press(overlay, bodyMiddle, Qt::LeftButton, Qt::ShiftModifier);
+        controller.move(overlay, bodyMiddle + travel, Qt::LeftButton, Qt::ShiftModifier);
+        controller.release(overlay, bodyMiddle + travel, Qt::LeftButton, Qt::ShiftModifier);
+        const vshot::LogicalRect moved = rectOf(controller);
+        expect(controller.annotations().size() == 1,
+               "a Shift drag moves the mark instead of drawing another",
+               QString::number(controller.annotations().size()));
+        expect(moved.x == 210 && moved.y == 210,
+               "the mark follows the Shift drag",
+               QStringLiteral("rect at %1,%2 (wanted 210,210)").arg(moved.x).arg(moved.y));
+
+        // And the pen is still the armed tool: a plain press now inks.  This is
+        // the claim the modifier exists for -- it was a state, not a tool
+        // change, so letting it go has to leave the user exactly where they
+        // were.
+        drag(controller, overlay, QPointF(60, 60), QPointF(110, 75));
+        expect(controller.annotations().size() == 2,
+               "the tool is still armed once the modifier is let go",
+               QString::number(controller.annotations().size()));
+    }
+
+    // The handles, with nothing armed and with a tool armed: a stretch has to
+    // work in both, because it is the one gesture that cannot be expressed any
+    // other way.
+    {
+        vshot::OverlayController controller(editingSession());
+        QString error;
+        vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+        if (overlay == nullptr) {
+            expect(false, "the controller accepts an overlay", error);
+            return;
+        }
+        overlay->show();
+        controller.beginPresetEdit();
+        controller.chooseTool(vshot::Tool::Rectangle);
+        drag(controller, overlay, corner, opposite);
+
+        // Nothing armed, no modifier: a press on the mark picks it up, and the
+        // corner handle then stretches it.  The handle is the far corner, so
+        // the near one is what stays put.
+        controller.chooseTool(std::nullopt);
+        controller.press(overlay, bodyMiddle, Qt::LeftButton, Qt::NoModifier);
+        controller.release(overlay, bodyMiddle, Qt::LeftButton, Qt::NoModifier);
+        controller.press(overlay, QPointF(299, 259), Qt::LeftButton, Qt::NoModifier);
+        controller.move(overlay, QPointF(340, 300), Qt::LeftButton, Qt::NoModifier);
+        controller.release(overlay, QPointF(340, 300), Qt::LeftButton, Qt::NoModifier);
+        const vshot::LogicalRect stretched = rectOf(controller);
+        expect(stretched.x == 180 && stretched.y == 190 && stretched.width == 161
+                   && stretched.height == 111,
+               "a handle stretches the mark with nothing armed",
+               QStringLiteral("%1,%2 %3x%4 (wanted 180,190 161x111)")
+                   .arg(stretched.x)
+                   .arg(stretched.y)
+                   .arg(stretched.width)
+                   .arg(stretched.height));
+
+        // The same stretch with the pen armed and no modifier at all: the
+        // handles are not gated on the pick-up modifier, so this has to move
+        // the mark's corner rather than start a stroke on it.
+        controller.chooseTool(vshot::Tool::Pen);
+        controller.press(overlay, QPointF(180, 190), Qt::LeftButton, Qt::NoModifier);
+        controller.move(overlay, QPointF(150, 160), Qt::LeftButton, Qt::NoModifier);
+        controller.release(overlay, QPointF(150, 160), Qt::LeftButton, Qt::NoModifier);
+        const vshot::LogicalRect pulled = rectOf(controller);
+        expect(controller.annotations().size() == 1,
+               "a handle with a tool armed stretches rather than inks",
+               QString::number(controller.annotations().size()));
+        expect(pulled.x == 150 && pulled.y == 160,
+               "the handle drags the corner it was aimed at",
+               QStringLiteral("rect at %1,%2 (wanted 150,160)").arg(pulled.x).arg(pulled.y));
+    }
+
+    // And the border of a mark is live on its own: a press that lands on the
+    // rim picks the mark up with nothing held and nothing armed, because the
+    // rim is a deliberate target that can only mean one thing.  The point is
+    // off the handles, which is what tells the two apart -- a press on a handle
+    // stretches, and this one moves.
+    {
+        vshot::OverlayController controller(editingSession());
+        QString error;
+        vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+        if (overlay == nullptr) {
+            expect(false, "the controller accepts an overlay", error);
+            return;
+        }
+        overlay->show();
+        controller.beginPresetEdit();
+        controller.chooseTool(vshot::Tool::Rectangle);
+        drag(controller, overlay, corner, opposite);
+        controller.chooseTool(std::nullopt);
+        drag(controller, overlay, onTheRim, onTheRim + travel);
+        const vshot::LogicalRect after = rectOf(controller);
+        expect(after.x == 210 && after.y == 210,
+               "the border drags the mark with nothing held",
+               QStringLiteral("rect at %1,%2 (wanted 210,210)").arg(after.x).arg(after.y));
+    }
+}
+
+// The pick-up state has to be *visible* before the press, not only after it.
+// The pointer's shape is not enough: it says a drag is possible, not which mark
+// would be taken, and a mark is a shape the user is aiming at rather than a
+// point.  So the mark the pick-up modifier has put the pointer over wears a
+// frame, and this is that frame: present under the modifier, gone without it,
+// and gone again once the pointer leaves the mark.
+//
+// The frame is drawn where the mark is, so the check looks for ink on the mark's
+// rim that a full render without the frame does not have -- and, just as
+// importantly, for the *absence* of it in the two states that must not show it.
+void checkThePickUpModifierFramesTheMarkUnderThePointer()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+    controller.chooseTool(vshot::Tool::Rectangle);
+    // A hollow rectangle, so its rim is the only thing there is to frame and the
+    // middle of it is bare picture: a filled shape would give the frame nowhere
+    // to show that the shape itself does not already cover.
+    drag(controller, overlay, QPointF(180, 190), QPointF(300, 260));
+    // Drawing leaves the new mark selected, and a selected mark already wears
+    // the handles -- the hover frame is deliberately not drawn on top of them.
+    // Ctrl+D is `select-none`, which is how a user gets to the same state.
+    controller.key(overlay, Qt::Key_D, Qt::ControlModifier);
+    controller.chooseTool(std::nullopt);
+
+    // The mark's *body*, not its rim: the rim answers a press on its own and so
+    // is framed whether the modifier is held or not, which would make the two
+    // renders below identical and the check unable to tell them apart.
+    const QPointF onTheMarkPoint(240, 225);
+    const QPointF offTheMark(60, 60);
+
+    // The frame is a difference, not a colour: the overlay's ground is the
+    // frozen screen, which is opaque everywhere, so "is there ink here" cannot
+    // be asked of one render.  It is asked of two -- the same pointer, with and
+    // without the modifier -- and counted where they disagree.
+    const auto framePixels = [&](const QPointF &at) {
+        controller.move(overlay, at, Qt::NoButton, Qt::NoModifier);
+        QImage plain(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+        paintOnce(overlay, &plain);
+        controller.move(overlay, at, Qt::NoButton, Qt::ShiftModifier);
+        QImage held(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+        paintOnce(overlay, &held);
+        return differingPixelsOutside(childAreas(overlay), plain, held);
+    };
+
+    const int onTheMark = framePixels(onTheMarkPoint);
+    expect(onTheMark > 0, "the pick-up modifier frames the mark under the pointer",
+           QStringLiteral("%1 pixel(s) appear under the modifier").arg(onTheMark));
+
+    const int away = framePixels(offTheMark);
+    expect(away == 0, "the frame goes when the pointer leaves the mark",
+           QStringLiteral("%1 pixel(s) off the mark, %2 on it").arg(away).arg(onTheMark));
+
+    // The modifier arriving as a *key press*, which is how it actually arrives:
+    // the pointer is already resting on the mark when the user reaches for
+    // Shift, so a frame that only appeared on the next motion would not appear
+    // at all for a user who presses the key and then presses the button.
+    //
+    // Nothing may be selected first.  Holding the modifier over a mark is now
+    // what *selects* it, so the renders above left it selected and wearing its
+    // handles -- and a mark that is already framed has nothing to show when the
+    // key arrives.  Ctrl+D is `select-none`, which is how a user gets back to
+    // the state this half is about: pointer on the mark, nothing taken yet.
+    controller.move(overlay, offTheMark, Qt::NoButton, Qt::NoModifier);
+    controller.key(overlay, Qt::Key_D, Qt::ControlModifier);
+    controller.move(overlay, onTheMarkPoint, Qt::NoButton, Qt::NoModifier);
+    QImage plainBefore(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &plainBefore);
+    controller.key(overlay, Qt::Key_Shift, Qt::ShiftModifier);
+    QImage plainAfter(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &plainAfter);
+    const int onKeyPress = differingPixelsOutside(childAreas(overlay), plainBefore, plainAfter);
+    expect(onKeyPress > 0, "pressing the pick-up modifier frames the mark already under the pointer",
+           QStringLiteral("%1 pixel(s) appear").arg(onKeyPress));
+
+    // The modifier does not only frame the mark: it hands it over as the
+    // *selected* one, which is what the handles hang off.  That was the defect
+    // the user reported -- a border with no handles -- and the reason a pixel
+    // comparison cannot show it here is that with no tool armed the chrome is
+    // drawn in every state, framed or not.  So it is asked of the Delete
+    // binding instead, which acts on the selected mark alone: a mark the
+    // modifier has taken is a mark that can be deleted.
+    //
+    // A second mark is what tells "the focus followed the pointer" from "the
+    // first mark is still the active one": the pointer is taken onto it and the
+    // key pressed, and the mark that goes has to be that one.
+    controller.chooseTool(vshot::Tool::Rectangle);
+    drag(controller, overlay, QPointF(120, 260), QPointF(180, 310));
+    controller.chooseTool(std::nullopt);
+    const int drawn = controller.annotations().size();
+    controller.key(overlay, Qt::Key_D, Qt::ControlModifier);
+    controller.move(overlay, offTheMark, Qt::NoButton, Qt::NoModifier);
+    controller.key(overlay, Qt::Key_Shift, Qt::ShiftModifier);
+    controller.move(overlay, QPointF(150, 285), Qt::NoButton, Qt::ShiftModifier);
+    controller.key(overlay, Qt::Key_Delete, Qt::NoModifier);
+    expect(controller.annotations().size() == drawn - 1,
+           "the mark the modifier is over is the selected one",
+           QStringLiteral("%1 mark(s) left of %2").arg(controller.annotations().size()).arg(drawn));
+    const vshot::LogicalRect left = controller.annotations().constFirst().rect;
+    expect(left.x == 180 && left.y == 190,
+           "and the focus followed the pointer onto the second mark",
+           QStringLiteral("the mark at %1,%2 survived (wanted 180,190)").arg(left.x).arg(left.y));
+}
+
+
 // Every move invalidates a rect; Qt then repaints only that rect on top of what
 // is already on screen.  If any segment the stroke baked is not covered by a
 // later step's rect, the pixels it should have painted are simply never drawn --

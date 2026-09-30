@@ -6950,7 +6950,27 @@ void OverlayController::doubleClick(CaptureOverlay *overlay, const QPointF &loca
 void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifiers modifiers)
 {
     Q_UNUSED(overlay);
-    if (key == Qt::Key_Escape) {
+    // Shift itself arrives here as a key with no keycode of its own, and it is
+    // the pick-up modifier: holding it is what puts the hover frame on the mark
+    // under the pointer, so the frame has to follow the modifier and not only
+    // the pointer.  The stored bits are updated before anything acts on them so
+    // that the whole of this press sees one state.
+    const int bits = static_cast<int>(modifiers);
+    if (bits != lastModifiers_) {
+        lastModifiers_ = bits;
+        refreshMarkHover();
+    }
+    const QKeySequence pressed(
+        static_cast<int>(static_cast<int>(modifiers) | static_cast<int>(key)));
+    // Everything below looks a key up in the binding table rather than
+    // comparing it against a hard-coded `Qt::Key_`, so a binding the user has
+    // changed in the settings is the one honoured here.  The pressed key is
+    // built once and asked about; `ShortcutPreferences::matches` is the only
+    // place that knows how a stored sequence and a pressed one are compared.
+    const auto is = [this, &pressed](ShortcutAction action) {
+        return shortcuts_.matches(action, pressed);
+    };
+    if (is(ShortcutAction::Cancel)) {
         if (translateMode_) {
             // The translation goes first, back to the framing it replaced; a
             // second Escape is the cancel the framing has.
@@ -9007,14 +9027,154 @@ int OverlayController::annotationHandleAt(Point point) const
     return 0;
 }
 
+int OverlayController::annotationBorderAt(Point point) const
+{
+    return selectedAnnotation_ >= 0 ? annotationBorderOf(selectedAnnotation_, point) : 0;
+}
+
+int OverlayController::markUnderPointer() const
+{
+    // Only where a press would actually pick the mark up, so the frame is a
+    // promise the press keeps.  The rim counts on its own -- a press there
+    // picks the mark up with nothing held and nothing armed -- and the body
+    // counts under the pick-up modifier, which is the state this frame exists
+    // to show.
+    if (gesture_->type != Gesture::Type::None) {
+        return -1;
+    }
+    const int hit = annotationHitAt(pointer_);
+    if (hit < 0) {
+        return -1;
+    }
+    if (annotationBorderOf(hit, pointer_) != 0) {
+        return hit;
+    }
+    return pickingMarks(lastModifiers_) ? hit : -1;
+}
+
+void OverlayController::refreshMarkHover()
+{
+    const int hovered = markUnderPointer();
+    // While the pick-up modifier is held, the mark under the pointer is the one
+    // a press would take, so it is also the one the editor treats as selected:
+    // its outline and handles come up, and the pointer travelling across marks
+    // moves the focus with it.  Without this the modifier only ever *framed* the
+    // mark -- `selectedAnnotation_` was written by the press alone -- so holding
+    // it over a mark showed a frame with no handles, and holding it while moving
+    // onto a mark could never make that mark active at all.
+    //
+    // Only the pointer landing on a mark selects one: travelling off a mark
+    // leaves the last one selected, so a frame the user has taken hold of does
+    // not slip away the moment the pointer grazes its edge.
+    //
+    // The selection is set here rather than through `selectAnnotation`, which
+    // ends in `updateAll`: a full repaint on every motion event is the repaint
+    // storm the rect tracking below exists to avoid, and it would also clear
+    // `markHovered_`, so the very frame this is deciding would be forgotten
+    // before it could be drawn.  The two marks that changed -- the one losing
+    // the selection and the one taking it -- are added to the repainted region
+    // instead, in the same pass that already covers the hover frame.
+    const int previousSelection = selectedAnnotation_;
+    const bool selectionMoves =
+        pickingMarks(lastModifiers_) && hovered >= 0 && hovered != selectedAnnotation_;
+    if (selectionMoves) {
+        selectedAnnotation_ = hovered;
+        nudgeBase_.reset();
+        allSelected_ = false;
+    }
+    if (hovered == markHovered_ && !selectionMoves) {
+        return;
+    }
+    const int previous = markHovered_;
+    markHovered_ = hovered;
+    LogicalRect touched;
+    bool any = false;
+    for (int index : {previous, hovered, previousSelection, selectedAnnotation_}) {
+        LogicalRect bounds;
+        if (index >= 0 && index < annotations_.size()
+            && annotationBounds(annotations_.at(index), &bounds)) {
+            const LogicalRect grown =
+                growBy(bounds, annotationReach(annotations_.at(index)) + kSelectionChrome);
+            touched = any ? uniteLogical(touched, grown) : grown;
+            any = true;
+        }
+    }
+    if (any) {
+        updateTouch(touched);
+    }
+}
+
+int OverlayController::annotationBorderOf(int index, Point point) const
+{
+    if (index < 0 || index >= annotations_.size()) {
+        return 0;
+    }
+    const Annotation &annotation = annotations_.at(index);
+    if (annotation.kind == Annotation::Kind::Text) {
+        return 0; // text annotations move but never resize
+    }
+    LogicalRect bounds;
+    if (!annotationBounds(annotation, &bounds)) {
+        return 0;
+    }
+    // The mark's outline as a rectangle in the mark's own frame: the bounds a
+    // handle drags, which is the same box the selection chrome draws.
+    const std::int64_t left = bounds.x;
+    const std::int64_t top = bounds.y;
+    const std::int64_t rightEdge = bounds.right() - 1;
+    const std::int64_t bottomEdge = bounds.bottom() - 1;
+    const std::int64_t right = bounds.right();
+    const std::int64_t bottom = bounds.bottom();
+    const auto close = [](std::int64_t value, std::int64_t edge) {
+        return std::abs(value - edge) <= kBorderGrab;
+    };
+    const bool nearLeft = close(point.x, left);
+    const bool nearRight = close(point.x, rightEdge);
+    const bool nearTop = close(point.y, top);
+    const bool nearBottom = close(point.y, bottomEdge);
+    const bool betweenX = point.x >= left && point.x < right;
+    const bool betweenY = point.y >= top && point.y < bottom;
+    if ((nearLeft || nearRight) && (nearTop || nearBottom)) {
+        // A corner, which stretches both ways at once.  Which diagonal it is
+        // depends on the two edges together, not on which side of the mark the
+        // pointer came from.
+        return nearLeft == nearTop ? 1 : 3;
+    }
+    if (nearTop && betweenX) {
+        return 2; // the top edge stretches vertically
+    }
+    if (nearBottom && betweenX) {
+        return 6;
+    }
+    if (nearLeft && betweenY) {
+        return 8; // the left edge stretches horizontally
+    }
+    if (nearRight && betweenY) {
+        return 4;
+    }
+    return 0;
+}
+
 void OverlayController::selectAnnotation(int index)
 {
     selectedAnnotation_ = index >= 0 && index < annotations_.size() ? index : -1;
+    // Any explicit selection ends the nudge run and the all-marks selection:
+    // they are the state of the keyboard's own walk, and this is the user
+    // pointing at one mark instead.
+    nudgeBase_.reset();
+    allSelected_ = false;
     updateAll();
 }
 
 void OverlayController::deleteSelectedAnnotation()
 {
+    if (allSelected_ && !annotations_.isEmpty()) {
+        // Ctrl+A picked every mark up; the delete key takes all of them, which
+        // is the one way to clear a canvas without picking them off one by one.
+        selectAnnotation(-1);
+        mutateAnnotations(QVector<Annotation>());
+        return;
+    }
     if (selectedAnnotation_ < 0 || selectedAnnotation_ >= annotations_.size()) {
         return;
     }
@@ -9024,7 +9184,7 @@ void OverlayController::deleteSelectedAnnotation()
     mutateAnnotations(std::move(next));
 }
 
-void OverlayController::beginAnnotationDrag(Point point, bool resize)
+void OverlayController::beginAnnotationDrag(Point point, bool resize, bool preserveAspect)
 {
     if (selectedAnnotation_ < 0 || selectedAnnotation_ >= annotations_.size()) {
         return;
@@ -9034,6 +9194,7 @@ void OverlayController::beginAnnotationDrag(Point point, bool resize)
     gesture_->anchor = point;
     gesture_->current = point;
     gesture_->handle = resize ? annotationHandleAt(point) : 0;
+    gesture_->preserveAspect = preserveAspect;
     dragAnnotation_ = annotations_.at(selectedAnnotation_);
     dragSnapshot_ = annotations_;
     dragMoved_ = false;
@@ -10844,10 +11005,26 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
         }
     }
 
+    // The mark the pick-up modifier has put under the pointer, framed so the
+    // user can see what a press would take before making it.  Without this the
+    // state is invisible: the pointer changes shape, but a shape says a drag is
+    // possible somewhere, not *which* mark the press would land on -- and with
+    // several marks under the pointer the wrong one is a real answer.
+    //
+    // No handles: they are the selected mark's, and this mark is not selected
+    // yet.  The frame is dashed the same way so the two read as one language --
+    // this is the mark, the handles come when it is yours.
+    if (markHovered_ >= 0 && markHovered_ < annotations_.size()
+        && markHovered_ != selectedAnnotation_) {
+        LogicalRect bounds;
+        if (annotationBounds(annotations_.at(markHovered_), &bounds)) {
+            painter->setPen(QPen(Qt::white, 1.0, Qt::DashLine));
+            painter->setBrush(Qt::NoBrush);
+            painter->drawRect(localRect(output, bounds, overlay->size()));
+        }
+    }
+
     if (selection_.has_value() && !pinEdit_) {
-        // Pin editing selects the whole image by construction: drawing the
-        // selection rect and its handles would ring the pin with chrome the
-        // user cannot act on.
         LogicalRect visible;
         if (intersection(*selection_, output.geometry, &visible)) {
             painter->setPen(QPen(Qt::white, 2.0, Qt::SolidLine));
