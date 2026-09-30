@@ -62,9 +62,12 @@
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QSpinBox>
+#include <QTimer>
 #include <QStackedWidget>
 #include <QStyle>
+#include <QStringList>
 #include <QVBoxLayout>
+#include <QVector>
 #include <QWidget>
 
 #include <unistd.h>
@@ -648,60 +651,16 @@ QStringList parseFollowText(const QString &text)
 /// itself after five seconds, so this is that plus room to start and exit.
 constexpr int kMicrophoneListTimeoutMs = 8000;
 
-/// The audio inputs `vshot record mics` lists, as `(node name, label)` pairs:
-/// the name is what `--mic` accepts and what the file keeps, the label is the
-/// description a person reads.
+/// Reads what `vshot record mics` printed into `(node name, label)` pairs.
 ///
-/// The list has to come from the running session -- it is the only thing that
-/// knows which inputs exist -- so this runs `vshot`, which is the binary beside
-/// this helper: the same discovery the capture overlay makes for the OCR engine,
-/// and for the same reason (this process *is* the helper, so its own path names
-/// the program to run).
-///
-/// Nothing here can fail the settings window.  A machine without PipeWire, a
-/// session with no inputs, or a vshot that cannot be found all yield an empty
-/// list, and the row then offers the two answers that always exist; the button
-/// beside it re-asks, which is what one does after fixing the machine.
-QList<QPair<QString, QString>> detectedMicrophones()
+/// The lines are `serial<TAB>name<TAB>description`.  The serial is not offered:
+/// a name is stable across sessions and a serial is not, and the file has to
+/// outlive the session.  Anything that does not look like a line is skipped, so
+/// a warning on stdout does not become a device.
+QList<QPair<QString, QString>> parseMicrophoneListing(const QString &listing)
 {
-    char buffer[4096];
-    const ssize_t length = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
-    if (length <= 0) {
-        return {};
-    }
-    buffer[length] = '\0';
-    const QString helper = QString::fromLocal8Bit(buffer);
-    QString program = QFileInfo(helper).absolutePath() + QStringLiteral("/vshot");
-    if (!QFileInfo::exists(program)) {
-        const QString beside =
-            QFileInfo(helper).absolutePath() + QStringLiteral("/../target/release/vshot");
-        if (QFileInfo::exists(beside)) {
-            program = QDir::cleanPath(beside);
-        } else {
-            program = QStringLiteral("vshot");
-        }
-    }
-
-    QProcess process;
-    process.setProgram(program);
-    process.setArguments({QStringLiteral("record"), QStringLiteral("mics")});
-    process.setStandardInputFile(QProcess::nullDevice());
-    process.start();
-    if (!process.waitForStarted(kMicrophoneListTimeoutMs)) {
-        return {};
-    }
-    if (!process.waitForFinished(kMicrophoneListTimeoutMs)) {
-        process.kill();
-        process.waitForFinished();
-        return {};
-    }
-
     QList<QPair<QString, QString>> inputs;
-    const QString listing = QString::fromUtf8(process.readAllStandardOutput());
     for (const QString &line : listing.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
-        // `serial<TAB>name<TAB>description`.  The serial is not offered: a name
-        // is stable across sessions and a serial is not, and the file has to
-        // outlive the session.
         const QStringList fields = line.split(QLatin1Char('\t'));
         if (fields.size() < 2 || fields.at(1).isEmpty()) {
             continue;
@@ -711,6 +670,136 @@ QList<QPair<QString, QString>> detectedMicrophones()
     }
     return inputs;
 }
+
+/// The path of the `vshot` binary to ask: this process *is* the helper, so its
+/// own path names the program beside it.  A build tree puts it in the parent,
+/// and anything else falls back to the name on `PATH`.
+QString helperProgram()
+{
+    char buffer[4096];
+    const ssize_t length = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+    if (length <= 0) {
+        return QStringLiteral("vshot");
+    }
+    buffer[length] = '\0';
+    const QString helper = QString::fromLocal8Bit(buffer);
+    const QString program = QFileInfo(helper).absolutePath() + QStringLiteral("/vshot");
+    if (QFileInfo::exists(program)) {
+        return program;
+    }
+    const QString beside =
+        QFileInfo(helper).absolutePath() + QStringLiteral("/../target/release/vshot");
+    if (QFileInfo::exists(beside)) {
+        return QDir::cleanPath(beside);
+    }
+    return QStringLiteral("vshot");
+}
+
+/// The audio inputs `vshot record mics` lists, as `(node name, label)` pairs:
+/// the name is what `--mic` accepts and what the file keeps, the label is the
+/// description a person reads.
+///
+/// The list has to come from the running session -- it is the only thing that
+/// knows which inputs exist -- so this runs `vshot`, the same discovery the
+/// capture overlay makes for the OCR engine.
+///
+/// It is asked for **once**, and in the background.  The command starts a
+/// second process that has to bring PipeWire up before it can answer, which
+/// takes about a second, and both the recording and the replay card carry a
+/// microphone row -- so asking synchronously while building the pages left the
+/// window blank for two seconds before it appeared, every time it was opened,
+/// to fill in a list most users never look at.  The window now opens at once
+/// with the two answers that always exist, and the devices drop into both boxes
+/// when the answer lands; the Detect button re-asks.
+///
+/// Nothing here can fail the settings window.  A machine without PipeWire, a
+/// session with no inputs, or a vshot that cannot be found all yield an empty
+/// list, and the row then offers the two answers that always exist.
+class MicrophoneProbe : public QObject {
+public:
+    explicit MicrophoneProbe(QObject *parent = nullptr)
+        : QObject(parent)
+    {
+    }
+
+    /// Fires when the listing arrives, from the event loop -- never from inside
+    /// [`start`].  Both cards connect here rather than to a signal of their own,
+    /// because the answer is the same for both.
+    std::function<void()> onFinished;
+
+    /// Asks for the listing, unless it is already on its way or already in.
+    void start()
+    {
+        if (finished_ || process_ != nullptr) {
+            return;
+        }
+        process_ = new QProcess(this);
+        process_->setProgram(helperProgram());
+        process_->setArguments({QStringLiteral("record"), QStringLiteral("mics")});
+        process_->setStandardInputFile(QProcess::nullDevice());
+        // Both are wired: a program that cannot be started reports it through
+        // `errorOccurred` and never reaches `finished`, and a program that
+        // starts and then hangs would otherwise leave the row waiting forever.
+        connect(process_, &QProcess::finished, this, [this] { finish(true); });
+        connect(process_, &QProcess::errorOccurred, this, [this] { finish(false); });
+        process_->start();
+        QTimer::singleShot(kMicrophoneListTimeoutMs, this, [this] { finish(false); });
+    }
+
+    /// Asks again from scratch, whatever the last answer was.
+    ///
+    /// This is what the Detect button does, and the reason it is not [`start`]:
+    /// the point of pressing it is that something changed -- a microphone was
+    /// plugged in, PipeWire was started -- so an answer already in is exactly
+    /// the one the user is asking to replace.
+    void restart()
+    {
+        if (process_ != nullptr) {
+            return;
+        }
+        finished_ = false;
+        inputs_.clear();
+        start();
+    }
+
+    /// The inputs, empty until the answer lands.
+    const QList<QPair<QString, QString>> &inputs() const { return inputs_; }
+    /// Whether the answer has landed, whether or not it found anything.
+    bool finished() const { return finished_; }
+
+private:
+    /// Reads the listing and hands it on.  `readable` is false when the answer
+    /// is a failure rather than a listing -- a program that would not start, or
+    /// one the timeout gave up on -- in which case the inputs stay empty.
+    void finish(bool readable)
+    {
+        // The timeout, the process and the error can all arrive: the first one
+        // here is the answer, and the rest are the same answer said again.
+        if (finished_) {
+            return;
+        }
+        finished_ = true;
+        if (process_ != nullptr) {
+            if (readable) {
+                inputs_ = parseMicrophoneListing(
+                    QString::fromUtf8(process_->readAllStandardOutput()));
+            }
+            if (process_->state() != QProcess::NotRunning) {
+                process_->kill();
+                process_->waitForFinished(100);
+            }
+            process_->deleteLater();
+            process_ = nullptr;
+        }
+        if (onFinished) {
+            onFinished();
+        }
+    }
+
+    QProcess *process_ = nullptr;
+    QList<QPair<QString, QString>> inputs_;
+    bool finished_ = false;
+};
 
 /// A small square of a colour, drawn with the same rounding as the swatch
 /// button it sits in.
@@ -1235,14 +1324,20 @@ void addRow(QWidget *card, const QString &label, const QString &hint, QWidget *c
 /// window.  Both the recording and the replay card carry one of these, so the
 /// filling lives here once.
 ///
+/// `inputs` is the probe's answer, which may be empty -- on the first fill it
+/// has not landed yet, and on a machine with no PipeWire it never will.  An
+/// empty list is not "no devices": it is "nothing to add", and the remembered
+/// name is added back below either way, so a box filled before the answer
+/// arrives still shows the device the file names.
+///
 /// `wanted` is the marker to keep selected: the box's current entry on a
 /// re-detect, and the file's own value on the first fill.
-void fillMicrophoneCombo(QComboBox *box, const QString &wanted)
+void fillMicrophoneCombo(QComboBox *box, const QString &wanted,
+                         const QList<QPair<QString, QString>> &inputs)
 {
     box->clear();
     box->addItem(uiTr("Do not record audio"), kNoMicrophone);
     box->addItem(uiTr("The session's default input"), kDefaultMicrophone);
-    const QList<QPair<QString, QString>> inputs = detectedMicrophones();
     for (const QPair<QString, QString> &input : inputs) {
         box->addItem(input.second, input.first);
         box->setItemData(box->count() - 1, input.first, Qt::ToolTipRole);
@@ -1526,6 +1621,13 @@ public:
 
         root->addWidget(body, 1);
         root->addWidget(buildFooter());
+
+        // Last, and queued rather than called: the pages are up and readable
+        // without the input listing, and asking for it here would block the
+        // constructor on a second process for about a second.  Queued so the
+        // window is on screen before the probe starts, which is what makes the
+        // two boxes fill in visibly rather than after a pause.
+        QTimer::singleShot(0, this, [this] { askForMicrophones(); });
     }
 
 private:
@@ -1733,10 +1835,15 @@ private:
     /// Fills the recording card's microphone row.  The config is read through
     /// [`rememberedMicrophone`]; rebuilding from the box rather than the config
     /// is what makes re-detecting midway through an edit keep the user's choice.
+    ///
+    /// The inputs come from the probe, which may not have answered yet: the row
+    /// is filled at once with what is known, and filled again when the listing
+    /// lands (see [`askForMicrophones`]).
     void fillMicrophoneBox()
     {
         const QString shown = recordMicBox_->currentData().toString();
-        fillMicrophoneCombo(recordMicBox_, shown.isEmpty() ? rememberedMicrophone() : shown);
+        fillMicrophoneCombo(recordMicBox_, shown.isEmpty() ? rememberedMicrophone() : shown,
+                            microphones_.inputs());
     }
 
     QString rememberedReplayMicrophone() const
@@ -2086,7 +2193,7 @@ private:
         recordMicDetectButton_->setToolTip(
             uiTr("Ask the running session which inputs it has"));
         connect(recordMicDetectButton_, &QPushButton::clicked, this,
-                [this] { fillMicrophoneBox(); });
+                [this] { askForMicrophones(true); });
         fillMicrophoneBox();
 
         auto *microphoneRow = new QWidget(recording);
@@ -2212,7 +2319,7 @@ private:
         replayMicDetectButton_->setToolTip(
             uiTr("Ask the running session which inputs it has"));
         connect(replayMicDetectButton_, &QPushButton::clicked, this,
-                [this] { fillReplayMicrophoneBox(); });
+                [this] { askForMicrophones(true); });
         fillReplayMicrophoneBox();
 
         auto *replayMicrophoneRow = new QWidget(replay);
