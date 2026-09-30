@@ -641,6 +641,16 @@ private:
     // veil again.  `baseCompositeKey_` says when it has to be rebuilt.
     QImage baseComposite_;
     QByteArray baseCompositeKey_;
+    // The magnifier's own view of the picture: the frozen frame with a band
+    // round it and the committed marks painted in, so the loupe reads what the
+    // user has actually made rather than the bare capture.  Kept apart from
+    // `baseComposite_`, which is the frame plus the veil and deliberately has
+    // no marks on it.  Rebuilt when the marks change, when the frame changes
+    // and when the pin's image is moved under them -- `loupeCompositeKey_`
+    // says which.
+    QImage loupeComposite_;
+    QByteArray loupeCompositeKey_;
+    int loupeCompositeOutput_ = -1;
     // Live pin window the editor drives in pin-edit mode.  One connection
     // serves the whole drag: opening a socket costs a connect, a server accept
     // and a fresh object on both sides, and paying that per motion event was
@@ -804,6 +814,76 @@ private:
     bool acceptTranslation(QString *error);
     void mutateAnnotations(QVector<Annotation> next);
     void drawLoupe(CaptureOverlay *overlay, QPainter *painter);
+    // The capture with the marks already on it, as the magnifier reads it: the
+    // frozen frame, a band of `kLoupeCompositeMargin` device pixels round it,
+    // and every committed mark painted in.  Returns null where there is
+    // nothing to read.
+    //
+    // It is a separate image from the frame on purpose.  The frame is the
+    // capture's own pixels and is what the marks are drawn *over* -- the result
+    // is composited from it, the mosaic samples it, and the pin's HDR half is
+    // built from it -- so painting marks into it would put them in the saved
+    // picture twice.  Rebuilt only when the marks, the frame or the frame's
+    // place have changed; see `loupeCompositeKey`.
+    const QImage *loupeFrame(const OutputSession &output);
+    // Everything the composite depends on.  A change to any of it is what
+    // makes the next magnifier paint rebuild rather than reuse the pixels.
+    QByteArray loupeCompositeKey(const OutputSession &output) const;
+    // Throws the composite away: the marks are about to change, or the frame
+    // has moved, so what is cached no longer describes the screen.
+    void invalidateLoupeComposite();
+    // The colour readout that hangs off the loupe: the pixel's code, on a
+    // ground of that pixel's own colour.  Drawn as its own pill rather than
+    // folded into the loupe's, because the two say different things -- one
+    // where the cursor is, one what is under it -- and a hint line under a
+    // swatch is unreadable on a swatch that happens to match it.
+    void drawColorPill(CaptureOverlay *overlay, QPainter *painter, const QPointF &anchor,
+                       const QColor &color);
+    // Puts the magnifier up for its moment after a keyboard move, restarting
+    // the countdown if it was already up.
+    void flashMagnifier();
+    void endMagnifierFlash();
+    // The image pixel under the cursor, as the magnifier reads it, or an
+    // invalid colour where there is no image under it.  `pixelIndex` receives
+    // the source pixel's coordinates, which is what the loupe's own pill shows.
+    QColor pixelUnderCursor(int *pixelIndexX, int *pixelIndexY) const;
+    // The frozen frame of an output, or null where it has none to read.
+    const QImage *outputFrame(const OutputSession &output) const;
+    // C copies the colour code, A takes it as the current tool's colour.  Both
+    // are bound while the magnifier is up and swallowed otherwise.
+    void copyColorUnderCursor();
+    void adoptColorUnderCursor();
+    // Walks the cursor by `dx`/`dy` logical pixels with the keyboard, which is
+    // how a start point is picked without the mouse: the magnifier comes up so
+    // the user can see where it landed.
+    void moveCursorBy(int dx, int dy);
+    // Walks the *stroke in progress* by `dx`/`dy` logical pixels, for the tools
+    // whose press picks a start and whose release picks an end: the button is
+    // held for the whole of it, so the keyboard is the only way to place the far
+    // end exactly.  The anchor the press set does not move.
+    void walkLiveGesture(int dx, int dy);
+    // The cursor the keyboard moves: where the last keyboard step left it, or
+    // where the pointer was if the keyboard has not been used yet.
+    Point cursorPoint() const;
+    // Moves the selected mark by `dx`/`dy` logical pixels.  A run of these is
+    // one undo step, so holding a key down does not bury the user's last edit.
+    void nudgeSelectedAnnotation(int dx, int dy);
+    // Moves the cursor to the next or previous mark, so the keyboard alone can
+    // walk the marks and the arrows can then nudge the one it stopped on.
+    void cycleAnnotationFocus(int step);
+    // Whether `modifiers` puts the editor in its selection state: what is on
+    // the screen is the target, and the armed tool waits.
+    //
+    // Shift is the modifier that answers to it: it is the state the removed
+    // Select tool left behind, and holding it must not change which tool is
+    // armed, so letting it go puts the user back exactly where they were.
+    bool pickingMarks(int modifiers) const;
+    // Ctrl+A: every mark is picked up at once, for a style change or a delete
+    // that reaches all of them.
+    void selectAllAnnotations();
+    // Ctrl+S: the capture with its marks on it goes to the clipboard as an
+    // image, through the same composite the Copy button would have made.
+    void copyToClipboard();
     // Draws the in-progress freehand stroke from a raster that only grows by the
     // points appended since the last paint.
     void paintLiveStroke(QPainter *painter, const OutputSession &output, const QSize &size,

@@ -2,7 +2,10 @@
 // Copyright (C) 2026 VShot contributors
 
 #include "capture_overlay.hpp"
+
+#include "pixel_fd.hpp"
 #include "config.hpp"
+#include "shortcuts.hpp"
 #include "i18n.hpp"
 #include "text_size.hpp"
 
@@ -278,22 +281,22 @@ QImage loupeCrop(const QImage &image, int centerX, int centerY)
     return crop;
 }
 
-// Two pi, spelled out rather than read from a platform's `M_PI`: the wave the
-// preview draws and the one the Rust renderer bakes into the PNG have to be the
-// same curve, and the constant is the one place that could silently differ.
+// Two pi, spelled out rather than read from a platform's `M_PI`: the wave's
+// shape must not depend on which libm the build landed on, and the constant is
+// the one place that could silently differ.
 constexpr double kTau = 6.283185307179586476925286766559;
 
-// Samples the sine wave along the segment `start`..`end` as a polyline, exactly
-// as the Rust renderer's `wave_polyline` does, so a wave drawn here and the
-// same wave baked into the final PNG agree line for line.
+// Samples the sine wave along the segment `start`..`end` as a polyline.  This
+// is the only wave there is -- the preview and the committed mark both come
+// from here -- so a wave looks the same live as it does once it is down.
 //
 // `start` and `end` are overlay-local logical pixels.  `widthLogical` is the
 // annotation's width in logical pixels; the amplitude and the wavelength are
 // its `max(width * 2, 4)` and `max(width * 6, 18)`, in logical pixels, so the
 // shape does not depend on the output's scale.  `scale` is that output's device
 // scale and sets only the sampling distance: one sample per *device* pixel
-// means a step of `1 / scale` logical pixels, which is what the Rust side's
-// `n = ceil(length_device) + 1` produces.
+// means a step of `1 / scale` logical pixels, so a wave's polyline is as fine
+// as the screen it is drawn on and no finer.
 //
 // The phase finishes on a whole number of cycles -- `cycles = max(1, round(L /
 // wavelength))`, with the wavelength actually used being `L / cycles` -- so both
@@ -454,7 +457,8 @@ void paintBezierInk(QPainter *painter, const QVector<QPointF> &at, bool closed, 
     const bool wantStroke = !wantFill || fill == QStringLiteral("both");
     const QPainterPath path = bezierPathAt(at, closed);
     if (wantFill) {
-        // Fill first and stroke second, the order the Rust renderer bakes in.
+        // Fill first and stroke second, so the outline is not tinted by the
+        // translucent fill it sits on.
         // The fill is the stroke's own colour at half its alpha, floored: that
         // is what "a translucent fill under a solid outline" means for a colour
         // the user picked an opacity for.
@@ -5927,6 +5931,9 @@ LogicalRect OverlayController::drawingTouch(int pointsBefore) const
         ? waveReach(style.amplitude, style.width)
         : liveStrokeMargin(brush, std::max(1, static_cast<int>(style.width)), scale,
                            mosaicStrength_);
+    // The magnifier follows every drawing drag, and it travels with the pointer:
+    // it is drawn a whole diameter away from the cursor, so a rect that only
+    // covered the ink would leave the circle it moved away from on screen.
     return growBy(touched, static_cast<int>(std::ceil(reach)) + kSelectionChrome);
 }
 
@@ -9485,6 +9492,35 @@ public:
         return total;
     }
 
+    // The identity of the pixels this mark would rasterize for `output`.  The
+    // cache compares it against what it already holds; a caller that is
+    // compositing several marks into one image uses it the same way, to tell
+    // whether anything it drew has changed.
+    QByteArray key(const Annotation &annotation, const OutputSession &output,
+                   const QSize &size) const
+    {
+        return signature(annotation, output, size);
+    }
+
+    // Draws the mark straight into `painter`, with no cache in the way.
+    //
+    // For a caller compositing marks into a raster of its own -- the magnifier
+    // -- the cache is not merely unnecessary but harmful: its slot would hold
+    // pixels built for this other size and this other frame, and the two would
+    // evict each other on every paint, rebuilding marks that had not changed.
+    // The pixels are the same ones `paint` would produce, drawn through the
+    // same `draw`, so the composite cannot drift from what is on the screen.
+    void drawInto(QPainter *painter, const Annotation &annotation, const OutputSession &output,
+                  const QSize &size) const
+    {
+        // The same hint `paint` gives its own raster, so the composite's marks
+        // are antialiased exactly as the screen's are.
+        const bool antialiased = painter->testRenderHint(QPainter::Antialiasing);
+        painter->setRenderHint(QPainter::Antialiasing, true);
+        draw(painter, annotation, output, size);
+        painter->setRenderHint(QPainter::Antialiasing, antialiased);
+    }
+
     // The device-pixel ratio the pixels were last built at, or 0 before the
     // first build.  Read through `Annotation::rasterDeviceRatio`.
     qreal builtAtRatio() const { return builtAtRatio_; }
@@ -10182,12 +10218,19 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
     // Annotations are clipped to the image: dragging the pin around must not
     // leave marks floating on the transparent canvas, and the renderer only
     // ever composites them onto the image.
+    //
+    // That clip is also what keeps the magnifier honest.  It is drawn after
+    // every mark -- it has to be, or a mark over the cursor would hide the
+    // pixel it exists to show -- and the marks are drawn inside this clip, so
+    // a magnifier hung inside it can only ever cover marks.  Where the pin
+    // editor has the image and nothing else, the loupe is bounded by the image
+    // too, which is the right thing: there are no pixels outside it to read.
     if (pinEdit_) {
         painter->setClipRect(imageRect, Qt::IntersectClip);
     }
     painter->setBrush(Qt::NoBrush);
     auto drawAnnotation = [this, &output, overlay, painter](const Annotation &annotation) {
-        const double scale = output.scale > 0 ? static_cast<double>(output.scale) : 1.0;
+        const double scale = outputScale(output);
         const QPen annotationPen = penForAnnotation(annotation);
         if (annotation.kind == Annotation::Kind::Image) {
             if (annotation.pixels.isNull()) {
@@ -10512,14 +10555,778 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
                      text, target);
     }
 
-    const bool loupeActive = gesture_->type == Gesture::Type::Selecting ||
-        gesture_->type == Gesture::Type::Moving || gesture_->type == Gesture::Type::Resizing ||
-        gesture_->type == Gesture::Type::MovingAnnotation ||
-        gesture_->type == Gesture::Type::ResizingAnnotation;
-    if (loupeActive && pointerOutput_ == overlay->outputIndex()) {
+    // The magnifier sits above every mark: it is a reading of the pixels the
+    // user is aiming at, and a mark drawn over it would hide exactly the pixel
+    // it exists to show.  It is drawn last for that reason.
+    //
+    // Any drag brings it up: every one of them is the user placing a point, and
+    // the point is a pixel.  The right button brings it up on its own, and a
+    // keyboard step flashes it, so aiming is covered whatever is moving.
+    const Gesture::Type loupeGesture = gesture_->type;
+    // Every drag but the ones that lay ink down.  A stroke is drawn where the
+    // cursor is, and the loupe is a 120-pixel disc hung off that same cursor:
+    // showing it while drawing covers the ink the user is placing, which is
+    // exactly what pixel-level annotating needs to see.  Moving, resizing and
+    // framing are the drags that aim at pixels already on the screen.
+    const bool dragging = loupeGesture != Gesture::Type::None &&
+        loupeGesture != Gesture::Type::Bezier && loupeGesture != Gesture::Type::Drawing;
+    if ((magnifierVisible() || dragging) && pointerOutput_ == overlay->outputIndex()) {
+        // The clip goes back to the surface before the loupe is drawn.  The
+        // disc hangs off the cursor by more than its own radius, so near the
+        // edge of the picture it deliberately reaches past it -- and the pin
+        // editor's image clip, taken above for the marks, cut it off there.
+        // That is the one place a magnifier is most wanted, so the loupe is the
+        // editor's chrome rather than a mark and is not bounded by the image.
+        painter->setClipRect(target);
         drawLoupe(overlay, painter);
     }
     painter->restore();
+}
+
+// Draws the committed marks onto a copy of the session's own pixels.
+//
+// The editor's screen and the result are not the same raster: the screen is a
+// window in logical pixels with a device ratio, and the result is the captured
+// frame in the output's device pixels.  The mapping between them is one factor,
+// `density` -- the output's device pixels per logical pixel -- which is exactly
+// what `output.scale` carries for the output the marks were placed on.  So the
+// output is rebuilt here with that scale, which makes every `localRect` and
+// `localPoint` in the painters below land on the result's pixels with no
+// arithmetic of its own.
+//
+// The painter's device ratio is set to the same factor rather than the mark
+// being scaled, so each mark's cached raster is rebuilt at the result's
+// resolution: a mark whose preview was cached at ratio 2 is rasterized again at
+// the output's density instead of being blitted at the wrong one.  The cache
+// belongs to the annotation and keys on the ratio, so a preview and a render at
+// different densities cannot read each other's pixels.
+QImage OverlayController::compositeAnnotations(const QImage &canvas, const QImage &source,
+                                               const LogicalRect &origin, double density,
+                                               QString *error) const
+{
+    const auto fail = [error](const QString &message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+        return QImage();
+    };
+    if (canvas.isNull() || source.isNull()) {
+        return fail(uiTr("There are no pixels to draw the annotations on."));
+    }
+    if (!(density > 0.0)) {
+        return fail(uiTr("The capture's density is not a positive number."));
+    }
+    if (canvas.size() != source.size()) {
+        return fail(uiTr("The annotations would be drawn on pixels of another size."));
+    }
+    if (annotations_.isEmpty()) {
+        return canvas;
+    }
+    // The marks were placed on the output the capture came from, which is the
+    // first one: a capture that spans several outputs is cropped from the scene
+    // at the highest density, and that is what `density` names.  Only its scale
+    // and its place matter here -- the pixels come in as an argument, not from
+    // the session -- so a fresh record is enough and the session need not have
+    // an output at all.  Its place is `origin`, the crop's own rect in the
+    // overlay's logical pixels: a mark's coordinates are global, and the painter
+    // draws in the crop's, so leaving the record at the origin would put every
+    // mark at the selection's offset from the screen's corner.
+    OutputSession output;
+    output.scale = density;
+    output.geometry = LogicalRect{origin.x, origin.y,
+                                  static_cast<std::uint32_t>(canvas.width()),
+                                  static_cast<std::uint32_t>(canvas.height())};
+    output.surface = output.geometry;
+    // What a mosaic samples.  For the flattened result this is the canvas
+    // itself; for the marks alone it is the capture, which the canvas does not
+    // hold.
+    output.image = source;
+
+    QImage composite = canvas.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    if (composite.isNull()) {
+        return fail(uiTr("The capture's pixels could not be converted for drawing."));
+    }
+    // The device ratio is what maps the painter's logical coordinates onto the
+    // result's pixels, and setting it on the image is what makes the painter
+    // pick it up: `AnnotationRaster::paint` reads it back off the paint device,
+    // so the cached rasters are built at the result's resolution rather than the
+    // screen's.
+    composite.setDevicePixelRatio(density);
+    // Off the screen: this runs after the session ended, and a mark drawn
+    // through an overlay's own size would be placed for the window rather than
+    // for the result.
+    QPainter painter(&composite);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setRenderHint(QPainter::TextAntialiasing, true);
+    for (const Annotation &annotation : annotations_) {
+        if (annotation.raster == nullptr) {
+            annotation.raster = makeAnnotationRaster(annotation);
+        }
+        annotation.raster->paint(&painter, annotation, output, composite.size(), 0);
+    }
+    painter.end();
+    // The result is a plain raster of device pixels; the ratio was this side's
+    // business and no consumer of the bytes should scale by it.
+    composite.setDevicePixelRatio(1.0);
+    return composite;
+}
+
+// A mark's colour, read the way the CLI wrote it: `#rrggbb`, or `#rrggbbaa`
+// when the alpha is not opaque.  The eight-digit form spells alpha last, which
+// is what `colorText` writes and what `parseColorText` reads back.
+QColor annotationColor(const QJsonValue &value, const QColor &fallback)
+{
+    if (!value.isString()) {
+        return fallback;
+    }
+    const QColor color = parseColorText(value.toString());
+    return color.isValid() ? color : fallback;
+}
+
+// One of a mark's small enumerations, read by name.  `allowed` is the set the
+// wire may carry; anything else is refused rather than silently defaulted,
+// because a mark the editor cannot reproduce exactly is worse than a session
+// that says so.
+bool annotationToken(const QJsonValue &value, const QStringList &allowed, const QString &label,
+                     QString *out, QString *error)
+{
+    if (!value.isString() || !allowed.contains(value.toString())) {
+        return jsonFail(error, label + QStringLiteral(" must be one of ") +
+                                   allowed.join(QStringLiteral(", ")));
+    }
+    *out = value.toString();
+    return true;
+}
+
+bool annotationWhole(const QJsonObject &object, const char *key, std::uint32_t minimum,
+                     std::uint32_t maximum, std::uint32_t *out, const QString &label,
+                     QString *error)
+{
+    std::int64_t value = 0;
+    if (!jsonInteger(object.value(QLatin1String(key)), minimum, maximum, &value)) {
+        return jsonFail(error, QStringLiteral("%1 must be an integer in %2..%3")
+                              .arg(label)
+                              .arg(minimum)
+                              .arg(maximum));
+    }
+    *out = static_cast<std::uint32_t>(value);
+    return true;
+}
+
+// The canvas the marks were made on: a mark's coordinates only mean something
+// against it, and one that fell outside would be painted off the edge and never
+// seen again.  Refusing it is what makes a session from a different capture
+// fail loudly rather than open with invisible marks.
+//
+// `x` and `y` arrive relative to the canvas's top-left, which is the frame
+// `marksDocument` writes them in, so the bounds are the canvas's own size and
+// not its place on the screen.
+bool insideCanvas(std::int64_t x, std::int64_t y, const LogicalRect &canvas, const QString &label,
+                  QString *error)
+{
+    if (x < 0 || y < 0 || x > static_cast<std::int64_t>(canvas.width) ||
+        y > static_cast<std::int64_t>(canvas.height)) {
+        return jsonFail(error, label + QStringLiteral(" lies outside the canvas"));
+    }
+    return true;
+}
+
+bool canvasRect(const QJsonObject &object, const LogicalRect &canvas, LogicalRect *out,
+                const QString &label, QString *error)
+{
+    LogicalRect rect;
+    if (!jsonRect(object, &rect, label, error)) {
+        return false;
+    }
+    if (!insideCanvas(rect.x, rect.y, canvas, label, error) ||
+        !insideCanvas(rect.right(), rect.bottom(), canvas, label, error)) {
+        return false;
+    }
+    // Back into the overlay's global logical pixels, which is where the editor
+    // keeps every mark it holds.
+    rect.x += canvas.x;
+    rect.y += canvas.y;
+    *out = rect;
+    return true;
+}
+
+// A rect written under a `rect` key, which is how every mark but a translation
+// line spells its boxes.
+bool annotationRect(const QJsonObject &object, const LogicalRect &canvas, LogicalRect *out,
+                    const QString &label, QString *error)
+{
+    const QJsonValue value = object.value(QStringLiteral("rect"));
+    if (!value.isObject()) {
+        return jsonFail(error, label + QStringLiteral(" must carry a `rect` object"));
+    }
+    return canvasRect(value.toObject(), canvas, out, label, error);
+}
+
+bool annotationPoint(const QJsonObject &object, const LogicalRect &canvas, Point *out,
+                     const QString &label, QString *error)
+{
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    if (!jsonSigned32(object, "x", &x) || !jsonSigned32(object, "y", &y)) {
+        return jsonFail(error, label + QStringLiteral(" must have integer x and y"));
+    }
+    if (!insideCanvas(x, y, canvas, label, error)) {
+        return false;
+    }
+    out->x = x + canvas.x;
+    out->y = y + canvas.y;
+    return true;
+}
+
+// One mark, read back from the shape `marksDocument` writes.
+//
+// The two directions are one protocol read from either end, so the names here
+// are the ones that writer emits and nothing else.  A mark of a kind this editor
+// does not know is refused rather than skipped: the writer only ever emits the
+// kinds below, so seeing another means the wire is not this protocol, and
+// quietly dropping it would open the pin with a mark the user drew missing.
+//
+// A pasted image arrives as a path to its pixels, not as pixels: it is written
+// beside the session by `writeMarkAssets` and the mark names the file.  Reading
+// it needs the file to still be there, which is why the session directory
+// outlives the session that made it.
+bool parseMark(const QJsonObject &mark, const LogicalRect &canvas, std::uint32_t deviceRatio,
+               Annotation *out, QString *error)
+{
+    const auto fail = [error](const QString &message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+        return false;
+    };
+
+    const QJsonValue kindValue = mark.value(QStringLiteral("kind"));
+    if (!kindValue.isString()) {
+        return fail(uiTr("A mark must carry a `kind`."));
+    }
+    const QString kind = kindValue.toString();
+    const QString label = QStringLiteral("mark `%1`").arg(kind);
+
+    const QJsonValue toolValue = mark.value(QStringLiteral("tool"));
+    if (!toolValue.isString()) {
+        return fail(label + QStringLiteral(" must carry a `tool`"));
+    }
+    const QString tool = toolValue.toString();
+
+    Annotation annotation;
+    annotation.tool = tool;
+    annotation.deviceRatio = deviceRatio;
+
+    if (kind == QStringLiteral("shape")) {
+        static const QStringList kShapeTools = {QStringLiteral("rectangle"),
+                                                QStringLiteral("ellipse"),
+                                                QStringLiteral("mosaic")};
+        static const QStringList kDashes = {QStringLiteral("solid"), QStringLiteral("dashed"),
+                                            QStringLiteral("dotted")};
+        static const QStringList kMasks = {QStringLiteral("rect"), QStringLiteral("ellipse")};
+        QString checked;
+        if (!annotationToken(toolValue, kShapeTools, label + QStringLiteral(" tool"), &checked,
+                             error)) {
+            return false;
+        }
+        if (!annotationRect(mark, canvas, &annotation.rect, label, error)) {
+            return false;
+        }
+        annotation.kind = Annotation::Kind::Shape;
+        annotation.color = annotationColor(mark.value(QStringLiteral("color")), annotation.color);
+        if (!annotationWhole(mark, "width", 1, static_cast<std::uint32_t>(kMaxWidth),
+                             &annotation.width, label + QStringLiteral(" width"), error) ||
+            !annotationWhole(mark, "strength", 1,
+                             static_cast<std::uint32_t>(kMaxMosaicStrength), &annotation.strength,
+                             label + QStringLiteral(" strength"), error)) {
+            return false;
+        }
+        if (!annotationToken(mark.value(QStringLiteral("dash")), kDashes,
+                             label + QStringLiteral(" dash"), &annotation.dash, error) ||
+            !annotationToken(mark.value(QStringLiteral("mask")), kMasks,
+                             label + QStringLiteral(" mask"), &annotation.mask, error)) {
+            return false;
+        }
+    } else if (kind == QStringLiteral("stroke")) {
+        // Every tool that lays down a freehand stroke has to be here, and the
+        // mosaic brush is one of them: `finishDrawing` stores it as a Stroke
+        // whenever the shape is the brush rather than a rect or an ellipse, and
+        // its `tool` reads `"mosaic"`.  Leaving it out made the reader refuse a
+        // document the writer had just produced -- and because `parseMarks` is
+        // all-or-nothing, that one mark took every other mark on the pin down
+        // with it, which is how a re-edit came up blank.
+        static const QStringList kStrokeTools = {
+            QStringLiteral("arrow"),  QStringLiteral("pen"),  QStringLiteral("draw"),
+            QStringLiteral("line"),   QStringLiteral("wave"), QStringLiteral("bezier"),
+            QStringLiteral("mosaic")};
+        static const QStringList kDashes = {QStringLiteral("solid"), QStringLiteral("dashed"),
+                                            QStringLiteral("dotted")};
+        static const QStringList kArrowStyles = {QStringLiteral("open"),
+                                                 QStringLiteral("filled")};
+        static const QStringList kFills = {QStringLiteral("stroke"), QStringLiteral("fill"),
+                                           QStringLiteral("both")};
+        QString checked;
+        if (!annotationToken(toolValue, kStrokeTools, label + QStringLiteral(" tool"), &checked,
+                             error)) {
+            return false;
+        }
+        const QJsonValue pointsValue = mark.value(QStringLiteral("points"));
+        if (!pointsValue.isArray()) {
+            return fail(label + QStringLiteral(" must carry a `points` array"));
+        }
+        const QJsonArray points = pointsValue.toArray();
+        if (points.isEmpty()) {
+            return fail(label + QStringLiteral(" must have at least one point"));
+        }
+        annotation.points.reserve(points.size());
+        for (int index = 0; index < points.size(); ++index) {
+            if (!points.at(index).isObject()) {
+                return fail(label + QStringLiteral(" point %1 must be an object").arg(index));
+            }
+            Point point;
+            if (!annotationPoint(points.at(index).toObject(), canvas, &point,
+                                 label + QStringLiteral(" point %1").arg(index), error)) {
+                return false;
+            }
+            annotation.points.push_back(point);
+        }
+        annotation.kind = Annotation::Kind::Stroke;
+        annotation.color = annotationColor(mark.value(QStringLiteral("color")), annotation.color);
+        if (!annotationWhole(mark, "width", 1, static_cast<std::uint32_t>(kMaxWidth),
+                             &annotation.width, label + QStringLiteral(" width"), error) ||
+            !annotationWhole(mark, "size", 1, static_cast<std::uint32_t>(kMaxArrowSize),
+                             &annotation.size, label + QStringLiteral(" size"), error) ||
+            !annotationWhole(mark, "strength", 1,
+                             static_cast<std::uint32_t>(kMaxMosaicStrength), &annotation.strength,
+                             label + QStringLiteral(" strength"), error) ||
+            !annotationWhole(mark, "amplitude", 0, static_cast<std::uint32_t>(kMaxWaveSize),
+                             &annotation.amplitude, label + QStringLiteral(" amplitude"), error) ||
+            !annotationWhole(mark, "wavelength", 0,
+                             static_cast<std::uint32_t>(kMaxWaveWavelength),
+                             &annotation.wavelength, label + QStringLiteral(" wavelength"),
+                             error)) {
+            return false;
+        }
+        if (!annotationToken(mark.value(QStringLiteral("dash")), kDashes,
+                             label + QStringLiteral(" dash"), &annotation.dash, error) ||
+            !annotationToken(mark.value(QStringLiteral("arrow_style")), kArrowStyles,
+                             label + QStringLiteral(" arrow_style"), &annotation.arrowStyle,
+                             error) ||
+            !annotationToken(mark.value(QStringLiteral("fill")), kFills,
+                             label + QStringLiteral(" fill"), &annotation.fill, error)) {
+            return false;
+        }
+        const QJsonValue closed = mark.value(QStringLiteral("closed"));
+        if (!closed.isBool()) {
+            return fail(label + QStringLiteral(" must carry a boolean `closed`"));
+        }
+        annotation.closed = closed.toBool();
+    } else if (kind == QStringLiteral("text")) {
+        const QJsonValue originValue = mark.value(QStringLiteral("origin"));
+        if (!originValue.isObject()) {
+            return fail(label + QStringLiteral(" must carry an `origin` object"));
+        }
+        if (!annotationPoint(originValue.toObject(), canvas, &annotation.origin, label, error)) {
+            return false;
+        }
+        const QJsonValue textValue = mark.value(QStringLiteral("text"));
+        if (!textValue.isString()) {
+            return fail(label + QStringLiteral(" must carry its `text`"));
+        }
+        annotation.kind = Annotation::Kind::Text;
+        annotation.color = annotationColor(mark.value(QStringLiteral("color")), annotation.color);
+        annotation.font = mark.value(QStringLiteral("font")).toString();
+        if (tool == QStringLiteral("number")) {
+            const QJsonValue style = mark.value(QStringLiteral("numberStyle"));
+            if (!style.isString()) {
+                return fail(label + QStringLiteral(" must carry its `numberStyle`"));
+            }
+            annotation.numberStyle = numberStyleForName(style.toString());
+            if (!annotationWhole(mark, "numberSize",
+                                 static_cast<std::uint32_t>(kNumberMinDiameter),
+                                 static_cast<std::uint32_t>(kNumberMaxDiameter),
+                                 &annotation.numberSize, label + QStringLiteral(" numberSize"),
+                                 error)) {
+                return false;
+            }
+            bool ok = false;
+            annotation.number = textValue.toString().toInt(&ok);
+            if (!ok) {
+                return fail(label + QStringLiteral(" must carry an integer count as its `text`"));
+            }
+            // The box is derived from the origin the badge was placed at rather
+            // than read from the wire: the hit test, the drag clamp and the
+            // raster cache are all sized from it, and a box that disagreed with
+            // the diameter would make the badge undraggable.  `layoutNumberBox`
+            // records the box's top-left as the origin, so the centre is that
+            // origin plus half the diameter it is about to lay out.
+            const int half = numberDiameter(annotation.numberSize) / 2;
+            const Point centre{annotation.origin.x + half, annotation.origin.y + half};
+            layoutNumberBox(annotation, centre);
+        } else {
+            annotation.text = textValue.toString();
+            if (!annotationWhole(mark, "textPixels",
+                                 static_cast<std::uint32_t>(kMinTextPixels),
+                                 static_cast<std::uint32_t>(kMaxTextPixels),
+                                 &annotation.textPixels, label + QStringLiteral(" textPixels"),
+                                 error)) {
+                return false;
+            }
+        }
+    } else if (kind == QStringLiteral("image")) {
+        // The pixels are named by path, not carried in the document; the mark
+        // holds the image the path resolves to.  They are the *original* pixels
+        // at their own size, and `rect` is the separate question of where the
+        // mark sits and how far it was scaled to fit, so a resize later can go
+        // back to the original instead of to an already-shrunk copy.
+        if (!annotationRect(mark, canvas, &annotation.rect, label, error)) {
+            return false;
+        }
+        const QJsonValue path = mark.value(QStringLiteral("pixels"));
+        if (!path.isString() || path.toString().isEmpty()) {
+            return fail(label + QStringLiteral(" must carry its `pixels` path"));
+        }
+        QImage pixels;
+        if (!pixels.load(path.toString())) {
+            return fail(label + QStringLiteral(" could not read its pixels from `%1`")
+                            .arg(path.toString()));
+        }
+        annotation.kind = Annotation::Kind::Image;
+        annotation.pixels = pixels;
+    } else if (kind == QStringLiteral("translation")) {
+        // A translation is its lines, and the lines are all numbers and strings,
+        // so the whole mark is in the document and needs no asset.  Each line's
+        // two boxes are read through the same point reader as everything else,
+        // so a line that lands outside the canvas is refused here rather than
+        // drawn off the image later.
+        if (!annotationRect(mark, canvas, &annotation.rect, label, error)) {
+            return false;
+        }
+        const QJsonValue linesValue = mark.value(QStringLiteral("lines"));
+        if (!linesValue.isArray() || linesValue.toArray().isEmpty()) {
+            return fail(label + QStringLiteral(" must carry a non-empty `lines` array"));
+        }
+        const QJsonArray lines = linesValue.toArray();
+        annotation.translation.reserve(lines.size());
+        for (int index = 0; index < lines.size(); ++index) {
+            const QString lineLabel = label + QStringLiteral(" line %1").arg(index);
+            if (!lines.at(index).isObject()) {
+                return fail(lineLabel + QStringLiteral(" must be an object"));
+            }
+            const QJsonObject entry = lines.at(index).toObject();
+            TranslatedLine line;
+            if (!canvasRect(entry, canvas, &line.source, lineLabel, error) ||
+                !canvasRect(entry, canvas, &line.fill, lineLabel, error)) {
+                return false;
+            }
+            const QJsonValue text = entry.value(QStringLiteral("text"));
+            if (!text.isString()) {
+                return fail(lineLabel + QStringLiteral(" must carry its `text`"));
+            }
+            line.text = text.toString();
+            line.family = entry.value(QStringLiteral("family")).toString();
+            std::uint32_t fontPixels = 0;
+            if (!annotationWhole(entry, "font_pixels", 1,
+                                 static_cast<std::uint32_t>(kMaxTextPixels), &fontPixels,
+                                 lineLabel + QStringLiteral(" font_pixels"), error)) {
+                return false;
+            }
+            line.fontPixels = static_cast<int>(fontPixels);
+            line.background =
+                annotationColor(entry.value(QStringLiteral("background")), line.background);
+            line.textColor =
+                annotationColor(entry.value(QStringLiteral("text_color")), line.textColor);
+            annotation.translation.push_back(line);
+        }
+        annotation.kind = Annotation::Kind::Translation;
+        annotation.font = mark.value(QStringLiteral("font")).toString();
+    } else {
+        return fail(QStringLiteral("mark kind `%1` is not one this editor can reopen").arg(kind));
+    }
+
+    *out = annotation;
+    return true;
+}
+
+// Reads the marks a session carried into annotations the editor can place.
+//
+// The wire shape is the one `marksDocument` writes and the editor's own result
+// uses, so the two directions are one protocol read from either end.  A mark
+// that cannot be rebuilt -- an unknown tool, a missing field, a rectangle off
+// the canvas -- fails the whole session rather than being skipped: an editor
+// that opened with some of the user's marks silently missing is worse than one
+// that says it cannot open at all.
+bool OverlayController::parseMarks(const QJsonArray &marks, const LogicalRect &canvas,
+                                   std::uint32_t deviceRatio, QString *error)
+{
+    QVector<Annotation> restored;
+    restored.reserve(marks.size());
+    for (int index = 0; index < marks.size(); ++index) {
+        if (!marks.at(index).isObject()) {
+            if (error != nullptr) {
+                *error = QStringLiteral("mark %1 is not an object").arg(index);
+            }
+            return false;
+        }
+        Annotation annotation;
+        if (!parseMark(marks.at(index).toObject(), canvas, deviceRatio, &annotation, error)) {
+            return false;
+        }
+        restored.push_back(annotation);
+    }
+    annotations_ = std::move(restored);
+    return true;
+}
+
+// A logical rect as the wire's own object, offset by the canvas: the document is
+// relative to the selection, which is the canvas a re-edit hands back.  Written
+// flat rather than under a `rect` key, which is how a translation's two boxes
+// per line are spelled; `parseMark` reads them back through `canvasRect`.
+static QJsonObject rectJson(const LogicalRect &rect, const LogicalRect &canvas)
+{
+    QJsonObject value;
+    value.insert(QStringLiteral("x"), static_cast<qint64>(rect.x) - canvas.x);
+    value.insert(QStringLiteral("y"), static_cast<qint64>(rect.y) - canvas.y);
+    value.insert(QStringLiteral("width"), static_cast<qint64>(rect.width));
+    value.insert(QStringLiteral("height"), static_cast<qint64>(rect.height));
+    return value;
+}
+
+QJsonArray OverlayController::marksDocument() const
+{
+    return marksDocumentInto(QString());
+}
+
+QJsonArray OverlayController::writeMarkAssets(const QString &directory) const
+{
+    return marksDocumentInto(directory);
+}
+
+QJsonArray OverlayController::marksDocumentInto(const QString &directory) const
+{
+    QJsonArray marks;
+    if (!selection_.has_value()) {
+        return marks;
+    }
+    // The marks are kept in the overlay's global logical pixels; the document
+    // is relative to the selection, because the selection is the canvas a
+    // re-edit hands back.
+    const LogicalRect &canvas = *selection_;
+    int asset = 0;
+    for (const Annotation &annotation : annotations_) {
+        QJsonObject value;
+        if (annotation.kind == Annotation::Kind::Shape) {
+            value.insert(QStringLiteral("kind"), QStringLiteral("shape"));
+            value.insert(QStringLiteral("tool"), annotation.tool);
+            value.insert(QStringLiteral("color"), colorText(annotation.color));
+            value.insert(QStringLiteral("width"), static_cast<qint64>(annotation.width));
+            value.insert(QStringLiteral("dash"), annotation.dash);
+            value.insert(QStringLiteral("mask"), annotation.mask);
+            value.insert(QStringLiteral("strength"), static_cast<qint64>(annotation.strength));
+            QJsonObject rect;
+            rect.insert(QStringLiteral("x"), static_cast<qint64>(annotation.rect.x - canvas.x));
+            rect.insert(QStringLiteral("y"), static_cast<qint64>(annotation.rect.y - canvas.y));
+            rect.insert(QStringLiteral("width"), static_cast<qint64>(annotation.rect.width));
+            rect.insert(QStringLiteral("height"), static_cast<qint64>(annotation.rect.height));
+            value.insert(QStringLiteral("rect"), rect);
+        } else if (annotation.kind == Annotation::Kind::Stroke) {
+            value.insert(QStringLiteral("kind"), QStringLiteral("stroke"));
+            value.insert(QStringLiteral("tool"), annotation.tool);
+            value.insert(QStringLiteral("color"), colorText(annotation.color));
+            value.insert(QStringLiteral("width"), static_cast<qint64>(annotation.width));
+            value.insert(QStringLiteral("dash"), annotation.dash);
+            value.insert(QStringLiteral("size"), static_cast<qint64>(annotation.size));
+            value.insert(QStringLiteral("arrow_style"), annotation.arrowStyle);
+            value.insert(QStringLiteral("strength"), static_cast<qint64>(annotation.strength));
+            value.insert(QStringLiteral("amplitude"), static_cast<qint64>(annotation.amplitude));
+            value.insert(QStringLiteral("wavelength"), static_cast<qint64>(annotation.wavelength));
+            value.insert(QStringLiteral("closed"), annotation.closed);
+            value.insert(QStringLiteral("fill"), annotation.fill);
+            QJsonArray points;
+            for (const Point &point : annotation.points) {
+                QJsonObject item;
+                item.insert(QStringLiteral("x"), static_cast<qint64>(point.x - canvas.x));
+                item.insert(QStringLiteral("y"), static_cast<qint64>(point.y - canvas.y));
+                points.push_back(item);
+            }
+            value.insert(QStringLiteral("points"), points);
+        } else if (annotation.kind == Annotation::Kind::Text) {
+            const bool number = isNumberAnnotation(annotation);
+            value.insert(QStringLiteral("kind"), QStringLiteral("text"));
+            // Every text mark names its tool, not only a badge.  The reader
+            // requires one -- a mark without a `tool` is refused, and a refusal
+            // fails the whole document rather than the one mark -- so leaving it
+            // off a plain label did not merely lose the label: it made every pin
+            // carrying one impossible to reopen, marks and all.
+            value.insert(QStringLiteral("tool"), annotation.tool);
+            if (number) {
+                value.insert(QStringLiteral("numberStyle"), numberStyleValue(annotation.numberStyle));
+                value.insert(QStringLiteral("numberSize"),
+                             static_cast<qint64>(annotation.numberSize));
+            } else {
+                value.insert(QStringLiteral("textPixels"),
+                             static_cast<qint64>(annotation.textPixels));
+            }
+            QJsonObject origin;
+            origin.insert(QStringLiteral("x"), static_cast<qint64>(annotation.origin.x - canvas.x));
+            origin.insert(QStringLiteral("y"), static_cast<qint64>(annotation.origin.y - canvas.y));
+            value.insert(QStringLiteral("origin"), origin);
+            value.insert(QStringLiteral("text"),
+                         number ? QString::number(annotation.number) : annotation.text);
+            value.insert(QStringLiteral("color"), colorText(annotation.color));
+            if (!annotation.font.isEmpty()) {
+                value.insert(QStringLiteral("font"), annotation.font);
+            }
+        } else if (annotation.kind == Annotation::Kind::Image) {
+            // A pasted image is its pixels: there is no smaller form that
+            // rebuilds it, so the pixels travel.  They are written beside the
+            // session and named by path -- a pasted screenshot is megabytes, and
+            // this document goes over a newline-delimited socket to the daemon,
+            // where inline data would be a single enormous line.
+            //
+            // Without a directory to write into the mark is left out, which is
+            // what a caller that only wants the geometry gets.
+            const QString path = writeMarkAsset(directory, annotation, &asset);
+            if (path.isEmpty()) {
+                continue;
+            }
+            value.insert(QStringLiteral("kind"), QStringLiteral("image"));
+            value.insert(QStringLiteral("tool"), annotation.tool);
+            value.insert(QStringLiteral("pixels"), path);
+            // The pixels' own size, which is not the rect's: the rect is where
+            // the image is placed and how much it was scaled to fit, and the
+            // reader needs both to rebuild the mark and to resize it later
+            // without going back through a scaled copy.
+            value.insert(QStringLiteral("pixel_width"),
+                         static_cast<qint64>(annotation.pixels.width()));
+            value.insert(QStringLiteral("pixel_height"),
+                         static_cast<qint64>(annotation.pixels.height()));
+            QJsonObject rect;
+            rect.insert(QStringLiteral("x"), static_cast<qint64>(annotation.rect.x - canvas.x));
+            rect.insert(QStringLiteral("y"), static_cast<qint64>(annotation.rect.y - canvas.y));
+            rect.insert(QStringLiteral("width"), static_cast<qint64>(annotation.rect.width));
+            rect.insert(QStringLiteral("height"), static_cast<qint64>(annotation.rect.height));
+            value.insert(QStringLiteral("rect"), rect);
+        } else if (annotation.kind == Annotation::Kind::Translation) {
+            // A translation is its lines, which are numbers and strings and
+            // travel in the document itself; it needs no asset.  It is written
+            // as its own kind so the reader can tell it from a shape, and its
+            // boxes are relative to the canvas like every other rect.
+            value.insert(QStringLiteral("kind"), QStringLiteral("translation"));
+            value.insert(QStringLiteral("tool"), annotation.tool);
+            if (!annotation.font.isEmpty()) {
+                value.insert(QStringLiteral("font"), annotation.font);
+            }
+            QJsonArray lines;
+            for (const TranslatedLine &line : annotation.translation) {
+                QJsonObject entry;
+                entry.insert(QStringLiteral("source"), rectJson(line.source, canvas));
+                entry.insert(QStringLiteral("fill"), rectJson(line.fill, canvas));
+                entry.insert(QStringLiteral("text"), line.text);
+                entry.insert(QStringLiteral("family"), line.family);
+                entry.insert(QStringLiteral("font_pixels"), static_cast<qint64>(line.fontPixels));
+                entry.insert(QStringLiteral("background"), colorText(line.background));
+                entry.insert(QStringLiteral("text_color"), colorText(line.textColor));
+                lines.push_back(entry);
+            }
+            value.insert(QStringLiteral("lines"), lines);
+            QJsonObject rect;
+            rect.insert(QStringLiteral("x"), static_cast<qint64>(annotation.rect.x - canvas.x));
+            rect.insert(QStringLiteral("y"), static_cast<qint64>(annotation.rect.y - canvas.y));
+            rect.insert(QStringLiteral("width"), static_cast<qint64>(annotation.rect.width));
+            rect.insert(QStringLiteral("height"), static_cast<qint64>(annotation.rect.height));
+            value.insert(QStringLiteral("rect"), rect);
+        } else {
+            continue;
+        }
+        marks.push_back(value);
+    }
+    return marks;
+}
+
+// One mark's pixels as a file in `directory`, or an empty string when there is
+// nowhere to write them.  The name is built from the mark's own place in the
+// document rather than from its content: two identical pastes are two marks, and
+// naming them by content would make one file serve both and lose the fact that
+// they are separate things the user can move apart.
+QString OverlayController::writeMarkAsset(const QString &directory, const Annotation &annotation,
+                                          int *counter) const
+{
+    if (directory.isEmpty() || annotation.pixels.isNull() || counter == nullptr) {
+        return QString();
+    }
+    const QString name = QStringLiteral("mark-%1.png").arg(++*counter);
+    const QString path = QDir(directory).filePath(name);
+    if (!annotation.pixels.save(path, "PNG")) {
+        return QString();
+    }
+    return path;
+}
+
+bool OverlayController::produceComposite(QImage *composite, QImage *marks, QString *error) const
+{
+    const auto fail = [error](const QString &message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+        return false;
+    };
+    if (composite == nullptr) {
+        return fail(uiTr("There is nowhere to put the rendered capture."));
+    }
+    if (!selection_.has_value()) {
+        // A picking session never frames anything, and a cancelled one has no
+        // marks worth rendering: neither is a failure.
+        return false;
+    }
+    const int index = outputContaining(*selection_);
+    if (index < 0 || index >= session_.outputs.size()) {
+        return fail(uiTr("The selection is on no output."));
+    }
+    const OutputSession &output = session_.outputs.at(index);
+    if (output.image.isNull()) {
+        return fail(uiTr("The captured frame is not available."));
+    }
+    const double density = outputScale(output);
+    // The same crop the translate mode writes: the selection in the output's
+    // own device pixels, which is the size the result is.
+    const QRect source = sourceRect(output, *selection_)
+                             .intersected(QRect(0, 0, output.image.width(), output.image.height()));
+    if (source.isEmpty()) {
+        return fail(uiTr("The selection has no pixels on this output."));
+    }
+    const QImage crop = output.image.copy(source);
+    if (crop.isNull()) {
+        return fail(uiTr("The selection's pixels could not be read."));
+    }
+    const QImage rendered = compositeAnnotations(crop, crop, *selection_, density, error);
+    if (rendered.isNull()) {
+        return false;
+    }
+    *composite = rendered;
+    if (marks != nullptr) {
+        // The marks on their own: the same painter over a transparent canvas,
+        // still reading the capture for the marks that sample it.  An opaque
+        // image cannot be composited onto the HDR half -- it would replace the
+        // light rather than mark it -- so the CLI needs the layer, not the
+        // flattened result.
+        //
+        // Cleared explicitly: a `QImage` built from a size alone owns
+        // uninitialized bytes, and a layer that started as whatever the last
+        // allocation held would composite a translucent mark over noise.
+        QImage blank(crop.size(), QImage::Format_ARGB32_Premultiplied);
+        if (blank.isNull()) {
+            return fail(uiTr("The capture's pixels could not be converted for drawing."));
+        }
+        blank.fill(Qt::transparent);
+        const QImage layer =
+            compositeAnnotations(blank, crop, *selection_, density, error);
+        if (layer.isNull()) {
+            return false;
+        }
+        *marks = layer;
+    }
+    return true;
 }
 
 void OverlayController::paintLiveStroke(QPainter *painter, const OutputSession &output,
@@ -10529,8 +11336,9 @@ void OverlayController::paintLiveStroke(QPainter *painter, const OutputSession &
         return;
     }
     const bool brush = tool_ == Tool::Mosaic;
-    const int widthLogical = std::max(1, static_cast<int>(toolStyle(toolName(tool_)).width));
-    const int scale = static_cast<int>(output.scale > 0 ? output.scale : 1);
+    const QString liveTool = tool_.has_value() ? toolName(*tool_) : QStringLiteral("pen");
+    const int widthLogical = std::max(1, static_cast<int>(toolStyle(liveTool).width));
+    const double scale = outputScale(output);
     const double deviceRadius = brush
         ? std::clamp(brushRadiusForStrength(
                          mosaicStrength_,
@@ -10549,9 +11357,9 @@ void OverlayController::paintLiveStroke(QPainter *painter, const OutputSession &
     {
         QDataStream stream(&key, QIODevice::WriteOnly);
         const LogicalRect &surface = surfaceOf(output);
-        const ToolStyle &liveStyle = toolStyle(toolName(tool_));
+        const ToolStyle &liveStyle = toolStyle(liveTool);
         stream << size.width() << size.height() << output.id << output.scale << surface.x
-               << surface.y << surface.width << surface.height << toolName(tool_)
+               << surface.y << surface.width << surface.height << liveTool
                << static_cast<quint32>(liveStyle.color.rgba()) << liveStyle.width << currentDash_
                << mosaicStrength_ << mosaicShape_ << ratio;
     }
@@ -10672,10 +11480,18 @@ void OverlayController::drawLoupe(CaptureOverlay *overlay, QPainter *painter)
 {
     const OutputSession &output = overlay->output();
     const QPointF local = localPoint(output, pointer_, overlay->size());
-    const std::uint32_t scale = output.scale > 0 ? output.scale : 1;
-    const int sourceWidth = static_cast<int>(output.image.width());
-    const int sourceHeight = static_cast<int>(output.image.height());
-    if (sourceWidth <= 0 || sourceHeight <= 0) {
+    // The loupe reads the *picture*: the capture with the marks the user has
+    // already made painted onto it.  Reading the bare frame -- as this once did
+    // -- made the magnifier the one place on screen that disagreed with
+    // everything else, which is the opposite of what it is for: it is a
+    // pixel-level reading of what is being annotated, so a mark that is on the
+    // screen has to be in it.  The frame is still what the sample is *taken*
+    // from in the sense that matters -- the composite is a copy of it, never
+    // the frame itself, so nothing here can reach the saved picture.
+    const QImage *frame = loupeFrame(output);
+    const int sourceWidth = frame != nullptr ? frame->width() : output.image.width();
+    const int sourceHeight = frame != nullptr ? frame->height() : output.image.height();
+    if (sourceWidth <= 0 || sourceHeight <= 0 || frame == nullptr) {
         return;
     }
     // The magnifier samples the *image*, so it has to count from where the image
@@ -10684,12 +11500,45 @@ void OverlayController::drawLoupe(CaptureOverlay *overlay, QPainter *painter)
     // stale one made the loupe show the wrong part of the picture while a pin
     // was being dragged -- the "scrambled magnifier".
     const LogicalRect &image = pinEdit_ && marksOrigin_.has_value() ? *marksOrigin_ : output.geometry;
-    const int centerX = std::clamp(
-        static_cast<int>(std::floor((pointer_.x - image.x) * static_cast<double>(scale))), 0,
-        sourceWidth - 1);
-    const int centerY = std::clamp(
-        static_cast<int>(std::floor((pointer_.y - image.y) * static_cast<double>(scale))), 0,
-        sourceHeight - 1);
+    // The frame holds device pixels and the pointer is in logical ones, so the
+    // offset has to cross the output's scale -- the number it is, not a rounded
+    // one: the pin editor's output is zoomed, and a scale truncated to 0 would
+    // pin every sample to the frame's first pixel.
+    const double scale = outputScale(output);
+    // A region capture's frame is the *whole* frozen output, not the selection
+    // the user framed, so counting from the output's origin alone would let the
+    // loupe read the desktop beside the capture.  What the magnifier is for is
+    // the pixels of the picture being annotated, so the sample is held inside
+    // that picture: a cursor past its edge reads the edge pixel, which is the
+    // same thing the loupe does at the frame's own border.  In the pin editor
+    // the frame *is* the picture, and the two are the same rect.
+    //
+    // Only a *committed* picture bounds the sample.  While the user is still
+    // framing the selection, `selection_` is the rect being dragged into
+    // existence -- a press and a move to the same point leaves it one pixel
+    // across -- and holding the loupe inside that would pin every sample to a
+    // single pixel for the whole drag, which is the one time the magnifier is
+    // read most.  Until the selection is made, the frame is the picture.
+    const bool bounded = !pinEdit_ && editing_ && selection_.has_value();
+    const LogicalRect &picture = bounded ? *selection_ : image;
+    const int minX = std::clamp(static_cast<int>(std::floor((picture.x - image.x) * scale)), 0,
+                                sourceWidth - 1);
+    const int minY = std::clamp(static_cast<int>(std::floor((picture.y - image.y) * scale)), 0,
+                                sourceHeight - 1);
+    const int maxX = std::clamp(
+        static_cast<int>(std::ceil((picture.x + static_cast<std::int64_t>(picture.width) - image.x) *
+                                   scale)) -
+            1,
+        minX, sourceWidth - 1);
+    const int maxY = std::clamp(
+        static_cast<int>(std::ceil((picture.y + static_cast<std::int64_t>(picture.height) - image.y) *
+                                   scale)) -
+            1,
+        minY, sourceHeight - 1);
+    const int centerX =
+        std::clamp(static_cast<int>(std::floor((pointer_.x - image.x) * scale)), minX, maxX);
+    const int centerY =
+        std::clamp(static_cast<int>(std::floor((pointer_.y - image.y) * scale)), minY, maxY);
     const qreal radius = kLoupeDiameter / 2.0;
 
     QPointF center = local + QPointF(radius * 1.1, radius * 1.1);
@@ -10714,7 +11563,7 @@ void OverlayController::drawLoupe(CaptureOverlay *overlay, QPainter *painter)
     // is underneath, which is the "scrambled magnifier".  Replicating the edge
     // pixels instead keeps the cursor's pixel dead centre and the whole circle
     // filled, which is the one thing the magnifier is read for.
-    const QImage crop = loupeCrop(output.image, centerX, centerY);
+    const QImage crop = loupeCrop(*frame, centerX, centerY);
     painter->drawImage(QRectF(center.x() - radius, center.y() - radius, 2.0 * radius,
                               2.0 * radius),
                        crop);

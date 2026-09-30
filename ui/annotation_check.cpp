@@ -1333,11 +1333,90 @@ void checkInteractiveUpdateCoversTheChange()
                .arg(shifted.y));
 }
 
+// The right button brings the magnifier up *without* ending the drag that is
+// already under way.  It is how the user aims at a pixel while drawing -- the
+// preview follows the cursor, and the loupe rides alongside it -- so a step
+// that carried both buttons has to serve both.  It used to return as soon as
+// the loupe had been moved, which swallowed every step of the gesture: the
+// preview froze at the point the right button went down and only caught up
+// once it was released and the pointer moved again.
+void checkTheMagnifierDoesNotFreezeTheDragUnderIt()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+
+    // A rectangle being drawn, with the right button joining mid-drag.
+    controller.chooseTool(vshot::Tool::Rectangle);
+    // The picture before anything is drawn on it, so "the preview is here" can
+    // be read as "these pixels are not what the capture alone shows".
+    QImage clean(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &clean);
+
+    controller.press(overlay, QPointF(60, 60), Qt::LeftButton, Qt::NoModifier);
+    controller.move(overlay, QPointF(140, 120), Qt::LeftButton, Qt::NoModifier);
+    expect(!overlay->colorPickerVisible(), "the picker is not up before the right button goes down");
+
+    controller.press(overlay, QPointF(140, 120), Qt::RightButton, Qt::NoModifier);
+    expect(overlay->colorPickerVisible(), "the right button brings the picker up");
+
+    // Both buttons down: the preview has to keep following the cursor, and the
+    // step has to cover the ground between the two places it draws.
+    const Qt::MouseButtons both = Qt::LeftButton | Qt::RightButton;
+    expectStepCoveredBy(
+        controller, overlay,
+        [&] { controller.move(overlay, QPointF(200, 160), both, Qt::NoModifier); },
+        "a move with the magnifier up still invalidates where the preview drew");
+    expectStepCoveredBy(
+        controller, overlay,
+        [&] { controller.move(overlay, QPointF(260, 200), both, Qt::NoModifier); },
+        "a growing preview under the magnifier invalidates where it drew");
+
+    // And the preview really did follow the cursor.  Read from the frame *now*,
+    // not from what the release commits: a release that commits the cursor's
+    // own position papers over a preview that stood still for the whole drag,
+    // and that is exactly the bug.  The corner the pointer last sat on has ink
+    // on it, and it is far enough from the loupe -- which hangs off the cursor
+    // by more than its own radius -- that none of the disc can account for it.
+    QImage live(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &live);
+    int ink = 0;
+    for (int dy = -3; dy <= 3; ++dy) {
+        for (int dx = -3; dx <= 3; ++dx) {
+            const int x = 260 + dx;
+            const int y = 200 + dy;
+            if (x < 0 || y < 0 || x >= live.width() || y >= live.height()) {
+                continue;
+            }
+            if (live.pixel(x, y) != clean.pixel(x, y)) {
+                ++ink;
+            }
+        }
+    }
+    expect(ink > 0, "the preview reached the corner the cursor was on",
+           QStringLiteral("%1 of 49 pixels at 260,200 carry ink").arg(ink));
+
+    controller.release(overlay, QPointF(260, 200), Qt::RightButton, Qt::NoModifier);
+    controller.release(overlay, QPointF(260, 200), Qt::LeftButton, Qt::NoModifier);
+    expect(controller.annotations().size() == 1, "the rectangle lands as one annotation",
+           QString::number(controller.annotations().size()));
+}
+
 // The wave's document form is the line's: `kind=stroke` with `tool=wave` and
-// exactly the two points the drag made.  The Rust reader parses the wave from
-// those two points and derives the crests itself, so a third point -- or any
-// name but `wave` -- would be read as a different mark and the preview would
-// stop matching the baked PNG.
+// exactly the two points the drag made.  A reader rebuilds the wave from those
+// two points and derives the crests itself, so a third point -- or any name but
+// `wave` -- would come back as a different mark.
 void checkWaveSerializesAsATwoPointStroke()
 {
     QScreen *screen = QGuiApplication::primaryScreen();
