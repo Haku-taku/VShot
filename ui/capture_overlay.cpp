@@ -10355,19 +10355,21 @@ protected:
 
     // The key prefix every kind shares: the output the pixels were rasterized
     // against and the surface size they were rasterized for.
+    //
+    // `output.geometry` is deliberately *not* here.  The mosaic and the mosaic
+    // brush sample the source image through it, so it does belong in their keys
+    // -- but in their own, as an offset from the mark, which is what actually
+    // decides which pixels they average.  Putting it here keyed every mark on
+    // where the frame happened to sit: `applyPinRect` rewrites `geometry` on
+    // every daemon confirmation, so dragging a pin invalidated and fully
+    // re-rasterized every mark on it, once per motion event.  A plain shape's
+    // pixels depend only on its own size and style, and a translation moves the
+    // mark and the geometry together, so the difference is what stays constant.
     static void writeContext(QDataStream &stream, const OutputSession &output, const QSize &size)
     {
         const LogicalRect &surface = surfaceOf(output);
-        // The mosaic and the mosaic brush average the source image, and both
-        // locate their samples through `geometry` rather than `surface`, so a
-        // raster of either is only valid for the frame and the geometry it was
-        // built from.  Neither changes within a session today, but leaving them
-        // out of the key would freeze such a mark on stale pixels the moment
-        // one does.
         stream << size.width() << size.height() << output.id << output.scale << surface.x
-               << surface.y << surface.width << surface.height << output.geometry.x
-               << output.geometry.y << output.geometry.width << output.geometry.height
-               << output.image.cacheKey();
+               << surface.y << surface.width << surface.height << output.image.cacheKey();
     }
 
 private:
@@ -10405,11 +10407,14 @@ protected:
         // A plain shape's pixels depend only on its size and style, so a pure
         // translation leaves the cached raster valid and the blit lands it at
         // the new place.  The area mosaic instead averages the source image at
-        // its absolute position, so a move changes every block it draws and its
-        // top-left has to stay part of the key.
+        // its absolute position, so a move changes every block it draws and
+        // where it sits has to stay part of the key.  It is keyed on the rect's
+        // offset *from the frame*, which is what the sampling reads: translating
+        // a mark and the frame together -- what dragging a pin does -- leaves
+        // the offset, and so the pixels, alone.
         if (annotation.tool == QStringLiteral("mosaic")) {
-            stream << static_cast<qint64>(annotation.rect.x)
-                   << static_cast<qint64>(annotation.rect.y);
+            stream << static_cast<qint64>(annotation.rect.x) - output.geometry.x
+                   << static_cast<qint64>(annotation.rect.y) - output.geometry.y;
         }
         stream << static_cast<quint64>(annotation.rect.width)
                << static_cast<quint64>(annotation.rect.height);
@@ -10469,9 +10474,12 @@ protected:
                << annotation.amplitude << annotation.wavelength << annotation.fill;
         if (annotation.tool == QStringLiteral("mosaic")) {
             // The freehand mosaic brush averages the source image under the
-            // path, so every point's absolute position has to stay in the key.
+            // path, so every point's position relative to the frame has to stay
+            // in the key -- relative, so that translating the mark and the frame
+            // together leaves the sampled pixels alone.
             for (const Point &point : annotation.points) {
-                stream << point.x << point.y;
+                stream << (static_cast<qint64>(point.x) - output.geometry.x)
+                       << (static_cast<qint64>(point.y) - output.geometry.y);
             }
         } else {
             // A stroke's pixels depend only on the shape of its path, not on
@@ -10711,8 +10719,13 @@ protected:
         QByteArray data;
         QDataStream stream(&data, QIODevice::WriteOnly);
         writeContext(stream, output, size);
-        stream << annotation.pixels.cacheKey() << static_cast<qint64>(annotation.rect.x)
-               << static_cast<qint64>(annotation.rect.y)
+        // The pasted pixels are drawn at the mark's rect, so what the raster
+        // holds depends on where that rect sits *within the frame*, not on where
+        // the frame itself is: a pin drag moves the mark and the geometry
+        // together and leaves the pixels alone.
+        stream << annotation.pixels.cacheKey()
+               << static_cast<qint64>(annotation.rect.x) - output.geometry.x
+               << static_cast<qint64>(annotation.rect.y) - output.geometry.y
                << static_cast<quint64>(annotation.rect.width)
                << static_cast<quint64>(annotation.rect.height);
         return data;
@@ -10755,11 +10768,17 @@ protected:
         writeContext(stream, output, size);
         stream << annotation.font << annotation.translation.size();
         for (const TranslatedLine &line : annotation.translation) {
-            stream << static_cast<qint64>(line.source.x) << static_cast<qint64>(line.source.y)
+            // The lines are drawn where they sit in the frame, so the key holds
+            // their offsets from it -- a pin drag translates the lines and the
+            // geometry by the same amount and the pixels do not change.
+            stream << static_cast<qint64>(line.source.x) - output.geometry.x
+                   << static_cast<qint64>(line.source.y) - output.geometry.y
                    << static_cast<quint64>(line.source.width)
                    << static_cast<quint64>(line.source.height) << line.text << line.family
-                   << line.fontPixels << static_cast<quint32>(line.fill.x)
-                   << static_cast<quint32>(line.fill.y) << static_cast<quint32>(line.fill.width)
+                   << line.fontPixels
+                   << (static_cast<qint64>(line.fill.x) - output.geometry.x)
+                   << (static_cast<qint64>(line.fill.y) - output.geometry.y)
+                   << static_cast<quint32>(line.fill.width)
                    << static_cast<quint32>(line.fill.height)
                    << static_cast<quint32>(line.background.rgba())
                    << static_cast<quint32>(line.textColor.rgba());
