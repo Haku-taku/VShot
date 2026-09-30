@@ -4,11 +4,15 @@
 #pragma once
 
 #include <QImage>
+#include <QJsonArray>
 #include <QJsonObject>
+#include <QJsonValue>
 #include <QString>
 #include <QVector>
 
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <optional>
 
 namespace vshot {
@@ -33,7 +37,12 @@ struct OutputSession {
     // editor widens it to the whole output so the toolbar can float beside the
     // pinned image instead of on top of it.
     LogicalRect surface;
-    std::uint32_t scale = 0;
+    // Device pixels per logical pixel of this output: a whole number for a real
+    // output (1, 2, ...), but not for the pin editor's virtual one, where it is
+    // the zoom the pinned image is shown at -- 160 pixels across a 176-logical-
+    // pixel window is 0.909. Rounding that to a whole number is what made the
+    // editor refuse a zoomed pin's session, so the ratio is carried as it is.
+    double scale = 0.0;
     std::uint32_t pixelWidth = 0;
     std::uint32_t pixelHeight = 0;
     QString path;
