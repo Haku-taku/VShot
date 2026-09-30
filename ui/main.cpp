@@ -254,16 +254,30 @@ int main(int argc, char **argv)
             // because the desktop it runs on is live.
             controller.beginPresetEdit();
             controller.enableCandidateRefresh();
+            // The keyboard walks a cursor of its own, and the pointer the
+            // compositor draws is not it.  Only the CLI on the other end of
+            // this pipe can move that one -- it holds the injection backends --
+            // so the walk asks, and this says there is someone to ask.  The
+            // test is what tells a CLI from a terminal: a helper run by hand
+            // writes its result to stdout, and a request written into the same
+            // stream would be printed among it as garbage.
+            if (!::isatty(STDOUT_FILENO)) {
+                controller.enablePointerWarp();
+            }
             app.exec();
             if (!controller.isFinished()) {
                 controller.cancel();
             }
-            QString resultError;
-            result = controller.resultDocument(QFileInfo(sessionPath).absolutePath(),
-                                               &resultError);
-            if (result.isNull() && !resultError.isEmpty()) {
-                reportError(resultError);
-                exitCode = 1;
+            // The handoff already wrote the result and sent the rendered pixels
+            // over the pixel channel; there is nothing left to say, and asking
+            // again would send the capture a second time.
+            if (!controller.resultSent()) {
+                QString resultError;
+                result = controller.resultDocument(&resultError);
+                if (result.isNull() && !resultError.isEmpty()) {
+                    reportError(resultError);
+                    exitCode = 1;
+                }
             }
         }
     }

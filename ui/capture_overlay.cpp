@@ -105,10 +105,34 @@ constexpr int kCandidateRefreshIntervalMs = 150;
 // seeing an event, and the highlight must not keep describing what used to be
 // there.  Only the picker's lifetime pays for this.
 constexpr int kCandidateRefreshPollMs = 300;
+// How often a walk of the keyboard cursor may ask the CLI to move the real
+// pointer.  Every request is a pipe write, a process round trip and a
+// compositor call, and a held key repeats far faster than that; the editor's
+// own cursor still moves on every repeat, so this is only how far the arrow on
+// the screen lags behind the loupe.  Short enough that a few taps look
+// immediate.
+constexpr int kPointerWarpIntervalMs = 40;
+// How long after a keyboard walk a pointer motion is still read as the echo of
+// that walk rather than as the user taking the pointer back.  VShot moves the
+// pointer by asking the compositor, and the compositor reports the result as an
+// ordinary motion event -- which arrives after the step that asked for it, so a
+// handler that treated it as "the user moved the mouse" would end the magnifier
+// flash the step had just raised, every step, and the loupe would blink.  The
+// distance test below is what separates the two in practice; this is the window
+// it is applied in, and it has to be wider than the warp throttle so a step
+// held back by it is still recognised when it finally goes out.
+constexpr qint64 kPointerWarpEchoMs = 250;
 // How many pin moves may be written before the daemon answers the first.  More
 // than one keeps it from idling between replies; the position is absolute and
 // only the newest matters, so the queue never needs to be long.
 constexpr int kPinMovesInFlight = 3;
+// How long the editor keeps drawing after it has asked to be let go.  The CLI
+// holds its answer until the daemon says the picture the editor is drawing is
+// on the screen, and the daemon has its own deadline for a surface that never
+// draws one; this is the backstop for the CLI itself being gone, which has
+// nothing to answer with.  Comfortably past the daemon's own wait, so it never
+// cuts a real handoff short.
+constexpr int kHandoffWaitMs = 600;
 constexpr int kMaxUndoSteps = 100;
 constexpr int kLoupeRadius = 7;
 constexpr int kLoupeZoom = 8;
@@ -7611,10 +7635,126 @@ void OverlayController::applySelectionMove(LogicalRect origin, Point anchor, Poi
     selection_ = moved;
 }
 
+// The editor has drawn everything it is going to draw, and asks to be let go.
+//
+// It does not stop here.  A session that rendered a capture is showing that
+// capture, and the caller has not been told about it yet -- for a pin, the
+// pixels the daemon is about to show come from a result this process has not
+// even written.  The two pictures have to overlap or the user sees the marks
+// blink out between them, so the editor asks the CLI to put its capture where
+// it belongs first, and keeps drawing until it is answered.
+//
+// The ask carries the session's whole answer -- the result JSON and, over the
+// pixel channel, the rendered capture -- written before the request so the CLI
+// has both by the time it reads the request.  What the CLI does with them is
+// its own business: for a pin it hands them to the daemon with an ask that
+// holds the daemon's answer until the pin's own frame is on the screen, and for
+// everything else it writes them out and answers at once.
+//
+// Answered by a line on stdin, by the pipe closing, or by the backstop: the
+// session must not be able to outlive the request.  A helper run by hand -- or
+// by a check -- has no CLI on the other end of this pipe, so there is nothing
+// to hand over to and nothing to wait for; it quits, as it always did.
+void OverlayController::beginHandoff()
+{
+    // The same test the pointer walk uses to tell a CLI from a terminal.
+    if (::isatty(STDOUT_FILENO)) {
+        QCoreApplication::quit();
+        return;
+    }
+    QString resultError;
+    const QJsonDocument result = resultDocument(&resultError);
+    if (result.isNull() && !resultError.isEmpty()) {
+        // Nothing to hand over, and the CLI's own read of the result would
+        // report the same thing; saying it here leaves the reason on stderr
+        // instead of in a half-written answer.
+        std::fprintf(stderr, "vshot-qt-ui: %s\n", resultError.toUtf8().constData());
+        QCoreApplication::quit();
+        return;
+    }
+    const QByteArray encoded = result.toJson(QJsonDocument::Compact);
+    std::fwrite(encoded.constData(), 1, static_cast<std::size_t>(encoded.size()), stdout);
+    std::fputc('\n', stdout);
+    std::fflush(stdout);
+    resultSent_ = true;
+    const int flags = ::fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (flags >= 0) {
+        ::fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+    }
+    // Any line at all is the answer: the CLI has nothing to tell the editor
+    // beyond "it is done", and a refusal still means it is done with the
+    // editor.  A pipe that closes means the same thing -- the CLI is gone, so
+    // nothing is coming.
+    handoffReader_ = new QSocketNotifier(STDIN_FILENO, QSocketNotifier::Read, this);
+    QObject::connect(handoffReader_, &QSocketNotifier::activated, handoffReader_, [this] {
+        char buffer[256];
+        const ssize_t got = ::read(STDIN_FILENO, buffer, sizeof(buffer));
+        if (got <= 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            QCoreApplication::quit();
+            return;
+        }
+        if (got > 0) {
+            QCoreApplication::quit();
+        }
+    });
+    handoffClock_.start();
+    handoffTimer_ = new QTimer(this);
+    handoffTimer_->setSingleShot(true);
+    QObject::connect(handoffTimer_, &QTimer::timeout, this, [this] { QCoreApplication::quit(); });
+    // The backstop for a CLI that never answers at all.  The CLI waits on the
+    // daemon, which has its own deadline, so this only fires when something in
+    // between has gone; without it the editor would keep drawing for ever.
+    handoffTimer_->start(kHandoffWaitMs);
+    writeCliRequest(QByteArrayLiteral("{\"request\":\"release\"}\n"));
+}
+
+// Whether the session rendered a capture of its own, which is what has to be
+// on the screen before this process may stop; see `beginHandoff`.
+bool OverlayController::rendersCapture() const
+{
+    return pixelChannelAvailable() && selection_.has_value();
+}
+
 void OverlayController::setPinTarget(std::uint64_t pinId, const QString &socketPath)
 {
     pinId_ = pinId;
     pinSocketPath_ = socketPath;
+    // Connected now rather than at the first drag.  The daemon says which pin is
+    // the live one on every connection it accepts, and the editor draws the
+    // image's frame from that answer -- waiting for the user to move something
+    // before asking would leave the frame off until then, and leave the answer
+    // to a report racing the connection that carries it.
+    if (pinId_ != 0 && !pinSocketPath_.isEmpty()) {
+        openPinSocket();
+    }
+}
+
+// The daemon's answer to "which pin is the live one".  A pin is live while this
+// editor's own surface holds the keyboard and the pointer is over it; the
+// moment the user clicks away, another pin takes both and the daemon says so.
+//
+// The editor's frame is the only thing this changes.  The marks, the input
+// region and the drag are all about the edit, which is still open, and taking
+// them away because the pointer went elsewhere would end an edit the user never
+// ended.
+void OverlayController::notePinActive(std::uint64_t pinId)
+{
+    const bool active = pinId != 0 && pinId == pinId_;
+    if (active == pinActive_) {
+        return;
+    }
+    pinActive_ = active;
+    // Exactly the frame's own band, so losing it costs one stroke's worth of
+    // pixels rather than the whole output.
+    if (marksOrigin_.has_value()) {
+        const LogicalRect band = *marksOrigin_;
+        const std::int32_t reach = 2;
+        invalidateLogicalRegion(LogicalRect{band.x - reach, band.y - reach,
+                                            band.width + 2 * reach,
+                                            band.height + 2 * reach});
+    } else {
+        repaintEverything();
+    }
 }
 
 // Sends the pin's new top-left (global logical pixels) to the daemon that owns
@@ -9846,6 +9986,16 @@ void OverlayController::terminal(bool cancelled)
     // starting point.
     hideToolbar();
     removeTextEditor();
+    // A session that rendered a capture is still showing it, and the caller
+    // does not have those pixels yet.  Stopping now would take the picture off
+    // the screen before the caller's own copy of it is up -- for a pin, before
+    // the pin exists at all -- which the user sees as the marks blinking out.
+    // So the surface stays, showing the same picture, until the handoff above
+    // says the caller is done with it.
+    if (!cancelled && rendersCapture()) {
+        beginHandoff();
+        return;
+    }
     if (terminalCallback_) {
         terminalCallback_();
     }

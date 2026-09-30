@@ -116,11 +116,16 @@ int runPinEdit(const QString &sessionPath)
     }
 
     // The helper already reports the pin image's final rect as the selection:
-    // the daemon repositions the pin there and renders the annotations
-    // relative to it, so nothing needs rewriting here.
+    // the daemon repositions the pin there and draws the marks relative to it,
+    // so nothing needs rewriting here.  The handoff wrote the result and sent
+    // the rendered pixels while the surface was still up, so there is nothing
+    // left to say -- asking again would send the capture a second time.
+    if (controller.resultSent()) {
+        return 0;
+    }
     QJsonDocument result;
     QString resultError;
-    result = controller.resultDocument(QFileInfo(sessionPath).absolutePath(), &resultError);
+    result = controller.resultDocument(&resultError);
     if (result.isNull() && !resultError.isEmpty()) {
         reportError(resultError);
         return 1;

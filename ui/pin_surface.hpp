@@ -153,6 +153,19 @@ public:
     {
         activeReported_ = std::move(callback);
     }
+    // Fires once per frame this surface actually puts on the screen, after the
+    // compositor has taken the buffer.  This is the only moment a client can
+    // know that something it drew is visible rather than merely queued, which
+    // is what a handoff that must not show a gap has to wait for -- the pin
+    // editor leaving while the pin it was drawing appears.  A no-op until the
+    // surface has a window to watch.
+    void setPaintedCallback(std::function<void()> callback)
+    {
+        painted_ = std::move(callback);
+    }
+    // Asks for the compositor's next frame callback, so `setPaintedCallback`
+    // fires once the frame being composed now has been presented.
+    void requestPainted();
     void setDragCallback(std::function<void(quint64, QPoint)> callback)
     {
         dragMoved_ = std::move(callback);
@@ -205,6 +218,7 @@ public:
 
 protected:
     bool event(QEvent *event) override;
+    bool eventFilter(QObject *watched, QEvent *event) override;
     void paintEvent(QPaintEvent *event) override;
     void enterEvent(QEnterEvent *event) override;
     void leaveEvent(QEvent *event) override;
@@ -352,11 +366,17 @@ private:
     QScreen *screen_;
     std::function<void(quint64)> picked_;
     std::function<void(quint64)> activeReported_;
+    // Called on every frame this surface swaps in; see `setPaintedCallback`.
+    std::function<void()> painted_;
+    // Whether the frame callback has been hooked up, so it is connected once.
+    bool frameWatch_ = false;
     std::function<void(quint64, QPoint)> dragMoved_;
     std::function<void(quint64, double)> zoomRequested_;
     std::function<void(quint64)> closeRequested_;
     std::function<void(quint64)> editRequested_;
+    std::function<void(quint64)> resetZoomRequested_;
     std::function<bool(quint64, const QString &)> copyRequested_;
+    std::function<bool(quint64)> copyImageRequested_;
     std::function<void(quint64)> saveRequested_;
     std::function<void(quint64)> recognizeRequested_;
 

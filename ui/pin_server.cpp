@@ -43,6 +43,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -284,6 +285,14 @@ void respond(QLocalSocket *socket, const QJsonObject &payload)
 // lets the next pin command spawn a fresh daemon. The grace period serves a
 // concurrent add (or a reply still in flight) before quitting.
 constexpr int kIdleQuitMs = 500;
+
+// How long a reply that waits for a presented frame is held before it is sent
+// anyway.  The repaint it reports has already been committed when the callback
+// is asked for, so the answer is one frame away; past this, the surface is not
+// going to draw one at all -- an output with nothing visible on it, a
+// compositor that never calls back -- and the client is answered rather than
+// left waiting on a frame that is not coming.
+constexpr int kFrameWaitMs = 250;
 
 constexpr double kMinScale = 0.1;
 constexpr double kMaxScale = 8.0;
@@ -1207,6 +1216,10 @@ private:
     static constexpr int kSocketWaitMs = 2000;
     static constexpr int kConnectWaitMs = 1000;
     static constexpr int kMappedWaitMs = 2000;
+    // How long the answer to one stack is waited for before the request that
+    // caused it is answered without it.  A helper composing a full 4K output
+    // takes a fraction of this; past it, the helper is not refusing but slow.
+    static constexpr int kReplyWaitMs = 400;
 
     QString program_;
     QString socketPath_;
@@ -1242,6 +1255,14 @@ public:
                 QCoreApplication::quit();
             }
         });
+        // The backstop for a held reply: a compositor that never hands back a
+        // frame callback must not leave a client waiting for ever.  The wait is
+        // short because a frame is what it is waiting for -- the repaint was
+        // committed before the callback was asked for, so the answer is one
+        // frame away or the surface is not going to draw one at all.
+        frameDeadline_ = new QTimer(this);
+        frameDeadline_->setSingleShot(true);
+        connect(frameDeadline_, &QTimer::timeout, this, [this] { releaseHeldReplies(); });
     }
 
     void handleNewConnection()
@@ -1299,6 +1320,45 @@ public:
     }
 
 private:
+    // One answer held until the frame carrying the change it reports has been
+    // presented.  The socket is a QPointer: a client that gave up and closed
+    // while the daemon waited must not be written to.
+    struct HeldReply
+    {
+        QPointer<QLocalSocket> socket;
+        QJsonObject reply;
+    };
+
+    // A surface put a frame on the screen, so whatever the daemon was holding
+    // for that frame is now true and can be answered.
+    //
+    // Only the first frame after the answers were queued releases them: the
+    // request went out with the repaint this batch caused, and that repaint is
+    // the one the client is waiting to see.  A later frame says nothing new.
+    void framePresented()
+    {
+        if (pendingReplies_.isEmpty()) {
+            return;
+        }
+        frameDeadline_->stop();
+        const QVector<HeldReply> held = std::move(pendingReplies_);
+        pendingReplies_.clear();
+        for (const HeldReply &entry : held) {
+            if (entry.socket != nullptr) {
+                respond(entry.socket, entry.reply);
+            }
+        }
+    }
+
+    // Answers anything still held, so a compositor that never delivers a frame
+    // callback -- a surface with nothing to draw, an output that went away --
+    // cannot leave a client waiting on a reply that will never come.  The
+    // change is applied either way; only the confirmation is early.
+    void releaseHeldReplies()
+    {
+        framePresented();
+    }
+
     static QJsonObject okReply()
     {
         return QJsonObject{{QStringLiteral("ok"), true}};
@@ -1333,7 +1393,35 @@ private:
         // after the whole batch: a client that pipelines several drag positions
         // gets one repaint and one answer each, and every answer carries the
         // position that repaint actually landed on.
-        QVector<QPair<QLocalSocket *, quint64>> moved;
+        struct Moved
+        {
+            QLocalSocket *socket;
+            quint64 id;
+            // Whether this particular move asked for its answer to wait for a
+            // presented frame.  A client with more than one move in flight has
+            // to be able to tell which answer is the one that ends its handoff,
+            // so the ask is echoed in the reply.
+            bool ack;
+        };
+        QVector<Moved> moved;
+        // Adds whose HDR half only the helper can accept or refuse: they wait
+        // for the one answer that covers the stack rendered below.
+        struct Deferred
+        {
+            QLocalSocket *socket;
+            QJsonObject reply;
+            bool ack;
+        };
+        QVector<Deferred> renders;
+        // Whether anything in this batch changed the stack by adding a pin.  An
+        // add leaves nothing in `moved` -- it is not a move -- and only an add
+        // that carried an HDR half leaves anything in `renders`, so without this
+        // an ordinary add would never render: the pin would sit in the model,
+        // invisible, until some later command happened to compose the stack,
+        // which is what made an SDR pin appear only once an HDR one was pinned
+        // after it.  Set from the reply rather than from the command, because
+        // the stack is `addPin`'s to change and a refusal changes nothing.
+        bool added = false;
         qsizetype newline = -1;
         while ((newline = buffer_[socket].indexOf('\n')) >= 0) {
             const QByteArray line = buffer_[socket].left(newline);
@@ -1461,18 +1549,87 @@ private:
         if (buffer_.value(socket).isEmpty()) {
             buffer_.remove(socket);
         }
-        if (moved.isEmpty()) {
+        // Nothing to render means nothing to answer, and an add that is not
+        // waiting on the helper was already answered above.  An add that landed
+        // is the exception: it changed the stack, and the stack is rendered
+        // here, once, for the whole batch.
+        if (moved.isEmpty() && renders.isEmpty() && !added) {
             return;
         }
-        syncAll();
-        for (const auto &entry : moved) {
-            const Pin *pin = byId_.value(entry.second, nullptr);
+        // Only wait for the helper's verdict when it was actually handed a new
+        // stack.  A stack it already has is nothing for it to answer, and
+        // blocking on a reply that is never coming is a stall: it used to cost
+        // every motion event of every drag the full deadline.
+        //
+        // Whatever the helper has already said is dropped first, so the verdict
+        // read below is this stack's and not an earlier one's: `syncAll` is
+        // called from places that never read the answer -- a zoom, a show -- and
+        // their replies would otherwise be waiting in the buffer to be mistaken
+        // for this one's.
+        hdr_.discardReplies();
+        const bool handedHdr = syncAll();
+        // The stack has been handed to every surface and queued for painting;
+        // nothing is on the screen yet.  A client that asked to be told when it
+        // is -- the pin editor, which has to stop drawing without leaving a gap
+        // -- has its answer held until the compositor's own frame callback
+        // arrives, so it is released only once the picture it was drawing over
+        // is really there.  Every other client is answered at once, as before.
+        const auto answer = [this](QLocalSocket *socket, const QJsonObject &reply, bool ack) {
+            // The ask is echoed back so the client knows which of its answers
+            // is the one that waited for the frame: a move pipelined behind
+            // another gets an ordinary reply, and only this one ends a handoff.
+            QJsonObject sent = reply;
+            if (ack) {
+                sent.insert(QStringLiteral("ack"), true);
+                pendingReplies_.append({socket, sent});
+            } else {
+                respond(socket, sent);
+            }
+        };
+        for (const Moved &entry : moved) {
+            const Pin *pin = byId_.value(entry.id, nullptr);
             if (pin == nullptr) {
-                respond(entry.first,
-                        error(QStringLiteral("pin %1 no longer exists").arg(entry.second)));
+                respond(entry.socket,
+                        error(QStringLiteral("pin %1 no longer exists").arg(entry.id)));
                 continue;
             }
-            respond(entry.first, moveReply(*pin));
+            answer(entry.socket, moveReply(*pin), entry.ack);
+        }
+        // One stack was handed over, so one answer came back: the same verdict
+        // covers every add in this batch that carried an HDR half.  The pin
+        // stays pinned either way -- it still has its SDR picture, which is
+        // what the user has to look at while fixing the mismatch.
+        //
+        // Read only when there is an add to put it in.  The verdict exists to
+        // answer a client that just pinned something and needs to know the HDR
+        // half did not take; a batch of pure moves has nobody to tell, and
+        // waiting for the helper to compose before answering them is a stall on
+        // every motion event of a drag -- which is exactly what the drag cannot
+        // afford.
+        const QString refused = (handedHdr && !renders.isEmpty()) ? hdr_.refusalAfterSync()
+                                                                  : QString();
+        for (const Deferred &entry : renders) {
+            if (refused.isEmpty()) {
+                answer(entry.socket, entry.reply, entry.ack);
+            } else {
+                answer(entry.socket,
+                       error(QStringLiteral("the HDR surface helper refused the pin "
+                                            "stack: %1")
+                                 .arg(refused)),
+                       entry.ack);
+            }
+        }
+        if (!pendingReplies_.isEmpty()) {
+            // Armed after the answers are queued, so a frame landing while they
+            // are being assembled cannot release them early: the repaint this
+            // batch caused is committed by `syncAll` above, and the callback
+            // asked for here is the one that follows it.
+            for (const QPointer<PinSurface> &surface : surfaces_) {
+                if (surface != nullptr) {
+                    surface->requestPainted();
+                }
+            }
+            frameDeadline_->start(kFrameWaitMs);
         }
         if (debug_) {
             std::fprintf(stderr, "vshot-pin: %lld move(s) applied and rendered in %lld ms\n",

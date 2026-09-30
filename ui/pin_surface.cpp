@@ -564,7 +564,41 @@ bool PinSurface::event(QEvent *event)
             traceFocus(QStringLiteral("window deactivate"));
         }
     }
+    // The compositor's own frame callback, which Qt turns into an
+    // `UpdateRequest` on the window once the buffer it was armed for has been
+    // presented.  That is the only moment a client can know something it drew
+    // is on the screen rather than merely queued, and it is what the daemon
+    // waits on before it lets a handoff finish.  Installed once, on the first
+    // event with a window behind it.
+    if (event->type() == QEvent::Show && !frameWatch_) {
+        if (QWindow *window = windowHandle()) {
+            frameWatch_ = true;
+            window->installEventFilter(this);
+        }
+    }
     return QWidget::event(event);
+}
+
+bool PinSurface::eventFilter(QObject *watched, QEvent *event)
+{
+    if (event->type() == QEvent::UpdateRequest && painted_) {
+        painted_();
+    }
+    return QWidget::eventFilter(watched, event);
+}
+
+// Asks Qt for the compositor's next frame callback, so `setPaintedCallback`
+// fires once the frame being composed now has been presented.
+//
+// Called after the stack has been handed over: the repaint that carries the
+// change is committed either way, and this arms the callback that says the
+// compositor took it.  A surface with nothing to draw may never be given one,
+// which is why the caller waits with a deadline rather than for ever.
+void PinSurface::requestPainted()
+{
+    if (QWindow *window = windowHandle()) {
+        window->requestUpdate();
+    }
 }
 
 // Which pin a key press would act on is the one under the pointer: that is what

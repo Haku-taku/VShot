@@ -452,6 +452,30 @@ public:
     // never with a request already in flight.  A no-op unless the refresh was
     // enabled; the CLI may answer with nothing, which keeps the current list.
     void requestCandidateRefresh();
+    // Let the keyboard's cursor walk move the real pointer through the CLI.
+    // The walk itself is the editor's; the pointer the compositor draws is the
+    // CLI's to move, because only it holds an injection backend.  Call once,
+    // from the helper's startup, for a session that has a CLI behind it.
+    void enablePointerWarp();
+    // The editor has drawn everything it is going to draw and asks to be let
+    // go.  It writes the session's result and rendered pixels, asks the CLI to
+    // put them where they belong, and keeps its surface up -- showing the same
+    // picture -- until the CLI answers, so the caller's own copy of it is on
+    // the screen before this one goes and the user never sees the two blink
+    // past each other.
+    //
+    // Always ends the session -- on the CLI's answer, on a lost connection, or
+    // on a backstop -- so the process cannot outlive the request.  Called from
+    // `terminal` for a session that rendered a capture; a helper run by hand
+    // has no CLI to ask and quits outright.
+    void beginHandoff();
+    // Whether this session rendered a capture of its own that the caller has
+    // not been told about yet; see `beginHandoff`.
+    bool rendersCapture() const;
+    // Whether `beginHandoff` has already written the session's result and
+    // rendered pixels.  The caller then has nothing left to write: the pixels
+    // travel once, and a second `resultDocument` would send them again.
+    bool resultSent() const { return resultSent_; }
     bool hasValidSelection() const;
     // Whether the scrolling-capture action would do anything: the session
     // offers it, the selection is big enough, and it sits inside a single
