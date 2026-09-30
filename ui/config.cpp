@@ -46,6 +46,11 @@ const QStringList kCompressionNames = {QStringLiteral("none"), QStringLiteral("f
 // The HDR half's format.  The names are the file suffixes, which is also what
 // `--hdr-format` accepts.
 const QStringList kHdrFormatNames = {QStringLiteral("avif"), QStringLiteral("hdr")};
+// How the SDR half is mapped down from the HDR one.  The names are what
+// `--tone-map` accepts, in the order the settings window offers them: the
+// default first, then the two that read a level.
+const QStringList kToneMapNames = {QStringLiteral("auto"), QStringLiteral("fixed"),
+                                   QStringLiteral("normalize")};
 const QStringList kInjectNames = {QStringLiteral("auto"), QStringLiteral("wlr"),
                                   QStringLiteral("portal"), QStringLiteral("uinput")};
 const QStringList kEncoderNames = {QStringLiteral("h264"), QStringLiteral("hevc"),
@@ -127,6 +132,27 @@ bool readFlag(const QJsonObject &object, const QString &key, bool fallback)
 {
     const QJsonValue value = object.value(key);
     return value.isBool() ? value.toBool() : fallback;
+}
+
+/// Reads a fraction, clamped into `[low, high]`; anything absent, of the wrong
+/// type, or not a number keeps `fallback`.
+///
+/// The tone-map white level is the reason it exists: it is the one setting in
+/// the `cli` section that is a real number rather than a count, and it is
+/// clamped rather than rejected because the map it feeds has a defined answer
+/// for a level out of range -- see `model::hdr::ToneMapOptions::clamp_white`.
+double readFraction(const QJsonObject &object, const QString &key, double fallback, double low,
+                    double high)
+{
+    const QJsonValue value = object.value(key);
+    if (!value.isDouble()) {
+        return fallback;
+    }
+    const double raw = value.toDouble();
+    if (!std::isfinite(raw)) {
+        return fallback;
+    }
+    return std::clamp(raw, low, high);
 }
 
 /// Reads an integer that may be negative, clamped into `[-max, max]`.
@@ -341,6 +367,8 @@ void dropRetiredEditorKeys(QJsonObject &root)
 /// writes all of it.
 const std::pair<const char *, const char *> kOwnedCliKeys[] = {
     {"", "png-compression"}, {"", "hdr-format"}, {"", "monitor"},
+    {"", "tone-map"},        {"", "tone-map-white"},
+    {"", "hdr-area-test"},   {"", "hdr-area-ratio"},
     {"long", "notches"},     {"long", "max-height"},
     {"long", "max-frames"},  {"long", "timeout"},
     {"long", "ignore-top"},  {"long", "inject"},
@@ -458,6 +486,14 @@ CliPreferences readCli(const QJsonObject &cli)
         readChoice(cli, QStringLiteral("png-compression"), QString(), kCompressionNames);
     preferences.hdrFormat =
         readChoice(cli, QStringLiteral("hdr-format"), QString(), kHdrFormatNames);
+    preferences.toneMap = readChoice(cli, QStringLiteral("tone-map"), QString(), kToneMapNames);
+    preferences.toneMapWhite = readFraction(cli, QStringLiteral("tone-map-white"), 0.0,
+                                            kMinToneMapWhite, kMaxToneMapWhite);
+    preferences.hdrAreaTest =
+        readFlag(cli, QStringLiteral("hdr-area-test"), preferences.hdrAreaTest);
+    // Zero is a ratio here, not an absent key, so the reader has to be able to
+    // tell the two apart -- see `CliPreferences::hdrAreaRatio`.
+    preferences.hdrAreaRatio = readFraction(cli, QStringLiteral("hdr-area-ratio"), -1.0, 0.0, 1.0);
     preferences.monitor = readString(cli, QStringLiteral("monitor"), QString());
     const QJsonObject longSection = cli.value(QStringLiteral("long")).toObject();
     preferences.longInject =
@@ -572,6 +608,24 @@ QJsonObject cliJson(const CliPreferences &preferences)
     }
     if (!preferences.hdrFormat.isEmpty()) {
         cli.insert(QStringLiteral("hdr-format"), preferences.hdrFormat);
+    }
+    if (!preferences.toneMap.isEmpty()) {
+        cli.insert(QStringLiteral("tone-map"), preferences.toneMap);
+    }
+    // A written zero is "the file says nothing": a white level of zero is not a
+    // level the map would ever use, so it cannot be a value the user meant.
+    if (preferences.toneMapWhite > 0.0) {
+        cli.insert(QStringLiteral("tone-map-white"), preferences.toneMapWhite);
+    }
+    // The area test is on when the key is absent, so only `false` is written --
+    // the same rule `record.notify` follows below.
+    if (!preferences.hdrAreaTest) {
+        cli.insert(QStringLiteral("hdr-area-test"), false);
+    }
+    // A negative ratio is "the file says nothing"; zero is the ratio that means
+    // "always HDR", so it is written like any other.
+    if (preferences.hdrAreaRatio >= 0.0) {
+        cli.insert(QStringLiteral("hdr-area-ratio"), preferences.hdrAreaRatio);
     }
     if (!preferences.monitor.isEmpty()) {
         cli.insert(QStringLiteral("monitor"), preferences.monitor);
@@ -1068,6 +1122,11 @@ const QStringList &compressionNames()
 const QStringList &hdrFormatNames()
 {
     return kHdrFormatNames;
+}
+
+const QStringList &toneMapNames()
+{
+    return kToneMapNames;
 }
 
 const QStringList &injectNames()

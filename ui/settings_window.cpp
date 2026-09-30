@@ -127,6 +127,7 @@ constexpr int kDefaultReplayFps = 30;
 // readable rather than implied by the word "default".
 constexpr const char *kDefaultPngCompression = "fast";
 constexpr const char *kDefaultHdrFormat = "avif";
+constexpr const char *kDefaultToneMap = "auto";
 constexpr const char *kDefaultEncoder = "h264";
 constexpr const char *kDefaultEncoderBackend = "auto";
 constexpr const char *kDefaultLongInject = "auto";
@@ -159,13 +160,17 @@ QListWidget#sidebar::item { color: %6; border-radius: 8px;
 QListWidget#sidebar::item:hover { background: #262d37; color: %2; }
 QListWidget#sidebar::item:selected { background: %7; color: %8; font-weight: 600; }
 
-QComboBox, QLineEdit, QSpinBox { color: %2; background: %9;
+/* QDoubleSpinBox is a sibling of QSpinBox, not a subclass of it, so the class
+   selector above does not reach it: a page that used one for a percentage got
+   the platform's own box next to restyled ones.  It is listed here so the two
+   look alike. */
+QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { color: %2; background: %9;
             border: 1px solid %10; border-radius: 8px;
             padding: 0 10px; min-height: 32px; font-size: 13px;
             selection-color: %8; selection-background-color: %7; }
-QComboBox:hover, QLineEdit:hover, QSpinBox:hover { border-color: #4d5765; }
-QComboBox:focus, QLineEdit:focus, QSpinBox:focus { border-color: %7; }
-QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {
+QComboBox:hover, QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover { border-color: #4d5765; }
+QComboBox:focus, QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: %7; }
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {
             color: %11; background: #242a33; }
 
 /* The indicator is painted by the widgets themselves (see ModernComboBox and
@@ -370,6 +375,106 @@ private:
     /// The two arrow hit boxes, stacked in the right-hand strip.  Logical
     /// pixels, like every other coordinate the painter and the event handlers
     /// see: Qt has already folded the output's scale into both.
+    QRectF upBox() const
+    {
+        constexpr qreal strip = 26.0;
+        constexpr qreal arrowWidth = 16.0;
+        return QRectF(width() - strip, 0.0, arrowWidth, height() / 2.0);
+    }
+
+    QRectF downBox() const
+    {
+        QRectF box = upBox();
+        box.moveTop(box.height());
+        return box;
+    }
+};
+
+/// [`ModernSpinBox`] for a value that is a real number rather than a count.
+///
+/// The tone-map white level is a fraction of the range, so it is stepped in
+/// hundredths and shown as a percentage: the map's own arithmetic is in
+/// fractions, but "80 %" is what a user can picture.
+class ModernDoubleSpinBox final : public QDoubleSpinBox {
+public:
+    explicit ModernDoubleSpinBox(QWidget *parent = nullptr)
+        : QDoubleSpinBox(parent)
+    {
+        setButtonSymbols(QAbstractSpinBox::NoButtons);
+        setDecimals(2);
+        setSingleStep(0.01);
+        lineEdit()->installEventFilter(this);
+    }
+
+protected:
+    void paintEvent(QPaintEvent *event) override
+    {
+        QDoubleSpinBox::paintEvent(event);
+        QPainter painter(this);
+        paintChevron(painter, upBox(), kChevron, false);
+        paintChevron(painter, downBox(), kChevron, true);
+    }
+
+    bool onArrow(const QPointF &position) const
+    {
+        return upBox().contains(position) || downBox().contains(position);
+    }
+
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (watched == lineEdit()) {
+            if (event->type() == QEvent::MouseButtonPress) {
+                auto *mouse = static_cast<QMouseEvent *>(event);
+                if (mouse->button() == Qt::LeftButton) {
+                    const QPointF position =
+                        lineEdit()->mapTo(this, mouse->position().toPoint());
+                    if (upBox().contains(position)) {
+                        stepUp();
+                        setFocus(Qt::MouseFocusReason);
+                        return true;
+                    }
+                    if (downBox().contains(position)) {
+                        stepDown();
+                        setFocus(Qt::MouseFocusReason);
+                        return true;
+                    }
+                }
+            } else if (event->type() == QEvent::MouseMove) {
+                auto *mouse = static_cast<QMouseEvent *>(event);
+                const QPointF position =
+                    lineEdit()->mapTo(this, mouse->position().toPoint());
+                lineEdit()->setCursor(onArrow(position) ? Qt::PointingHandCursor
+                                                        : Qt::IBeamCursor);
+            }
+        }
+        return QDoubleSpinBox::eventFilter(watched, event);
+    }
+
+    void mousePressEvent(QMouseEvent *event) override
+    {
+        const QPointF position = event->position();
+        if (event->button() == Qt::LeftButton && upBox().contains(position)) {
+            stepUp();
+            event->accept();
+            return;
+        }
+        if (event->button() == Qt::LeftButton && downBox().contains(position)) {
+            stepDown();
+            event->accept();
+            return;
+        }
+        QDoubleSpinBox::mousePressEvent(event);
+    }
+
+    void mouseMoveEvent(QMouseEvent *event) override
+    {
+        const QPointF position = event->position();
+        const bool onArrow = upBox().contains(position) || downBox().contains(position);
+        setCursor(onArrow ? Qt::PointingHandCursor : Qt::IBeamCursor);
+        QDoubleSpinBox::mouseMoveEvent(event);
+    }
+
+private:
     QRectF upBox() const
     {
         constexpr qreal strip = 26.0;
@@ -1644,7 +1749,54 @@ private:
     {
         const QString shown = replayMicBox_->currentData().toString();
         fillMicrophoneCombo(replayMicBox_,
-                            shown.isEmpty() ? rememberedReplayMicrophone() : shown);
+                            shown.isEmpty() ? rememberedReplayMicrophone() : shown,
+                            microphones_.inputs());
+    }
+
+    /// Asks the session for its inputs, and fills both rows again when the
+    /// answer lands.  `again` is what the Detect button passes: the point of
+    /// pressing it is that something changed, so an answer already in is the one
+    /// the user is asking to replace.
+    ///
+    /// The first call is made after the window is up rather than while it is
+    /// being built: the command takes about a second, and the rows are readable
+    /// without it -- they open on the two answers that always exist and the name
+    /// the file remembers -- so waiting for it before showing anything bought
+    /// nothing.
+    void askForMicrophones(bool again = false)
+    {
+        // Both rows are refilled from the box, so a choice made while the probe
+        // was out is kept rather than reset to the file's value.
+        microphones_.onFinished = [this] {
+            fillMicrophoneBox();
+            fillReplayMicrophoneBox();
+        };
+        if (again) {
+            microphones_.restart();
+        } else {
+            microphones_.start();
+        }
+    }
+
+    /// Whether the white-level box does anything for the mode now selected.
+    ///
+    /// `auto` and `fixed` both read a level; `normalize` works its own out from
+    /// the capture's peak, so the box is greyed rather than left live and
+    /// ignored.  The leading "built-in default" entry means `auto`, which does
+    /// read one.
+    void updateToneMapWhiteEnabled()
+    {
+        const QString mode = toneMapBox_->currentData().toString();
+        toneMapWhiteSpin_->setEnabled(mode != QStringLiteral("normalize"));
+    }
+
+    /// Whether the area ratio does anything for the switch's position.
+    ///
+    /// With the area test off there is no share to weigh -- the one-pixel rule
+    /// stands -- so the box is greyed rather than left live and ignored.
+    void updateHdrAreaRatioEnabled()
+    {
+        hdrAreaRatioSpin_->setEnabled(hdrAreaSwitch_->isChecked());
     }
 
     QWidget *buildOutputPage()
@@ -1679,6 +1831,82 @@ private:
                     "by few"),
                hdrFormatBox_, true);
 
+        toneMapBox_ = choiceBox(output, toneMapNames(), QString::fromLatin1(kDefaultToneMap));
+        toneMapBox_->setObjectName(QStringLiteral("toneMap"));
+        toneMapBox_->setMinimumWidth(200);
+        selectChoice(toneMapBox_, config_.cli.toneMap);
+        addRow(output, uiTr("HDR to SDR"),
+               uiTr("How the SDR half of an HDR capture is made from the HDR one. "
+                    "Auto reads each capture: an SDR picture comes out exactly as it "
+                    "was, and one with highlights makes room for them. Fixed always "
+                    "maps SDR white to the level below, so a pixel's value does not "
+                    "depend on what else is in the picture. Normalize scales the "
+                    "capture so its brightest point becomes white"),
+               toneMapBox_, false);
+
+        toneMapWhiteSpin_ = new ModernDoubleSpinBox(output);
+        toneMapWhiteSpin_->setObjectName(QStringLiteral("toneMapWhite"));
+        // The map works in fractions and the box shows percentages, so the two
+        // are converted on the way in and on the way out -- including the span,
+        // which is why it is scaled here rather than taken as it comes.
+        toneMapWhiteSpin_->setRange(kMinToneMapWhite * 100.0, kMaxToneMapWhite * 100.0);
+        toneMapWhiteSpin_->setSuffix(uiTr(" %"));
+        toneMapWhiteSpin_->setMinimumWidth(120);
+        toneMapWhiteSpin_->setValue(
+            (config_.cli.toneMapWhite > 0.0 ? config_.cli.toneMapWhite : kDefaultToneMapWhite) *
+            100.0);
+        addRow(output, uiTr("SDR white level"),
+               uiTr("Where SDR white lands in the range, as a percentage. The rest is "
+                    "spent on light above white, so a lower level keeps highlights more "
+                    "apart and makes the picture dimmer. Used by Auto (only for a "
+                    "capture that has highlights) and by Fixed"),
+               toneMapWhiteSpin_, false);
+        // A level is only read by two of the three modes, and Normalize works
+        // its own out from the capture's peak: a box that did nothing would
+        // read as a setting that was ignored.
+        connect(toneMapBox_, &QComboBox::currentIndexChanged, this,
+                [this] { updateToneMapWhiteEnabled(); });
+        updateToneMapWhiteEnabled();
+
+        hdrAreaSwitch_ = new ModernSwitch(output);
+        hdrAreaSwitch_->setObjectName(QStringLiteral("hdrAreaTest"));
+        hdrAreaSwitch_->setChecked(config_.cli.hdrAreaTest);
+        hdrAreaSwitch_->setToolTip(
+            uiTr("Off: one bright pixel is enough. On: the ratio below has to be met"));
+        addRow(output, uiTr("Judge HDR by area"),
+               uiTr("Whether a capture counts as HDR content by how much of it is brighter "
+                    "than SDR white rather than by any single pixel. A ten-bit PQ screen "
+                    "rounds ordinary SDR white a few thousandths over, so with this off a "
+                    "handful of rounding pixels can pass a whole desktop off as HDR and dim "
+                    "it. Only outputs the compositor describes as HDR are asked at all"),
+               hdrAreaSwitch_, false);
+
+        hdrAreaRatioSpin_ = new ModernDoubleSpinBox(output);
+        hdrAreaRatioSpin_->setObjectName(QStringLiteral("hdrAreaRatio"));
+        hdrAreaRatioSpin_->setDecimals(4);
+        hdrAreaRatioSpin_->setSingleStep(0.0005);
+        // The ratio is a share of the frame, shown as a percentage of it: the
+        // box's own arithmetic is in fractions, but "0.05 %" is what a user can
+        // picture.  Four decimals of a percent is the resolution the built-in
+        // default needs.
+        hdrAreaRatioSpin_->setRange(0.0, 100.0);
+        hdrAreaRatioSpin_->setSuffix(uiTr(" %"));
+        hdrAreaRatioSpin_->setMinimumWidth(120);
+        hdrAreaRatioSpin_->setValue((config_.cli.hdrAreaRatio >= 0.0 ? config_.cli.hdrAreaRatio
+                                                                     : kDefaultHdrAreaRatio) *
+                                    100.0);
+        addRow(output, uiTr("HDR area"),
+               uiTr("How much of the capture has to be brighter than SDR white to count as "
+                    "HDR content, as a percentage of it. Zero means every capture of an HDR "
+                    "output is HDR content, with no test at all"),
+               hdrAreaRatioSpin_, false);
+        // A ratio is only read when the switch above is on, so a live box under
+        // an off switch would read as a setting that was ignored.
+        connect(hdrAreaSwitch_, &QAbstractButton::toggled, this,
+                [this] { updateHdrAreaRatioEnabled(); });
+        updateHdrAreaRatioEnabled();
+
+        output = addCard(page, uiTr("Which output"));
         monitorEdit_ = new QLineEdit(output);
         monitorEdit_->setObjectName(QStringLiteral("monitor"));
         monitorEdit_->setMinimumWidth(220);
@@ -2353,6 +2581,21 @@ private:
         CliPreferences &cli = config.cli;
         cli.pngCompression = compressionBox_->currentData().toString();
         cli.hdrFormat = hdrFormatBox_->currentData().toString();
+        cli.toneMap = toneMapBox_->currentData().toString();
+        // A box still sitting on the built-in default writes nothing, exactly
+        // like the spin boxes: the file then keeps following the map's own
+        // default instead of freezing today's number into it.
+        const double white = toneMapWhiteSpin_->value() / 100.0;
+        cli.toneMapWhite = std::abs(white - kDefaultToneMapWhite) < 1e-6 ? 0.0 : white;
+        cli.hdrAreaTest = hdrAreaSwitch_->isChecked();
+        // A box still sitting on the built-in default writes nothing, as the
+        // white level above does -- the file then follows the daemon's own
+        // default instead of freezing today's number into it.  Zero is not the
+        // default, so a user who asks for "always HDR" still writes a zero and
+        // still reads it back: the sentinel is only for a box nobody touched.
+        const double ratio = hdrAreaRatioSpin_->value() / 100.0;
+        cli.hdrAreaRatio =
+            std::abs(ratio - kDefaultHdrAreaRatio) < 1e-9 ? -1.0 : ratio;
         cli.monitor = monitorEdit_->text().trimmed();
         // Every spin box is read back with the built-in default it opened on: a
         // value still sitting there is written as the sentinel, which is what
@@ -2473,6 +2716,10 @@ private:
     QSpinBox *mosaicStrengthSpin_ = nullptr;
     QComboBox *compressionBox_ = nullptr;
     QComboBox *hdrFormatBox_ = nullptr;
+    QComboBox *toneMapBox_ = nullptr;
+    QDoubleSpinBox *toneMapWhiteSpin_ = nullptr;
+    ModernSwitch *hdrAreaSwitch_ = nullptr;
+    QDoubleSpinBox *hdrAreaRatioSpin_ = nullptr;
     QLineEdit *monitorEdit_ = nullptr;
     QSpinBox *densitySpin_ = nullptr;
     QSpinBox *notchesSpin_ = nullptr;

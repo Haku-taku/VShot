@@ -161,6 +161,37 @@ void checkEveryFieldReachesTheFile()
            "the compression list offers balanced");
     expect(choose(find<QComboBox>(dialog.get(), "hdrFormat"), QStringLiteral("hdr")),
            "the HDR format list offers hdr");
+    expect(choose(find<QComboBox>(dialog.get(), "toneMap"), QStringLiteral("fixed")),
+           "the tone-map list offers fixed");
+    // A level of 0.72 is neither the default nor a whole percentage, so a round
+    // trip that snapped or ignored it would show up below.
+    find<QDoubleSpinBox>(dialog.get(), "toneMapWhite")->setValue(72.0);
+    // The box is a percentage and the map works in fractions, so its span is
+    // the map's own scaled -- a range left in fractions would cap the value
+    // just typed at 0.95 and the round trip below would read that back.
+    QDoubleSpinBox *white = find<QDoubleSpinBox>(dialog.get(), "toneMapWhite");
+    expect(std::abs(white->minimum() - vshot::kMinToneMapWhite * 100.0) < 1e-6 &&
+               std::abs(white->maximum() - vshot::kMaxToneMapWhite * 100.0) < 1e-6,
+           "the white-level box is bounded in the units it shows",
+           QStringLiteral("%1..%2").arg(white->minimum()).arg(white->maximum()));
+    // Only two of the three modes read a level, and `normalize` works its own
+    // out from the capture: the box is greyed rather than left live and
+    // ignored.
+    choose(find<QComboBox>(dialog.get(), "toneMap"), QStringLiteral("normalize"));
+    expect(!white->isEnabled(), "the level box is off while normalizing");
+    choose(find<QComboBox>(dialog.get(), "toneMap"), QStringLiteral("fixed"));
+    expect(white->isEnabled(), "the level box is back on for fixed");
+    // The area test's switch and its ratio are the same shape of pair: a ratio
+    // is only weighed when the switch is on, so the box is greyed rather than
+    // left live and ignored.  The ratio is set to a value that is neither the
+    // default nor a whole percentage, so a round trip that snapped or dropped it
+    // would show up below -- and to a *non-zero* one, because zero is the state
+    // that means "always HDR" and the file has to keep it.
+    QDoubleSpinBox *ratio = find<QDoubleSpinBox>(dialog.get(), "hdrAreaRatio");
+    expect(ratio->isEnabled(), "the ratio box is on while the area test is");
+    find<QAbstractButton>(dialog.get(), "hdrAreaTest")->setChecked(false);
+    expect(!ratio->isEnabled(), "the ratio box is off with the area test");
+    ratio->setValue(0.25);
     find<QLineEdit>(dialog.get(), "monitor")->setText(QStringLiteral("  HDMI-A-1  "));
     find<QSpinBox>(dialog.get(), "pinDensity")->setValue(3);
     find<QSpinBox>(dialog.get(), "longNotches")->setValue(7);
@@ -262,6 +293,19 @@ void checkEveryFieldReachesTheFile()
            "the compression default reached the file", saved.cli.pngCompression);
     expect(saved.cli.hdrFormat == QStringLiteral("hdr"),
            "the HDR format default reached the file", saved.cli.hdrFormat);
+    expect(saved.cli.toneMap == QStringLiteral("fixed"),
+           "the tone-map default reached the file", saved.cli.toneMap);
+    // The box shows a percentage and the file holds the fraction, so this is
+    // also what checks the conversion between them.
+    expect(std::abs(saved.cli.toneMapWhite - 0.72) < 1e-6,
+           "the tone-map white level reached the file",
+           QString::number(saved.cli.toneMapWhite));
+    // The switch was turned off above and the ratio box left on a value that is
+    // not the default, so both have to come back -- and the ratio is the one
+    // setting whose zero is a value rather than "the file says nothing".
+    expect(!saved.cli.hdrAreaTest, "the area-test switch reached the file");
+    expect(std::abs(saved.cli.hdrAreaRatio - 0.0025) < 1e-9,
+           "the HDR area ratio reached the file", QString::number(saved.cli.hdrAreaRatio));
     // Whitespace around a hand-typed monitor name is trimmed rather than saved.
     expect(saved.cli.monitor == QStringLiteral("HDMI-A-1"),
            "the monitor default reached the file", saved.cli.monitor);
@@ -1359,6 +1403,46 @@ void checkTheBuiltInDefaultsAreTheClis()
                    .arg(rust));
     }
 
+    // The tone-map white level is the one default in the window that is not a
+    // count, and it is shown as a percentage while the map works in fractions.
+    // Both the default and the span it is bounded by are the map's own numbers,
+    // so they are read out of it rather than trusted to stay in step.
+    const QString hdr = readSource(QStringLiteral("src/model/hdr.rs"));
+    const struct {
+        const char *marker;
+        double expected;
+        const char *what;
+    } mapNumbers[] = {
+        {"const SDR_WHITE_LEVEL: f32 = ", vshot::kDefaultToneMapWhite,
+         "the level the box opens on is the map's own default"},
+        {"pub const MIN_WHITE: f32 = ", vshot::kMinToneMapWhite,
+         "the bottom of the box is the map's own floor"},
+        {"pub const MAX_WHITE: f32 = ", vshot::kMaxToneMapWhite,
+         "the top of the box is the map's own ceiling"},
+        // The area ratio is the second of these, and it is read from the same
+        // struct: a box that opened on a different floor than the daemon
+        // applies would judge captures the window never saw.
+        {"            ratio: ", vshot::kDefaultHdrAreaRatio,
+         "the ratio the box opens on is the daemon's own floor"},
+    };
+    for (const auto &row : mapNumbers) {
+        const int at = hdr.indexOf(QString::fromLatin1(row.marker));
+        double rust = -1.0;
+        if (at >= 0) {
+            const int start = at + static_cast<int>(std::strlen(row.marker));
+            int end = start;
+            while (end < hdr.size() &&
+                   (hdr.at(end).isDigit() || hdr.at(end) == QLatin1Char('.'))) {
+                ++end;
+            }
+            rust = hdr.mid(start, end - start).toDouble();
+        }
+        expect(std::abs(rust - row.expected) < 1e-6, row.what,
+               QStringLiteral("the window says %1, hdr.rs says %2")
+                   .arg(row.expected)
+                   .arg(rust));
+    }
+
     // The arrows have to be usable.  They are painted in a strip the spin box's
     // own line edit covers, and a click there used to land on the line edit and
     // do nothing at all -- the arrows were decoration.
@@ -1396,6 +1480,24 @@ void checkTheBuiltInDefaultsAreTheClis()
     const QString saved = QString::fromUtf8(file.readAll());
     expect(!saved.contains(QStringLiteral("30000")) && !saved.contains(QStringLiteral("6000")),
            "defaults nobody touched are not written into the file", saved.trimmed());
+    // The area ratio is the second default with a box of its own, and it is the
+    // one whose *zero* is a value rather than "unset": the default has to stay
+    // out of the file like the others, but a user who asks for zero has to get
+    // a zero written and read back.
+    expect(!saved.contains(QStringLiteral("hdr-area-ratio")),
+           "the area ratio's own default is not written into the file", saved.trimmed());
+    QDoubleSpinBox *areaRatio = find<QDoubleSpinBox>(dialog.get(), "hdrAreaRatio");
+    areaRatio->setValue(0.0);
+    find<QPushButton>(dialog.get(), "saveButton")->click();
+    QFile zeroFile(configPath());
+    if (zeroFile.open(QIODevice::ReadOnly)) {
+        const QString zeroSaved = QString::fromUtf8(zeroFile.readAll());
+        expect(zeroSaved.contains(QStringLiteral("hdr-area-ratio")),
+               "a ratio of zero is written rather than dropped", zeroSaved.trimmed());
+        expect(std::abs(vshot::loadConfig().cli.hdrAreaRatio) < 1e-9,
+               "and it reads back as zero rather than as the built-in default",
+               QString::number(vshot::loadConfig().cli.hdrAreaRatio));
+    }
 
     // The leading entry of each combo box names the built-in default rather than
     // saying the word "default", so a user can read which level or codec they

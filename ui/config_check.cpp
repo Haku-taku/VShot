@@ -106,6 +106,11 @@ double numberAt(const QJsonObject &object, const char *path)
     return valueAt(object, path).toDouble();
 }
 
+bool booleanAt(const QJsonObject &object, const char *path)
+{
+    return valueAt(object, path).toBool();
+}
+
 /// Whether a `/`-separated path exists at all, which is how "the section was
 /// pruned rather than left empty" is told apart from "it is there but empty".
 bool containsAt(const QJsonObject &object, const char *path)
@@ -230,6 +235,104 @@ void checkTheHdrFormatRoundTripsAndIsCleared()
     root = afterSave([&] { vshot::saveConfig(config); });
     expect(textAt(root, "cli/hdr-format").isEmpty() && !containsAt(root, "cli/hdr-format"),
            "clearing it removes the key rather than writing an empty one");
+}
+
+void checkTheToneMapRoundTripsAndIsCleared()
+{
+    std::printf("--- the tone map is remembered and can be cleared ------------------\n");
+    // The map down to SDR, on the same terms as the format above: an absent key
+    // means "let the built-in default stand", and only a name this build knows
+    // is read at all.
+    writeConfig(QStringLiteral(R"({"cli": {"tone-map": "normalize", "tone-map-white": 0.72}})"));
+    expect(vshot::loadConfig().cli.toneMap == QStringLiteral("normalize"),
+           "a known tone-map name is read", vshot::loadConfig().cli.toneMap);
+    expect(std::abs(vshot::loadConfig().cli.toneMapWhite - 0.72) < 1e-6,
+           "the white level is read", QString::number(vshot::loadConfig().cli.toneMapWhite));
+
+    writeConfig(QStringLiteral(R"({"cli": {"tone-map": "soft-knee"}})"));
+    expect(vshot::loadConfig().cli.toneMap.isEmpty(),
+           "an unknown tone-map name falls back to the built-in default");
+
+    // A level outside the span the map accepts is clamped rather than dropped:
+    // it is a number the user meant, and the map has a defined answer for it.
+    writeConfig(QStringLiteral(R"({"cli": {"tone-map-white": 0.2}})"));
+    expect(std::abs(vshot::loadConfig().cli.toneMapWhite - vshot::kMinToneMapWhite) < 1e-6,
+           "a level below the span is clamped up",
+           QString::number(vshot::loadConfig().cli.toneMapWhite));
+    writeConfig(QStringLiteral(R"({"cli": {"tone-map-white": 4}})"));
+    expect(std::abs(vshot::loadConfig().cli.toneMapWhite - vshot::kMaxToneMapWhite) < 1e-6,
+           "a level above the span is clamped down",
+           QString::number(vshot::loadConfig().cli.toneMapWhite));
+    writeConfig(QStringLiteral(R"({"cli": {"tone-map-white": "high"}})"));
+    expect(vshot::loadConfig().cli.toneMapWhite == 0.0,
+           "a level that is not a number falls back to the built-in default");
+
+    vshot::Config config = vshot::loadConfig();
+    config.cli.toneMap = QStringLiteral("fixed");
+    config.cli.toneMapWhite = 0.72;
+    QJsonObject root = afterSave([&] { vshot::saveConfig(config); });
+    expect(textAt(root, "cli/tone-map") == QStringLiteral("fixed"),
+           "the chosen tone map was written", textAt(root, "cli/tone-map"));
+    expect(numberAt(root, "cli/tone-map-white") > 0.71 &&
+               numberAt(root, "cli/tone-map-white") < 0.73,
+           "the white level was written", QString::number(numberAt(root, "cli/tone-map-white")));
+
+    // Zero is how the settings window says "the built-in default stands", so it
+    // must not be written: a level of zero is not one the map would ever use.
+    config.cli.toneMapWhite = 0.0;
+    root = afterSave([&] { vshot::saveConfig(config); });
+    expect(!containsAt(root, "cli/tone-map-white"),
+           "a white level of zero writes no key rather than a zero");
+
+    config.cli.toneMap.clear();
+    root = afterSave([&] { vshot::saveConfig(config); });
+    expect(!containsAt(root, "cli/tone-map"),
+           "clearing the tone map removes the key rather than writing an empty one");
+}
+
+void checkTheHdrAreaTestRoundTripsAndKeepsItsZero()
+{
+    std::printf("--- the HDR area test is remembered and its zero survives ----------\n");
+    // The test is on when the file says nothing, so an absent key and a `true`
+    // are the same thing, and only "off" needs a key of its own.
+    writeConfig(QStringLiteral(R"({"cli": {}})"));
+    expect(vshot::loadConfig().cli.hdrAreaTest, "the area test is on when the file says nothing");
+    writeConfig(QStringLiteral(R"({"cli": {"hdr-area-test": false}})"));
+    expect(!vshot::loadConfig().cli.hdrAreaTest, "an area test switched off is read");
+
+    // A ratio of zero is the state that means "every capture of an HDR output
+    // is HDR content", so it is a value and not an absent key -- the one place
+    // in this section where zero is meaningful.  A file that says nothing has to
+    // read back as *not* zero, which is what the negative sentinel is for.
+    writeConfig(QStringLiteral(R"({"cli": {"hdr-area-ratio": 0}})"));
+    expect(std::abs(vshot::loadConfig().cli.hdrAreaRatio) < 1e-9,
+           "a ratio of zero is read as zero",
+           QString::number(vshot::loadConfig().cli.hdrAreaRatio));
+    writeConfig(QStringLiteral(R"({"cli": {}})"));
+    expect(vshot::loadConfig().cli.hdrAreaRatio < 0.0,
+           "an absent ratio reads as the sentinel, not as zero");
+    writeConfig(QStringLiteral(R"({"cli": {"hdr-area-ratio": 2}})"));
+    expect(std::abs(vshot::loadConfig().cli.hdrAreaRatio - 1.0) < 1e-9,
+           "a ratio past a whole frame is clamped",
+           QString::number(vshot::loadConfig().cli.hdrAreaRatio));
+
+    vshot::Config config = vshot::loadConfig();
+    config.cli.hdrAreaTest = false;
+    config.cli.hdrAreaRatio = 0.0;
+    QJsonObject root = afterSave([&] { vshot::saveConfig(config); });
+    expect(booleanAt(root, "cli/hdr-area-test") == false, "the switch being off was written");
+    expect(containsAt(root, "cli/hdr-area-ratio") && numberAt(root, "cli/hdr-area-ratio") == 0.0,
+           "a ratio of zero was written rather than dropped",
+           QString::number(numberAt(root, "cli/hdr-area-ratio")));
+
+    // The switch being on is the default and needs no key, and a ratio nobody
+    // chose is the sentinel and needs none either.
+    config.cli.hdrAreaTest = true;
+    config.cli.hdrAreaRatio = -1.0;
+    root = afterSave([&] { vshot::saveConfig(config); });
+    expect(!containsAt(root, "cli/hdr-area-test"),
+           "an area test left on writes no key rather than a true");
+    expect(!containsAt(root, "cli/hdr-area-ratio"), "an unset ratio writes no key");
 }
 
 void checkEditorSaveKeepsTheCliSection()
@@ -674,6 +777,13 @@ void checkRoundTripOfEveryField()
         expect(vshot::loadConfig().cli.hdrFormat == value,
                "the settings window's HDR format names all load back", value);
     }
+    for (const QString &value : vshot::toneMapNames()) {
+        vshot::Config probe = written;
+        probe.cli.toneMap = value;
+        vshot::saveConfig(probe);
+        expect(vshot::loadConfig().cli.toneMap == value,
+               "the settings window's tone-map names all load back", value);
+    }
     for (const QString &value : vshot::toolNames()) {
         vshot::Config probe = written;
         probe.editor.tool = value;
@@ -1014,7 +1124,10 @@ int main(int argc, char **argv)
     checkDefaultsWhenTheFileIsMissing();
     checkUnknownKeysAreIgnored();
     checkBadValuesFallBackFieldByField();
+    checkTheRetiredSelectToolStillMeansNothingArmed();
     checkTheHdrFormatRoundTripsAndIsCleared();
+    checkTheToneMapRoundTripsAndIsCleared();
+    checkTheHdrAreaTestRoundTripsAndKeepsItsZero();
     checkColorsUseTheCssSpelling();
     checkTheLegacyTextSizeIsMigrated();
     checkEditorSaveKeepsTheCliSection();

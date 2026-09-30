@@ -416,6 +416,45 @@ const QHash<QString, QString> &chineseTable()
          QString::fromUtf8("截图带 HDR 内容时，与 PNG 同名并排写出的第二个文件。"
                            "AVIF 是 10 位 BT.2020 PQ 并在文件里声明，所有读取器都能正确"
                            "显示，但为有损；Radiance RGBE 是原样记录的光，但读取器很少")},
+        {QStringLiteral("HDR to SDR"), QString::fromUtf8("HDR 转 SDR")},
+        {QStringLiteral("How the SDR half of an HDR capture is made from the HDR one. "
+                        "Auto reads each capture: an SDR picture comes out exactly as it "
+                        "was, and one with highlights makes room for them. Fixed always "
+                        "maps SDR white to the level below, so a pixel's value does not "
+                        "depend on what else is in the picture. Normalize scales the "
+                        "capture so its brightest point becomes white"),
+         QString::fromUtf8("一次 HDR 截图的 SDR 那一半怎么由 HDR 那一半得到。"
+                           "自动会逐张判断：本来就是 SDR 的画面原样输出，带高光的才腾出空间。"
+                           "固定则总是把 SDR 白映射到下面那个档位，"
+                           "一个像素的值不取决于画面里还有什么。"
+                           "归一化把整张截图缩放到最亮处即白")},
+        {QStringLiteral("SDR white level"), QString::fromUtf8("SDR 白电平")},
+        {QStringLiteral("Where SDR white lands in the range, as a percentage. The rest is "
+                        "spent on light above white, so a lower level keeps highlights more "
+                        "apart and makes the picture dimmer. Used by Auto (only for a "
+                        "capture that has highlights) and by Fixed"),
+         QString::fromUtf8("SDR 白落在整个范围的百分之多少处。剩下的留给比白更亮的光，"
+                           "所以档位越低，高光之间分得越开，画面也越暗。"
+                           "自动（仅对带高光的截图）和固定会读它")},
+        {QStringLiteral("Judge HDR by area"), QString::fromUtf8("按面积判定 HDR")},
+        {QStringLiteral("Whether a capture counts as HDR content by how much of it is brighter "
+                        "than SDR white rather than by any single pixel. A ten-bit PQ screen "
+                        "rounds ordinary SDR white a few thousandths over, so with this off a "
+                        "handful of rounding pixels can pass a whole desktop off as HDR and dim "
+                        "it. Only outputs the compositor describes as HDR are asked at all"),
+         QString::fromUtf8("一张截图算不算 HDR 内容，看的是有多大面积比 SDR 白更亮，"
+                           "而不是有没有任何一个像素超过。十位 PQ 屏幕会把普通的 SDR 白"
+                           "舍入得高出千分之几，所以关掉它时，几个舍入出来的像素就能把"
+                           "整个桌面判成 HDR 并把它压暗。"
+                           "只有合成器声明为 HDR 的输出才会被问到")},
+        {QStringLiteral("HDR area"), QString::fromUtf8("HDR 面积")},
+        {QStringLiteral("How much of the capture has to be brighter than SDR white to count as "
+                        "HDR content, as a percentage of it. Zero means every capture of an HDR "
+                        "output is HDR content, with no test at all"),
+         QString::fromUtf8("截图里有多大比例比 SDR 白更亮才算 HDR 内容。"
+                           "零表示 HDR 输出上的每次截图都算，完全不做检测")},
+        {QStringLiteral("Off: one bright pixel is enough. On: the ratio below has to be met"),
+         QString::fromUtf8("关：一个亮像素就够。开：要达到下面那个比例")},
         {QStringLiteral("Default monitor"), QString::fromUtf8("默认输出")},
         {QStringLiteral("Which output a capture takes when the command line names none. Leave it "
                         "empty to use whichever output the pointer is on -- `current` says the "
