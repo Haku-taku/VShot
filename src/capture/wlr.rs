@@ -24,7 +24,7 @@ use wayland_protocols_wlr::screencopy::v1::client::{
 use crate::error::{Result, VshotError};
 use crate::geometry::{Rect, Size};
 use crate::model::hdr::{OutputColor, Primaries, Rgb10Summary, Transfer};
-use crate::model::{Frame, HdrFrame};
+use crate::model::{Frame, HdrFrame, ToneMapOptions};
 use crate::parallel::map_rows;
 
 use super::dmabuf::{is_hdr_fourcc, swap_red_blue_10, DmabufFrame, GbmBuffer};
@@ -605,6 +605,13 @@ impl CaptureState {
 pub struct WlrCapture {
     event_queue: EventQueue<CaptureState>,
     state: CaptureState,
+    /// How an HDR buffer this backend reads itself is mapped down to SDR: the
+    /// frozen scene the user annotates on, and the SDR half written beside an
+    /// HDR capture, have to be the same map or the marks would be drawn over
+    /// pixels that never reach the file.  It is set from the request rather
+    /// than passed to every call, because the captures that need it are the
+    /// ones taken on paths with no request in hand.
+    tone_map: ToneMapOptions,
 }
 
 impl WlrCapture {
@@ -635,7 +642,16 @@ impl WlrCapture {
                 "at least one wl_output".into(),
             ));
         }
-        Ok(Self { event_queue, state })
+        Ok(Self {
+            event_queue,
+            state,
+            tone_map: ToneMapOptions::default(),
+        })
+    }
+
+    /// Sets the map used for every HDR buffer this capture reads itself.
+    pub fn set_tone_map(&mut self, tone_map: ToneMapOptions) {
+        self.tone_map = tone_map;
     }
 
     pub fn capture_output(&mut self, name: &str, cursor: bool) -> Result<Frame> {
@@ -666,7 +682,8 @@ impl WlrCapture {
         // as sRGB.
         let frame = match self.hdr_output_color(name)? {
             Some(color) if is_10bit_shm(buffer.format) => {
-                decode_output_rgb10(name, &buffer, y_invert, color)?.tone_map_to_srgb()?
+                decode_output_rgb10(name, &buffer, y_invert, color)?
+                    .tone_map_to_srgb_with(self.tone_map)?
             }
             _ => buffer.into_frame(y_invert)?,
         };

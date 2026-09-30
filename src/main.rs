@@ -176,6 +176,12 @@ fn run() -> Result<()> {
     let topology = wayland.output_infos();
     let known_outputs: &[OutputInfo] = topology.as_deref().unwrap_or(&[]);
     let mut capture = Capturer::connect()?;
+    // An HDR output's frozen scene is tone-mapped down by the capture itself,
+    // and the SDR half of the file is tone-mapped later from the annotated HDR
+    // frame.  Both have to be the same map: the user draws over the frozen
+    // scene, so a mark lands on the pixels the file will hold only when the
+    // scene the mark was placed on is the file's own SDR half.
+    capture.set_tone_map(request.tone_map);
 
     // Everything below freezes the desktop, and the annotation overlay is a
     // window like any other: left alone, its toolbar would be baked into the
@@ -1089,7 +1095,7 @@ fn finish_capture(
     // and the HDR half is encoded.  That is the delay the user meets as a slow
     // close, and nothing below needs those surfaces, so they go first.
     let cleanup = wayland.destroy_overlays();
-    let (sdr, hdr_out) = sdr_and_hdr(&edits, frame, hdr)?;
+    let (sdr, hdr_out) = sdr_and_hdr(Some(edits), frame, hdr, request.tone_map)?;
     let pinned = cli::Destination::Pin;
     let destination = if pin { &pinned } else { &request.destination };
     let result = output::write_frame_with_hdr(
@@ -1140,8 +1146,11 @@ fn sdr_and_hdr(
     // SDR white at sRGB 220 of 255, 145 of 203 cd/m2).  Taking it would dim the
     // whole capture, not just the highlights.
     match hdr {
-        Some(half) => Ok((half.frame.tone_map_to_srgb()?, Some(half))),
-        None => Ok((edits.apply(ImageDocument::new(frame))?.into_frame(), None)),
+        Some(half) => Ok((half.frame.tone_map_to_srgb_with(tone_map)?, Some(half))),
+        None => match edits {
+            Some(edits) => Ok((edits.apply(ImageDocument::new(frame))?.into_frame(), None)),
+            None => Ok((frame, None)),
+        },
     }
 }
 
@@ -1852,12 +1861,13 @@ mod tests {
         )
         .unwrap();
         let (sdr, kept) = sdr_and_hdr(
-            &EditPipeline::new(),
+            Some(&EditPipeline::new()),
             plain_frame(),
             Some(HdrHalf {
                 frame: hdr,
                 reference_nits: REFERENCE_WHITE_NITS,
             }),
+            ToneMapOptions::default(),
         )
         .unwrap();
         let pixel = sdr.pixel(Point::new(0, 0)).unwrap();
@@ -1875,12 +1885,13 @@ mod tests {
         // `.hdr` appears beside a screenshot that never held any highlight.
         let flat = HdrFrame::new(Size::new(2, 1), vec![[1.0, 1.0, 1.0, 1.0]; 2]).unwrap();
         let (sdr, kept) = sdr_and_hdr(
-            &EditPipeline::new(),
+            Some(&EditPipeline::new()),
             plain_frame(),
             Some(HdrHalf {
                 frame: flat,
                 reference_nits: REFERENCE_WHITE_NITS,
             }),
+            ToneMapOptions::default(),
         )
         .unwrap();
         assert_eq!(sdr.pixel(Point::new(0, 0)), Some([0, 255, 0, 255]));
@@ -1889,7 +1900,13 @@ mod tests {
 
     #[test]
     fn a_capture_without_hdr_uses_the_compositors_frame_alone() {
-        let (sdr, kept) = sdr_and_hdr(&EditPipeline::new(), plain_frame(), None).unwrap();
+        let (sdr, kept) = sdr_and_hdr(
+            Some(&EditPipeline::new()),
+            plain_frame(),
+            None,
+            ToneMapOptions::default(),
+        )
+        .unwrap();
         assert_eq!(sdr.pixel(Point::new(0, 0)), Some([0, 255, 0, 255]));
         assert!(kept.is_none());
     }

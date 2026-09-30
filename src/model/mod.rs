@@ -9,5 +9,5 @@ pub mod scene;
 
 pub use document::ImageDocument;
 pub use frame::{Frame, PngCompression};
-pub use hdr::{HdrFrame, OutputColor};
+pub use hdr::{HdrDecision, HdrFrame, OutputColor, Primaries, ToneMap, ToneMapOptions};
 pub use scene::{OutputSnapshot, SceneSnapshot};

@@ -509,7 +509,8 @@ fn map_into_709(rgb: [f32; 3]) -> [f32; 3] {
 
 // --- the HDR -> SDR roll-off ---------------------------------------------
 
-/// Where SDR white lands, as a fraction of the sRGB range.
+/// Where SDR white lands, as a fraction of the sRGB range, **in a frame that
+/// carries light above it**.
 ///
 /// This is the one real choice in an HDR → SDR map, and it is forced: an 8-bit
 /// SDR image's ceiling *is* white, so light brighter than SDR white can only be
@@ -519,10 +520,149 @@ fn map_into_709(rgb: [f32; 3]) -> [f32; 3] {
 ///
 /// 0.8 spends the top fifth of the range on light above SDR white: white lands
 /// on sRGB 231 and an 8× highlight on 252, so the two are 21 codes apart and a
-/// bright patch reads as a patch.  The cost is that SDR content sits 10 % lower
-/// than it would — which is the same cost the compositor's own rendition pays
-/// (it puts white at 220) and far less of it.
+/// bright patch reads as a patch.  The cost is that everything else sits 10 %
+/// lower than it would.
+///
+/// That cost is only worth paying when there is something to spend it on.  A
+/// frame with no light above white has no highlights, so its white goes on the
+/// last code instead and SDR content is shown exactly as it was — see
+/// [`white_level_for`], which picks between the two.
+///
+/// The number is the **default** for [`ToneMap::Fixed`]'s untuned case and for
+/// [`ToneMap::Auto`]; a user who wants a different trade sets it with
+/// `--tone-map-white` / the settings window, and the choice travels in
+/// [`ToneMapOptions::white`].
 const SDR_WHITE_LEVEL: f32 = 0.8;
+
+/// How an HDR frame is mapped down to the 8-bit SDR image written beside it.
+///
+/// The white level is where SDR white lands in the 0..=1 output range, which is
+/// what decides how much of the range is left for the light above it.  Three
+/// behaviours are offered because the right one depends on what the capture is
+/// for: a screenshot of an SDR window wants that window untouched, while a
+/// photograph of an HDR scene wants its highlights kept apart.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ToneMap {
+    /// Pick the white level from the frame: the last code for a frame with
+    /// nothing above white, [`ToneMapOptions::white`] for one that has
+    /// highlights.  This is what an SDR capture being exact means, and it is
+    /// the default.
+    #[default]
+    Auto,
+    /// Always use [`ToneMapOptions::white`, defaulting to `SDR_WHITE_LEVEL`],
+    /// whatever the frame holds.  An SDR capture on an HDR output then comes out
+    /// slightly dim rather than exact, in exchange for a pixel's code not
+    /// depending on what else shares the frame — which is what makes a pinned
+    /// copy match the content it was taken from.
+    Fixed,
+    /// Scale the light so the frame's own brightest point lands on white, i.e.
+    /// SDR white goes to `1.0 / peak`.  Highlights keep their *ordering* but not
+    /// their separation — everything above white is compressed into whatever
+    /// the reciprocal leaves, so a bright gradient flattens.  Only right when
+    /// the frame's peak is known to be a highlight worth normalising to.
+    Normalize,
+}
+
+impl ToneMap {
+    /// The names the CLI and the settings window use.
+    pub const NAMES: [&'static str; 3] = ["auto", "fixed", "normalize"];
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "auto" => Some(Self::Auto),
+            "fixed" => Some(Self::Fixed),
+            "normalize" => Some(Self::Normalize),
+            _ => None,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Fixed => "fixed",
+            Self::Normalize => "normalize",
+        }
+    }
+}
+
+/// Everything the HDR → SDR map is told from outside: which behaviour, and the
+/// white level the two that take one use.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ToneMapOptions {
+    pub mode: ToneMap,
+    /// Where SDR white lands in the 0..=1 output range.  Used by
+    /// [`ToneMap::Auto`] (only for a frame that carries highlights) and by
+    /// [`ToneMap::Fixed`] (always).  Clamped to a sane span so a config file
+    /// cannot put white on black or on the ceiling itself.
+    pub white: f32,
+    /// How "this frame carries highlights" is decided, so that
+    /// [`ToneMap::Auto`] moves the white point exactly when the rest of the
+    /// pipeline agrees the capture is HDR content.  [`ToneMap::Fixed`] and
+    /// [`ToneMap::Normalize`] do not read it.
+    pub hdr: HdrDecision,
+}
+
+impl Default for ToneMapOptions {
+    fn default() -> Self {
+        Self {
+            mode: ToneMap::Auto,
+            white: SDR_WHITE_LEVEL,
+            hdr: HdrDecision::default(),
+        }
+    }
+}
+
+impl ToneMapOptions {
+    /// The lowest and highest white level accepted, as a fraction of the range.
+    /// Below the floor there is no room left to show an SDR image at all, and
+    /// at the ceiling the highlights have nowhere to go — which is the bug the
+    /// roll-off exists to avoid.
+    pub const MIN_WHITE: f32 = 0.5;
+    pub const MAX_WHITE: f32 = 0.95;
+
+    /// Clamps a white level a user may have typed into a config file or a
+    /// number box.  A value that is not a finite number falls back to the
+    /// default rather than poisoning the whole map with a NaN.
+    pub fn clamp_white(white: f32) -> f32 {
+        if !white.is_finite() {
+            return SDR_WHITE_LEVEL;
+        }
+        white.clamp(Self::MIN_WHITE, Self::MAX_WHITE)
+    }
+
+    /// The two levels this frame is mapped with: where SDR white lands in the
+    /// 0..=1 output range, and the light that reaches the top of it.
+    ///
+    /// They are returned together because the second is not always the same
+    /// constant: [`ToneMap::Normalize`] normalises to the *frame's* own peak, so
+    /// its top of range moves with the frame.
+    ///
+    /// `frame` is what [`ToneMap::Auto`] reads to tell a frame with highlights
+    /// from one without, through the same [`HdrFrame::carries_hdr`] the rest of
+    /// the pipeline uses — so an SDR capture on an HDR output is mapped exactly
+    /// when the pipeline agrees it is one.
+    fn levels_for(self, frame: &HdrFrame) -> (f32, f32) {
+        let white = Self::clamp_white(self.white);
+        let peak = frame.peak();
+        let has_highlights = frame.carries_hdr(self.hdr);
+        match self.mode {
+            ToneMap::Auto => (if has_highlights { white } else { 1.0 }, ROLL_OFF_PEAK),
+            ToneMap::Fixed => (white, ROLL_OFF_PEAK),
+            // The reciprocal of the peak, which is exactly "the brightest point
+            // becomes white": white lands on `1 / peak` and the curve is scaled
+            // so that same peak is what reaches the top of the range.  A frame
+            // with no light above white has no peak to normalise to, so it keeps
+            // white where white is.
+            ToneMap::Normalize => {
+                if has_highlights {
+                    ((1.0 / peak).clamp(Self::MIN_WHITE, 1.0), peak)
+                } else {
+                    (1.0, ROLL_OFF_PEAK)
+                }
+            }
+        }
+    }
+}
 
 /// The light, as a multiple of SDR white, that reaches the top of the range.
 ///
@@ -530,6 +670,9 @@ const SDR_WHITE_LEVEL: f32 = 0.8;
 /// SDR white is about five.  PQ's own peak is 10 000, so most of what a really
 /// bright frame holds still lands on the last code; the HDR half is what carries
 /// that light exactly.
+///
+/// It is the ceiling for every mode but [`ToneMap::Normalize`], which normalises
+/// to the frame's own peak instead — see [`ToneMapOptions::levels_for`].
 const ROLL_OFF_PEAK: f32 = 10.0;
 
 /// Rolls a BT.709 linear triple whose light may exceed SDR white off into the
@@ -551,11 +694,14 @@ const ROLL_OFF_PEAK: f32 = 10.0;
 /// Those two pull against each other, because an 8-bit SDR image's ceiling *is*
 /// white.  The only way to show light brighter than white is to put white below
 /// the ceiling and spend the codes above it on the highlights — which is what
-/// [`SDR_WHITE_LEVEL`] is, and what the compositor's own rendition does too.
+/// `white` is here, and where [`white_level_for`] decides it belongs.
 ///
 /// Hue is preserved throughout: one factor applies to the whole triple, and
 /// only that factor is a curve of the peak rather than its reciprocal.
-fn roll_off(rgb: [f32; 3]) -> [f32; 3] {
+///
+/// `white` is where SDR white lands in the 0..=1 range and `top` is the light
+/// that reaches the top of it — see [`roll_off_peak`].
+fn roll_off(rgb: [f32; 3], white: f32, top: f32) -> [f32; 3] {
     let below = [rgb[0].max(0.0), rgb[1].max(0.0), rgb[2].max(0.0)];
     let peak = rgb[0].max(rgb[1]).max(rgb[2]);
     // A pixel with no light has no scale that applies to it: `0/0` is NaN, and
@@ -564,7 +710,7 @@ fn roll_off(rgb: [f32; 3]) -> [f32; 3] {
     if peak <= 0.0 {
         return [0.0, 0.0, 0.0];
     }
-    let scale = roll_off_peak(peak) / peak;
+    let scale = roll_off_peak(peak, white, top) / peak;
     [
         (below[0] * scale).min(1.0),
         (below[1] * scale).min(1.0),
@@ -574,22 +720,51 @@ fn roll_off(rgb: [f32; 3]) -> [f32; 3] {
 
 /// Where a pixel's brightest channel lands, given the light it carries.
 ///
-/// Up to SDR white the map is a straight scale by [`SDR_WHITE_LEVEL`], so the
-/// *ratios* inside the SDR range — and so the whole shape of an SDR image — are
-/// exactly what they were, and white is where white is defined to be.  Above it,
-/// a Reinhard curve spends what is left of the range, monotonically, so a
-/// brighter pixel always lands on a brighter code and a highlight never
-/// collapses onto white.
-fn roll_off_peak(peak: f32) -> f32 {
+/// Up to SDR white the map is a straight scale by `white`, so the *ratios*
+/// inside the SDR range — and so the whole shape of an SDR image — are exactly
+/// what they were, and white is where white is defined to be.  Above it, a
+/// Reinhard curve spends what is left of the range, monotonically, so a brighter
+/// pixel always lands on a brighter code and a highlight never collapses onto
+/// white.
+///
+/// `top` is the light that reaches the top of the range: `ROLL_OFF_PEAK` for
+/// every mode that anchors white to a level, and the frame's own peak for
+/// [`ToneMap::Normalize`], whose whole point is that the brightest point *is*
+/// white.  A peak below `top` therefore stops short of the ceiling in the
+/// anchored modes — which is what keeps a brighter pixel brighter than it — and
+/// lands exactly on it when normalised.
+fn roll_off_peak(peak: f32, white: f32, top: f32) -> f32 {
     if peak <= 1.0 {
-        return peak * SDR_WHITE_LEVEL;
+        return peak * white;
     }
-    // How far into the range above white this light is, 0..1 at the peak.
-    let at = (peak - 1.0) / (ROLL_OFF_PEAK - 1.0);
-    // Reinhard, scaled so `at == 1` (the peak) reaches the top of the range.
-    let headroom = 1.0 - SDR_WHITE_LEVEL;
+    // How far into the range above white this light is, 0..1 at `top`.
+    let at = (peak - 1.0) / (top - 1.0);
+    // Reinhard, scaled so `at == 1` (the top of the range) reaches white's own
+    // ceiling.
+    let headroom = 1.0 - white;
     let spent = (at / (1.0 + at)) / 0.5;
-    (SDR_WHITE_LEVEL + headroom * spent.min(1.0)).min(1.0)
+    (white + headroom * spent.min(1.0)).min(1.0)
+}
+
+/// Where this frame's SDR white lands, as a fraction of the sRGB range.
+///
+/// A frame with nothing above SDR white is an SDR image and has no highlights to
+/// make room for, so its white belongs on the last code: that is the whole of
+/// what "SDR content shows exactly as it did" means, and putting it on
+/// [`SDR_WHITE_LEVEL`] instead dimmed every SDR capture taken on an HDR output
+/// to sRGB 231.  A frame that does carry light above white has to spend the top
+/// of the range on it — an 8-bit image's ceiling *is* white, so there is nowhere
+/// else for the highlights to go — and its white moves down to
+/// [`SDR_WHITE_LEVEL`] to leave that room.
+///
+/// This makes the map a property of the frame rather than of the pixel, which is
+/// the one thing it did not used to be: the same light can land on a different
+/// code depending on what else shares the frame.  That is the price of an SDR
+/// capture being exact, and it is the trade the other order makes — see the
+/// note on [`HdrFrame::tone_map_to_srgb_with`].  A user who would rather not pay
+/// it picks [`ToneMap::Fixed`], whose white does not read the frame at all.
+fn white_level_for(frame: &HdrFrame, options: ToneMapOptions) -> f32 {
+    options.levels_for(frame).0
 }
 
 // --- the frame ------------------------------------------------------------
@@ -615,11 +790,7 @@ impl HdrFrame {
     }
 
     /// Wraps already-linear pixels that are in `primaries`.
-    pub fn in_primaries(
-        size: Size,
-        pixels: Vec<[f32; 4]>,
-        primaries: Primaries,
-    ) -> Result<Self> {
+    pub fn in_primaries(size: Size, pixels: Vec<[f32; 4]>, primaries: Primaries) -> Result<Self> {
         let expected = size.area()?;
         if pixels.len() != expected {
             return Err(VshotError::InvalidGeometry(format!(
@@ -769,14 +940,11 @@ impl HdrFrame {
     /// pair.
     ///
     /// The map is **display-referred**: linear 1.0 is the output's own SDR white
-    /// (see [`OutputColor::reference_nits`]) and it lands on [`SDR_WHITE_LEVEL`]
-    /// — below sRGB white on purpose, so the codes above it can carry light
-    /// brighter than white, and so a sample inside the SDR range keeps the ratio
-    /// its light had.  The frame's own peak deliberately does **not** set the
-    /// white point: with that, one capture of a window would come out at a
-    /// different brightness from the next depending on what else shared the
-    /// frame, and a pinned copy of a capture would not match the content it was
-    /// taken from.
+    /// (see [`OutputColor::reference_nits`]) and it lands where [`white_level_for`]
+    /// puts it for this frame — on the last code when the frame holds nothing
+    /// above white, so an SDR capture comes out exactly as it looked, and at
+    /// [`SDR_WHITE_LEVEL`] when it does hold highlights, so the codes above white
+    /// have somewhere to carry them.
     ///
     /// Light above SDR white has nowhere to go in an 8-bit SDR image — the
     /// format ends at white — so it is rolled off by [`roll_off`]: up to white
@@ -788,9 +956,27 @@ impl HdrFrame {
     /// `(4, 2, 1)` and `(8, 4, 2)` become the same pixel and the HDR marks of a
     /// test page come out indistinguishable from the SDR around them.
     ///
+    /// The white point is a property of the **frame**, not of the pixel, and the
+    /// two goals it has to serve pull against each other.  Anchoring it to a
+    /// fixed level makes a pixel's byte the same whatever else shares the frame —
+    /// which is what lets a pinned copy match the content it was taken from —
+    /// but it dims every SDR capture to sRGB 231 even when there is no highlight
+    /// to make room for.  Reading it from the frame's peak keeps an SDR capture
+    /// exact and makes the same light land on a different code in a frame that
+    /// also holds a highlight.  Exactness for SDR content is the stronger of the
+    /// two: it is what a screenshot of an SDR window is for, and a highlight
+    /// only moves the white when the capture really has one.
+    ///
     /// Alpha is quantised to a byte like every other channel (a capture is
     /// opaque).
-    pub fn tone_map_to_srgb(&self) -> Result<Frame> {
+    ///
+    /// `options` carries the one choice the map has: where SDR white lands, and
+    /// whether that is read from the frame ([`ToneMap::Auto`], the default), held
+    /// fixed ([`ToneMap::Fixed`]) or normalised to the frame's peak
+    /// ([`ToneMap::Normalize`]).  [`HdrFrame::tone_map_to_srgb`] is the same map
+    /// at the built-in defaults, for a caller with no setting to honour.
+    pub fn tone_map_to_srgb_with(&self, options: ToneMapOptions) -> Result<Frame> {
+        let (white, top) = options.levels_for(self);
         let mut bytes = vec![0u8; self.pixels.len() * 4];
         map_rows(&mut bytes, self.size.width as usize * 4, |offset, row| {
             for (index, destination) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
@@ -803,7 +989,7 @@ impl HdrFrame {
                     self.primaries.to_bt709(),
                     [pixel[0], pixel[1], pixel[2]],
                 ));
-                let rgb = roll_off(rgb);
+                let rgb = roll_off(rgb, white, top);
                 destination[0] = to_u8(srgb_oetf(rgb[0]));
                 destination[1] = to_u8(srgb_oetf(rgb[1]));
                 destination[2] = to_u8(srgb_oetf(rgb[2]));
@@ -811,6 +997,11 @@ impl HdrFrame {
             }
         });
         Frame::new(self.size, bytes)
+    }
+
+    /// [`HdrFrame::tone_map_to_srgb_with`] at the built-in defaults.
+    pub fn tone_map_to_srgb(&self) -> Result<Frame> {
+        self.tone_map_to_srgb_with(ToneMapOptions::default())
     }
 
     /// Composites an 8-bit sRGB layer (an annotation raster, black where it is
@@ -1447,17 +1638,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(frame.primaries(), Primaries::Bt2020);
-        let pixel = frame.tone_map_to_srgb().unwrap().pixel(Point::new(0, 0)).unwrap();
-        // White is neutral, and it lands where the map puts SDR white — which is
-        // *not* the last code, because the codes above it are what light
-        // brighter than white is shown with (see `SDR_WHITE_LEVEL`).
+        let pixel = frame
+            .tone_map_to_srgb()
+            .unwrap()
+            .pixel(Point::new(0, 0))
+            .unwrap();
+        // White is neutral, and a frame with nothing above white puts it on the
+        // last code: an SDR image is shown exactly as it was, with no headroom
+        // spent on highlights it does not have (see `white_level_for`).
         assert_eq!(pixel[0], pixel[1]);
         assert_eq!(pixel[1], pixel[2]);
-        assert!(
-            (215..=245).contains(&pixel[0]),
-            "white landed on {}, which leaves the highlights nowhere to go",
-            pixel[0]
-        );
+        assert_eq!(pixel[0], 255, "SDR white did not land on white");
     }
 
     #[test]
@@ -1724,9 +1915,158 @@ mod tests {
         // The ratio between the channels is what the light had, so the mark on
         // the image keeps its colour instead of washing out towards white.
         let expected = to_u8(srgb_oetf(srgb_eotf(f32::from(pixel[0]) / 255.0) * 0.5));
-        assert!((i32::from(pixel[1]) - i32::from(expected)).abs() <= 1, "{pixel:?}");
+        assert!(
+            (i32::from(pixel[1]) - i32::from(expected)).abs() <= 1,
+            "{pixel:?}"
+        );
         let expected = to_u8(srgb_oetf(srgb_eotf(f32::from(pixel[0]) / 255.0) * 0.25));
-        assert!((i32::from(pixel[2]) - i32::from(expected)).abs() <= 1, "{pixel:?}");
+        assert!(
+            (i32::from(pixel[2]) - i32::from(expected)).abs() <= 1,
+            "{pixel:?}"
+        );
+    }
+
+    #[test]
+    fn a_fixed_white_level_does_not_read_the_frame() {
+        // The trade `ToneMap::Fixed` exists for: the same light lands on the
+        // same code whatever else shares the frame, so a pin taken out of a
+        // capture keeps the code it had.  `Auto` gives that up on purpose — an
+        // SDR capture on an HDR output has to come out exact.
+        let options = ToneMapOptions {
+            mode: ToneMap::Fixed,
+            white: 0.8,
+            ..ToneMapOptions::default()
+        };
+        let alone = one_pixel([1.0, 1.0, 1.0, 1.0])
+            .tone_map_to_srgb_with(options)
+            .unwrap()
+            .pixel(Point::new(0, 0))
+            .unwrap()[0];
+        let beside = HdrFrame::new(
+            Size::new(2, 1),
+            vec![[1.0, 1.0, 1.0, 1.0], [8.0, 8.0, 8.0, 1.0]],
+        )
+        .unwrap()
+        .tone_map_to_srgb_with(options)
+        .unwrap()
+        .pixel(Point::new(0, 0))
+        .unwrap()[0];
+        assert_eq!(alone, beside, "a fixed white level read the frame");
+        // And it is the level asked for, not the last code.
+        assert_eq!(alone, to_u8(srgb_oetf(0.8)));
+    }
+
+    #[test]
+    fn normalizing_puts_the_peak_on_white() {
+        // `ToneMap::Normalize` is the reciprocal: SDR white goes to `1 / peak`,
+        // so the frame's own brightest point lands on the ceiling.  It is the
+        // right map when the peak really is a highlight to normalise to, and it
+        // is what `Auto` deliberately is not — the highlights are compressed
+        // into whatever the reciprocal leaves.
+        let options = ToneMapOptions {
+            mode: ToneMap::Normalize,
+            white: SDR_WHITE_LEVEL,
+            ..ToneMapOptions::default()
+        };
+        let frame = HdrFrame::new(
+            Size::new(2, 1),
+            vec![[1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 1.0]],
+        )
+        .unwrap();
+        let mapped = frame.tone_map_to_srgb_with(options).unwrap();
+        let white = mapped.pixel(Point::new(0, 0)).unwrap()[0];
+        let peak = mapped.pixel(Point::new(1, 0)).unwrap()[0];
+        assert_eq!(white, to_u8(srgb_oetf(0.5)), "white did not halve");
+        assert_eq!(peak, 255, "the peak did not reach white");
+
+        // A frame with nothing above white has no peak to normalise to, so its
+        // white stays where white is rather than being pushed to the ceiling by
+        // the reciprocal of a light that is already SDR.
+        let sdr = one_pixel([0.5, 0.5, 0.5, 1.0])
+            .tone_map_to_srgb_with(options)
+            .unwrap()
+            .pixel(Point::new(0, 0))
+            .unwrap()[0];
+        assert_eq!(sdr, to_u8(srgb_oetf(0.5)));
+    }
+
+    #[test]
+    fn auto_leaves_an_sdr_frame_alone_however_many_rounding_pixels_it_has() {
+        // The regression this whole decision exists for.  A plain SDR desktop on
+        // a ten-bit PQ output holds thousands of pixels a few thousandths over
+        // white; under the old peak test a handful of them moved the white point
+        // from 1.0 to 0.8 and dimmed the whole 3.7-megapixel capture about 18 %.
+        // White has to land on the last code, not on the configured level.
+        let options = ToneMapOptions {
+            mode: ToneMap::Auto,
+            white: 0.8,
+            ..ToneMapOptions::default()
+        };
+        let frame = frame_with(1.03, 35, 100_000);
+        let white = frame
+            .tone_map_to_srgb_with(options)
+            .unwrap()
+            .pixel(Point::new(99_999, 0))
+            .unwrap()[0];
+        assert_eq!(white, 255, "an SDR frame was dimmed by its own rounding");
+
+        // A frame that really does carry light above white still moves it, which
+        // is the other half of the trade: `Auto` reads the frame, it just reads
+        // it by the share and not by the peak.
+        let frame = frame_with(2.0, 10_000, 100_000);
+        let white = frame
+            .tone_map_to_srgb_with(options)
+            .unwrap()
+            .pixel(Point::new(99_999, 0))
+            .unwrap()[0];
+        assert!(white < 255, "the highlights had nowhere to go: {white}");
+    }
+
+    #[test]
+    fn a_white_level_outside_the_range_is_clamped_not_obeyed() {
+        // White on the ceiling leaves the highlights nowhere to go, and white on
+        // black shows no SDR image at all; both are clamped to the span the map
+        // defines.  A level that is not a number at all falls back to the
+        // default rather than poisoning every pixel with a NaN.
+        assert_eq!(ToneMapOptions::clamp_white(0.0), ToneMapOptions::MIN_WHITE);
+        assert_eq!(ToneMapOptions::clamp_white(1.0), ToneMapOptions::MAX_WHITE);
+        assert_eq!(ToneMapOptions::clamp_white(f32::NAN), SDR_WHITE_LEVEL);
+        assert_eq!(ToneMapOptions::clamp_white(f32::INFINITY), SDR_WHITE_LEVEL);
+
+        // A white level at the ceiling is still clamped when it reaches the map
+        // through `Fixed`, so a hand-edited config cannot collapse the
+        // highlights even though it asked to.
+        let frame = HdrFrame::new(
+            Size::new(2, 1),
+            vec![[1.0, 1.0, 1.0, 1.0], [8.0, 8.0, 8.0, 1.0]],
+        )
+        .unwrap();
+        let mapped = frame
+            .tone_map_to_srgb_with(ToneMapOptions {
+                mode: ToneMap::Fixed,
+                white: 1.0,
+                ..ToneMapOptions::default()
+            })
+            .unwrap();
+        let white = mapped.pixel(Point::new(0, 0)).unwrap()[0];
+        let highlight = mapped.pixel(Point::new(1, 0)).unwrap()[0];
+        assert!(white < 255, "white reached the ceiling: {white}");
+        assert!(highlight > white, "the highlight collapsed onto white");
+    }
+
+    #[test]
+    fn the_modes_are_named_and_parsed_the_same_way() {
+        // The CLI, the config file and the settings window all go through these
+        // two, so a name that parses has to be the name that is printed and the
+        // other way round.
+        for name in ToneMap::NAMES {
+            let mode = ToneMap::parse(name).unwrap_or_else(|| panic!("{name} did not parse"));
+            assert_eq!(mode.name(), name);
+        }
+        assert_eq!(ToneMap::parse("AUTO"), None);
+        assert_eq!(ToneMap::parse(""), None);
+        assert_eq!(ToneMap::default(), ToneMap::Auto);
+        assert_eq!(ToneMapOptions::default().white, SDR_WHITE_LEVEL);
     }
 
     #[test]
@@ -1736,31 +2076,40 @@ mod tests {
         // an HDR gradient collapsed to one flat patch.  A brighter pixel must
         // come out at least as bright, and a strictly brighter one strictly so
         // for as long as the range allows.
-        let codes = |light: f32| -> u8 {
-            one_pixel([light, light, light, 1.0])
-                .tone_map_to_srgb()
-                .unwrap()
-                .pixel(Point::new(0, 0))
-                .unwrap()[0]
-        };
+        //
+        // The ladder lives in **one** frame, which is what a capture is: the
+        // white point is the frame's, so probing each light in a frame of its own
+        // would measure a different map each time.
+        let ladder = [0.25f32, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 16.0, 64.0];
+        let frame = HdrFrame::new(
+            Size::new(ladder.len() as u32, 1),
+            ladder
+                .iter()
+                .map(|light| [*light, *light, *light, 1.0])
+                .collect(),
+        )
+        .unwrap();
+        let mapped = frame.tone_map_to_srgb().unwrap();
+        let code_at = |index: usize| mapped.pixel(Point::new(index as i32, 0)).unwrap()[0];
         // SDR light keeps its own shape: the map is one straight scale below
         // white, so the ratios inside the SDR range are exactly what they were.
-        // (White itself sits below the last code — that is what leaves room for
-        // the highlights.)
+        // This frame holds a highlight, so that scale is `SDR_WHITE_LEVEL` —
+        // white itself sits below the last code, which is what leaves the
+        // highlights room.
         assert_eq!(
-            codes(0.5),
+            code_at(1),
             to_u8(srgb_oetf(0.5 * SDR_WHITE_LEVEL)),
             "SDR light is not a straight scale"
         );
         // SDR white leaves headroom for the highlights, which is the only way an
         // 8-bit image can show light brighter than white at all.
-        let white = codes(1.0);
+        let white = code_at(2);
         assert!((215..=245).contains(&white), "white = {white}");
         // Above white the map stays monotonic — never decreasing — and is still
         // strictly increasing for as long as 8-bit codes are left to spend.
         let mut previous = white;
-        for light in [1.5f32, 2.0, 3.0, 5.0, 8.0, 16.0, 64.0] {
-            let now = codes(light);
+        for (index, light) in ladder.iter().enumerate().skip(3) {
+            let now = code_at(index);
             assert!(
                 now >= previous,
                 "light {light} came out darker ({now}) than less light ({previous})"
@@ -1768,7 +2117,7 @@ mod tests {
             previous = now;
         }
         // And separated: a bright patch is codes away from white, not on it.
-        let separation = i32::from(codes(8.0)) - i32::from(white);
+        let separation = i32::from(code_at(7)) - i32::from(white);
         assert!(
             separation >= 15,
             "the highlights are only {separation} codes above white"
