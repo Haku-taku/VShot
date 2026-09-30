@@ -549,13 +549,13 @@ bool drawStrokeWithColor(vshot::OverlayController &controller, vshot::CaptureOve
 }
 
 // The colour the picker hands the editor has to survive into the committed mark
-// and out through the result document.  Every place that writes an annotation's
-// colour into that document goes through `colorText`, and the document is the
-// only thing the renderer ever sees -- so a colour that lost its alpha between
-// the picker and the JSON is invisible on screen and only shows up as a solid
-// mark in the output PNG.  The exact string is pinned because the Rust reader
-// reads `#rrggbbaa` with the alpha last: a channel dropped, swapped or put in
-// the wrong place changes which colour comes out.
+// and out through the marks document.  Every place that writes an annotation's
+// colour into that document goes through `colorText`, and the document is what
+// the daemon keeps and hands back -- so a colour that lost its alpha between the
+// picker and the JSON comes back wrong the next time the mark is edited, and
+// the exact string is pinned because it is read back with `#rrggbbaa`, alpha
+// last: a channel dropped, swapped or put in the wrong place changes which
+// colour comes out.
 void checkTranslucentColorSerializesWithAlpha()
 {
     QScreen *screen = QGuiApplication::primaryScreen();
@@ -575,14 +575,12 @@ void checkTranslucentColorSerializesWithAlpha()
            "the committed stroke keeps the alpha the current colour carried",
            QStringLiteral("alpha=%1").arg(mark.color.alpha()));
 
-    const QJsonDocument document = controller.resultDocument();
-    const QJsonArray annotations =
-        document.object().value(QStringLiteral("annotations")).toArray();
-    expect(annotations.size() == 1, "the document carries the stroke");
-    if (annotations.isEmpty()) {
+    const QJsonArray marks = controller.marksDocument();
+    expect(marks.size() == 1, "the document carries the stroke");
+    if (marks.isEmpty()) {
         return;
     }
-    const QString color = annotations.at(0).toObject().value(QStringLiteral("color")).toString();
+    const QString color = marks.at(0).toObject().value(QStringLiteral("color")).toString();
     expect(color == QStringLiteral("#1122cc80"),
            "a translucent colour serializes as #rrggbbaa, alpha in the last two digits",
            QStringLiteral("got %1").arg(color));
@@ -606,14 +604,12 @@ void checkOpaqueColorSerializesWithoutAlpha()
     expect(controller.annotations().at(0).color.alpha() == 255,
            "an opaque stroke stays fully opaque");
 
-    const QJsonDocument document = controller.resultDocument();
-    const QJsonArray annotations =
-        document.object().value(QStringLiteral("annotations")).toArray();
-    if (annotations.isEmpty()) {
+    const QJsonArray marks = controller.marksDocument();
+    if (marks.isEmpty()) {
         expect(false, "the document carries the stroke");
         return;
     }
-    const QString color = annotations.at(0).toObject().value(QStringLiteral("color")).toString();
+    const QString color = marks.at(0).toObject().value(QStringLiteral("color")).toString();
     expect(color == QStringLiteral("#1122cc"),
            "an opaque colour serializes as #rrggbb, not eight digits",
            QStringLiteral("got %1").arg(color));
@@ -1450,14 +1446,12 @@ void checkWaveSerializesAsATwoPointStroke()
         return;
     }
 
-    const QJsonDocument document = controller.resultDocument();
-    const QJsonArray annotations =
-        document.object().value(QStringLiteral("annotations")).toArray();
-    expect(annotations.size() == 1, "the document carries the wave");
-    if (annotations.isEmpty()) {
+    const QJsonArray marks = controller.marksDocument();
+    expect(marks.size() == 1, "the document carries the wave");
+    if (marks.isEmpty()) {
         return;
     }
-    const QJsonObject mark = annotations.at(0).toObject();
+    const QJsonObject mark = marks.at(0).toObject();
     expect(mark.value(QStringLiteral("kind")).toString() == QStringLiteral("stroke"),
            "the wave serializes as a stroke",
            mark.value(QStringLiteral("kind")).toString());
@@ -1484,13 +1478,11 @@ void checkWaveSerializesAsATwoPointStroke()
 }
 
 // A numbered badge rides the text annotation all the way out: `kind=text` with
-// `tool=number`, the count as the decimal string the renderer's no-bitmap
-// fallback would draw, and a bitmap it composites instead.  The one extra name
-// is the whole of the protocol change -- the Rust side reads a badge exactly
-// like a label -- so a badge that stopped carrying its bitmap, or that lost the
-// `tool` name, would still be "a text annotation" and would only be noticed at
-// render time.
-void checkNumberSerializesAsATextBitmap()
+// `tool=number`, its count as a decimal string, and the two numbers a re-edit
+// cannot guess -- its style and its diameter.  A badge that lost either would
+// still read as "a text annotation" and would only be noticed the second time
+// it was opened, when it came back the wrong shape or the wrong size.
+void checkNumberSerializesWithItsStyleAndSize()
 {
     QScreen *screen = QGuiApplication::primaryScreen();
     if (screen == nullptr) {
@@ -1522,20 +1514,12 @@ void checkNumberSerializesAsATextBitmap()
     expect(controller.annotations().at(0).number == 1, "the first badge counts one",
            QStringLiteral("number=%1").arg(controller.annotations().at(0).number));
 
-    QTemporaryDir directory;
-    expect(directory.isValid(), "a temporary directory for the bitmap");
-    if (!directory.isValid()) {
+    const QJsonArray marks = controller.marksDocument();
+    expect(marks.size() == 1, "the document carries the badge");
+    if (marks.isEmpty()) {
         return;
     }
-    const QJsonDocument document = controller.resultDocument(directory.path(), &error);
-    expect(error.isEmpty(), "the export reports no error", error);
-    const QJsonArray annotations =
-        document.object().value(QStringLiteral("annotations")).toArray();
-    expect(annotations.size() == 1, "the document carries the badge");
-    if (annotations.isEmpty()) {
-        return;
-    }
-    const QJsonObject mark = annotations.at(0).toObject();
+    const QJsonObject mark = marks.at(0).toObject();
     expect(mark.value(QStringLiteral("kind")).toString() == QStringLiteral("text"),
            "the badge serializes as a text annotation",
            mark.value(QStringLiteral("kind")).toString());
@@ -1545,13 +1529,12 @@ void checkNumberSerializesAsATextBitmap()
     expect(mark.value(QStringLiteral("text")).toString() == QStringLiteral("1"),
            "the badge's text is its count in decimal",
            mark.value(QStringLiteral("text")).toString());
-    const int width = mark.value(QStringLiteral("bitmap_width")).toInt();
-    const int height = mark.value(QStringLiteral("bitmap_height")).toInt();
-    expect(width == 36 && height == 36,
-           "the badge's bitmap is its 36x36 box at the scene's 1x density",
-           QStringLiteral("got %1x%2").arg(width).arg(height));
-    expect(!mark.value(QStringLiteral("bitmap")).toString().isEmpty(),
-           "the badge names the bitmap file it was written to");
+    expect(mark.value(QStringLiteral("numberSize")).toInt() == 36,
+           "the badge carries the diameter it was drawn at",
+           QStringLiteral("got %1").arg(mark.value(QStringLiteral("numberSize")).toInt()));
+    expect(mark.value(QStringLiteral("numberStyle")).toString() == QStringLiteral("filled_circle"),
+           "the badge carries its style",
+           mark.value(QStringLiteral("numberStyle")).toString());
 }
 
 // The undo comparison treats a badge's count and style as content: two badges at
@@ -1585,10 +1568,10 @@ void checkNumberBadgesCompareByCountAndStyle()
 
 // The pen path's wire form: one stroke, `tool=bezier`, the anchors and their
 // outgoing handles interleaved and absolute, and the closure as its own field.
-// The renderer fills a closed path before it strokes it, so a path that lost its
-// closure -- or whose points came out as the incoming handles rather than the
-// outgoing ones -- would still be "a stroke" and would only be noticed in the
-// baked PNG.
+// A closed path is filled before it is stroked, so a path that lost its closure
+// -- or whose points came out as the incoming handles rather than the outgoing
+// ones -- would still be "a stroke" and would only be noticed when it was drawn
+// again.
 void checkBezierSerializesWithItsClosure()
 {
     vshot::OverlayController controller(largeSession());
@@ -1623,14 +1606,17 @@ void checkBezierSerializesWithItsClosure()
     }
     expect(placed, "the points are the anchors and the handles they were dragged to");
 
-    const QJsonDocument document = controller.resultDocument();
-    const QJsonArray annotations =
-        document.object().value(QStringLiteral("annotations")).toArray();
-    expect(annotations.size() == 1, "the document carries the pen path");
-    if (annotations.isEmpty()) {
+    // The marks document is what a daemon keeps and hands back, so the path's
+    // closure has to survive it: an open curve and the closed one that fills it
+    // are different marks, and a re-edit that lost the flag would fill a path
+    // the user left open.
+    const QJsonArray marks =
+        controller.marksDocument();
+    expect(marks.size() == 1, "the marks document carries the pen path");
+    if (marks.isEmpty()) {
         return;
     }
-    const QJsonObject value = annotations.at(0).toObject();
+    const QJsonObject value = marks.at(0).toObject();
     expect(value.value(QStringLiteral("kind")).toString() == QStringLiteral("stroke"),
            "the pen path serializes as a stroke",
            value.value(QStringLiteral("kind")).toString());
@@ -1662,16 +1648,282 @@ void checkBezierSerializesWithItsClosure()
     expect(open.annotations().at(0).points.size() == 2 * kPenAnchorCount,
            "the open pen path carries the same three anchors",
            QStringLiteral("points=%1").arg(open.annotations().at(0).points.size()));
-    const QJsonArray openAnnotations =
-        open.resultDocument().object().value(QStringLiteral("annotations")).toArray();
-    if (openAnnotations.isEmpty()) {
-        expect(false, "the document carries the open pen path");
+    const QJsonArray openMarks = open.marksDocument();
+    if (openMarks.isEmpty()) {
+        expect(false, "the marks document carries the open pen path");
         return;
     }
-    const QJsonObject openValue = openAnnotations.at(0).toObject();
+    const QJsonObject openValue = openMarks.at(0).toObject();
     expect(openValue.value(QStringLiteral("tool")).toString() == QStringLiteral("bezier") &&
                !openValue.value(QStringLiteral("closed")).toBool(),
            "the open pen path serializes as an unclosed bezier");
+}
+
+// The whole point of keeping the marks as data: what the editor hands a daemon
+// has to be enough to put the same marks back, so a re-edit opens on the
+// picture the user left rather than on a blank canvas.  The two halves are
+// `marksDocument` and `parseMarks`, and they are a protocol -- a field one
+// writes and the other does not read is a mark that comes back subtly wrong,
+// which nothing else here would catch.
+void checkMarksRoundTripThroughASession()
+{
+    vshot::OverlayController source(largeSession());
+    vshot::CaptureOverlay *overlay = nullptr;
+    if (!openLargeOverlay(source, &overlay)) {
+        return;
+    }
+    // One of each mark a session can carry, with a value in every field that
+    // has one, so a field dropped on either side shows up as a difference.
+    source.setCurrentColor(QColor(17, 34, 204, 128));
+    source.chooseTool(vshot::Tool::Rectangle);
+    source.setWidth(5);
+    drag(source, overlay, QPointF(120, 140), QPointF(400, 300));
+    source.setCurrentColor(QColor(9, 200, 30));
+    source.chooseTool(vshot::Tool::Arrow);
+    source.setWidth(7);
+    drag(source, overlay, QPointF(500, 160), QPointF(760, 340));
+    source.setCurrentColor(QColor(240, 120, 10));
+    source.chooseTool(vshot::Tool::Wave);
+    source.setWidth(4);
+    // A period longer than the amplitude's own ceiling: the two share a limit
+    // only by accident of the sliders, and a document written with a long wave
+    // has to be one the reader will take back.
+    source.setWaveWavelength(200);
+    drag(source, overlay, QPointF(200, 600), QPointF(700, 600));
+    // The mosaic brush is a Stroke, not a Shape, and the reader has to know it
+    // under the name the writer gave it.  It is the one tool whose kind depends
+    // on a second setting, so it is the one that can drift out of the list
+    // unnoticed -- and a single unreadable mark fails the whole document.
+    source.setCurrentColor(QColor(60, 60, 60));
+    source.chooseTool(vshot::Tool::Mosaic);
+    source.setMosaicShape(QStringLiteral("brush"));
+    source.setWidth(20);
+    drag(source, overlay, QPointF(150, 900), QPointF(600, 1050));
+    source.setCurrentColor(QColor(255, 30, 30));
+    source.chooseTool(vshot::Tool::Number);
+    source.setNumberSize(36);
+    source.press(overlay, QPointF(900, 700), Qt::LeftButton, Qt::NoModifier);
+    source.release(overlay, QPointF(900, 700), Qt::LeftButton, Qt::NoModifier);
+    expect(source.annotations().size() == 5, "five marks of five kinds are down",
+           QString::number(source.annotations().size()));
+    if (source.annotations().size() != 5) {
+        return;
+    }
+    const QVector<vshot::Annotation> before = source.annotations();
+
+    // Through the document, which is the only thing that crosses to the daemon.
+    const QJsonArray marks = source.marksDocument();
+    expect(marks.size() == 5, "the document carries all five marks",
+           QString::number(marks.size()));
+    if (marks.size() != 5) {
+        return;
+    }
+
+    // And back into a fresh editor opened on the same canvas, which is what a
+    // re-edit does: the session's own bounds are the canvas the marks were
+    // measured against.
+    vshot::Session reopened = largeSession();
+    reopened.annotations = marks;
+    reopened.mode = QStringLiteral("pin");
+    reopened.bounds = vshot::LogicalRect{0, 0, 1600, 1200};
+    vshot::OverlayController restored(reopened);
+    restored.setPinEditMode(true);
+    restored.beginPinEdit();
+    const QVector<vshot::Annotation> after = restored.annotations();
+    expect(after.size() == before.size(), "the restored editor carries the same marks",
+           QStringLiteral("%1 of %2").arg(after.size()).arg(before.size()));
+    if (after.size() != before.size()) {
+        return;
+    }
+    for (int index = 0; index < before.size(); ++index) {
+        expect(vshot::annotationEquals(before.at(index), after.at(index)),
+               "a restored mark equals the one that was drawn",
+               QStringLiteral("mark %1: %2 vs %3")
+                   .arg(index)
+                   .arg(before.at(index).tool, after.at(index).tool));
+    }
+
+    // The restored marks are the state the user left the pin in, so undo stops
+    // there rather than peeling them off one at a time.
+    restored.undo();
+    expect(restored.annotations().size() == before.size(),
+           "a reopened pin has nothing to undo back to",
+           QString::number(restored.annotations().size()));
+
+    // The document is relative to the canvas, so the same marks reopened on a
+    // canvas somewhere else land at that canvas's own origin plus the offset
+    // they were drawn at.  A reader that took the offsets for global pixels --
+    // which is what a canvas at the origin hides -- would put every mark back
+    // at the top-left corner of the screen instead.  Re-reading the document
+    // back off the moved canvas is what proves it: relative to its own canvas
+    // the same marks are the same offsets again.
+    constexpr int shiftX = 300;
+    constexpr int shiftY = 200;
+    vshot::Session elsewhere = largeSession();
+    elsewhere.annotations = marks;
+    elsewhere.bounds = vshot::LogicalRect{shiftX, shiftY, 1600, 1200};
+    elsewhere.selection = elsewhere.bounds;
+    vshot::OverlayController moved(elsewhere);
+    moved.setPinEditMode(true);
+    moved.beginPinEdit();
+    expect(moved.annotations().size() == before.size(),
+           "an offset canvas carries the same marks",
+           QStringLiteral("%1 of %2").arg(moved.annotations().size()).arg(before.size()));
+    if (moved.annotations().size() != before.size()) {
+        return;
+    }
+    expect(moved.marksDocument() == marks,
+           "a mark reopens at its canvas's own origin",
+           QString::fromUtf8(QJsonDocument(moved.marksDocument()).toJson(QJsonDocument::Compact)));
+}
+
+// The two marks a session cannot rebuild from geometry: a pasted image is its
+// pixels and a placed translation is its lines, and neither has a smaller form
+// the editor could re-derive.  They used to be dropped from the document
+// outright -- the writer `continue`d past both -- so a pin carrying a pasted
+// screenshot came back without it, and a text label, which is the other half of
+// the same defect, failed the session instead: the writer left `tool` off a
+// plain label and the reader refuses any mark without one, so one label made
+// the whole document unreadable and *every* mark was lost.  What has to hold is
+// that a re-edit opens on all of them, and that the image comes back at its own
+// resolution rather than at the size it was scaled to.
+void checkImageAndTranslationMarksSurviveAReEdit()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    QTemporaryDir dir;
+    if (!dir.isValid()) {
+        expect(false, "somewhere for the session's mark assets");
+        return;
+    }
+
+    vshot::OverlayController source(largeSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = source.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    source.beginPresetEdit();
+    source.setMarkAssetDirectory(dir.path());
+
+    // A label: the mark whose missing `tool` used to take the whole document
+    // down with it, so it is first for a reason -- everything after it is what
+    // the failure was hiding.
+    source.setCurrentColor(QColor(10, 20, 30));
+    source.chooseTool(vshot::Tool::Text);
+    source.press(overlay, QPointF(200, 300), Qt::LeftButton, Qt::NoModifier);
+    QLineEdit *editor = overlay->findChild<QLineEdit *>();
+    if (editor == nullptr) {
+        expect(false, "the text tool opens its inline editor");
+        return;
+    }
+    editor->setText(QStringLiteral("kept"));
+    source.key(overlay, Qt::Key_Return, Qt::NoModifier);
+
+    // A pasted image, deliberately larger than the canvas, so it is shrunk to
+    // fit on the way in: the mark's own pixels and the rect it was placed in
+    // then disagree, which is exactly the pair the user asked to keep apart --
+    // the rect is a placement and the pixels are the source a later resize has
+    // to go back to.
+    QImage seed(180, 130, QImage::Format_ARGB32);
+    for (int y = 0; y < seed.height(); ++y) {
+        for (int x = 0; x < seed.width(); ++x) {
+            seed.setPixelColor(x, y, QColor((x * 7) % 256, (y * 11) % 256, 200, 255));
+        }
+    }
+    const QImage pasted = seed.scaled(1800, 1300);
+    expect(source.pasteImage(pasted, QStringLiteral("check")), "the image pastes");
+    const QVector<vshot::Annotation> before = source.annotations();
+    expect(before.size() == 2, "the label and the image are both down",
+           QString::number(before.size()));
+    if (before.size() != 2) {
+        return;
+    }
+    const QImage &imageBefore = before.at(1).pixels;
+    expect(imageBefore.width() == 1800 && imageBefore.height() == 1300,
+           "the pasted image keeps its own resolution",
+           QStringLiteral("%1x%2").arg(imageBefore.width()).arg(imageBefore.height()));
+    expect(before.at(1).rect.width < 1800,
+           "and the mark was placed smaller than that, so the two really differ",
+           QStringLiteral("placed %1 wide").arg(before.at(1).rect.width));
+
+    // Through the document that crosses to the daemon, with the assets written
+    // beside it -- which is what a re-edit reads back.
+    const QJsonArray marks = source.writeMarkAssets(dir.path());
+    expect(marks.size() == 2, "the document carries both marks",
+           QString::number(marks.size()));
+    if (marks.size() != 2) {
+        return;
+    }
+    const QJsonObject label = marks.at(0).toObject();
+    expect(label.value(QStringLiteral("kind")).toString() == QStringLiteral("text") &&
+               label.value(QStringLiteral("tool")).toString().isEmpty() == false,
+           "a plain label names its tool",
+           QString::fromUtf8(QJsonDocument(label).toJson(QJsonDocument::Compact)));
+    const QJsonObject image = marks.at(1).toObject();
+    const QString asset = image.value(QStringLiteral("pixels")).toString();
+    expect(!asset.isEmpty() && QFileInfo::exists(asset),
+           "the pasted image's pixels are written beside the session", asset);
+    expect(image.value(QStringLiteral("pixel_width")).toInt() == 1800 &&
+               image.value(QStringLiteral("pixel_height")).toInt() == 1300,
+           "and the document records their own size, not the placed one",
+           QString::fromUtf8(QJsonDocument(image).toJson(QJsonDocument::Compact)));
+
+    // And back into a fresh editor opened on the same canvas, which is what a
+    // re-edit does.
+    vshot::Session reopened = largeSession();
+    reopened.annotations = marks;
+    reopened.mode = QStringLiteral("pin");
+    reopened.bounds = vshot::LogicalRect{0, 0, 1600, 1200};
+    vshot::OverlayController restored(reopened);
+    restored.setPinEditMode(true);
+    restored.beginPinEdit();
+    const QVector<vshot::Annotation> after = restored.annotations();
+    expect(after.size() == before.size(), "the restored editor carries both marks back",
+           QStringLiteral("%1 of %2").arg(after.size()).arg(before.size()));
+    if (after.size() != before.size()) {
+        return;
+    }
+    // The label is pure geometry and compares as one mark.  The image cannot go
+    // through `annotationEquals`: it compares pixel buffers by cache key, which
+    // is a cheap identity test for the undo stack and deliberately not a
+    // content test, and a mark that came back off a file is a different buffer
+    // holding the same picture.  So the picture is compared, which is the thing
+    // the user would notice.
+    expect(vshot::annotationEquals(before.at(0), after.at(0)),
+           "the restored label equals the one that was drawn",
+           QStringLiteral("%1 vs %2").arg(before.at(0).tool, after.at(0).tool));
+    expect(after.at(1).kind == before.at(1).kind && after.at(1).rect.x == before.at(1).rect.x &&
+               after.at(1).rect.y == before.at(1).rect.y &&
+               after.at(1).rect.width == before.at(1).rect.width &&
+               after.at(1).rect.height == before.at(1).rect.height,
+           "the restored image sits where the pasted one was placed",
+           QStringLiteral("%1,%2 %3x%4 vs %5,%6 %7x%8")
+               .arg(after.at(1).rect.x)
+               .arg(after.at(1).rect.y)
+               .arg(after.at(1).rect.width)
+               .arg(after.at(1).rect.height)
+               .arg(before.at(1).rect.x)
+               .arg(before.at(1).rect.y)
+               .arg(before.at(1).rect.width)
+               .arg(before.at(1).rect.height));
+    expect(after.at(1).pixels == before.at(1).pixels,
+           "and its pixels come back unchanged",
+           QStringLiteral("%1x%2 vs %3x%4")
+               .arg(after.at(1).pixels.width())
+               .arg(after.at(1).pixels.height())
+               .arg(before.at(1).pixels.width())
+               .arg(before.at(1).pixels.height()));
+    // The point of keeping the original bytes: a later resize goes back to the
+    // source, so what came back has to be the source and not the placed copy.
+    expect(after.at(1).pixels.width() == 1800 && after.at(1).pixels.height() == 1300,
+           "the image reopens at its own resolution, ready to be resized",
+           QStringLiteral("%1x%2").arg(after.at(1).pixels.width()).arg(after.at(1).pixels.height()));
 }
 
 // The closure is content: an open path and the closed one that fills it are

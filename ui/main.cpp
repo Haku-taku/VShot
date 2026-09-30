@@ -218,6 +218,12 @@ int main(int argc, char **argv)
         controller.setTerminalCallback([&app] {
             app.quit();
         });
+        // Where a mark's pixels go when the result carries one: a pasted image
+        // is its pixels and travels as a path to a file rather than inline.
+        // Beside the session, which is the directory this run was handed; the
+        // CLI copies each file into the pin's own directory when it pins the
+        // capture, so nothing has to outlive this process.
+        controller.setMarkAssetDirectory(QFileInfo(sessionPath).absolutePath());
 
         for (int index = 0; index < controller.outputCount(); ++index) {
             const vshot::OutputSession &output = controller.session().outputs.at(index);

@@ -170,6 +170,25 @@ struct Annotation {
     qreal rasterDeviceRatio() const;
 };
 
+// A numbered badge's diameter range, in logical pixels: floored at 18 so the
+// count stays legible and capped at 96 so it does not paint a billboard.  The
+// editor's own size control and the session reader both clamp to these, so a
+// badge that arrives from the daemon lands in the range the control can show.
+constexpr int kNumberMinDiameter = 18;
+constexpr int kNumberMaxDiameter = 96;
+
+// The diameter a badge's stored size means, clamped into that range.
+int numberDiameter(std::uint32_t size);
+
+// The four looks, read from the tag the wire carries.
+NumberStyle numberStyleForName(const QString &value);
+
+// Lays a badge's box out around `center` for the diameter it carries.  The box
+// is not decoration: the hit test, the drag clamp, the raster cache and the
+// bitmap the renderer is handed are all sized from it, so it is re-derived
+// wherever the diameter changes.
+void layoutNumberBox(Annotation &annotation, Point center);
+
 inline bool annotationEquals(const Annotation &first, const Annotation &second)
 {
     if (first.kind != second.kind || first.tool != second.tool || first.dash != second.dash ||
@@ -430,6 +449,12 @@ public:
     // socket rather than drawing a second copy of the image. Call before the
     // overlay is shown.
     void setPinTarget(std::uint64_t pinId, const QString &socketPath);
+    // Pin-edit mode: where the editor may write a mark's pixels -- a pasted
+    // image is its pixels and travels as a path to a file rather than inline.
+    // Empty leaves it nowhere to put them, and the marks that need one are left
+    // out of the document rather than named by paths that will not resolve.
+    // Call before the overlay is shown.
+    void setMarkAssetDirectory(const QString &directory) { markAssetDirectory_ = directory; }
     // Enters editing state over the fixed canvas (shows the toolbar).
     void beginPinEdit();
     // The same editor, opened on the text rather than on the marks: it does
@@ -495,9 +520,93 @@ public:
     // started.  Lets the offline check prove each segment is drawn once rather
     // than recomputed on every paint.
     int liveStrokeBakes() const;
-    QJsonDocument resultDocument(const QString &bitmapDirectory = QString(), QString *error = nullptr) const;
+    QJsonDocument resultDocument(QString *error = nullptr) const;
+    // The marks painted onto the session's own pixels, at the pixel size the
+    // result should be.  Qt is the only renderer: the CLI takes this image
+    // instead of rasterizing the marks a second time, which is what used to
+    // leave a committed mark half a pixel away from the preview.
+    //
+    // `pixels` is the capture the marks were placed on, already cropped to the
+    // selection, in the output's device pixels; `density` is its device pixels
+    // per logical pixel, which is what the marks were measured against.
+    // Draws the committed marks.  `canvas` is what they are painted onto and
+    // `source` is what a sampling mark reads: the two are the same image for
+    // the flattened result, and differ for the marks alone, which is painted
+    // onto transparency but must still pixelate the capture underneath it.
+    //
+    // `origin` is the global logical rect the crop was taken from and `density`
+    // the capture's device pixels per logical pixel, which is what the marks
+    // were measured against; together they are what maps a mark's own
+    // coordinates onto the crop.
+    QImage compositeAnnotations(const QImage &canvas, const QImage &source,
+                                const LogicalRect &origin, double density,
+                                QString *error = nullptr) const;
+    // The same thing for the session's own selection, as the two images the CLI
+    // needs.  `composite` is the capture with the marks drawn on it, which is
+    // the SDR result verbatim; `marks` is the marks alone on transparency, which
+    // is what composites onto the HDR half -- the flattened image would replace
+    // it rather than mark it, since it is opaque everywhere.
+    //
+    // False when there is nothing to render, which is not an error -- a
+    // cancelled session, or a route that never had a selection.
+    bool produceComposite(QImage *composite, QImage *marks, QString *error = nullptr) const;
+    // The marks as data, in the shape a session can hand straight back, so a
+    // daemon that keeps them can reopen this image for editing rather than only
+    // showing the flattened result.  The coordinates are relative to the
+    // selection, which is the canvas a re-edit hands back; an empty array when
+    // nothing is framed.  The pixels a label was rasterized into are left out:
+    // they are derived from the mark, not part of it, and a daemon holding only
+    // the marks can rebuild them.
+    //
+    // A pasted image and a placed translation are carried by their pixels and
+    // have no other form, so those are written out beside the session and named
+    // by path -- see `writeMarkAssets`.  A path rather than inline data because
+    // a pasted screenshot is megabytes, and this document travels in a
+    // newline-delimited JSON message to the daemon.
+    QJsonArray marksDocument() const;
+    // Writes the pixels of every mark that has any into `directory`, and returns
+    // the document naming them.  Separate from `marksDocument` because the
+    // document is also wanted where there is nowhere to write -- a check, a
+    // caller that only wants the geometry -- and there the marks without a
+    // carrier are simply left out, which is what this did for all of them
+    // before.  The bytes written are the mark's *original* pixels, not the copy
+    // scaled to fit the canvas: the scale is a placement, and a mark resized
+    // later has to go back to the source rather than to a copy of a copy.
+    QJsonArray writeMarkAssets(const QString &directory) const;
+
+    // The inverse: the marks a session carried, placed on `canvas` so they can
+    // be edited again.  A mark that cannot be rebuilt -- an unknown tool, a
+    // missing field, a rectangle off the canvas -- fails the whole session
+    // rather than being skipped, because an editor that opened with some of the
+    // user's marks silently missing is worse than one that says so.
+    bool parseMarks(const QJsonArray &marks, const LogicalRect &canvas,
+                    std::uint32_t deviceRatio, QString *error);
 
     void setTerminalCallback(std::function<void()> callback);
+
+    // The one pass behind `marksDocument` and `writeMarkAssets`: an asset is
+    // written for each mark that has pixels, but only when there is a directory
+    // to write into.  An empty `directory` is "document only", and a mark with no
+    // other form is then left out of it.
+    QJsonArray marksDocumentInto(const QString &directory) const;
+    // One mark's pixels into `directory`, named from `*counter`, or an empty
+    // string when there is nowhere to put them or nothing to write.
+    QString writeMarkAsset(const QString &directory, const Annotation &annotation,
+                           int *counter) const;
+
+    // Whether the magnifier in front of the user is the colour picker's, and
+    // whether any magnifier is up at all.  The two are a distinction the offline
+    // checks have to make and cannot read off the pixels: the picker's loupe and
+    // the drag loupe are the same widget drawn the same way, and the difference
+    // is only whether the pill under it says a colour or a coordinate.
+    bool colorPickerVisible() const;
+    bool magnifierVisible() const;
+    // The name of the tool a press would draw with, or an empty string when
+    // nothing is armed.  The same answer the style row reads, exposed because
+    // whether a session opens armed is a decision the offline checks have to
+    // make and cannot see in the pixels: an unarmed press re-frames and an
+    // armed one inks, and which happened is only visible in the marks.
+    QString armedToolName() const { return styleTargetTool(); }
 
 private:
     class FloatingToolbar;

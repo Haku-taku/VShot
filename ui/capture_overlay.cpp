@@ -670,21 +670,6 @@ QSize textMetrics(const Annotation &annotation)
     return QSize(width, std::max(1, static_cast<int>(lines.size()) * metrics.lineSpacing()));
 }
 
-// A numbered badge's diameter is a value of its own, set by the number tool's
-// size control: floored at 18 logical pixels so the count stays legible, and
-// capped at 96 so it does not paint a billboard.  It used to be six pen widths
-// across, which tied a badge's size to the width slider and left no way to size
-// one without restyling every stroke.  The standalone annotate surface spells
-// the same two numbers out for itself: the two files share no code on purpose,
-// and this is the price of that.
-constexpr int kNumberMinDiameter = 18;
-constexpr int kNumberMaxDiameter = 96;
-
-int numberDiameter(std::uint32_t size)
-{
-    return std::clamp(static_cast<int>(size), kNumberMinDiameter, kNumberMaxDiameter);
-}
-
 // The glyphs are a touch over half the badge, bold, so that a two-digit count
 // still sits inside the disc.
 int numberFontPixels(int diameter)
@@ -717,9 +702,8 @@ QColor numberOnInk(const QColor &ink)
 constexpr qreal kNumberHaloWidth = 2.0;
 
 // The one place a numbered badge is turned into ink.  The overlay's live
-// preview, its cached per-mark raster and the bitmap the renderer is handed all
-// draw through here, so the four styles cannot drift apart between them -- and
-// the bitmap the Rust side composites is exactly what the user saw.
+// preview, its cached per-mark raster and the layer handed to the CLI all draw
+// through here, so the four styles cannot drift apart between them.
 void paintNumberBadge(QPainter &painter, const QRectF &box, const QString &text, NumberStyle style,
                       const QColor &color)
 {
@@ -793,8 +777,9 @@ QString numberStyleName(NumberStyle style)
     return QString();
 }
 
-// The tag the four number-style segments carry.  It never leaves this file: the
-// segment row is a Qt-side control and nothing about it is serialized.
+// The tag the four number-style segments carry, and the name the style travels
+// under in the marks document: a badge that comes back from a re-edit has to be
+// the same shape it went out as.
 QString numberStyleValue(NumberStyle style)
 {
     switch (style) {
@@ -810,6 +795,37 @@ QString numberStyleValue(NumberStyle style)
     return QStringLiteral("plain");
 }
 
+// Whether an annotation is the number tool's badge rather than a typed label.
+// Both are text annotations and differ only in the one name, which is what
+// keeps every reader that does not care about badges from having to know.
+bool isNumberAnnotation(const Annotation &annotation)
+{
+    return annotation.kind == Annotation::Kind::Text &&
+        annotation.tool == QStringLiteral("number");
+}
+
+// The point a badge is centred on, recovered from its own box.
+Point numberCenter(const Annotation &annotation)
+{
+    return Point{annotation.rect.x + static_cast<std::int32_t>(annotation.rect.width / 2),
+                 annotation.rect.y + static_cast<std::int32_t>(annotation.rect.height / 2)};
+}
+
+} // namespace
+
+// A numbered badge's diameter is a value of its own, set by the number tool's
+// size control: floored at 18 logical pixels so the count stays legible, and
+// capped at 96 so it does not paint a billboard.  It used to be six pen widths
+// across, which tied a badge's size to the width slider and left no way to size
+// one without restyling every stroke.  The standalone annotate surface spells
+// the same two numbers out for itself: the two files share no code on purpose,
+// and this is the price of that.
+int numberDiameter(std::uint32_t size)
+{
+    return std::clamp(static_cast<int>(size), kNumberMinDiameter, kNumberMaxDiameter);
+}
+
+// The four looks, read from the tag the wire carries.
 NumberStyle numberStyleForName(const QString &value)
 {
     if (value == QStringLiteral("ring")) {
@@ -822,22 +838,6 @@ NumberStyle numberStyleForName(const QString &value)
         return NumberStyle::Plain;
     }
     return NumberStyle::FilledCircle;
-}
-
-// Whether an annotation is the number tool's badge rather than a typed label.
-// Both travel as text annotations with a bitmap, and the difference is the one
-// name -- which is exactly why the renderer never has to know about it.
-bool isNumberAnnotation(const Annotation &annotation)
-{
-    return annotation.kind == Annotation::Kind::Text &&
-        annotation.tool == QStringLiteral("number");
-}
-
-// The point a badge is centred on, recovered from its own box.
-Point numberCenter(const Annotation &annotation)
-{
-    return Point{annotation.rect.x + static_cast<std::int32_t>(annotation.rect.width / 2),
-                 annotation.rect.y + static_cast<std::int32_t>(annotation.rect.height / 2)};
 }
 
 // Lays a badge's box out around `center` for the diameter it currently carries.
@@ -853,12 +853,14 @@ void layoutNumberBox(Annotation &annotation, Point center)
     annotation.origin = origin;
     annotation.rect = LogicalRect{origin.x, origin.y, static_cast<std::uint32_t>(diameter),
                                   static_cast<std::uint32_t>(diameter)};
-    // The legacy glyph multiple the protocol derives from this is only ever read
-    // by the renderer's no-bitmap fallback, so the count it means is the badge's
-    // own diameter: the fallback then draws glyphs about as tall as the bitmap
-    // the helper ships, rather than a label at some unrelated size.
+    // The glyph multiple the wire carries is only read by a reader that has to
+    // draw the badge itself, so the count it means is the badge's own diameter:
+    // such a reader then draws glyphs about as tall as the badge, rather than a
+    // label at some unrelated size.
     annotation.textPixels = static_cast<std::uint32_t>(diameter);
 }
+
+namespace {
 
 // The logical rect an annotation occupies, whatever its kind.  Shared by the
 // hit test, the drag clamps and the render cache so all three agree on what a
@@ -1249,9 +1251,8 @@ int brushRadiusForStrength(std::uint32_t strength, int radius)
     }
 }
 
-// Builds the pen for an annotation, translating the wire line style into a
-// dash pattern that approximates the Rust renderer (dashes of 3w with 2w gaps,
-// width-wide dots with 2w gaps, in device pixels).
+// Builds the pen for an annotation, translating the wire line style into a dash
+// pattern in device pixels: dashes of 3w with 2w gaps, dots of w with 2w gaps.
 QPen penForAnnotation(const Annotation &annotation)
 {
     const bool solid = annotation.dash == QStringLiteral("solid");
@@ -1384,9 +1385,9 @@ void fillLogicalBlock(QPainter *painter, const OutputSession &output, const Logi
     painter->fillRect(logical, color);
 }
 
-// Renders a real pixelation mosaic over the annotation bounds, matching the
-// Rust renderer: blocks of 12 * scale device pixels averaged independently and
-// aligned to the bounds origin.  `mask` picks a rectangular or elliptical area;
+// Renders a real pixelation mosaic over the annotation bounds: blocks of
+// 12 * scale device pixels averaged independently and aligned to the bounds
+// origin.  `mask` picks a rectangular or elliptical area;
 // ellipse boundary blocks are averaged and filled per pixel so the edge stays
 // as smooth as the final render.
 void drawMosaicAnnotation(QPainter *painter, const OutputSession &output,
@@ -3621,9 +3622,9 @@ public:
         // Every tool that paints a stroked shape: the rectangle and ellipse
         // outlines, the arrow, the pen, the two segment tools and the bezier
         // pen.  They share the colour and width controls; the dash is only
-        // meaningful to the tools the Rust renderer walks with a dashes
-        // pattern -- the wave is sampled as a solid sine and a bezier path is
-        // stroked whole, so neither is offered a dash control.
+        // meaningful to the tools that carry a dash pattern -- the wave is
+        // sampled as a solid sine and a bezier path is stroked whole, so
+        // neither is offered a dash control.
         const bool stroke = shape || target == QStringLiteral("arrow") ||
             target == QStringLiteral("pen") || target == QStringLiteral("line") ||
             target == QStringLiteral("wave") || target == QStringLiteral("bezier");
@@ -8731,8 +8732,8 @@ bool OverlayController::translateSelection(QString *error)
                           static_cast<std::uint32_t>(bottom - top)};
     }
     annotation.rect = box;
-    // One annotation, so the whole translation undoes in one step and rides the
-    // existing commit path as a single bitmap.
+    // One annotation, so the whole translation undoes in one step and goes out
+    // through the renderer as a single mark.
     QVector<Annotation> next = annotations_;
     next.push_back(annotation);
     mutateAnnotations(std::move(next));
@@ -9879,9 +9880,41 @@ void OverlayController::beginPinEdit()
     // The marks origin starts at the same place: the image is where the
     // session placed it, and the FP16 surface is already showing it there.
     marksOrigin_ = *selection_;
+    // The marks the last edit committed, put back so they can be edited again
+    // rather than merely seen.  They are read against the canvas the session
+    // says they were made on, which for a pin is the image's own rect: the pin
+    // may have been dragged since, and a mark placed against the screen would
+    // then land somewhere the user never drew it.
+    if (!session_.annotations.isEmpty()) {
+        const std::uint32_t ratio = static_cast<std::uint32_t>(
+            std::max(1.0, outputScale(session_.outputs.value(0))));
+        QString markError;
+        if (!parseMarks(session_.annotations, *selection_, ratio, &markError)) {
+            // The session named marks the editor cannot place.  Reporting it is
+            // the whole point of parsing strictly -- an editor that opened with
+            // some of the user's marks silently missing would be worse -- and
+            // the pin is still shown, so the failure is a message rather than a
+            // refusal to open.
+            const QString message = uiTr("The pin's marks could not be restored: %1").arg(markError);
+            if (textResultCallback_) {
+                textResultCallback_(TextOutcome::Failed, message);
+            }
+            qWarning("%s", qUtf8Printable(message));
+        } else {
+            // Restoring the marks is the state the user left the pin in, so it
+            // is where undo stops rather than a step that can be undone away.
+            undoStack_.clear();
+            redoStack_.clear();
+        }
+    }
     editing_ = true;
     toolbarOutput_ = 0;
     showToolbar();
+    // The surface covers the whole output so the toolbar has room beside the
+    // image; only the image, its border and the toolbar itself should take
+    // pointer input, or every click on the rest of the screen would land on the
+    // editor instead of on the desktop behind it.
+    scheduleInputMask();
 }
 
 void OverlayController::beginPinEditText()
@@ -10036,8 +10069,7 @@ int OverlayController::liveStrokeBakes() const
     return liveStrokeBakes_;
 }
 
-QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
-                                                QString *error) const
+QJsonDocument OverlayController::resultDocument(QString *error) const
 {
     QJsonObject root;
     if (cancelled_) {
@@ -10081,301 +10113,50 @@ QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
         root.insert(QStringLiteral("image_path"), resultImagePath_);
     }
 
-    QJsonArray outputAnnotations;
-    for (const Annotation &annotation : annotations_) {
-        QJsonObject value;
-        if (annotation.kind == Annotation::Kind::Image) {
-            // The pixels travel as a raw RGBA8888 file beside the session JSON,
-            // exactly like a text label's bitmap: the protocol carries paths,
-            // not megabytes of base64.
-            value.insert(QStringLiteral("kind"), QStringLiteral("image"));
-            value.insert(QStringLiteral("tool"), QStringLiteral("image"));
-            QJsonObject rect;
-            rect.insert(QStringLiteral("x"), static_cast<qint64>(annotation.rect.x));
-            rect.insert(QStringLiteral("y"), static_cast<qint64>(annotation.rect.y));
-            rect.insert(QStringLiteral("width"), static_cast<qint64>(annotation.rect.width));
-            rect.insert(QStringLiteral("height"), static_cast<qint64>(annotation.rect.height));
-            value.insert(QStringLiteral("rect"), rect);
-            if (bitmapDirectory.isEmpty() || annotation.pixels.isNull()) {
-                // No directory to write into: the annotation cannot be handed
-                // over, so it is dropped rather than reported as a mark the
-                // renderer would then fail to find.
-                continue;
-            }
-            // Rasterize at the size the image occupies on the canvas, in scene
-            // device pixels -- the same contract a text bitmap is written
-            // under. The source is usually a different size entirely (a photo
-            // pasted small, or a screenshot pasted smaller than its pixels),
-            // and rendering it here means the file is bounded by the canvas
-            // rather than by the source, and that what travels is exactly what
-            // the preview showed.
-            const int scale = sceneScale();
-            const int width = static_cast<int>(annotation.rect.width) * scale;
-            const int height = static_cast<int>(annotation.rect.height) * scale;
-            if (width <= 0 || height <= 0
-                || static_cast<qint64>(width) * static_cast<qint64>(height) > 16LL * 1024 * 1024) {
-                if (error != nullptr) {
-                    *error = QStringLiteral("pasted image is too large to render (%1x%2)")
-                                 .arg(width)
-                                 .arg(height);
-                    return QJsonDocument();
-                }
-                continue;
-            }
-            const QImage pixels = annotation.pixels
-                                      .scaled(width, height, Qt::IgnoreAspectRatio,
-                                              Qt::SmoothTransformation)
-                                      .convertToFormat(QImage::Format_RGBA8888);
-            if (pixels.isNull()) {
-                continue;
-            }
-            const QString path = QStringLiteral("%1/image-%2.rgba")
-                                     .arg(bitmapDirectory)
-                                     .arg(imageBitmapIndex_++);
-            QFile file(path);
-            if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)
-                || file.write(reinterpret_cast<const char *>(pixels.constBits()),
-                              static_cast<qint64>(pixels.sizeInBytes()))
-                    != static_cast<qint64>(pixels.sizeInBytes())) {
-                if (error != nullptr) {
-                    *error = QStringLiteral("cannot write pasted image `%1`: %2")
-                                 .arg(path, file.errorString());
-                    return QJsonDocument();
-                }
-                continue;
-            }
-            value.insert(QStringLiteral("bitmap_width"), static_cast<qint64>(pixels.width()));
-            value.insert(QStringLiteral("bitmap_height"), static_cast<qint64>(pixels.height()));
-            value.insert(QStringLiteral("bitmap"), path);
-        } else if (annotation.kind == Annotation::Kind::Shape) {
-            value.insert(QStringLiteral("kind"), QStringLiteral("shape"));
-            value.insert(QStringLiteral("tool"), annotation.tool);
-            value.insert(QStringLiteral("color"), colorText(annotation.color));
-            value.insert(QStringLiteral("width"), static_cast<qint64>(annotation.width));
-            value.insert(QStringLiteral("dash"), annotation.dash);
-            if (annotation.tool == QStringLiteral("mosaic")) {
-                value.insert(QStringLiteral("mask"), annotation.mask);
-                value.insert(QStringLiteral("strength"),
-                             static_cast<qint64>(annotation.strength));
-            }
-            QJsonObject rect;
-            rect.insert(QStringLiteral("x"), static_cast<qint64>(annotation.rect.x));
-            rect.insert(QStringLiteral("y"), static_cast<qint64>(annotation.rect.y));
-            rect.insert(QStringLiteral("width"), static_cast<qint64>(annotation.rect.width));
-            rect.insert(QStringLiteral("height"), static_cast<qint64>(annotation.rect.height));
-            value.insert(QStringLiteral("rect"), rect);
-        } else if (annotation.kind == Annotation::Kind::Stroke) {
-            value.insert(QStringLiteral("kind"), QStringLiteral("stroke"));
-            value.insert(QStringLiteral("tool"), annotation.tool);
-            value.insert(QStringLiteral("color"), colorText(annotation.color));
-            value.insert(QStringLiteral("width"), static_cast<qint64>(annotation.width));
-            value.insert(QStringLiteral("dash"), annotation.dash);
-            if (annotation.tool == QStringLiteral("arrow")) {
-                value.insert(QStringLiteral("size"), static_cast<qint64>(annotation.size));
-                value.insert(QStringLiteral("arrow_style"), annotation.arrowStyle);
-            }
-            if (annotation.tool == QStringLiteral("mosaic")) {
-                value.insert(QStringLiteral("strength"),
-                             static_cast<qint64>(annotation.strength));
-            }
-            if (annotation.tool == QStringLiteral("wave")) {
-                // The wave's own crest offset and period, in logical pixels.  A
-                // wave the user never tuned carries zeroes, which tells the
-                // renderer to derive both from the width exactly as the editor
-                // does -- so an untouched wave keeps the shape it always had.
-                value.insert(QStringLiteral("amplitude"),
-                             static_cast<qint64>(annotation.amplitude));
-                value.insert(QStringLiteral("wavelength"),
-                             static_cast<qint64>(annotation.wavelength));
-            }
-            if (annotation.tool == QStringLiteral("bezier")) {
-                // The pen path's closure and how it is painted: the two fields
-                // that make the ends of the protocol agree.  Only a bezier
-                // carries them, the same way only an arrow carries `size`.
-                value.insert(QStringLiteral("closed"), annotation.closed);
-                value.insert(QStringLiteral("fill"), annotation.fill);
-            }
-            QJsonArray points;
-            for (const Point &point : annotation.points) {
-                QJsonObject item;
-                item.insert(QStringLiteral("x"), static_cast<qint64>(point.x));
-                item.insert(QStringLiteral("y"), static_cast<qint64>(point.y));
-                points.push_back(item);
-            }
-            value.insert(QStringLiteral("points"), points);
-        } else if (annotation.kind == Annotation::Kind::Translation) {
-            // The translation travels as an image, exactly the way a pasted
-            // image does: its own kind never reaches the renderer, which only
-            // ever has to blit the bitmap the helper drew.  That is what keeps
-            // the final PNG the same pixels the preview showed -- both come
-            // from the placed lines the annotation carries.
-            value.insert(QStringLiteral("kind"), QStringLiteral("image"));
-            value.insert(QStringLiteral("tool"), QStringLiteral("translate"));
-            QJsonObject rect;
-            rect.insert(QStringLiteral("x"), static_cast<qint64>(annotation.rect.x));
-            rect.insert(QStringLiteral("y"), static_cast<qint64>(annotation.rect.y));
-            rect.insert(QStringLiteral("width"), static_cast<qint64>(annotation.rect.width));
-            rect.insert(QStringLiteral("height"), static_cast<qint64>(annotation.rect.height));
-            value.insert(QStringLiteral("rect"), rect);
-            if (bitmapDirectory.isEmpty() || annotation.translation.isEmpty()) {
-                continue;
-            }
-            const int scale = sceneScale();
-            const int width = static_cast<int>(annotation.rect.width) * scale;
-            const int height = static_cast<int>(annotation.rect.height) * scale;
-            if (width <= 0 || height <= 0
-                || static_cast<qint64>(width) * static_cast<qint64>(height) > 16LL * 1024 * 1024) {
-                if (error != nullptr) {
-                    *error = QStringLiteral("the translation is too large to render (%1x%2)")
-                                 .arg(width)
-                                 .arg(height);
-                    return QJsonDocument();
-                }
-                continue;
-            }
-            QImage bitmap(width, height, QImage::Format_RGBA8888);
-            if (bitmap.isNull()) {
-                continue;
-            }
-            bitmap.fill(Qt::transparent);
-            {
-                QPainter bitmapPainter(&bitmap);
-                bitmapPainter.setRenderHint(QPainter::Antialiasing, true);
-                bitmapPainter.setRenderHint(QPainter::TextAntialiasing, true);
-                paintTranslation(
-                    bitmapPainter, annotation.translation,
-                    [&](const TranslatedLine &line) {
-                        return QRectF((line.fill.x - annotation.rect.x) * scale,
-                                      (line.fill.y - annotation.rect.y) * scale,
-                                      line.fill.width * scale, line.fill.height * scale);
-                    },
-                    scale);
-            }
-            const QString path = QStringLiteral("%1/image-%2.rgba")
-                                     .arg(bitmapDirectory)
-                                     .arg(imageBitmapIndex_++);
-            QFile file(path);
-            if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)
-                || file.write(reinterpret_cast<const char *>(bitmap.constBits()),
-                              static_cast<qint64>(bitmap.sizeInBytes()))
-                    != static_cast<qint64>(bitmap.sizeInBytes())) {
-                if (error != nullptr) {
-                    *error = QStringLiteral("cannot write translation bitmap `%1`: %2")
-                                 .arg(path, file.errorString());
-                    return QJsonDocument();
-                }
-                continue;
-            }
-            value.insert(QStringLiteral("bitmap_width"), static_cast<qint64>(width));
-            value.insert(QStringLiteral("bitmap_height"), static_cast<qint64>(height));
-            value.insert(QStringLiteral("bitmap"), path);
-        } else {
-            const bool number = isNumberAnnotation(annotation);
-            value.insert(QStringLiteral("kind"), QStringLiteral("text"));
-            if (number) {
-                // The number tool rides the text annotation, and the one extra
-                // name is what tells the two apart on the way out.  The renderer
-                // does not read it -- it composites the bitmap like any other
-                // text annotation -- which is why the Rust side needs no change
-                // at all to carry a numbered badge.
-                value.insert(QStringLiteral("tool"), QStringLiteral("number"));
-            }
-            QJsonObject origin;
-            origin.insert(QStringLiteral("x"), static_cast<qint64>(annotation.origin.x));
-            origin.insert(QStringLiteral("y"), static_cast<qint64>(annotation.origin.y));
-            value.insert(QStringLiteral("origin"), origin);
-            value.insert(QStringLiteral("text"),
-                         number ? QString::number(annotation.number) : annotation.text);
-            // The protocol still carries the legacy integer glyph multiple;
-            // it is derived from the pixel size here and nowhere else.  A
-            // helper that ships a bitmap below renders the exact size, so this
-            // only ever reaches the Rust fallback font.
-            value.insert(QStringLiteral("scale"), static_cast<qint64>(textPixelsToScale(
-                                                     static_cast<int>(annotation.textPixels))));
-            value.insert(QStringLiteral("color"), colorText(annotation.color));
-            if (!annotation.font.isEmpty()) {
-                value.insert(QStringLiteral("font"), annotation.font);
-            }
-            // Rasterize the label -- or the badge -- so the final PNG matches
-            // what the user saw. The bitmap is rendered in scene device pixels
-            // (the highest output scale), matching how Rust composites it onto
-            // the cropped frame; the renderer is handed that same density, so
-            // the composite is a straight blit at 1:1 rather than a resample.
-            if (!bitmapDirectory.isEmpty()) {
-                const int scale = sceneScale();
-                // A label's box comes from its glyphs; a badge's is the box it
-                // was placed with, which is also where its ink is drawn.
-                const QSize logical =
-                    number ? QSize(static_cast<int>(annotation.rect.width),
-                                   static_cast<int>(annotation.rect.height))
-                           : textMetrics(annotation);
-                const int width = logical.width() * scale;
-                const int height = logical.height() * scale;
-                if (width > 0 && height > 0 &&
-                    static_cast<qint64>(width) * static_cast<qint64>(height) <=
-                        16LL * 1024 * 1024) {
-                    QImage bitmap(width, height, QImage::Format_RGBA8888);
-                    if (!bitmap.isNull()) {
-                        bitmap.fill(Qt::transparent);
-                        QPainter bitmapPainter(&bitmap);
-                        bitmapPainter.setRenderHint(QPainter::Antialiasing, true);
-                        bitmapPainter.setRenderHint(QPainter::TextAntialiasing, true);
-                        if (number) {
-                            // The badge is drawn at the scene's density, into
-                            // the whole bitmap: its top-left is the annotation's
-                            // own origin, which is exactly where the renderer
-                            // blits the file.
-                            bitmapPainter.scale(scale, scale);
-                            paintNumberBadge(bitmapPainter,
-                                             QRectF(0, 0, logical.width(), logical.height()),
-                                             QString::number(annotation.number),
-                                             annotation.numberStyle, annotation.color);
-                        } else {
-                            QFont font = textFont(
-                                annotation.font,
-                                std::max(1, static_cast<int>(annotation.textPixels) * scale));
-                            bitmapPainter.setFont(font);
-                            bitmapPainter.setPen(annotation.color);
-                            const QStringList lines = annotation.text.split(QLatin1Char('\n'));
-                            const QFontMetrics metrics(font);
-                            qreal y = 0.0;
-                            for (const QString &line : lines) {
-                                bitmapPainter.drawText(QRectF(0, y, width, metrics.height()),
-                                                       Qt::AlignLeft | Qt::AlignTop, line);
-                                y += metrics.lineSpacing();
-                            }
-                        }
-                        bitmapPainter.end();
-                        const QString path = QStringLiteral("%1/text-%2.rgba")
-                                                 .arg(bitmapDirectory)
-                                                 .arg(textBitmapIndex_++);
-                        QFile file(path);
-                        if (file.open(QIODevice::WriteOnly | QIODevice::Truncate) &&
-                            file.write(reinterpret_cast<const char *>(bitmap.constBits()),
-                                       static_cast<qint64>(bitmap.sizeInBytes())) ==
-                                static_cast<qint64>(bitmap.sizeInBytes())) {
-                            value.insert(QStringLiteral("bitmap_width"),
-                                         static_cast<qint64>(width));
-                            value.insert(QStringLiteral("bitmap_height"),
-                                         static_cast<qint64>(height));
-                            value.insert(QStringLiteral("bitmap"), path);
-                        } else if (error != nullptr) {
-                            *error = QStringLiteral("cannot write text bitmap `%1`: %2")
-                                         .arg(path, file.errorString());
-                            return QJsonDocument();
-                        }
-                    } else if (error != nullptr) {
-                        *error = QStringLiteral("cannot allocate %1x%2 text bitmap")
-                                     .arg(width)
-                                     .arg(height);
-                        return QJsonDocument();
+    // The same marks as data, for a caller that wants to reopen this image for
+    // editing rather than only keep the flattened result.  They are relative to
+    // the selection, which is the canvas a re-edit hands back: the pin editor
+    // gets the pristine pixels and these marks together, and draws them where
+    // they were.
+    //
+    // Written through `writeMarkAssets`, not `marksDocument`: a pasted image is
+    // its pixels, and a pin-edit session is the one caller that can put them
+    // somewhere the daemon will still be able to read after this process is
+    // gone.  Every other caller has nowhere to write and gets the document
+    // without the marks that have no other form, exactly as before.
+    root.insert(QStringLiteral("marks"), writeMarkAssets(markAssetDirectory_));
+    // The rendered capture goes back over the pixel channel rather than in the
+    // JSON: it is the size of the selection, not of a label.  Qt is the only
+    // renderer, so these images *are* the result -- the CLI takes them instead
+    // of rasterizing the marks again, which is what used to put a committed mark
+    // half a pixel away from the preview it was drawn from.
+    //
+    // Two of them, and the order is the protocol: the marks alone first, then
+    // the flattened capture.  The CLI needs the layer for the HDR half, which an
+    // opaque image cannot mark, and reading them in a fixed order is what lets
+    // it take them without a second header field to tell them apart.
+    if (pixelChannelAvailable()) {
+        QImage composite;
+        QImage marks;
+        QString compositeError;
+        if (produceComposite(&composite, &marks, &compositeError)) {
+            for (const QImage &image : {marks, composite}) {
+                QString sendError;
+                if (!sendPixelImage(kPixelKindResult, image, &sendError)) {
+                    if (error != nullptr) {
+                        *error = sendError;
                     }
+                    return QJsonDocument();
                 }
             }
+            root.insert(QStringLiteral("composite"), true);
+        } else if (!compositeError.isEmpty()) {
+            if (error != nullptr) {
+                *error = compositeError;
+            }
+            return QJsonDocument();
         }
-        outputAnnotations.push_back(value);
     }
-    root.insert(QStringLiteral("annotations"), outputAnnotations);
     return QJsonDocument(root);
 }
 
@@ -10836,8 +10617,8 @@ protected:
         }
         painter->setFont(annotationFont(annotation));
         painter->setPen(annotation.color);
-        // Top-left anchored inside the measured bounds so the preview matches
-        // the Rust glyph origin and the re-edit hit test.
+        // Top-left anchored inside the measured bounds, which is where the
+        // re-edit hit test looks for the text.
         painter->drawText(localRect(output, rect, size), Qt::AlignLeft | Qt::AlignTop,
                           annotation.text);
     }
@@ -11264,8 +11045,8 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
             QFont font = annotationFont(annotation);
             painter->setFont(font);
             painter->setPen(annotation.color);
-            // Top-left anchored inside the measured bounds so the preview
-            // matches the Rust glyph origin and the re-edit hit test.
+            // Top-left anchored inside the measured bounds, which is where the
+            // re-edit hit test looks for the text.
             painter->drawText(localRect(output, bounds, overlay->size()),
                               Qt::AlignLeft | Qt::AlignTop, annotation.text);
             return;

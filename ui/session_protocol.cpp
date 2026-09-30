@@ -273,6 +273,18 @@ bool loadSession(const QString &sessionPath, Session *session, QString *error)
             }
             parsed.action = actionValue.toString();
         }
+        // Optional: the marks already on the pinned image, so a re-edit opens on
+        // them. Carried as they arrived -- the editor is the only place that
+        // knows how to read one -- but their shape is checked here, because a
+        // session whose marks are not a list is one the editor cannot use.
+        const QJsonValue marksValue = root.value(QStringLiteral("annotations"));
+        if (!marksValue.isUndefined() && !marksValue.isNull()) {
+            if (!marksValue.isArray()) {
+                return fail(error,
+                            QStringLiteral("pin-edit session `annotations` must be an array"));
+            }
+            parsed.annotations = marksValue.toArray();
+        }
     }
 
     // Window picking needs something to pick: the candidates come from the
