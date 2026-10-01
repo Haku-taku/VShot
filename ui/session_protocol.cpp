@@ -459,4 +459,96 @@ bool loadSession(const QString &sessionPath, Session *session, QString *error)
     return true;
 }
 
+// --- ElementTree -----------------------------------------------------------
+
+void ElementTree::clear()
+{
+    nodes_.clear();
+    current_ = -1;
+    descent_.clear();
+}
+
+void ElementTree::load(const QJsonArray &array)
+{
+    QVector<Node> nodes;
+    nodes.reserve(array.size());
+    for (int index = 0; index < array.size(); ++index) {
+        const QJsonObject node = array.at(index).toObject();
+        const std::int32_t x = static_cast<std::int32_t>(node.value(QStringLiteral("x")).toDouble());
+        const std::int32_t y = static_cast<std::int32_t>(node.value(QStringLiteral("y")).toDouble());
+        const std::uint32_t width =
+            static_cast<std::uint32_t>(node.value(QStringLiteral("width")).toDouble());
+        const std::uint32_t height =
+            static_cast<std::uint32_t>(node.value(QStringLiteral("height")).toDouble());
+        // A node with no extent cannot be pointed at.  Real trees carry a
+        // tenth of these -- zero-sized containers, and hidden pages whose size
+        // is uninitialized memory -- and drawing one would put a box across the
+        // screen, so they are dropped instead.
+        if (width == 0 || height == 0) {
+            continue;
+        }
+        Node parsed;
+        parsed.rect = LogicalRect{x, y, width, height};
+        parsed.label = node.value(QStringLiteral("label")).toString();
+        parsed.parent = node.contains(QStringLiteral("parent"))
+                            ? node.value(QStringLiteral("parent")).toInt(-1)
+                            : -1;
+        nodes.push_back(std::move(parsed));
+    }
+    nodes_ = std::move(nodes);
+    current_ = -1;
+    descent_.clear();
+}
+
+int ElementTree::indexAt(std::int32_t x, std::int32_t y) const
+{
+    int best = -1;
+    for (int index = 0; index < nodes_.size(); ++index) {
+        const LogicalRect &rect = nodes_.at(index).rect;
+        if (x < rect.x || y < rect.y || x >= rect.right() || y >= rect.bottom()) {
+            continue;
+        }
+        // Not "the smallest one": a node drawn over a sibling is not always the
+        // smaller of the two, and picking the smaller would hand back what sits
+        // underneath.  The last hit is the one on top.
+        best = index;
+    }
+    return best;
+}
+
+void ElementTree::select(int index)
+{
+    current_ = index;
+    // Deliberately *not* the node's whole ancestry.  The descent is what the
+    // wheel has travelled, and a highlight placed by a pointer move has not
+    // travelled at all -- so there is nothing to retrace, and wheeling down
+    // does nothing until the user has climbed.  Seeding it with the ancestry
+    // would make a descent from a freshly pointed-at node walk all the way back
+    // to it, which is no gesture the user made.
+    descent_.clear();
+}
+
+bool ElementTree::step(bool up)
+{
+    if (nodes_.isEmpty()) {
+        return false;
+    }
+    if (up) {
+        // Remembered so wheeling back down returns to this node rather than to
+        // some other child of the parent.
+        if (current_ >= 0) {
+            descent_.push_back(current_);
+            current_ = nodes_.at(current_).parent;
+        } else {
+            return false;
+        }
+    } else {
+        if (descent_.isEmpty()) {
+            return false;
+        }
+        current_ = descent_.takeLast();
+    }
+    return true;
+}
+
 } // namespace vshot

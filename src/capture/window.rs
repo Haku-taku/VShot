@@ -1877,3 +1877,4 @@ mod tests {
         assert!(runner.asked().is_empty(), "no command should have run");
     }
 }
+

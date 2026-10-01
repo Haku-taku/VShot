@@ -336,6 +336,7 @@ fn run_helper_dialogue(
                 })?
             }
             HelperRequest::Elements { index } => {
+
                 // Asked once per hovered window, not once per pointer move: a
                 // tree walk is a D-Bus round trip per node.  `None` means this
                 // window has no accessibility tree, which leaves the picker
