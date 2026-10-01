@@ -40,7 +40,7 @@ use super::{ElementRequest, ElementSource};
 /// How many pixels of a window are analysed, at most.  The frame is downsampled
 /// until it fits, which is what keeps a 4K window from costing 8M operations
 /// per pass.
-const MAX_ANALYSIS_PIXELS: u64 = 96 * 1024;
+const MAX_ANALYSIS_PIXELS: u64 = 512 * 1024;
 
 /// Two colours are "the same" for segmentation when every channel is within
 /// this.  Loose enough to absorb a gradient or a subtle texture, tight enough
@@ -66,6 +66,7 @@ const MIN_BAND_THICKNESS: u32 = 48;
 /// background, not a control inside it.
 const MAX_ELEMENT_SHARE: f64 = 0.92;
 
+
 /// The pixel source.
 pub struct Pixels;
 
@@ -75,7 +76,35 @@ impl ElementSource for Pixels {
     fn elements(&self, request: &ElementRequest<'_>) -> Option<Vec<RegionNode>> {
         let window = request.window;
         let analysis = Analysis::of(request.scene, window)?;
+        let components = analysis.uniform_components();
+        let bands = analysis.band_divisions();
         let candidates = analysis.candidates();
+        if debug_enabled() {
+            eprintln!(
+                "vshot: element pixels on {:?} ({}x{} at {}x{}): analysis {}x{}, factor {}, \
+                 {} component(s), {} band(s), {} candidate(s)",
+                window.label,
+                window.geometry.size.width,
+                window.geometry.size.height,
+                window.geometry.left(),
+                window.geometry.top(),
+                analysis.width,
+                analysis.height,
+                analysis.factor,
+                components.len(),
+                bands.len(),
+                candidates.len(),
+            );
+            for rect in &candidates {
+                eprintln!(
+                    "vshot:   candidate {}x{}+{}+{}",
+                    rect.size.width,
+                    rect.size.height,
+                    rect.left(),
+                    rect.top()
+                );
+            }
+        }
         if candidates.is_empty() {
             return None;
         }
@@ -84,12 +113,25 @@ impl ElementSource for Pixels {
     }
 }
 
+/// Whether the element detector says what it found, for `VSHOT_PIXEL_DEBUG`.
+///
+/// The same switch the window-level pixel detector reads, so one variable turns
+/// on everything that reads pixels.
+fn debug_enabled() -> bool {
+    std::env::var_os("VSHOT_PIXEL_DEBUG").is_some()
+}
+
 /// One window's pixels, downsampled, in window-local coordinates.
 struct Analysis {
     width: u32,
     height: u32,
-    /// The window's global origin, which every local rect is shifted by.
-    origin: Point,
+    /// The window's own global rectangle — the compositor's, which is what
+    /// every local rect is shifted by and clipped to.  Kept whole rather than
+    /// as an origin because the clip needs the size too: the analysis grid is
+    /// the window rounded *up* to a whole number of analysis pixels, so it is
+    /// regularly a pixel or two larger, and clipping to that would let a box
+    /// hang over the window's edge.
+    window: Rect,
     /// Device pixels per analysis pixel, so a local rect can be scaled back.
     factor: u32,
     /// Device pixels per logical pixel of the output the window is on.
@@ -161,7 +203,7 @@ impl Analysis {
         Some(Self {
             width,
             height,
-            origin: bounds.origin,
+            window: bounds,
             factor,
             scale,
             pixels,
@@ -186,19 +228,14 @@ impl Analysis {
         let width = to_logical(i64::from(rect.size.width)).max(1);
         let height = to_logical(i64::from(rect.size.height)).max(1);
         let global = Rect::new(
-            self.origin.x + i32::try_from(x).ok()?,
-            self.origin.y + i32::try_from(y).ok()?,
+            self.window.origin.x + i32::try_from(x).ok()?,
+            self.window.origin.y + i32::try_from(y).ok()?,
             u32::try_from(width).ok()?,
             u32::try_from(height).ok()?,
         );
         // Keep it inside the window: rounding at a scale other than 1 can push
         // an edge a pixel past where the window ends.
-        global.clamp_to(Rect::new(
-            self.origin.x,
-            self.origin.y,
-            self.width * self.factor / self.scale,
-            self.height * self.factor / self.scale,
-        ))
+        global.clamp_to(self.window)
     }
 
     /// Every element-shaped region the window's pixels yield, in global
@@ -379,6 +416,13 @@ impl Analysis {
 
     /// Drops what cannot be a control: too small to point at, or so large it is
     /// the window's own background.
+    ///
+    /// Deliberately *not* a rule against a rectangle that spans the window
+    /// along one axis.  A sidebar is exactly that — full height, a fraction of
+    /// the width — and an editor's panes are too, so rejecting them would throw
+    /// away the layout the user most wants to point at.  What makes a box the
+    /// background is covering the window in *both* directions, which is what
+    /// the area test already says.
     fn filter(&self, rects: Vec<Rect>) -> Vec<Rect> {
         let window_area = u64::from(self.width) * u64::from(self.height);
         let mut kept: Vec<Rect> = rects
