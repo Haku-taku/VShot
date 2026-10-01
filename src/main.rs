@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 VShot contributors
 
-mod a11y;
 mod annotate;
 mod capture;
 mod cli;
 mod cli_i18n;
 mod config;
 mod edit;
+mod element;
 mod error;
 mod geometry;
 mod inject;
@@ -574,14 +574,16 @@ fn run() -> Result<()> {
                         }
                         ProcessWindowProvider.windows().ok()
                     },
-                    // The pixel fallback invents its windows from border bands,
-                    // so they have no title for AT-SPI to match against and no
-                    // elements to offer.
-                    (!*pixel_detect).then_some(
-                        &|window: &WindowCandidate| -> Option<Vec<crate::selection_region::RegionNode>> {
-                            a11y::elements_for_window(window)
-                        },
-                    ),
+                    // The sources are tried in turn for whatever window the
+                    // pointer is on: the accessibility tree first, because it
+                    // knows the widgets rather than guessing them, and the pixel
+                    // detector last, because it answers for any window at all.
+                    // Both take the frozen frame, which the pixel source reads
+                    // and the accessibility source ignores.
+                    Some(&|window: &WindowCandidate| -> Option<Vec<crate::selection_region::RegionNode>> {
+                        let request = element::ElementRequest { window, scene: &scene };
+                        element::elements_of(&request)
+                    }),
                 )?;
                 // Picking runs on the live desktop and only decides *what* to
                 // capture, so the pixels have to come from now: wait for the
