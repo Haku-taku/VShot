@@ -172,6 +172,8 @@ void checkEveryFieldReachesTheFile()
     expect(recordBackend->findData(QStringLiteral("vulkan")) >= 0,
            "the encoder-backend list offers vulkan");
     find<QSpinBox>(dialog.get(), "recordFps")->setValue(144);
+    find<QSpinBox>(dialog.get(), "recordBitrate")->setValue(150);
+    find<QSpinBox>(dialog.get(), "recordQuality")->setValue(200);
     find<QLineEdit>(dialog.get(), "recordFollow")->setText(QStringLiteral("game, chat"));
     find<QAbstractButton>(dialog.get(), "recordPortal")->setChecked(true);
     // The recording notification switch is turned off, as the OCR one is: on is
@@ -202,6 +204,8 @@ void checkEveryFieldReachesTheFile()
     expect(replayBackend->findData(QStringLiteral("vulkan")) >= 0,
            "the replay encoder-backend list offers vulkan");
     find<QSpinBox>(dialog.get(), "replayFps")->setValue(72);
+    find<QSpinBox>(dialog.get(), "replayBitrate")->setValue(60);
+    find<QSpinBox>(dialog.get(), "replayQuality")->setValue(255);
     find<QLineEdit>(dialog.get(), "replayFollow")->setText(QStringLiteral("game"));
     find<QAbstractButton>(dialog.get(), "replayPortal")->setChecked(true);
     find<QLineEdit>(dialog.get(), "replaySaveDir")->setText(QStringLiteral("  /tmp/clips  "));
@@ -264,6 +268,10 @@ void checkEveryFieldReachesTheFile()
            "the encoder-backend default reached the file", saved.cli.recordEncoderBackend);
     expect(saved.cli.recordFps == 144, "the frame rate default reached the file",
            QString::number(saved.cli.recordFps));
+    expect(saved.cli.recordBitrate == 150, "the target bitrate reached the file",
+           QString::number(saved.cli.recordBitrate));
+    expect(saved.cli.recordQualitySet && saved.cli.recordQuality == 200,
+           "the encoder level reached the file", QString::number(saved.cli.recordQuality));
     expect(saved.cli.recordFollow == QStringList({QStringLiteral("game"), QStringLiteral("chat")}),
            "the follow list reached the file", saved.cli.recordFollow.join(QLatin1Char(',')));
     expect(saved.cli.recordPortal, "the portal switch reached the file");
@@ -271,6 +279,11 @@ void checkEveryFieldReachesTheFile()
     expect(saved.cli.recordMicEnabled && saved.cli.recordMic.isEmpty(),
            "the session's default input reached the file as an empty name",
            saved.cli.recordMic);
+    expect(saved.cli.replayBitrate == 60, "the replay target bitrate reached the file",
+           QString::number(saved.cli.replayBitrate));
+    expect(saved.cli.replayQualitySet && saved.cli.replayQuality == 255,
+           "the replay encoder level reached the file",
+           QString::number(saved.cli.replayQuality));
     expect(saved.cli.replayWindow == 45, "the replay history window reached the file",
            QString::number(saved.cli.replayWindow));
     expect(saved.cli.replayGop == 3, "the replay key-frame distance reached the file",
@@ -354,6 +367,15 @@ void checkTheBoxesOfferTheWholeRange()
                              "longMaxFrames", "longTimeout", "longIgnoreTop"}) {
         offers(dialog.get(), name, vshot::kMaxFrameValue);
     }
+    // The rate-control rows: the level's ceiling is the widest scale any of the
+    // three codecs has, and the bitrate's is only there so the box can hold the
+    // number -- it is not a policy, and the command line has no ceiling at all.
+    for (const char *name : {"recordBitrate", "replayBitrate"}) {
+        offers(dialog.get(), name, vshot::kMaxBitrate);
+    }
+    for (const char *name : {"recordQuality", "replayQuality"}) {
+        offers(dialog.get(), name, vshot::kMaxQuality);
+    }
     // The look values whose cost grows with them: the blur's reach, the ring's
     // window and key-frame distance, and the pin's density.
     for (const char *name : {"pinShadowSize", "dialogShadowSize"}) {
@@ -383,11 +405,13 @@ void checkTheWindowOpensOnTheStoredValues()
         "cli": {"png-compression": "fastest", "monitor": "DP-3",
                 "long": {"notches": 3, "inject": "portal", "timeout": 45},
                 "pin": {"density": 2}, "ocr": {"notify": false},
-                "record": {"encoder": "av1", "encoder-backend": "nvenc", "fps": 30, "portal": true,
+                "record": {"encoder": "av1", "encoder-backend": "nvenc", "fps": 30,
+                           "bitrate": 150, "quality": 200, "portal": true,
                            "follow": ["game", "chat"], "notify": false,
                            "mic": "alsa_input.pci-0000_2f_00.4.analog-stereo"},
                 "replay": {"window": 12, "gop": 2, "encoder": "hevc",
-                           "encoder-backend": "vaapi", "fps": 24, "portal": true,
+                           "encoder-backend": "vaapi", "fps": 24,
+                           "bitrate": 60, "quality": 255, "portal": true,
                            "follow": ["game"], "save-dir": "/tmp/clips", "notify": false}},
         "pin": {"radius": 9, "shadow": false, "shadowSize": 21, "shadowOffset": -7,
                 "shadowOpacity": 200, "borderWidth": 6,
@@ -432,6 +456,14 @@ void checkTheWindowOpensOnTheStoredValues()
            "the encoder-backend box shows the stored backend");
     expect(find<QSpinBox>(dialog.get(), "recordFps")->value() == 30,
            "the frame rate box shows the stored rate");
+    expect(find<QSpinBox>(dialog.get(), "recordBitrate")->value() == 150,
+           "the target bitrate box shows the stored rate");
+    expect(find<QSpinBox>(dialog.get(), "recordQuality")->value() == 200,
+           "the encoder level box shows the stored level");
+    expect(find<QSpinBox>(dialog.get(), "replayBitrate")->value() == 60,
+           "the replay target bitrate box shows the stored rate");
+    expect(find<QSpinBox>(dialog.get(), "replayQuality")->value() == 255,
+           "the replay encoder level box shows the stored level");
     expect(find<QLineEdit>(dialog.get(), "recordFollow")->text() ==
                QStringLiteral("game, chat"),
            "the follow box shows the stored windows",
@@ -813,15 +845,21 @@ void checkTheBuiltInDefaultsAreTheClis()
     };
 
     // The ones the Rust side gives a name to: `pub const DEFAULT_FPS: u32 = 60;`.
+    // `perUnit` is how many of the constant's own units make one of the box's:
+    // the bitrate is stated in bits per second over there and shown in Mbit/s
+    // here, so the two are compared in the box's unit rather than the file's.
     const struct {
         const char *widget;
         const char *file;
         const char *marker;
+        int perUnit = 1;
     } named[] = {
         {"recordFps", "src/record/mod.rs", "DEFAULT_FPS: u32 = "},
         {"replayFps", "src/record/replay.rs", "DEFAULT_FPS: u32 = "},
         {"replayWindow", "src/record/replay.rs", "DEFAULT_WINDOW: u64 = "},
         {"replayGop", "src/record/replay.rs", "DEFAULT_GOP: u64 = "},
+        {"recordBitrate", "src/record/avcodec.rs", "DEFAULT_BITRATE: i64 = ", 1'000'000},
+        {"replayBitrate", "src/record/avcodec.rs", "DEFAULT_BITRATE: i64 = ", 1'000'000},
     };
     for (const auto &row : named) {
         const QString source = readSource(QString::fromLatin1(row.file));
@@ -840,14 +878,30 @@ void checkTheBuiltInDefaultsAreTheClis()
             }
             rust = digits.toInt();
         }
+        const int wanted = rust < 0 ? -1 : rust / row.perUnit;
         QSpinBox *box = dialog->findChild<QSpinBox *>(QString::fromLatin1(row.widget));
-        expect(rust >= 0 && box != nullptr && box->value() == rust,
+        expect(wanted >= 0 && box != nullptr && box->value() == wanted,
                "the number the window opens on is the CLI's",
-               QStringLiteral("%1 shows %2, %3 says %4")
+               QStringLiteral("%1 shows %2, %3 says %4 (%5 per unit)")
                    .arg(QString::fromLatin1(row.widget))
                    .arg(box == nullptr ? -1 : box->value())
                    .arg(QString::fromLatin1(row.file))
-                   .arg(rust));
+                   .arg(rust)
+                   .arg(row.perUnit));
+    }
+
+    // Leaving the two bitrate boxes on the number they open with has to write
+    // the file's sentinel rather than the number: freezing today's 45 into the
+    // file would stop a later version's better default from reaching this user.
+    // The config this check wrote is `{}`, so both boxes are untouched.
+    if (QPushButton *save = find<QPushButton>(dialog.get(), "saveButton")) {
+        save->click();
+        const vshot::Config saved = vshot::loadConfig();
+        expect(saved.cli.recordBitrate == 0,
+               "a recording bitrate left on the default is written as the sentinel",
+               QString::number(saved.cli.recordBitrate));
+        expect(saved.cli.replayBitrate == 0,
+               "and so is a replay one", QString::number(saved.cli.replayBitrate));
     }
 
     // The scrolling-capture ones have no constant of their own: they are inline

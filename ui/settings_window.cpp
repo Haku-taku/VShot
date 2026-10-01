@@ -1424,6 +1424,33 @@ private:
         recordFpsSpin_->setValue(rememberedOr(config_.cli.recordFps, kDefaultRecordFps));
         addRow(recording, uiTr("Frame rate"), uiTr("1-240"), recordFpsSpin_, false);
 
+        recordBitrateSpin_ =
+            optionalSpin(recording, vshot::kDefaultBitrate, vshot::kMaxBitrate, uiTr(" Mbit/s"));
+        recordBitrateSpin_->setObjectName(QStringLiteral("recordBitrate"));
+        recordBitrateSpin_->setMinimumWidth(120);
+        recordBitrateSpin_->setValue(
+            rememberedOr(config_.cli.recordBitrate, vshot::kDefaultBitrate));
+        addRow(recording, uiTr("Target bitrate"),
+               uiTr("The size the file aims for; 45 Mbit/s whatever the frame's own size, "
+                    "which is what a 4K recording needs to survive watching.  There is no "
+                    "ceiling but the encoder's own"),
+               recordBitrateSpin_, false);
+
+        recordQualitySpin_ = optionalSpin(recording, 0, vshot::kMaxQuality, QString(),
+                                          uiTr("from the bitrate"));
+        recordQualitySpin_->setObjectName(QStringLiteral("recordQuality"));
+        recordQualitySpin_->setMinimumWidth(120);
+        recordQualitySpin_->setValue(config_.cli.recordQualitySet
+                                         ? static_cast<int>(config_.cli.recordQuality)
+                                         : 0);
+        addRow(recording, uiTr("Encoder level"),
+               uiTr("On the codec's own scale and taken as written: 0-51 for h264 and hevc, "
+                    "0-255 for av1, and 0 is the most expensive end of either.  A level makes "
+                    "the encoder hold that quality and spend up to the bitrate instead of "
+                    "spending it.  The file and the command line take every value; this box "
+                    "leaves 0 for \"let the bitrate decide\""),
+               recordQualitySpin_, false);
+
         recordFollowEdit_ = new QLineEdit(recording);
         recordFollowEdit_->setObjectName(QStringLiteral("recordFollow"));
         recordFollowEdit_->setMinimumWidth(240);
@@ -1543,6 +1570,29 @@ private:
                     "long session"),
                replayFpsSpin_, false);
 
+        replayBitrateSpin_ =
+            optionalSpin(replay, vshot::kDefaultBitrate, vshot::kMaxBitrate, uiTr(" Mbit/s"));
+        replayBitrateSpin_->setObjectName(QStringLiteral("replayBitrate"));
+        replayBitrateSpin_->setMinimumWidth(120);
+        replayBitrateSpin_->setValue(
+            rememberedOr(config_.cli.replayBitrate, vshot::kDefaultBitrate));
+        addRow(replay, uiTr("Target bitrate"),
+               uiTr("The ring is held in memory, so this is what decides what a long window "
+                    "costs; 45 Mbit/s whatever the frame's own size"),
+               replayBitrateSpin_, false);
+
+        replayQualitySpin_ = optionalSpin(replay, 0, vshot::kMaxQuality, QString(),
+                                          uiTr("from the bitrate"));
+        replayQualitySpin_->setObjectName(QStringLiteral("replayQuality"));
+        replayQualitySpin_->setMinimumWidth(120);
+        replayQualitySpin_->setValue(config_.cli.replayQualitySet
+                                         ? static_cast<int>(config_.cli.replayQuality)
+                                         : 0);
+        addRow(replay, uiTr("Encoder level"),
+               uiTr("As on the recording side: the codec's own scale, taken as written, and "
+                    "0 left for \"let the bitrate decide\""),
+               replayQualitySpin_, false);
+
         replayFollowEdit_ = new QLineEdit(replay);
         replayFollowEdit_->setObjectName(QStringLiteral("replayFollow"));
         replayFollowEdit_->setMinimumWidth(240);
@@ -1550,7 +1600,9 @@ private:
         replayFollowEdit_->setText(followText(config_.cli.replayFollow));
         addRow(replay, uiTr("Follow the focus"),
                uiTr("Window names, comma-separated (`replay start window` with no NAME); the "
-                    "ring moves to whichever the focus lands on"),
+                    "replay records whichever has the focus, keeps recording the last one "
+                    "while the focus is elsewhere, and starts a new ring at that window's own "
+                    "size when it moves"),
                replayFollowEdit_, false);
 
         replayPortalSwitch_ = new ModernSwitch(replay);
@@ -1870,6 +1922,13 @@ private:
         cli.recordEncoder = recordEncoderBox_->currentData().toString();
         cli.recordEncoderBackend = recordEncoderBackendBox_->currentData().toString();
         cli.recordFps = spinValue(recordFpsSpin_, kDefaultRecordFps);
+        cli.recordBitrate = spinValue(recordBitrateSpin_, vshot::kDefaultBitrate);
+        // The level's own flag is what says whether the file names one: zero is
+        // a level, so the box cannot use its zero to mean "unset" and this is
+        // the one row whose reading is a pair.
+        cli.recordQualitySet = recordQualitySpin_->value() > 0;
+        cli.recordQuality =
+            cli.recordQualitySet ? static_cast<std::uint32_t>(recordQualitySpin_->value()) : 0;
         cli.recordPortal = recordPortalSwitch_->isChecked();
         cli.recordFollow = parseFollowText(recordFollowEdit_->text());
         cli.recordNotify = recordNotifySwitch_->isChecked();
@@ -1886,6 +1945,10 @@ private:
         cli.replayEncoder = replayEncoderBox_->currentData().toString();
         cli.replayEncoderBackend = replayEncoderBackendBox_->currentData().toString();
         cli.replayFps = spinValue(replayFpsSpin_, kDefaultReplayFps);
+        cli.replayBitrate = spinValue(replayBitrateSpin_, vshot::kDefaultBitrate);
+        cli.replayQualitySet = replayQualitySpin_->value() > 0;
+        cli.replayQuality =
+            cli.replayQualitySet ? static_cast<std::uint32_t>(replayQualitySpin_->value()) : 0;
         cli.replayFollow = parseFollowText(replayFollowEdit_->text());
         cli.replayPortal = replayPortalSwitch_->isChecked();
         const QString replayMicrophone = replayMicBox_->currentData().toString();
@@ -1958,6 +2021,8 @@ private:
     QComboBox *recordEncoderBox_ = nullptr;
     QComboBox *recordEncoderBackendBox_ = nullptr;
     ModernSpinBox *recordFpsSpin_ = nullptr;
+    ModernSpinBox *recordBitrateSpin_ = nullptr;
+    ModernSpinBox *recordQualitySpin_ = nullptr;
     QLineEdit *recordFollowEdit_ = nullptr;
     ModernSwitch *recordPortalSwitch_ = nullptr;
     ModernComboBox *recordMicBox_ = nullptr;
@@ -1968,6 +2033,8 @@ private:
     QComboBox *replayEncoderBox_ = nullptr;
     QComboBox *replayEncoderBackendBox_ = nullptr;
     ModernSpinBox *replayFpsSpin_ = nullptr;
+    ModernSpinBox *replayBitrateSpin_ = nullptr;
+    ModernSpinBox *replayQualitySpin_ = nullptr;
     QLineEdit *replayFollowEdit_ = nullptr;
     ModernSwitch *replayPortalSwitch_ = nullptr;
     ModernComboBox *replayMicBox_ = nullptr;

@@ -2902,7 +2902,15 @@ public:
                                    {uiTr("OCR…"), uiTr("Copied"), uiTr("Failed")});
         textButton_ = text;
         connect(text, &QToolButton::clicked, [controller = controller_] {
-            controller->beginTextSelection(nullptr);
+            // The button is a toggle: the mode it starts is the mode it ends.
+            // Pressing it again is how a user who is done with the selection
+            // gets out of it without reaching for Escape, and without a second
+            // recognition run over the same pixels.
+            if (controller->textMode_) {
+                controller->leaveTextMode();
+            } else {
+                controller->beginTextSelection(nullptr);
+            }
         });
         // The result is reported where the user is looking: the button itself,
         // which is the thing they just clicked.  The copy can be triggered by a
@@ -2953,7 +2961,14 @@ public:
             {uiTr("Translating…"), uiTr("Failed")});
         translateButton_ = translate;
         connect(translate, &QToolButton::clicked, [controller = controller_] {
-            controller->translateSelection(nullptr);
+            // The button is a toggle: a second press takes the translation back
+            // off rather than reading the same selection again and stacking a
+            // second copy of it on the first.
+            if (controller->hasPlacedTranslation()) {
+                controller->removePlacedTranslation();
+            } else {
+                controller->translateSelection(nullptr);
+            }
         });
         controller_->setTranslateResultCallback([this](TextOutcome outcome, const QString &) {
             if (translateButton_ == nullptr) {
@@ -3527,6 +3542,10 @@ public:
             // Translation reads the same selection the text mode works on, so
             // it is out of reach while that mode is up.
             translateButton_->setEnabled(!textMode);
+            // A translation that is up is the state a second press leaves, so
+            // the button is drawn the way the Text+ button is drawn while its
+            // mode is on: pressed, not just available.
+            setButtonActive(translateButton_, controller_->hasPlacedTranslation());
         }
         const Annotation *selected = nullptr;
         if (controller_->selectedAnnotation_ >= 0 &&
@@ -6658,6 +6677,13 @@ void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifi
             // The mode goes first: Escape leaves the text selection without
             // ending the capture, so a second Escape is what cancels it.
             leaveTextMode();
+        } else if (hasPlacedTranslation()) {
+            // The translation the Translate button placed goes the same way the
+            // text mode does, and for the same reason: it is a state the user
+            // put the picture into, so Escape leaves that state before it means
+            // "cancel the capture".  Without this the first Escape threw away
+            // the frame the translation was drawn on.
+            removePlacedTranslation();
         } else if (gesture_->type == Gesture::Type::Bezier) {
             // The pen path in progress goes first: Escape drops it without
             // ending the session, the way it drops any other in-progress
@@ -7672,6 +7698,33 @@ bool OverlayController::translateSelection(QString *error)
         translateResultCallback_(TextOutcome::Idle, QString());
     }
     return true;
+}
+
+bool OverlayController::hasPlacedTranslation() const
+{
+    for (const Annotation &annotation : annotations_) {
+        if (annotation.kind == Annotation::Kind::Translation) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void OverlayController::removePlacedTranslation()
+{
+    QVector<Annotation> next;
+    next.reserve(annotations_.size());
+    for (const Annotation &annotation : annotations_) {
+        if (annotation.kind != Annotation::Kind::Translation) {
+            next.push_back(annotation);
+        }
+    }
+    if (next.size() == annotations_.size()) {
+        return;
+    }
+    // Through the ordinary commit path, so the step back is one Ctrl+Z the way
+    // every other change to the list is, and so the toolbar redraws from it.
+    mutateAnnotations(std::move(next));
 }
 
 bool OverlayController::computeTranslation(QVector<TranslatedLine> *lines, QString *text,

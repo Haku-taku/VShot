@@ -697,6 +697,9 @@ typedef struct VshotReplay {
     int64_t newest_ms; // end of the newest packet
     int64_t oldest_ms; // start of the oldest packet
     int64_t saved;     // how many saves have run
+    int     fps;       // the rate the session aims at: one frame is the time
+                       // unit of the MP4 a save writes, so its frame lengths
+                       // come out whole and a player can name the rate
 } VshotReplay;
 
 static VshotReplay *replay_create(int64_t window_ms, int fps) {
@@ -704,6 +707,7 @@ static VshotReplay *replay_create(int64_t window_ms, int fps) {
     if (!r) {
         return NULL;
     }
+    r->fps = fps;
     // Room for the window at the rate the session actually runs, plus its
     // audio: a video packet per frame and roughly one AAC packet per 21 ms.
     // Sizing on the real rate (not the CLI ceiling) keeps a 4K120 ring a
@@ -818,6 +822,15 @@ struct VshotAvEnc {
     // VSHOT_BACKEND_VULKAN or VSHOT_BACKEND_NVENC.  Chosen once at open time
     // from `--encoder-backend`.
     int backend;
+    // Target bitrate for the video encoder, in bits per second.  Zero means
+    // "no target": the encoder runs at a constant QP instead (see
+    // `open_encoder`).
+    int64_t bitrate;
+    // The session's frame rate.  The encoder needs it for more than the
+    // muxer's time base: ffmpeg's VAAPI layer turns the target bitrate into a
+    // per-frame budget using the framerate it hands the driver, and that is
+    // where it comes from (see `open_encoder`).
+    int fps;
     // The software path's letterbox staging: a canvas-sized RGBA buffer the
     // incoming frame is fitted into when the source was resized mid-session.
     // A dma-buf session does that fitting in its filtergraph; this one has no
@@ -865,6 +878,7 @@ struct VshotAvEnc {
     AVStream *mux_stream;
     AVRational mux_time_base; // the muxer's, read back after the header
     int64_t mux_next_pts;     // milliseconds, our own timeline
+    int64_t mux_last_pts;     // the last timestamp handed to the muxer, -1 before the first
     // The durations of the frames sent but not yet handed back as packets.
     // A hardware encoder returns a packet a frame or two late, so the
     // duration that belongs to a packet arrives *before* the packet does;
@@ -956,11 +970,11 @@ static int drain_packets(VshotAvEnc *enc) {
             // consistent with the bitstream itself.
             //
             // The stream's time base is not the one asked for, though:
-            // avformat_write_header settles it (movenc normalised our
-            // 1/1000 into 1/16000), and packet timestamps are read in *that*
-            // unit.  Unscaled millisecond values made a three-second
-            // recording play in 0.18s, so the millisecond timeline is
-            // rescaled into the muxer's time base here.
+            // avformat_write_header settles it (movenc widens the millisecond
+            // to 1/16000, and keeps a frame base as it is), and packet
+            // timestamps are read in *that* unit.  Unscaled millisecond values
+            // made a three-second recording play in 0.18s, so the millisecond
+            // timeline is rescaled into the muxer's time base here.
             AVRational ms = {1, 1000};
             // The frame this packet belongs to, whose duration was queued on
             // its way in — not the frame being sent right now, which is one
@@ -969,6 +983,23 @@ static int drain_packets(VshotAvEnc *enc) {
             pkt->stream_index = enc->mux_stream->index;
             pkt->pts = pkt->dts = api->rescale_q(enc->mux_next_pts, ms, enc->mux_time_base);
             pkt->duration = api->rescale_q(duration, ms, enc->mux_time_base);
+            // A frame that covered less than one time unit still covered
+            // time: a zero-length sample is not something a sample table can
+            // hold.
+            if (pkt->duration < 1) {
+                pkt->duration = 1;
+            }
+            // Two frames can land on the same unit when the unit is a frame of
+            // the rate the session aims at and the loop answers a little
+            // faster than that rate: millisecond stamps that round to the
+            // same frame index are one sample in the table, and the muxer
+            // refuses the second packet for a DTS that does not move.  The
+            // second frame takes the next unit, the smallest time the file
+            // can express; the loop's own stamps stay untouched.
+            if (pkt->pts <= enc->mux_last_pts) {
+                pkt->pts = pkt->dts = enc->mux_last_pts + 1;
+            }
+            enc->mux_last_pts = pkt->pts;
             enc->mux_next_pts += duration;
             enc->mux_frames++;
             int written = api->format_write_frame(enc->mux, pkt);
@@ -1103,6 +1134,16 @@ static void set_vulkan_colour_params(VshotAvEnc *enc, AVBufferSrcParameters *par
     }
 }
 
+// The highest level the named encoder takes, for the message a level outside
+// it is refused with.  The scales are the encoders' own and are not
+// interchangeable: H.264 and HEVC carry a private `qp` option on 0-51, and
+// AV1 has no such option — its level is the generic `global_quality`, which is
+// 0-255.  A number is never converted between the two: a level means what the
+// encoder that reads it says it means.
+static int codec_level_max(const char *codec) {
+    return strcmp(codec, "av1") == 0 ? 255 : 51;
+}
+
 static int open_encoder(VshotAvEnc *enc, int width, int height, const char *codec, int qp,
                         int gop_frames) {
     // The hardware device: a render node for VAAPI, a CUDA device for NVENC.
@@ -1147,21 +1188,32 @@ static int open_encoder(VshotAvEnc *enc, int width, int height, const char *code
     }
     enc->ctx->width = width;
     enc->ctx->height = height;
-    enc->ctx->time_base = (AVRational){1, 1000000};
-    enc->ctx->framerate = (AVRational){0, 1};
+    // The encoder's own clock, and it has to be the session's rate rather
+    // than ffmpeg's placeholder.  ffmpeg's VAAPI layer derives the framerate
+    // it writes into `VAEncSequenceParameterBuffer` from `framerate` when
+    // that is set and from `time_base` when it is not (vaapi_encode.c, the
+    // `fr_num`/`fr_den` reduce), and the driver divides the target bitrate by
+    // that framerate to get a per-frame budget.  Left at `{0, 1}` over a
+    // microsecond time base, the reduce clamps to 65535 fps and the encoder
+    // spends a ten-thousandth of what it was given: measured, a 46 Mbit/s
+    // target came out at 4.9.  The same settings through ffmpeg's own CLI —
+    // which sets both fields — hit the target exactly (45.01 Mbit/s measured
+    // against 46 asked for).
+    const int rate = enc->fps > 0 ? enc->fps : 60;
+    enc->ctx->time_base = (AVRational){1, rate};
+    enc->ctx->framerate = (AVRational){rate, 1};
     enc->ctx->pix_fmt = backend_pix_fmt(enc->backend);
-    // Every frame its own IDR: this encoder only produces I frames when it
-    // is told at open time (the radeonsi VCN ignores mid-stream requests),
-    // and idr_interval counts *I frames*, so any interval above 0 produces
-    // a stream whose only key frame is the first — unseekable and
-    // uncuttable.  An all-intra stream is what the direct-libva path
-    // produced too; the bitrate is higher, every frame decodes on its own.
+    // The key-frame distance, in frames.  A recording passes two seconds'
+    // worth (see `recording_gop`); a replay passes the distance its own caller
+    // asked for, because a save has to start on a key frame.
     //
-    // A replay wants the opposite: a bounded GOP (`gop_frames` > 0) so a
-    // window of history costs a fraction of an all-intra stream and every
-    // GOP boundary is a place a save can start from.  `idr_interval` stays 0
-    // for the recording case (all-intra) and is set to the GOP length for a
-    // replay, which makes the encoder emit a key frame every `gop_frames`.
+    // A `gop_size` of 0 is not "let the encoder choose": libavcodec reads it as
+    // intra only, so every frame is an IDR and no frame can be predicted from
+    // another.  That is what made a target bitrate unreachable here, and the
+    // message libavcodec prints for it — "Using intra frames only." — is in
+    // the verbose log this shim raises.  `idr_interval` stays 0, which is what
+    // makes the key frames land exactly `gop_size` frames apart (measured:
+    // `gop_size` 320 over 480 frames is 2 key frames).
     enc->ctx->gop_size = gop_frames > 0 ? gop_frames : 0;
     // Ask libavcodec for the parameter sets as extradata (SPS/PPS for
     // H.264, VPS/SPS/PPS for HEVC, the sequence header OBU for AV1)
@@ -1177,58 +1229,124 @@ static int open_encoder(VshotAvEnc *enc, int width, int height, const char *code
     if (strcmp(codec, "h264") == 0) {
         enc->ctx->level = 62;
     }
-    enc->ctx->bit_rate = 0;
+    // Rate control: a target bitrate, or a constant QP when there is none.
+    //
+    // The constant-QP path is what every recording used to take, and it has no
+    // ceiling: a game that redraws the whole frame every 6 ms at 4K drove a
+    // measured recording to 1.15 Gbit/s, which no consumer decoder can play
+    // back (105 fps against the 160 the file asks for).  A target bitrate is
+    // what makes the file's size something the caller can predict and the
+    // decoder can keep up with.
+    // Three modes, and which one is in use is the caller's own choice:
+    //
+    //   CQP  — a constant level and no ceiling.  The file's size follows the
+    //          content.  Asked for by passing a level and no bitrate.
+    //   VBR  — a target bitrate, and the level ignored.  The file's size is
+    //          predictable.  Asked for by passing a bitrate and no level; this
+    //          is the default, and it is the mode a recording wants.
+    //   QVBR — a constant level with the target as a ceiling.  Asked for by
+    //          passing both: the size stays near the level's own cost and
+    //          cannot run away on a scene that moves.
+    //
+    // A level below zero means the caller did not ask for one, which is what
+    // picks VBR out of the two bitrate modes and what leaves the encoder's own
+    // default level in place.  Both values are the caller's, and both are on
+    // the scale the *codec's* encoder reads (see the Rust side's
+    // `RateControl`, which is where the two scales are reconciled).
+    const int want_level = qp >= 0;
+    const int want_bitrate = enc->bitrate > 0;
+    const int qvbr = want_level && want_bitrate;
+    const int vbr = want_bitrate && !qvbr;
+    enc->ctx->bit_rate = want_bitrate ? enc->bitrate : 0;
+    if (want_bitrate) {
+        // A ceiling twice the target with a one-second buffer: enough room for
+        // a scene change to spend, little enough that the average holds.
+        enc->ctx->rc_max_rate = enc->bitrate * 2;
+        enc->ctx->rc_buffer_size = (int)enc->bitrate;
+    }
     // The rate-control options are the encoders' private options (they
     // live in ctx->priv_data); AV_OPT_SEARCH_CHILDREN is how libavcodec
     // itself reaches them from the context.  Every option is checked: an
     // unrecognised name fails silently otherwise, and a stream without
     // key frames is the exact bug a wrong name produced here once.
     //
-    // The names differ by backend.  VAAPI's are `rc_mode=CQP` (a string) and
-    // `idr_interval` for the key-frame distance (`g` is the generic name and
-    // these encoders do not take it — the first recordings had no IDR at all
-    // because of that).  NVENC's are `rc=constqp` (an int, so it is set from
-    // the enum's numeric value) and the generic `g`, with `forced-idr` so a
-    // key frame is a real IDR.  Vulkan's are VAAPI's names with a different
-    // type: `rc_mode` is an integer enum there (`cqp` = 1), and a string
-    // would leave the option at its `auto` default.  The key-frame distance
-    // itself is carried by `ctx->gop_size` on all three (0 = every frame an I
-    // frame), which NVENC reads through its `g` option and VAAPI and Vulkan
+    // The names differ by backend, and the mode is named rather than numbered
+    // wherever the encoder takes a name.  A name cannot be off by one:
+    // NVENC's enum has `vbr` at 1 and `cbr` at 2, and Vulkan's has `cqp` at 1,
+    // `cbr` at 2 and `vbr` at 4 — the numbers this used to pass (`2` for
+    // NVENC's VBR, `3` for Vulkan's) were CBR and an unlisted value, so a
+    // recording on either backend was rate-controlled as something nobody
+    // asked for.  Both encoders' options are enum-typed, which is what makes
+    // the named form work; `ffmpeg -h encoder=<name>` prints the names.
+    //
+    // The key-frame distance itself is carried by `ctx->gop_size` on all
+    // three, which NVENC reads through its `g` option and VAAPI and Vulkan
     // through `idr_interval`.
+    //
+    // Neither NVENC nor Vulkan has a quality-defined mode, so QVBR becomes
+    // VBR there: the target still holds, and the level is left to the encoder.
     if (enc->backend == VSHOT_BACKEND_NVENC) {
-        // NVENC_RC_CONSTQP == 0 in the encoder's own enum; the string is not
-        // accepted for an integer AVOption.
-        if (api->opt_set_int(enc->ctx, "rc", 0, AV_OPT_SEARCH_CHILDREN) < 0) {
+        if (api->opt_set(enc->ctx, "rc", vbr || qvbr ? "vbr" : "constqp",
+                         AV_OPT_SEARCH_CHILDREN) < 0) {
             snprintf(enc->err, sizeof(enc->err),
-                     "this ffmpeg build's %s_nvenc encoder does not take the constqp "
-                     "rate-control option",
+                     "this ffmpeg build's %s_nvenc encoder does not take the rate-control "
+                     "option",
                      codec);
             return -1;
         }
         api->opt_set_int(enc->ctx, "forced-idr", 1, AV_OPT_SEARCH_CHILDREN);
     } else if (enc->backend == VSHOT_BACKEND_VULKAN) {
-        if (api->opt_set_int(enc->ctx, "rc_mode", 1, AV_OPT_SEARCH_CHILDREN) < 0 ||
+        if (api->opt_set(enc->ctx, "rc_mode", vbr || qvbr ? "vbr" : "cqp",
+                         AV_OPT_SEARCH_CHILDREN) < 0 ||
             api->opt_set_int(enc->ctx, "idr_interval", 0, AV_OPT_SEARCH_CHILDREN) < 0) {
             snprintf(enc->err, sizeof(enc->err),
-                     "this ffmpeg build's %s encoder does not take the CQP rate-control options",
+                     "this ffmpeg build's %s encoder does not take the rate-control options",
                      codec);
             return -1;
         }
-    } else if (api->opt_set(enc->ctx, "rc_mode", "CQP", AV_OPT_SEARCH_CHILDREN) < 0 ||
+    } else if (api->opt_set(enc->ctx, "rc_mode", qvbr ? "QVBR" : vbr ? "VBR" : "CQP",
+                            AV_OPT_SEARCH_CHILDREN) < 0 ||
                api->opt_set_int(enc->ctx, "idr_interval", 0, AV_OPT_SEARCH_CHILDREN) < 0) {
         snprintf(enc->err, sizeof(enc->err),
-                 "this ffmpeg build's %s encoder does not take the CQP rate-control options",
-                 codec);
+                 "this ffmpeg build's %s encoder does not take the rate-control options", codec);
         return -1;
     }
-    // The quality knob is per-encoder.  H.264 and HEVC carry a private `qp`
-    // option on both backends, which is what libavcodec's `explicit_qp`
-    // reads.  The AV1 encoder has no such option and takes its CQP level from
-    // the generic `global_quality` field instead — exactly what ffmpeg's own
-    // `-qp` sets.  Requiring `qp` from every encoder is what made
-    // `--encoder av1` fail to open.
-    if (api->opt_set_int(enc->ctx, "qp", qp, AV_OPT_SEARCH_CHILDREN) < 0) {
-        enc->ctx->global_quality = qp;
+    // The level is set in CQP and QVBR, where it means something, and left
+    // alone in VBR, where the target bitrate is what decides.  A caller that
+    // asked for no level at all leaves the encoder's own default in place,
+    // which is why the negative case is skipped rather than turned into 0 —
+    // on H.264's 0-51 scale 0 is a level, and a very expensive one.
+    //
+    // The knob is per-encoder.  H.264 and HEVC carry a private `qp` option on
+    // both backends, which is what libavcodec's `explicit_qp` reads.  The AV1
+    // encoder has no such option and takes its CQP level from the generic
+    // `global_quality` field instead — exactly what ffmpeg's own `-qp` sets.
+    // Requiring `qp` from every encoder is what made `--encoder av1` fail to
+    // open.
+    if (want_level) {
+        const int status = api->opt_set_int(enc->ctx, "qp", qp, AV_OPT_SEARCH_CHILDREN);
+        if (status < 0) {
+            // Two different failures look alike here and must not be treated
+            // alike.  `AVERROR_OPTION_NOT_FOUND` is the AV1 encoder, which has
+            // no `qp` option at all: its level lives in the generic
+            // `global_quality` field, and that is the fallback.  Anything else
+            // is a level the option exists for but will not take — H.264 and
+            // HEVC stop at 51 — and writing it into `global_quality` instead
+            // would set a *different* knob to a number nobody chose.
+            if (status != AVERROR_OPTION_NOT_FOUND) {
+                snprintf(enc->err, sizeof(enc->err),
+                         "the %s encoder will not take a level of %d (its own range is 0 to %d)",
+                         codec, qp, codec_level_max(codec));
+                return -1;
+            }
+            enc->ctx->global_quality = qp;
+        }
+    }
+    if (getenv("VSHOT_RECORD_DEBUG")) {
+        fprintf(stderr,
+                "vshot: encoder rate control: %s, bit_rate %lld, max_rate %lld, buffer %d, qp %d\n",
+                qvbr ? "QVBR" : vbr ? "VBR" : "CQP", (long long)enc->ctx->bit_rate,
+                (long long)enc->ctx->rc_max_rate, enc->ctx->rc_buffer_size, qp);
     }
     // Keep the stream simple and seekable: no B frames.  `bf` is a public
     // AVCodecContext option (not private), and AV1 has no B frames and no
@@ -1763,7 +1881,10 @@ static int open_filtergraph_dmabuf(VshotAvEnc *enc, int sw_format) {
 // calls this with `dmabuf == 0` after sizing `enc->sw`, the zero-copy path
 // with `dmabuf == 1` and the buffer's fourcc.
 static int finish_open(VshotAvEnc *enc, int width, int height, const char *codec, int qp,
-                       int dmabuf, unsigned fourcc, int gop_frames) {
+                       int dmabuf, unsigned fourcc, int gop_frames, int64_t bitrate,
+                       int fps) {
+    enc->bitrate = bitrate;
+    enc->fps = fps;
     enc->width = width;
     enc->height = height;
     enc->in_w = width;
@@ -1802,7 +1923,10 @@ static int finish_open(VshotAvEnc *enc, int width, int height, const char *codec
         enc->ctx->width = link->w;
         enc->ctx->height = link->h;
         enc->ctx->pix_fmt = link->format;
-        enc->ctx->time_base = link->time_base;
+        // The time base is not taken from the link: the filtergraph runs at
+        // ffmpeg's microsecond placeholder, and the encoder's clock is the
+        // session's rate (set before `open_encoder`, which is where the rate
+        // control reads it).
         AVBufferRef *sink_frames = api->buffersink_get_hw_frames_ctx(enc->graph_sink);
         if (sink_frames) {
             enc->ctx->hw_frames_ctx = api->buffer_ref(sink_frames);
@@ -1860,7 +1984,7 @@ static int finish_open(VshotAvEnc *enc, int width, int height, const char *codec
 // ---------------------------------------------------------------------------
 
 VshotAvEnc *vshot_av_enc_create(int width, int height, const char *codec, int qp, int gop_frames,
-                                int backend) {
+                                int backend, int64_t bitrate, int fps) {
     api = load_api();
     if (!api) {
         return NULL;
@@ -1873,7 +1997,11 @@ VshotAvEnc *vshot_av_enc_create(int width, int height, const char *codec, int qp
     // land in the middle of vshot's own stderr.  The debug switch keeps
     // them, which is what it is for.
     if (getenv("VSHOT_RECORD_DEBUG")) {
-        api->log_set_level(AV_LOG_INFO);
+        // VERBOSE rather than INFO: this is the level at which ffmpeg's VAAPI
+        // layer prints the rate control it settled on and the framerate it
+        // handed the driver, which is what a bitrate that comes out wrong has
+        // to be read against.
+        api->log_set_level(AV_LOG_VERBOSE);
     } else {
         api->log_set_level(AV_LOG_ERROR);
     }
@@ -1882,7 +2010,7 @@ VshotAvEnc *vshot_av_enc_create(int width, int height, const char *codec, int qp
         return NULL;
     }
     enc->backend = backend;
-    if (finish_open(enc, width, height, codec, qp, 0, 0, gop_frames) != 0) {
+    if (finish_open(enc, width, height, codec, qp, 0, 0, gop_frames, bitrate, fps) != 0) {
         snprintf(create_error, sizeof(create_error), "%s", enc->err);
         vshot_av_enc_destroy(enc);
         return NULL;
@@ -1891,7 +2019,8 @@ VshotAvEnc *vshot_av_enc_create(int width, int height, const char *codec, int qp
 }
 
 VshotAvEnc *vshot_av_enc_create_dmabuf(int width, int height, const char *codec, int qp,
-                                       int gop_frames, unsigned fourcc, int backend) {
+                                       int gop_frames, unsigned fourcc, int backend,
+                                       int64_t bitrate, int fps) {
     api = load_api();
     if (!api) {
         return NULL;
@@ -1900,7 +2029,11 @@ VshotAvEnc *vshot_av_enc_create_dmabuf(int width, int height, const char *codec,
         return NULL;
     }
     if (getenv("VSHOT_RECORD_DEBUG")) {
-        api->log_set_level(AV_LOG_INFO);
+        // VERBOSE rather than INFO: this is the level at which ffmpeg's VAAPI
+        // layer prints the rate control it settled on and the framerate it
+        // handed the driver, which is what a bitrate that comes out wrong has
+        // to be read against.
+        api->log_set_level(AV_LOG_VERBOSE);
     } else {
         api->log_set_level(AV_LOG_ERROR);
     }
@@ -1909,7 +2042,7 @@ VshotAvEnc *vshot_av_enc_create_dmabuf(int width, int height, const char *codec,
         return NULL;
     }
     enc->backend = backend;
-    if (finish_open(enc, width, height, codec, qp, 1, fourcc, gop_frames) != 0) {
+    if (finish_open(enc, width, height, codec, qp, 1, fourcc, gop_frames, bitrate, fps) != 0) {
         snprintf(create_error, sizeof(create_error), "%s", enc->err);
         vshot_av_enc_destroy(enc);
         return NULL;
@@ -2915,7 +3048,7 @@ static void rec_take_enc_error(VshotRec *rec, const char *fallback) {
 // wf-recorder makes too; anything the encoder repeats in-band it prefers on
 // its own, so the two never disagree in the file.
 static int rec_open_muxer(VshotRec *rec, const char *path, int width, int height,
-                          const char *codec) {
+                          const char *codec, int fps) {
     if (!api->format_loaded) {
         snprintf(rec->err, sizeof(rec->err),
                  "libavformat is not installed, so MP4 recording is unavailable "
@@ -2932,16 +3065,40 @@ static int rec_open_muxer(VshotRec *rec, const char *path, int width, int height
         snprintf(rec->err, sizeof(rec->err), "could not open an MP4 muxer for %s", path);
         return -1;
     }
+    // The video track's time unit is one frame of the rate the session aims
+    // at, rather than the muxer's own (movenc picks a hundred times the rate
+    // when left to itself).  With the frame as the unit, frame lengths come
+    // out whole frames: the millisecond timeline the loop keeps lands on the
+    // frame grid, and a player — or `ffprobe` — has a rate it can name
+    // instead of falling back to reporting the raw timescale (16000 for a
+    // 160 fps recording).  Set here, on the muxer before its streams exist,
+    // which is where the muxer reads it.
+    //
+    // The option belongs to the muxer's own class, so it is set on the
+    // private context.  Asking `av_opt_set_int` to search the format
+    // context's children for it answers AVERROR_OPTION_NOT_FOUND on this
+    // ffmpeg (9.0.1) even though the name is right there in
+    // `fmt->oformat->priv_class`; the private context itself takes it.
+    if (fps > 0 && rec->fmt->priv_data) {
+        int opt = api->opt_set_int(rec->fmt->priv_data, "video_track_timescale", fps, 0);
+        if (opt < 0) {
+            fprintf(stderr, "vshot: video_track_timescale=%d was refused (%d)\n", fps, opt);
+        }
+    }
     rec->stream = api->format_new_stream(rec->fmt, NULL);
     if (!rec->stream) {
         snprintf(rec->err, sizeof(rec->err), "could not add a video stream to the MP4 muxer");
         return -1;
     }
-    // Milliseconds: every frame carries the time it really spent on screen,
-    // so the timeline is variable and states that rather than faking a
-    // nominal rate.  This is the unit the encoder side speaks; the muxer
-    // gets to answer with its own time base below.
-    rec->stream->time_base = (AVRational){1, 1000};
+    // The video track's time unit is one frame of the rate the session aims
+    // at, rather than a millisecond: the loop already stamps each frame on the
+    // slot grid that rate describes, and a millisecond grid cuts across it —
+    // 160 fps is 6.25 ms a frame, so the file holds sixes and sevens, and a
+    // sample table of two lengths is one no frame rate fits: `ffprobe` gives
+    // up on it and reports the raw timescale (16000) as the file's rate.  In
+    // frames the lengths are whole frames, and a rate can be read off them.
+    // A session that names no rate keeps the millisecond.
+    rec->stream->time_base = fps > 0 ? (AVRational){1, fps} : (AVRational){1, 1000};
     ret = api->parameters_from_context(rec->stream->codecpar, rec->enc->ctx);
     if (ret < 0) {
         set_err(rec->enc, "the MP4 muxer refused the codec parameters", ret);
@@ -3005,13 +3162,36 @@ static int rec_open_muxer(VshotRec *rec, const char *path, int width, int height
     rec->enc->mux = rec->fmt;
     rec->enc->mux_stream = rec->stream;
     rec->enc->mux_next_pts = 0;
+    rec->enc->mux_last_pts = -1;
     rec->enc->mux_frames = 0;
     return 0;
 }
 
+// The key-frame distance a *recording* is opened with, in frames.
+//
+// Two seconds, which is the usual compromise: every seek in the file lands
+// within two seconds of its target, and the frames between key frames cost a
+// fraction of what an all-intra stream costs.
+//
+// A recording used to be opened all-intra (`gop_size` 0), on the reading that
+// this encoder's key frames could only be set at open time.  That is not what
+// the encoder does: with `gop_size` 0 libavcodec treats the stream as intra
+// only ("Using intra frames only." in its own verbose log), so every frame was
+// an IDR and the rate control had nothing to work with — a target of 46 Mbit/s
+// produced 76 Mbit/s on a 1888x1019 window, and the 4K case produced
+// 1.15 Gbit/s.  Measured against ffmpeg's own command line, which passes a
+// `gop_size` and hits its target to within 2%, this is the missing setting.
+//
+// The replay ring is unaffected: it opens with the key-frame distance its own
+// caller asked for, because a save has to start on a key frame.
+static int recording_gop(int fps) {
+    const int rate = fps > 0 ? fps : 60;
+    return rate * 2;
+}
+
 static VshotRec *rec_start(const char *path, int width, int height, const char *codec, int qp,
                            int dmabuf, unsigned fourcc, int mic_rate, int mic_channels,
-                           int backend) {
+                           int backend, int fps, int64_t bitrate) {
     api = load_api();
     if (!api) {
         return NULL;
@@ -3047,8 +3227,11 @@ static VshotRec *rec_start(const char *path, int width, int height, const char *
             return NULL;
         }
     }
-    rec->enc = dmabuf ? vshot_av_enc_create_dmabuf(width, height, codec, qp, 0, fourcc, backend)
-                      : vshot_av_enc_create(width, height, codec, qp, 0, backend);
+    rec->enc = dmabuf
+                   ? vshot_av_enc_create_dmabuf(width, height, codec, qp, recording_gop(fps), fourcc,
+                                                backend, bitrate, fps)
+                   : vshot_av_enc_create(width, height, codec, qp, recording_gop(fps), backend,
+                                         bitrate, fps);
     if (!rec->enc) {
         // `vshot_av_enc_load_error` reads the same module-level buffer this
         // would write, so copy through a local first.
@@ -3058,7 +3241,7 @@ static VshotRec *rec_start(const char *path, int width, int height, const char *
         vshot_rec_free(rec);
         return NULL;
     }
-    if (rec_open_muxer(rec, path, width, height, codec) != 0) {
+    if (rec_open_muxer(rec, path, width, height, codec, fps) != 0) {
         snprintf(create_error, sizeof(create_error), "%s", rec->err);
         vshot_rec_free(rec);
         return NULL;
@@ -3071,28 +3254,32 @@ static VshotRec *rec_start(const char *path, int width, int height, const char *
 // VSHOT_BACKEND_VULKAN (2).  Returns NULL with the reason in
 // `vshot_rec_load_error`.
 VshotRec *vshot_rec_start(const char *path, int width, int height, const char *codec, int qp,
-                          int backend) {
-    return rec_start(path, width, height, codec, qp, 0, 0, 0, 0, backend);
+                          int backend, int fps, int64_t bitrate) {
+    return rec_start(path, width, height, codec, qp, 0, 0, 0, 0, backend, fps, bitrate);
 }
 
 // The same, with a microphone: a soundtrack is recorded beside the video
 // when both the rate and the channel count are positive.
 VshotRec *vshot_rec_start_mic(const char *path, int width, int height, const char *codec, int qp,
-                              int mic_rate, int mic_channels, int backend) {
-    return rec_start(path, width, height, codec, qp, 0, 0, mic_rate, mic_channels, backend);
+                              int mic_rate, int mic_channels, int backend, int fps,
+                              int64_t bitrate) {
+    return rec_start(path, width, height, codec, qp, 0, 0, mic_rate, mic_channels, backend, fps,
+                     bitrate);
 }
 
 // The zero-copy variant: the frames are dma-bufs with this fourcc.
 VshotRec *vshot_rec_start_dmabuf(const char *path, int width, int height, const char *codec,
-                                 int qp, unsigned fourcc, int backend) {
-    return rec_start(path, width, height, codec, qp, 1, fourcc, 0, 0, backend);
+                                 int qp, unsigned fourcc, int backend, int fps,
+                                 int64_t bitrate) {
+    return rec_start(path, width, height, codec, qp, 1, fourcc, 0, 0, backend, fps, bitrate);
 }
 
 // The zero-copy variant with a microphone.
 VshotRec *vshot_rec_start_dmabuf_mic(const char *path, int width, int height, const char *codec,
                                      int qp, unsigned fourcc, int mic_rate, int mic_channels,
-                                     int backend) {
-    return rec_start(path, width, height, codec, qp, 1, fourcc, mic_rate, mic_channels, backend);
+                                     int backend, int fps, int64_t bitrate) {
+    return rec_start(path, width, height, codec, qp, 1, fourcc, mic_rate, mic_channels, backend,
+                     fps, bitrate);
 }
 
 // Feeds one RGBA frame and hands its packets to the muxer.  `duration_ms` is
@@ -3378,7 +3565,8 @@ int vshot_av_enc_backend_probe(int backend, char *err, size_t err_len) {
 // `dmabuf` selects the zero-copy input, exactly as for a recording.
 VshotRec *vshot_rec_start_replay(int width, int height, const char *codec, int qp, int dmabuf,
                                  unsigned fourcc, int mic_rate, int mic_channels,
-                                 int64_t window_ms, int gop_frames, int fps, int backend) {
+                                 int64_t window_ms, int gop_frames, int fps, int backend,
+                                 int64_t bitrate) {
     api = load_api();
     if (!api) {
         return NULL;
@@ -3420,8 +3608,9 @@ VshotRec *vshot_rec_start_replay(int width, int height, const char *codec, int q
     }
     rec->enc = dmabuf
                    ? vshot_av_enc_create_dmabuf(width, height, codec, qp, gop_frames, fourcc,
-                                                backend)
-                   : vshot_av_enc_create(width, height, codec, qp, gop_frames, backend);
+                                                backend, bitrate, fps)
+                   : vshot_av_enc_create(width, height, codec, qp, gop_frames, backend,
+                                         bitrate, fps);
     if (!rec->enc) {
         char detail[sizeof(create_error)];
         snprintf(detail, sizeof(detail), "%s", vshot_av_enc_load_error());
@@ -3556,7 +3745,8 @@ int vshot_rec_replay_save(VshotRec *rec, const char *path, int seconds, int64_t 
         free(picks);
         return -1;
     }
-    vstream->time_base = (AVRational){1, 1000};
+    // One frame of the rate the ring was filled at, as in `rec_open_muxer`.
+    vstream->time_base = r->fps > 0 ? (AVRational){1, r->fps} : (AVRational){1, 1000};
     if (api->parameters_from_context(vstream->codecpar, rec->enc->ctx) < 0) {
         snprintf(rec->err, sizeof(rec->err), "the MP4 muxer refused the codec parameters");
         api->format_free_context(fmt);
@@ -3585,6 +3775,17 @@ int vshot_rec_replay_save(VshotRec *rec, const char *path, int seconds, int64_t 
         astream->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
         astream->codecpar->sample_rate = rec->audio->rate;
     }
+    // The video track's time unit is one frame of the rate the session aimed
+    // at, not the muxer's own (movenc picks a hundred times the rate when left
+    // to itself).  With the frame as the unit, frame lengths are whole frames:
+    // the millisecond timeline the ring keeps lands on the frame grid, and a
+    // player — or `ffprobe` — has a rate it can name instead of falling back
+    // to reporting the raw timescale (16000 for a 160 fps recording).
+    if (r->fps > 0 && fmt->priv_data) {
+        // On the muxer's own class, for the reason given in `rec_open_muxer`:
+        // searching the format context's children for it does not find it.
+        api->opt_set_int(fmt->priv_data, "video_track_timescale", r->fps, 0);
+    }
     if (!(fmt->oformat->flags & AVFMT_NOFILE)) {
         if (api->io_open(&fmt->pb, path, AVIO_FLAG_WRITE) < 0) {
             snprintf(rec->err, sizeof(rec->err), "could not open %s for writing", path);
@@ -3606,16 +3807,30 @@ int vshot_rec_replay_save(VshotRec *rec, const char *path, int seconds, int64_t 
     AVRational atb = astream ? astream->time_base : (AVRational){1, 1000};
     AVRational ms = {1, 1000};
     int written = 0;
+    // Per stream, as in the recording path: a frame whose stamp rounds onto
+    // the one before it takes the next unit instead, because the muxer
+    // refuses a timestamp that does not move.
+    int64_t last_pts[2] = {-1, -1};
     for (int i = 0; i < npick; i++) {
         VshotReplayPkt *e = &r->pkts[picks[i].index];
         int64_t rel = e->ms - base_ms;
         if (rel < 0) {
             rel = 0;
         }
+        int is_audio = e->is_audio ? 1 : 0;
         e->pkt->stream_index = e->is_audio ? astream->index : vstream->index;
         AVRational tb = e->is_audio ? atb : vtb;
         e->pkt->pts = e->pkt->dts = api->rescale_q(rel, ms, tb);
         e->pkt->duration = api->rescale_q(e->dur_ms, ms, tb);
+        // A frame that covered less than one time unit still covered time:
+        // a zero-length sample is not something a sample table can hold.
+        if (!e->is_audio && e->pkt->duration < 1) {
+            e->pkt->duration = 1;
+        }
+        if (e->pkt->pts <= last_pts[is_audio]) {
+            e->pkt->pts = e->pkt->dts = last_pts[is_audio] + 1;
+        }
+        last_pts[is_audio] = e->pkt->pts;
         if (api->format_write_frame(fmt, e->pkt) < 0) {
             snprintf(rec->err, sizeof(rec->err),
                      "writing a replay packet to the MP4 muxer failed");

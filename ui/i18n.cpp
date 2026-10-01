@@ -353,6 +353,31 @@ const QHash<QString, QString> &chineseTable()
          QString::fromUtf8("三者都跑 GPU 的媒体引擎")},
         {QStringLiteral("Frame rate"), QString::fromUtf8("帧率")},
         {QStringLiteral("1-240"), QString::fromUtf8("1-240")},
+        {QStringLiteral("Target bitrate"), QString::fromUtf8("目标码率")},
+        {QStringLiteral("The size the file aims for; 45 Mbit/s whatever the frame's own size, "
+                        "which is what a 4K recording needs to survive watching.  There is no "
+                        "ceiling but the encoder's own"),
+         QString::fromUtf8("文件想达到的大小；不管画面多大都是 45 Mbit/s，这是 4K 录制看着不糊"
+                           "所需的量。除了编码器本身的硬上限，没有别的上限")},
+        {QStringLiteral("The ring is held in memory, so this is what decides what a long window "
+                        "costs; 45 Mbit/s whatever the frame's own size"),
+         QString::fromUtf8("环是放在内存里的，所以这个决定一段长历史要占多少；"
+                           "不管画面多大都是 45 Mbit/s")},
+        {QStringLiteral("Encoder level"), QString::fromUtf8("编码器档位")},
+        {QStringLiteral("from the bitrate"), QString::fromUtf8("按码率")},
+        {QStringLiteral("On the codec's own scale and taken as written: 0-51 for h264 and hevc, "
+                        "0-255 for av1, and 0 is the most expensive end of either.  A level makes "
+                        "the encoder hold that quality and spend up to the bitrate instead of "
+                        "spending it.  The file and the command line take every value; this box "
+                        "leaves 0 for \"let the bitrate decide\""),
+         QString::fromUtf8("按编码器自己的尺度，写多少就是多少：h264 与 hevc 是 0-51，"
+                           "av1 是 0-255，两者都是 0 最贵。给了档位，编码器就守住这一档、"
+                           "最多花到目标码率，而不是把码率花完。"
+                           "文件与命令行接受任何取值；这个框把 0 留给「按码率」")},
+        {QStringLiteral("As on the recording side: the codec's own scale, taken as written, and "
+                        "0 left for \"let the bitrate decide\""),
+         QString::fromUtf8("同录制侧：按编码器自己的尺度、写多少就是多少，"
+                           "0 留给「按码率」")},
         {QStringLiteral("Through the desktop portal"),
          QString::fromUtf8("走桌面 portal")},
         {QStringLiteral("Needs xdg-desktop-portal and libpipewire; `record all` cannot use it"),
@@ -384,9 +409,12 @@ const QHash<QString, QString> &chineseTable()
          QString::fromUtf8("窗口名，用逗号分隔（对不带 NAME 的 `record window`）；"
                            "焦点落到哪扇就录哪扇")},
         {QStringLiteral("Window names, comma-separated (`replay start window` with no NAME); the "
-                        "ring moves to whichever the focus lands on"),
+                        "replay records whichever has the focus, keeps recording the last one "
+                        "while the focus is elsewhere, and starts a new ring at that window's own "
+                        "size when it moves"),
          QString::fromUtf8("窗口名，用逗号分隔（对不带 NAME 的 `replay start window`）；"
-                           "焦点落到哪扇就回录哪扇")},
+                           "焦点在哪扇就回录哪扇，焦点在别处时留在上一扇，"
+                           "换到另一扇就按它自己的尺寸重开一段")},
         {QStringLiteral("Notify when the recording is written"),
          QString::fromUtf8("录制写盘时通知")},
         {QStringLiteral("Notify when a save is written"),

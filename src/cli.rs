@@ -396,6 +396,19 @@ fallback composition instead of the GPU overlay."#
             value_parser = crate::record::avcodec::EncoderBackend::ALL.map(|backend| backend.word())
         )]
         encoder_backend: Option<String>,
+        /// Target bitrate in Mbit/s; the config's `cli.record.bitrate` when the
+        /// flag is not given. Without either, the built-in 45 is used, whatever
+        /// the frame's own size.
+        #[arg(long, global = true, value_parser = clap::value_parser!(u32).range(1..))]
+        bitrate: Option<u32>,
+        /// Encoder level, on the codec's own scale: 0-51 for h264 and hevc,
+        /// 0-255 for av1, and 0 is the most expensive end of either. The number
+        /// is passed through as written -- it is not converted between codecs.
+        /// A level makes the session quality-defined: the encoder holds the
+        /// level and spends up to the target bitrate instead of spending it.
+        /// `cli.record.quality` when the flag is not given.
+        #[arg(long, global = true, value_parser = clap::value_parser!(u16).range(0..=255))]
+        quality: Option<u16>,
         /// Record through the XDG desktop portal
         /// (org.freedesktop.portal.ScreenCast) instead of the compositor's own
         /// protocols; `cli.record.portal` when the flag is not given. The
@@ -415,9 +428,12 @@ re-encode -- so the trigger costs almost nothing and nothing is written until it
 is asked for. `--window` seconds is how far a save can reach back.
 
 `replay start` runs the session, `replay save` asks it to write a file,
-`replay status` prints how much history it holds, and `replay stop` ends it. The
-control channel is a socket under $XDG_RUNTIME_DIR, so `save` and `stop` need no
-display and work from a keybinding:
+`replay status` prints how much history it holds and whether it is recording at
+all (a window replay with none of its windows left to record is idle: the same
+session, not recording, and still holding the last window's history for a
+save), and `replay stop` ends it. The control channel is a socket under
+$XDG_RUNTIME_DIR, so `save` and `stop` need no display and work from a
+keybinding:
     bind = SUPER SHIFT, R, exec, vshot replay save
 
 The target is what `record` records, from the same capture backends and the same
@@ -469,6 +485,16 @@ file `replay stop` reads, and VSHOT_RECORD_DEBUG=1 traces each frame."#
             value_parser = crate::record::avcodec::EncoderBackend::ALL.map(|backend| backend.word())
         )]
         encoder_backend: Option<String>,
+        /// Target bitrate in Mbit/s; the config's `cli.replay.bitrate` when the
+        /// flag is not given, else the built-in 45, as on the recording side. A
+        /// ring is held in memory, so this is what decides what a long
+        /// `--window` costs.
+        #[arg(long, global = true, value_parser = clap::value_parser!(u32).range(1..))]
+        bitrate: Option<u32>,
+        /// Encoder level, on the codec's own scale, as `record --quality`; the
+        /// config's `cli.replay.quality` when the flag is not given.
+        #[arg(long, global = true, value_parser = clap::value_parser!(u16).range(0..=255))]
+        quality: Option<u16>,
         /// Keep the microphone in the ring beside the video: a bare `--mic`
         /// takes the session's default source, and `record mics` lists them.
         /// Without either flag `cli.replay.mic` decides.
@@ -483,7 +509,13 @@ file `replay stop` reads, and VSHOT_RECORD_DEBUG=1 traces each frame."#
         app_audio: bool,
         /// Follow the focus between windows, as `record --follow` does:
         /// `--follow NAME`, repeated. Only `replay start window`, never with a
-        /// window NAME or `--pick`; without it, `cli.replay.follow`.
+        /// window NAME or `--pick`; without it, `cli.replay.follow`. A window
+        /// replay follows the same one-way way a recording does: the window
+        /// that has the focus is the one recorded, a focus on anything else
+        /// leaves it recording the window it is on (the history is kept either
+        /// way), and a switch to another followed window restarts it there, at
+        /// that window's own size, with the last window's ring dropped. Only
+        /// every followed window being gone leaves the replay idle.
         #[arg(long = "follow", global = true, value_name = "NAME", action = clap::ArgAction::Append)]
         follow: Vec<String>,
         /// Do not follow the focus, even when the config's `cli.replay.follow`
@@ -732,7 +764,10 @@ pub enum ReplayCommandLine {
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         seconds: Option<u64>,
     },
-    /// Print how much history the running session holds.
+    /// Print how much history the running session holds, and whether it is
+    /// recording at all: `0.0  0  idle` is a replay that has not recorded a
+    /// window yet.  An idle session can still hold history -- the seconds are
+    /// the last window's, and a save writes them.
     Status,
     /// End the replay session that is running.
     Stop,
@@ -781,7 +816,17 @@ dma-buf route as `record region`."#
 covered or half-off-screen window records whole. The window is named by app id
 or title, picked with `--pick`, or -- with no argument -- the focused one. A
 resize is fitted into the replay's canvas (scaled down, centred, letterboxed),
-because a ring holds one frame size."#
+because a ring holds one frame size.
+
+The window is not recorded for the whole session, though: a replay keeps one
+ring at one frame size, so a switch of window restarts it there -- at the new
+window's own size -- and a ring holds one window's history. With `--follow` the
+replay records whenever one of its windows is on the screen: the focus picks
+which one, a focus on anything else leaves it on the one it has, and only every
+followed window being gone makes it idle -- a window that was closed waits for
+its return rather than ending the session. `replay status` says which of the two
+it is. An idle replay is not an empty one: the last window's seconds stay in
+memory, and `replay save` writes them."#
     )]
     Window {
         /// App id or title of the window; the focused window when omitted.
@@ -1079,6 +1124,8 @@ impl Cli {
             duration,
             encoder,
             encoder_backend,
+            bitrate,
+            quality,
             portal,
             no_portal,
             mic,
@@ -1106,6 +1153,8 @@ impl Cli {
                 || duration.is_some()
                 || encoder.is_some()
                 || encoder_backend.is_some()
+                || bitrate.is_some()
+                || quality.is_some()
                 || *portal
                 || *no_portal
                 || mic.is_some()
@@ -1297,6 +1346,10 @@ impl Cli {
                     })?
                 }
             };
+            // The rate control: the flags win, the config decides what "no
+            // flag" means, and neither leaves the choice to the sink.
+            let bitrate = bitrate.or_else(crate::record::default_bitrate);
+            let quality = quality.or_else(crate::record::default_quality);
             // The microphone: `--mic` is on, `--no-mic` is off, and
             // neither means the config's remembered default (off unless it
             // was written).  An empty name is the default source.
@@ -1327,6 +1380,8 @@ impl Cli {
                     mic,
                     app_audio: *app_audio,
                     follow: follow.clone(),
+                    bitrate,
+                    quality,
                 },
             )));
         }
@@ -1337,6 +1392,8 @@ impl Cli {
             gop,
             encoder,
             encoder_backend,
+            bitrate,
+            quality,
             mic,
             no_mic,
             app_audio,
@@ -1357,12 +1414,14 @@ impl Cli {
             // The options that only shape a session, with which of them the
             // user actually gave: the three one-line control shapes ask a
             // session that is already running and cannot apply any of them.
-            let session_options: [(&str, bool); 11] = [
+            let session_options: [(&str, bool); 13] = [
                 ("--window", window.is_some()),
                 ("--fps", fps.is_some()),
                 ("--gop", gop.is_some()),
                 ("--encoder", encoder.is_some()),
                 ("--encoder-backend", encoder_backend.is_some()),
+                ("--bitrate", bitrate.is_some()),
+                ("--quality", quality.is_some()),
                 ("--mic", mic.is_some()),
                 ("--no-mic", *no_mic),
                 ("--app-audio", *app_audio),
@@ -1470,6 +1529,8 @@ impl Cli {
                             })?
                         }
                     };
+                    let bitrate = bitrate.or_else(crate::record::default_replay_bitrate);
+                    let quality = quality.or_else(crate::record::default_replay_quality);
                     let encoder_backend = match encoder_backend.as_deref() {
                         None => crate::record::default_replay_encoder_backend(),
                         Some(word) => crate::record::avcodec::EncoderBackend::parse(word)
@@ -1568,6 +1629,8 @@ impl Cli {
                         portal,
                         save_dir,
                         gop_secs: gop.unwrap_or_else(crate::record::default_replay_gop),
+                        bitrate,
+                        quality,
                     };
                     Ok(Action::Replay(ReplayAction::Start {
                         request: Box::new(request),

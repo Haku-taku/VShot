@@ -246,6 +246,49 @@ pub(crate) fn default_portal() -> bool {
     crate::config::load().record.portal.unwrap_or(false)
 }
 
+/// The remembered target bitrate: `--bitrate` overrides it, and the config's
+/// `record.bitrate` decides what "no flag" means.  `None` — the built-in
+/// default — leaves the choice to the sink, which uses `avcodec::DEFAULT_BITRATE`.
+/// A remembered zero is the built-in default rather than an error, for the same
+/// reason as the frame rate above: a target of nothing is not something an
+/// encoder can be asked for.
+pub(crate) fn default_bitrate() -> Option<u32> {
+    crate::config::load()
+        .record
+        .bitrate
+        .filter(|mbps| *mbps >= 1)
+}
+
+/// The remembered encoder level: the config's `record.quality`.  `None` means
+/// the target bitrate decides alone.  A level above the widest encoder's own
+/// range (AV1's 255) is the built-in default rather than an error, for the same
+/// reason as the target above: no encoder has a level there, and a hand edit
+/// gone wrong must not break every future recording.
+pub(crate) fn default_quality() -> Option<u16> {
+    crate::config::load()
+        .record
+        .quality
+        .filter(|level| *level <= 255)
+}
+
+/// The remembered replay target bitrate, on the same terms as
+/// [`default_bitrate`] and read from `replay.bitrate`.
+pub(crate) fn default_replay_bitrate() -> Option<u32> {
+    crate::config::load()
+        .replay
+        .bitrate
+        .filter(|mbps| *mbps >= 1)
+}
+
+/// The remembered replay encoder level, on the same terms as
+/// [`default_quality`] and read from `replay.quality`.
+pub(crate) fn default_replay_quality() -> Option<u16> {
+    crate::config::load()
+        .replay
+        .quality
+        .filter(|level| *level <= 255)
+}
+
 /// The remembered replay window: the config's `replay.window` when it is a
 /// usable value, else the replay default.  A value outside 1-3600 is the
 /// built-in default rather than an error, for the same reason as the encoder
@@ -383,12 +426,38 @@ pub struct RecordRequest {
     /// Empty is an ordinary window recording, and the empty case is what keeps
     /// a recording from asking the compositor for the focus at all.
     pub follow: Vec<String>,
+    /// The target bitrate in Mbit/s (`--bitrate`), or `None` for the built-in
+    /// one, which is what a recording uses unless the caller says otherwise:
+    /// 45 Mbit/s whatever the frame's own size.
+    pub bitrate: Option<u32>,
+    /// The encoder's level (`--quality`), or `None` to let the target bitrate
+    /// decide alone.  A level turns the session into a quality-defined one:
+    /// the encoder holds the level and spends up to the target, instead of
+    /// spending the target.
+    ///
+    /// The number is on the codec's own scale and is passed through as written
+    /// — 0-51 for H.264 and HEVC, 0-255 for AV1 — because a level only means
+    /// something to the encoder that reads it (see `avcodec::RateControl`).
+    pub quality: Option<u16>,
 }
 
 impl RecordRequest {
     /// The frame interval the loop aims for, from the requested rate.
     fn frame_interval(&self) -> Duration {
         Duration::from_nanos(1_000_000_000 / u64::from(self.fps.max(1)))
+    }
+
+    /// What this request asks of the encoder's rate control.
+    ///
+    /// A `--bitrate` is Mbit/s because that is how a person says it; the
+    /// encoder takes bits per second.  What is left unset stays unset: the
+    /// target a session falls back to is the built-in 45, which is a fact the
+    /// sink knows and this request does not.
+    pub(crate) fn rate_control(&self) -> crate::record::avcodec::RateControl {
+        crate::record::avcodec::RateControl {
+            bitrate: self.bitrate.map(|mbps| i64::from(mbps) * 1_000_000),
+            quality: self.quality,
+        }
     }
 }
 
@@ -698,6 +767,8 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
             fourcc,
             format,
             backend,
+            request.fps,
+            request.rate_control(),
         )?,
         (Some(fourcc), None) => Recorder::start_dmabuf(
             &path,
@@ -706,6 +777,8 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
             request.encoder,
             fourcc,
             backend,
+            request.fps,
+            request.rate_control(),
         )?,
         (None, Some(format)) => Recorder::start_mic(
             &path,
@@ -714,6 +787,8 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
             request.encoder,
             format,
             backend,
+            request.fps,
+            request.rate_control(),
         )?,
         (None, None) => Recorder::start(
             &path,
@@ -721,6 +796,8 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
             encoded_height,
             request.encoder,
             backend,
+            request.fps,
+            request.rate_control(),
         )?,
     };
     if debug_enabled() {
@@ -1248,6 +1325,30 @@ fn debug_enabled() -> bool {
     std::env::var_os("VSHOT_RECORD_DEBUG").is_some()
 }
 
+/// Encodes one grabbed frame with the time it was on screen.
+///
+/// Both the frame the grab just brought and the one the loop is holding for a
+/// slot nothing arrived in go through here: a repeat is the same pixels with
+/// another interval, so it is the same call.  Generic over the sink because a
+/// replay's ring takes the same frames a recording's file does.
+pub(super) fn encode_grabbed<S: crate::record::avcodec::VideoSink>(
+    recorder: &mut S,
+    frame: &Grabbed,
+    duration_ms: u32,
+) -> Result<()> {
+    match frame {
+        Grabbed::Software(frame) => recorder.frame_rgba(frame.pixels(), duration_ms),
+        Grabbed::Dmabuf(dmabuf) => recorder.frame_dmabuf(
+            dmabuf.fd,
+            dmabuf.fourcc,
+            dmabuf.modifier,
+            dmabuf.offset as i32,
+            dmabuf.stride as i32,
+            duration_ms,
+        ),
+    }
+}
+
 /// The main loop: grab, encode, mux, sleep the remainder of the interval.
 /// Returns the finished file, its frame count and its duration.
 fn record_loop(
@@ -1264,9 +1365,27 @@ fn record_loop(
     let mut scratch = SceneScratch {
         outputs: Vec::new(),
     };
+    // The slot the next frame is wanted in.  The grid is the *clock's*: a slot
+    // is `interval` after the one before it, never after the moment a copy
+    // happened to land.  A grid anchored on the arrival makes every frame's
+    // length follow how late its grab was, and the lateness is a different
+    // amount every frame — which is judder on screen and a file that plays at
+    // the rate the capture managed rather than the rate it was asked for.
     let mut next_frame = started;
     let mut last_frame_at = started;
     let mut consecutive_errors = 0u32;
+    // The frame the loop is holding, for the slots the capture missed.  A slot
+    // that passed with nothing new in it carries the frame before it, so every
+    // frame in the file is one interval long and the holds land on the frames
+    // that really were not delivered.  The window loop does the same (see
+    // `window::loop_over`).
+    //
+    // Re-encoding it is safe on both paths: a software frame owns its pixels,
+    // and the dma-buf pool rotates over four slots, so a buffer the loop is
+    // still holding is not copied into again for three more captures — and no
+    // capture is in flight while the loop is here, because a grab that had one
+    // outstanding would have been refused.
+    let mut held: Option<Grabbed> = None;
     // The timeline so far in milliseconds, and the real time those frames
     // covered.  Each frame's duration is the *difference* between the two, so
     // rounding to whole milliseconds cannot accumulate: at 60 fps a frame is
@@ -1286,6 +1405,26 @@ fn record_loop(
             if started.elapsed() >= Duration::from_secs(seconds) {
                 break;
             }
+        }
+        // The slots that have passed since the last frame.  The file plays on
+        // the clock's grid, so a slot with nothing new in it carries the frame
+        // before it: that is what keeps a late grab from stretching its own
+        // frame, and it is what puts the hold on the frame that really was not
+        // delivered rather than on whichever one the copy happened to land in.
+        let now = Instant::now();
+        while next_frame + interval <= now {
+            // Nothing has been grabbed yet, so there is nothing to repeat.
+            let Some(frame) = held.as_ref() else {
+                break;
+            };
+            let duration_ms = cast::cover(
+                &mut covered_us,
+                &mut timeline_ms,
+                &mut last_frame_at,
+                next_frame,
+            );
+            encode_grabbed(&mut recorder, frame, duration_ms)?;
+            next_frame += interval;
         }
         // Pace: sleep until this frame's slot.  A slot already past means
         // the machine is behind and the frame goes out immediately; the
@@ -1340,37 +1479,25 @@ fn record_loop(
         };
         consecutive_errors = 0;
         refusals.delivered();
-        // The frame's timestamp is the moment its pixels were taken: what
-        // counts is how long the *previous* frame was on screen, which is the
-        // interval between two grab starts.  Anchoring on the grab's end
-        // instead would fold each grab's own duration — and its jitter, a few
-        // milliseconds of it — into the timeline: 13ms and 21ms alternating
-        // around a true 16.7ms, which is judder a player faithfully reproduces.
-        let duration_ms = {
-            covered_us += grab_started
-                .saturating_duration_since(last_frame_at)
-                .as_micros() as u64;
-            last_frame_at = grab_started;
-            let due_ms = covered_us / 1000;
-            let step = due_ms.saturating_sub(timeline_ms);
-            timeline_ms = timeline_ms.max(due_ms);
-            u32::try_from(step).unwrap_or(1).max(1)
-        };
+        // The frame belongs to the slot it was asked for, and the grid moves on
+        // by one interval *from that slot* rather than from the moment the grab
+        // came back — see the note on `next_frame` at the top of the loop.  The
+        // grab's own duration is not part of what the screen showed: it is the
+        // capture's cost, and letting it into the timeline is what made a busy
+        // compositor come out as a slower file with holds in it.
+        let taken_at = next_frame;
+        next_frame = taken_at + interval;
+        let duration_ms = cast::cover(
+            &mut covered_us,
+            &mut timeline_ms,
+            &mut last_frame_at,
+            taken_at,
+        );
         let encode_started = Instant::now();
         // The recorder encodes and muxes in one step: the frame's packets go
         // straight into libavformat, so nothing here has to reconstruct a
         // container out of a byte stream.
-        match &frame {
-            Grabbed::Software(frame) => recorder.frame(frame, duration_ms)?,
-            Grabbed::Dmabuf(dmabuf) => recorder.frame_dmabuf(
-                dmabuf.fd,
-                dmabuf.fourcc,
-                dmabuf.modifier,
-                dmabuf.offset as i32,
-                dmabuf.stride as i32,
-                duration_ms,
-            )?,
-        }
+        encode_grabbed(&mut recorder, &frame, duration_ms)?;
         let encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
         // The soundtrack for the interval this frame covered: everything the
         // microphone has produced since the last frame is queued and encoded
@@ -1392,13 +1519,8 @@ fn record_loop(
                 recorder.frames()
             );
         }
-        next_frame += interval;
-        // More than a frame interval behind: resynchronise rather than
-        // sprinting to catch up on a desktop that has moved on.
-        let now = Instant::now();
-        if now > next_frame + interval {
-            next_frame = now;
-        }
+        // Kept for the slots the next iteration finds already past.
+        held = Some(frame);
     }
 
     // Writing the trailer is what leaves a seekable file behind: the sample
@@ -1672,6 +1794,8 @@ mod tests {
             mic: None,
             app_audio: false,
             follow: Vec::new(),
+            bitrate: None,
+            quality: None,
         };
         assert_eq!(request.frame_interval(), Duration::from_nanos(16_666_666));
         request.fps = 30;

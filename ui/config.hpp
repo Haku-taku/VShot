@@ -77,6 +77,21 @@ struct CliPreferences {
     /// says nothing.  A rate outside that range is read as "nothing" rather
     /// than clamped, because that is what vshot itself does with one.
     std::uint32_t recordFps = 0;
+    /// The target bitrate `record --bitrate` falls back to, in Mbit/s; zero
+    /// means the file says nothing and the recording derives one from the
+    /// frame's own size.  There is no ceiling on it beyond the encoder's own:
+    /// a bitrate is the user's to choose.
+    std::uint32_t recordBitrate = 0;
+    /// The encoder level `record --quality` falls back to, and whether the file
+    /// names one at all.
+    ///
+    /// Two fields rather than the usual zero-means-nothing, because zero *is* a
+    /// level: it is the most expensive one either scale has.  The scale is the
+    /// codec's own and the number is stored as written -- 0-51 for h264 and
+    /// hevc, 0-255 for av1 -- since converting between them would be inventing
+    /// a meaning the encoder never agreed to.
+    bool recordQualitySet = false;
+    std::uint32_t recordQuality = 0;
     /// Whether a recording goes through the desktop portal without `--portal`.
     /// Off when the file says nothing, which is also what an absent key means.
     bool recordPortal = false;
@@ -118,6 +133,14 @@ struct CliPreferences {
     /// The replay frame rate (`cli.replay.fps`); zero means the file says
     /// nothing.
     std::uint32_t replayFps = 0;
+    /// The replay target bitrate (`cli.replay.bitrate`), on the recording
+    /// side's terms.  A ring is held in memory, so this is what decides what a
+    /// long `--window` costs.
+    std::uint32_t replayBitrate = 0;
+    /// The replay encoder level (`cli.replay.quality`), on the recording side's
+    /// two-field terms.
+    bool replayQualitySet = false;
+    std::uint32_t replayQuality = 0;
     /// Whether a replay uses the portal (`cli.replay.portal`); off when the file
     /// says nothing.
     bool replayPortal = false;
@@ -195,6 +218,23 @@ constexpr int kMaxFrameValue = 1'000'000;
 /// logical pixels of reach is already further than a 4K screen is tall, so what
 /// is left out is a shadow that would be drawn mostly off screen.
 constexpr int kMaxShadowSize = 512;
+/// The highest encoder level any of the three codecs takes: H.264 and HEVC
+/// stop at 51, AV1 at 255, and this is the wider of the two.  A level above
+/// the chosen codec's own range is refused by that encoder with its own
+/// message, which is the only place that knows the range.
+constexpr int kMaxQuality = 255;
+/// The bitrate ceiling the settings window and the settings *file* keep, in
+/// Mbit/s.  It is not a policy: the command line has no ceiling at all, and
+/// this one only exists so that a hand-edited number cannot overflow the spin
+/// box that shows it.  It sits far above anything an encoder takes -- 1 Tbit/s.
+constexpr int kMaxBitrate = 1'000'000;
+/// The bitrate a recording aims for when the caller named none, in Mbit/s, and
+/// the number the settings window opens its box on.
+///
+/// It is `avcodec::DEFAULT_BITRATE` on the Rust side, which is what actually
+/// encodes the file; the two are separate languages and cannot share the
+/// number, so each side pins it and each side has a check that says so.
+constexpr int kDefaultBitrate = 45;
 constexpr int kMaxShadowOffset = 512;
 constexpr int kMaxShadowOpacity = 255;
 

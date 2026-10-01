@@ -1283,6 +1283,95 @@ void checkStandaloneFlow()
     qunsetenv("VSHOT_BIN");
 }
 
+// The two action buttons are toggles.  A second press leaves the state the
+// first one entered -- the text mode, or the translation drawn over the picture
+// -- and the first Escape does the same, so neither the key nor the click
+// throws the capture away.
+void checkButtonToggles()
+{
+    std::printf("--- the two action buttons are toggles -------------------------\n");
+    QScreen *screen = QApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    QTemporaryDir directory;
+    if (!directory.isValid()) {
+        expect(false, "a temporary directory for the stub");
+        return;
+    }
+    const QString stub = directory.filePath(QStringLiteral("vshot"));
+    expect(writeExecutable(stub, QByteArray(kStubScript)), "the vshot stub is written");
+    qputenv("VSHOT_BIN", stub.toUtf8());
+
+    vshot::OverlayController controller(controllerSession(lightFrame(), QStringLiteral("region")));
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        qunsetenv("VSHOT_BIN");
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    controller.beginPresetEdit();
+    // Shown, so the toolbar counts as visible: `repaintEverything` only asks it
+    // to re-read the controller while it is, and the button's pressed state is
+    // what that re-read puts there.
+    overlay->show();
+    auto *surface = overlay->findChild<QWidget *>(QStringLiteral("toolbarCommandSurface"));
+    auto *ocr = surface != nullptr
+        ? surface->findChild<QToolButton *>(QStringLiteral("ocrButton"))
+        : nullptr;
+    auto *translate = surface != nullptr
+        ? surface->findChild<QToolButton *>(QStringLiteral("translateButton"))
+        : nullptr;
+    if (ocr == nullptr || translate == nullptr) {
+        qunsetenv("VSHOT_BIN");
+        expect(false, "the toolbar carries both action buttons");
+        return;
+    }
+
+    // Text+ first: one press runs the recognition and enters the mode, and the
+    // button is drawn pressed while it is on.
+    ocr->click();
+    expect(controller.textMode(), "the text button enters the mode");
+    expect(ocr->property("active").toBool(), "and is drawn pressed while it is on");
+    // The second press leaves it rather than reading the same pixels again.
+    ocr->click();
+    expect(!controller.textMode(), "a second press leaves the mode");
+    expect(!ocr->property("active").toBool(), "and the button goes back to rest");
+    expect(!controller.isFinished() && !controller.isCancelled(),
+           "and the capture is still running");
+
+    // Translate: one press draws the translation, the button shows the state is
+    // on, and a second press takes it back off instead of stacking a second
+    // copy of the same text on the first.
+    translate->click();
+    expect(controller.hasPlacedTranslation(), "the translate button places a translation");
+    expect(controller.annotations().size() == 1, "as one annotation",
+           QString::number(controller.annotations().size()));
+    expect(translate->property("active").toBool(), "and the button is drawn pressed");
+    translate->click();
+    expect(!controller.hasPlacedTranslation(), "a second press takes it back off");
+    expect(controller.annotations().isEmpty(), "leaving the picture as it was");
+    expect(!translate->property("active").toBool(), "and the button goes back to rest");
+    expect(!controller.isFinished() && !controller.isCancelled(),
+           "and the capture is still running");
+
+    // Escape does what the second press does: the translation the button placed
+    // goes before the capture does.  Without this the first Escape threw away
+    // the frame the translation was drawn on.
+    translate->click();
+    expect(controller.hasPlacedTranslation(), "a translation is up again");
+    sendKey(overlay, Qt::Key_Escape);
+    expect(!controller.hasPlacedTranslation(), "Escape takes the translation off");
+    expect(!controller.isFinished() && !controller.isCancelled(),
+           "without ending the capture");
+    sendKey(overlay, Qt::Key_Escape);
+    expect(controller.isCancelled(), "a second Escape is the cancel the capture has");
+
+    qunsetenv("VSHOT_BIN");
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -1300,6 +1389,7 @@ int main(int argc, char **argv)
     checkControllerWithStub();
     checkControllerFailure();
     checkStandaloneFlow();
+    checkButtonToggles();
 
     if (failures != 0) {
         std::printf("\n%d check(s) failed\n", failures);

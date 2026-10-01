@@ -24,9 +24,9 @@
 use std::ffi::{c_char, c_int, CStr};
 use std::fmt;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::error::{Result, VshotError};
-use crate::model::Frame;
 
 /// The opaque recorder handle from `shim.c`.
 #[repr(C)]
@@ -42,6 +42,8 @@ extern "C" {
         codec: *const c_char,
         qp: c_int,
         backend: c_int,
+        fps: c_int,
+        bitrate: i64,
     ) -> *mut VshotRec;
     fn vshot_rec_start_dmabuf(
         path: *const c_char,
@@ -51,6 +53,8 @@ extern "C" {
         qp: c_int,
         fourcc: u32,
         backend: c_int,
+        fps: c_int,
+        bitrate: i64,
     ) -> *mut VshotRec;
     fn vshot_rec_start_mic(
         path: *const c_char,
@@ -61,6 +65,8 @@ extern "C" {
         mic_rate: c_int,
         mic_channels: c_int,
         backend: c_int,
+        fps: c_int,
+        bitrate: i64,
     ) -> *mut VshotRec;
     fn vshot_rec_start_dmabuf_mic(
         path: *const c_char,
@@ -72,6 +78,8 @@ extern "C" {
         mic_rate: c_int,
         mic_channels: c_int,
         backend: c_int,
+        fps: c_int,
+        bitrate: i64,
     ) -> *mut VshotRec;
     fn vshot_rec_frame(rec: *mut VshotRec, rgba: *const u8, duration_ms: c_int) -> c_int;
     fn vshot_rec_resize_fit(rec: *mut VshotRec, width: c_int, height: c_int, fourcc: u32) -> c_int;
@@ -116,6 +124,7 @@ extern "C" {
         gop_frames: c_int,
         fps: c_int,
         backend: c_int,
+        bitrate: i64,
     ) -> *mut VshotRec;
     fn vshot_rec_replay_save(
         rec: *mut VshotRec,
@@ -167,8 +176,86 @@ fn c_take(pointer: *const c_char) -> String {
         .into_owned()
 }
 
-/// Quality, matching the levels the old libva path used.
-const FRAME_QP: c_int = 26;
+/// What a session asks of the encoder's rate control.
+///
+/// Both fields are optional, and the pair is what picks the encoder's mode —
+/// see `open_encoder` in the shim, which is where the three-way decision is
+/// made:
+///
+/// | `bitrate` | `quality` | mode | what the file's size does |
+/// |---|---|---|---|
+/// | set | unset | VBR | follows the target |
+/// | unset | set | QVBR | follows the level, capped at the target |
+/// | set | set | QVBR | follows the level, capped at the target |
+/// | unset | unset | CQP | follows the content, with no ceiling at all |
+///
+/// The last row is the one a recording never takes: `RecordRequest` always
+/// derives a target when the caller named none, because a constant level with
+/// no ceiling is what drove a measured 4K window recording to 1.15 Gbit/s —
+/// a file no consumer decoder plays back (105 fps against the 160 it asks
+/// for).  It is left reachable because the shim has to describe the encoder
+/// it opens, and because a caller that really does want it can say so.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RateControl {
+    /// The target, in bits per second.  `None` leaves the mode to the level.
+    pub bitrate: Option<i64>,
+    /// The level, on the codec's own scale: 0-51 for H.264 and HEVC, 0-255
+    /// for AV1.  Zero is the most expensive end of either.  `None` leaves the
+    /// encoder's own default in place.
+    ///
+    /// The number is passed through untouched: what it means is the encoder's
+    /// business, not this type's.  A level the chosen encoder cannot take is
+    /// refused when it is opened, with the encoder's own reason — which is the
+    /// only place that knows the range, since the range depends on the codec.
+    pub quality: Option<u16>,
+}
+
+impl RateControl {
+    /// The level as the codec's own encoder reads it, or a negative value when
+    /// the caller asked for none — which is what the shim's `want_level` test
+    /// is looking at.  Zero is a level (a very expensive one) and cannot stand
+    /// for "unset".
+    fn level(self) -> c_int {
+        match self.quality {
+            None => -1,
+            Some(level) => c_int::from(level),
+        }
+    }
+}
+
+/// The target a session aims for when the caller named no bitrate of its own,
+/// in bits per second.
+///
+/// One number rather than a rate per pixel, because a rate per pixel grows with
+/// the frame without limit: 0.15 bit per pixel per second asked a 4K160 desktop
+/// for 199 Mbit/s, which is 25 MB for every second recorded, and past a point
+/// the extra bits are spent on a photograph's noise and a shader's dither
+/// rather than on anything a person watching the file back can see.  45 Mbit/s
+/// is what a 4K recording needs at the quality that survives watching, and it
+/// is a number the caller can predict without working out the frame's own size
+/// first.
+///
+/// It is also the number the settings window opens its box on, so the box and
+/// the rule agree.  A caller who wants another one has `--bitrate`, which is
+/// held below nothing.
+///
+/// One number for all three codecs, because the codecs' own efficiency is not
+/// what the caller is choosing between here — `--bitrate` is, and a caller who
+/// wants H.264's 25% overhead paid for has a knob for it.
+const DEFAULT_BITRATE: i64 = 45_000_000;
+
+/// How long a window's new size has to hold before a replay's ring is rebuilt
+/// at it.
+///
+/// A ring holds one canvas, so a window that changed size cannot be followed
+/// without starting the ring over — and a ring that starts over is a ring that
+/// holds nothing, which is exactly what a save arriving a moment later would
+/// find.  A drag of a window edge and a compositor's resize animation both
+/// send a new size every frame, so the ring waits for the size to be the
+/// window's own rather than a step on the way there: three tenths of a second
+/// is several frames of a 160 Hz source and far below the time it takes a
+/// person to finish dragging a window.
+const RING_SETTLE: Duration = Duration::from_millis(300);
 
 /// The video codecs `--encoder` accepts, in the order the help lists them.
 /// Each maps to the ffmpeg encoder named `<word>_vaapi`; whether the
@@ -408,9 +495,14 @@ impl VideoSink for ReplayRecorder {
     }
 
     fn resize_fit(&mut self, width: u32, height: u32, fourcc: u32) -> Result<()> {
-        // A replay's ring holds one canvas, like a file: the new frames are
-        // fitted into it.  The shim's fit chain is the same one a recording
-        // uses, reached through the same entry point.
+        // A ring holds one canvas, and unlike a file it does not have to keep
+        // it: what it is for is the *recent* past, and the recent past of a
+        // window that has changed size is the window at its new one.  So the
+        // new frames are fitted into the canvas the ring has — a window that
+        // is mid-resize is still a window — and the ring is rebuilt at the new
+        // size once that size holds still ([`RING_SETTLE`]).  Rebuilding on
+        // the spot would empty the ring on every step of a drag, which is a
+        // save with nothing to write.
         if self.handle.is_null() {
             return Err(VshotError::Recording("the replay is closed".into()));
         }
@@ -427,6 +519,19 @@ impl VideoSink for ReplayRecorder {
                 self.last_error("following the window resize failed"),
             ));
         }
+        let now = Instant::now();
+        self.pending = if (width, height) == (self.width, self.height) {
+            // Back to where it was: nothing to move to, and a window that
+            // wobbled for a moment is not a resize at all.
+            None
+        } else {
+            match self.pending {
+                Some((w, h, f, since)) if (w, h, f) == (width, height, fourcc) => {
+                    Some((w, h, f, since))
+                }
+                _ => Some((width, height, fourcc, now)),
+            }
+        };
         Ok(())
     }
 
@@ -462,14 +567,17 @@ impl Recorder {
         height: u32,
         codec: VideoCodec,
         backend: EncoderBackend,
+        fps: u32,
+        rate: RateControl,
     ) -> Result<Self> {
-        Self::open(path, width, height, codec, None, None, backend)
+        Self::open(path, width, height, codec, None, None, backend, fps, rate)
     }
 
     /// The zero-copy variant: frames arrive as dma-bufs with this DRM fourcc
     /// instead of as RGBA pixels.  On NVENC the fourcc is dropped — that
     /// backend has no dma-buf import, so the caller's frames are read back
     /// through the software path instead (see [`Self::open`]).
+    #[allow(clippy::too_many_arguments)] // the recording's own shape: where it goes, what it encodes, what it reads
     pub fn start_dmabuf(
         path: &Path,
         width: u32,
@@ -477,13 +585,26 @@ impl Recorder {
         codec: VideoCodec,
         fourcc: u32,
         backend: EncoderBackend,
+        fps: u32,
+        rate: RateControl,
     ) -> Result<Self> {
-        Self::open(path, width, height, codec, Some(fourcc), None, backend)
+        Self::open(
+            path,
+            width,
+            height,
+            codec,
+            Some(fourcc),
+            None,
+            backend,
+            fps,
+            rate,
+        )
     }
 
     /// The same two, with a soundtrack: `mic` is the microphone's negotiated
     /// rate and channel count, and the recorder opens an AAC encoder for it
     /// and declares a second stream in the MP4 before writing the header.
+    #[allow(clippy::too_many_arguments)] // the recording's own shape: where it goes, what it encodes, what it reads
     pub fn start_mic(
         path: &Path,
         width: u32,
@@ -491,10 +612,23 @@ impl Recorder {
         codec: VideoCodec,
         mic: crate::record::pipewire_audio::Format,
         backend: EncoderBackend,
+        fps: u32,
+        rate: RateControl,
     ) -> Result<Self> {
-        Self::open(path, width, height, codec, None, Some(mic), backend)
+        Self::open(
+            path,
+            width,
+            height,
+            codec,
+            None,
+            Some(mic),
+            backend,
+            fps,
+            rate,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)] // the recording's own shape: where it goes, what it encodes, what it reads
     pub fn start_dmabuf_mic(
         path: &Path,
         width: u32,
@@ -503,10 +637,23 @@ impl Recorder {
         fourcc: u32,
         mic: crate::record::pipewire_audio::Format,
         backend: EncoderBackend,
+        fps: u32,
+        rate: RateControl,
     ) -> Result<Self> {
-        Self::open(path, width, height, codec, Some(fourcc), Some(mic), backend)
+        Self::open(
+            path,
+            width,
+            height,
+            codec,
+            Some(fourcc),
+            Some(mic),
+            backend,
+            fps,
+            rate,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)] // the recording's own shape: where it goes, what it encodes, what it reads
     fn open(
         path: &Path,
         width: u32,
@@ -515,6 +662,8 @@ impl Recorder {
         fourcc: Option<u32>,
         mic: Option<crate::record::pipewire_audio::Format>,
         backend: EncoderBackend,
+        fps: u32,
+        rate: RateControl,
     ) -> Result<Self> {
         if !recorder_available() {
             return Err(VshotError::Recording(format!(
@@ -565,6 +714,11 @@ impl Recorder {
             ),
             None => (0, 0),
         };
+        // A target is always named when the caller named none: a level with no
+        // ceiling is not something a recording should reach by omission (see
+        // the note on `RateControl`).
+        let bitrate = rate.bitrate.unwrap_or(DEFAULT_BITRATE);
+        let level = rate.level();
         let handle = match (fourcc, mic) {
             (Some(fourcc), Some(_)) => unsafe {
                 vshot_rec_start_dmabuf_mic(
@@ -572,11 +726,13 @@ impl Recorder {
                     width as c_int,
                     height as c_int,
                     word.as_ptr(),
-                    FRAME_QP,
+                    level,
                     fourcc,
                     mic_rate,
                     mic_channels,
                     shim_backend,
+                    fps as c_int,
+                    bitrate,
                 )
             },
             (Some(fourcc), None) => unsafe {
@@ -585,9 +741,11 @@ impl Recorder {
                     width as c_int,
                     height as c_int,
                     word.as_ptr(),
-                    FRAME_QP,
+                    level,
                     fourcc,
                     shim_backend,
+                    fps as c_int,
+                    bitrate,
                 )
             },
             (None, Some(_)) => unsafe {
@@ -596,10 +754,12 @@ impl Recorder {
                     width as c_int,
                     height as c_int,
                     word.as_ptr(),
-                    FRAME_QP,
+                    level,
                     mic_rate,
                     mic_channels,
                     shim_backend,
+                    fps as c_int,
+                    bitrate,
                 )
             },
             (None, None) => unsafe {
@@ -608,8 +768,10 @@ impl Recorder {
                     width as c_int,
                     height as c_int,
                     word.as_ptr(),
-                    FRAME_QP,
+                    level,
                     shim_backend,
+                    fps as c_int,
+                    bitrate,
                 )
             },
         };
@@ -655,14 +817,12 @@ impl Recorder {
         })
     }
 
-    /// Encodes one captured frame and muxes it.  `duration_ms` is how long
-    /// the frame was on screen; it becomes the sample's duration, which is
-    /// what makes a recording play back at the speed it happened.
-    pub fn frame(&mut self, frame: &Frame, duration_ms: u32) -> Result<()> {
-        self.frame_rgba(frame.pixels(), duration_ms)
-    }
-
     /// Encodes one RGBA buffer: `width * height` tightly packed pixels.
+    ///
+    /// This is the one entry point for software frames: `Grabbed::Software`
+    /// carries a `Frame`, and the loops hand its pixels over through here
+    /// (`record::encode_grabbed`), so a separate `Frame`-taking wrapper would
+    /// be a second name for the same call.
     pub fn frame_rgba(&mut self, rgba: &[u8], duration_ms: u32) -> Result<()> {
         if self.handle.is_null() {
             return Err(VshotError::Recording("the recorder is closed".into()));
@@ -735,6 +895,13 @@ impl Recorder {
                 self.last_error("following the window resize failed"),
             ));
         }
+        // Said here rather than by the loops: what a resize means is the
+        // sink's own business, and this one holds one canvas for the whole
+        // file.
+        eprintln!(
+            "vshot: fitting it into the recording's {}x{} canvas",
+            self.width, self.height
+        );
         Ok(())
     }
 
@@ -867,10 +1034,33 @@ pub struct ReplayRecorder {
     handle: *mut VshotRec,
     width: u32,
     height: u32,
-    saves: u64,
     /// Whether the ring holds dma-buf-encoded frames (VAAPI zero-copy) or
     /// RGBA-encoded ones (the software path, and every NVENC session).
     dmabuf: bool,
+    /// Everything a second ring is opened with, so following a window to a new
+    /// size needs nothing from the caller that opened this one.
+    shape: RingShape,
+    /// The size the window has moved to, and when it was first seen there.
+    /// The ring is rebuilt at it once it holds (see [`RING_SETTLE`]).
+    pending: Option<(u32, u32, u32, Instant)>,
+}
+
+/// The shape a ring is opened with, kept for the rebuild a resize asks for.
+struct RingShape {
+    codec: VideoCodec,
+    /// The capture format a dma-buf ring imports; `None` on a ring that takes
+    /// RGBA frames.
+    fourcc: Option<u32>,
+    mic: Option<crate::record::pipewire_audio::Format>,
+    retention_secs: u64,
+    gop_frames: u32,
+    fps: u32,
+    backend: EncoderBackend,
+    /// What the ring asks of the encoder's rate control.  It lives on the
+    /// shape rather than beside it because the shape is what a rebuilt ring is
+    /// opened from, and a ring that was reopened at a window's new size has to
+    /// come back with the same rate control it had before.
+    rate: RateControl,
 }
 
 impl ReplayRecorder {
@@ -889,6 +1079,7 @@ impl ReplayRecorder {
         gop_frames: u32,
         fps: u32,
         backend: EncoderBackend,
+        rate: RateControl,
     ) -> Result<Self> {
         if !recorder_available() {
             return Err(VshotError::Recording(format!(
@@ -919,29 +1110,62 @@ impl ReplayRecorder {
                 crate::record::MAX_DIMENSION
             )));
         }
+        let shape = RingShape {
+            codec,
+            fourcc,
+            mic,
+            retention_secs,
+            gop_frames,
+            fps,
+            backend,
+            rate,
+        };
+        let handle = Self::open(width, height, &shape)?;
+        Ok(Self {
+            handle,
+            width,
+            height,
+            dmabuf: shape.fourcc.is_some(),
+            shape,
+            pending: None,
+        })
+    }
+
+    /// Opens one ring of this shape.  The validation `start` does is not
+    /// repeated: a rebuild passes the shape the first ring was opened with,
+    /// and a size that has already been through it.
+    fn open(width: u32, height: u32, shape: &RingShape) -> Result<*mut VshotRec> {
+        let codec = shape.codec;
         let word = std::ffi::CString::new(codec.word()).expect("codec words have no NUL");
-        let (mic_rate, mic_channels) = match mic {
+        let (mic_rate, mic_channels) = match shape.mic {
             Some(format) => (
                 c_int::try_from(format.rate).unwrap_or(0),
                 c_int::try_from(format.channels).unwrap_or(0),
             ),
             None => (0, 0),
         };
-        let window_ms = i64::try_from(retention_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+        let window_ms =
+            i64::try_from(shape.retention_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+        // As on the recording side: a target is always named when the caller
+        // named none, because a level with no ceiling is not something a ring
+        // should reach by omission (see the note on `RateControl`).
+        let bitrate = shape.rate.bitrate.unwrap_or(DEFAULT_BITRATE);
+        let level = shape.rate.level();
         let handle = unsafe {
             vshot_rec_start_replay(
                 width as c_int,
                 height as c_int,
                 word.as_ptr(),
-                FRAME_QP,
-                fourcc.is_some() as c_int,
-                fourcc.unwrap_or(0),
+                level,
+                shape.fourcc.is_some() as c_int,
+                shape.fourcc.unwrap_or(0),
                 mic_rate,
                 mic_channels,
                 window_ms,
-                c_int::try_from(gop_frames).unwrap_or(0),
-                c_int::try_from(fps).unwrap_or(0),
-                backend.resolve().shim_value(),
+                c_int::try_from(shape.gop_frames).unwrap_or(0),
+                c_int::try_from(shape.fps).unwrap_or(0),
+                shape.backend.resolve().shim_value(),
+                bitrate,
             )
         };
         if handle.is_null() {
@@ -957,18 +1181,66 @@ impl ReplayRecorder {
                 codec.word()
             )));
         }
-        Ok(Self {
-            handle,
-            width,
-            height,
-            saves: 0,
-            dmabuf: fourcc.is_some(),
-        })
+        Ok(handle)
+    }
+
+    /// Rebuilds the ring at the size the window has moved to, if that size has
+    /// held long enough to be the window's own.  Called once per frame, which
+    /// is what makes the wait measurable and what keeps a drag from rebuilding
+    /// the ring at every step of it.
+    fn settle(&mut self) -> Result<()> {
+        let Some((width, height, fourcc, since)) = self.pending else {
+            return Ok(());
+        };
+        if since.elapsed() < RING_SETTLE {
+            return Ok(());
+        }
+        self.pending = None;
+        self.reopen(width, height, fourcc)
+    }
+
+    /// Starts the ring over at `width` x `height`, dropping the history it
+    /// held: one ring holds one frame size, and the frames it held are of a
+    /// window that was a different size then — a save that reached back past
+    /// the resize could not hold both.  The microphone keeps running: the new
+    /// ring is opened with the same one, and its own timeline starts at zero
+    /// with the video's.
+    fn reopen(&mut self, width: u32, height: u32, fourcc: u32) -> Result<()> {
+        // The ring keeps the kind of frames it was opened for — a dma-buf ring
+        // stays one — and takes the format the capture now delivers.
+        let shape = RingShape {
+            codec: self.shape.codec,
+            fourcc: if self.dmabuf { Some(fourcc) } else { None },
+            mic: self.shape.mic,
+            retention_secs: self.shape.retention_secs,
+            gop_frames: self.shape.gop_frames,
+            fps: self.shape.fps,
+            backend: self.shape.backend,
+            rate: self.shape.rate,
+        };
+        let handle = Self::open(width, height, &shape)?;
+        // The old ring goes only once the new one is up: a rebuild that failed
+        // leaves the session as it was, holding what it held.
+        let old = std::mem::replace(&mut self.handle, handle);
+        if !old.is_null() {
+            unsafe { vshot_rec_free(old) };
+        }
+        self.shape = shape;
+        self.width = width;
+        self.height = height;
+        eprintln!(
+            "vshot: the replay ring starts over at {width}x{height}; the history from before the \
+             resize is gone"
+        );
+        Ok(())
     }
 
     /// Encodes one packed-RGBA frame into the ring.  The window replay uses
-    /// this on a backend without dma-buf import (NVENC).
+    /// this on a backend without dma-buf import (NVENC), and the screen
+    /// replay's held frame goes back through it for a slot nothing arrived
+    /// in — the same call either way, so there is no `Frame`-taking wrapper.
     pub fn frame_rgba(&mut self, rgba: &[u8], duration_ms: u32) -> Result<()> {
+        self.settle()?;
         if self.handle.is_null() {
             return Err(VshotError::Recording("the replay is closed".into()));
         }
@@ -994,6 +1266,7 @@ impl ReplayRecorder {
         stride: c_int,
         duration_ms: u32,
     ) -> Result<()> {
+        self.settle()?;
         if self.handle.is_null() {
             return Err(VshotError::Recording("the replay is closed".into()));
         }
@@ -1011,21 +1284,6 @@ impl ReplayRecorder {
         if status != 0 {
             return Err(VshotError::Recording(
                 self.last_error("encoding a dma-buf frame into the replay failed"),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Encodes one software frame into the ring (the compatibility path).
-    pub fn frame(&mut self, frame: &Frame, duration_ms: u32) -> Result<()> {
-        if self.handle.is_null() {
-            return Err(VshotError::Recording("the replay is closed".into()));
-        }
-        let status =
-            unsafe { vshot_rec_frame(self.handle, frame.pixels().as_ptr(), duration_ms as c_int) };
-        if status != 0 {
-            return Err(VshotError::Recording(
-                self.last_error("encoding a frame into the replay failed"),
             ));
         }
         Ok(())
@@ -1059,13 +1317,7 @@ impl ReplayRecorder {
                 self.last_error("saving the replay failed"),
             ));
         }
-        self.saves += 1;
         Ok((written as u64, out_ms as f64 / 1000.0))
-    }
-
-    /// How many saves this session has served.
-    pub fn saves(&self) -> u64 {
-        self.saves
     }
 
     /// Queues interleaved float samples from the microphone into the ring's
@@ -1197,6 +1449,16 @@ mod tests {
         }
         assert_eq!(VideoCodec::parse("vp9"), None);
         assert_eq!(VideoCodec::parse(""), None);
+    }
+
+    #[test]
+    fn the_built_in_target_is_45_mbit() {
+        // The number the settings window opens its box on, and the one a
+        // session with no `--bitrate` and nothing remembered encodes at.  The
+        // box and the rule are on opposite sides of a language boundary, so
+        // each side pins the number: this is the Rust half of the pair, and
+        // `settings_check.cpp` holds the other.
+        assert_eq!(DEFAULT_BITRATE, 45_000_000);
     }
 
     #[test]

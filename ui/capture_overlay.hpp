@@ -384,6 +384,14 @@ public:
     /// nothing to read; reports its progress through
     /// `setTranslateResultCallback`, the way the text button does.
     bool translateSelection(QString *error);
+    /// Whether the Translate button has a translation up: the annotation it
+    /// placed is in the list.  The standalone overlay paints its own and holds
+    /// no annotation, so this is false there -- the button is the only caller.
+    bool hasPlacedTranslation() const;
+    /// Takes the button's translation back off the picture.  This is what a
+    /// second press of the button means, and what the first Escape means, so
+    /// neither ends the capture the way a bare Escape would.
+    void removePlacedTranslation();
     /// Whether the session is the standalone `translate` overlay: a region-only
     /// frame, the translation drawn over the frozen scene as soon as that frame
     /// is finished, and an Enter that accepts, writing the composited PNG.
