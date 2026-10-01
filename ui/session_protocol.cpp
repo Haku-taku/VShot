@@ -13,6 +13,7 @@
 #include <QJsonValue>
 
 #include <cmath>
+#include <functional>
 #include <limits>
 
 namespace vshot {
@@ -470,8 +471,17 @@ void ElementTree::clear()
 
 void ElementTree::load(const QJsonArray &array)
 {
-    QVector<Node> nodes;
-    nodes.reserve(array.size());
+    // Built as a real tree first, because collapsing a wrapper changes which
+    // node a child hangs off and therefore the parent index every later node
+    // carries -- which cannot be patched up in the flat form.
+    struct Branch {
+        LogicalRect rect;
+        QString label;
+        QVector<int> children;
+    };
+    QVector<Branch> branches;
+    QVector<int> roots;
+    branches.reserve(array.size());
     for (int index = 0; index < array.size(); ++index) {
         const QJsonObject node = array.at(index).toObject();
         const std::int32_t x = static_cast<std::int32_t>(node.value(QStringLiteral("x")).toDouble());
@@ -487,14 +497,65 @@ void ElementTree::load(const QJsonArray &array)
         if (width == 0 || height == 0) {
             continue;
         }
-        Node parsed;
-        parsed.rect = LogicalRect{x, y, width, height};
-        parsed.label = node.value(QStringLiteral("label")).toString();
-        parsed.parent = node.contains(QStringLiteral("parent"))
-                            ? node.value(QStringLiteral("parent")).toInt(-1)
-                            : -1;
-        nodes.push_back(std::move(parsed));
+        Branch branch;
+        branch.rect = LogicalRect{x, y, width, height};
+        branch.label = node.value(QStringLiteral("label")).toString();
+        branches.push_back(std::move(branch));
+        const int parent = node.contains(QStringLiteral("parent"))
+                               ? node.value(QStringLiteral("parent")).toInt(-1)
+                               : -1;
+        if (parent >= 0 && parent < branches.size() - 1) {
+            branches[parent].children.push_back(branches.size() - 1);
+        } else {
+            roots.push_back(branches.size() - 1);
+        }
     }
+
+    // A wrapper is a node whose only visible child covers exactly the same
+    // rectangle -- a filler, or a plain container a toolkit nests for layout.
+    // Offering it as a level of its own makes the wheel stop on a box
+    // identical to the one under it, which reads as a gesture that did
+    // nothing, so the two are one node.  Repeated, because a toolkit nests
+    // several in a row.
+    auto wrapper = [](const Branch &branch, const QVector<Branch> &all) {
+        if (branch.children.size() != 1) {
+            return -1;
+        }
+        const Branch &child = all.at(branch.children.first());
+        const bool same = child.rect.x == branch.rect.x && child.rect.y == branch.rect.y &&
+                          child.rect.width == branch.rect.width &&
+                          child.rect.height == branch.rect.height;
+        return same ? branch.children.first() : -1;
+    };
+
+    QVector<Node> nodes;
+    // Pre-order, so a parent is written before its children.
+    std::function<void(int, int)> write = [&](int index, int parent) {
+        int taken = index;
+        // A named wrapper would lose its name to an anonymous child, so the
+        // child inherits it: the name is what the user recognises the level by.
+        for (int child = wrapper(branches.at(taken), branches); child >= 0;
+             child = wrapper(branches.at(taken), branches)) {
+            if (!branches.at(taken).label.isEmpty() && branches.at(child).label.isEmpty()) {
+                branches[child].label = branches.at(taken).label;
+            }
+            taken = child;
+        }
+        const Branch &branch = branches.at(taken);
+        Node node;
+        node.rect = branch.rect;
+        node.label = branch.label;
+        node.parent = parent;
+        nodes.push_back(node);
+        const int here = nodes.size() - 1;
+        for (int child : branch.children) {
+            write(child, here);
+        }
+    };
+    for (int root : roots) {
+        write(root, -1);
+    }
+
     nodes_ = std::move(nodes);
     current_ = -1;
     descent_.clear();

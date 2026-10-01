@@ -201,6 +201,81 @@ int main()
         expect(tree.current() == -1, "clearing returns the highlight to the window");
     }
 
+    // --- Wrappers are collapsed ------------------------------------------
+    //
+    // A toolkit nests plain containers for layout, and a container whose only
+    // visible child covers exactly the same rectangle is not a level the user
+    // can tell apart from the one inside it: stopping there makes the wheel
+    // look broken.  The two are one node.
+    {
+        QJsonArray array;
+        array.push_back(node("filler", 0, 0, 100, 50, -1));
+        array.push_back(node("real", 0, 0, 100, 50, 0));
+        ElementTree tree;
+        tree.load(array);
+        expect(tree.size() == 1, "a same-sized only child is collapsed into its wrapper",
+               QStringLiteral("kept %1").arg(tree.size()));
+        expect(tree.node(0) != nullptr && tree.node(0)->label == QStringLiteral("real"),
+               "the named child's label survives the collapse");
+        expect(tree.indexAt(50, 25) == 0, "the collapsed node is still reachable");
+    }
+
+    // A wrapper chain -- several in a row -- collapses to one node.
+    {
+        QJsonArray array;
+        array.push_back(node("a", 0, 0, 100, 50, -1));
+        array.push_back(node("b", 0, 0, 100, 50, 0));
+        array.push_back(node("c", 0, 0, 100, 50, 1));
+        ElementTree tree;
+        tree.load(array);
+        expect(tree.size() == 1, "a chain of wrappers collapses to one node",
+               QStringLiteral("kept %1").arg(tree.size()));
+    }
+
+    // Only a *single* child collapses: two children is a real branching level
+    // even when both happen to cover the parent.
+    {
+        QJsonArray array;
+        array.push_back(node("parent", 0, 0, 100, 50, -1));
+        array.push_back(node("left", 0, 0, 100, 50, 0));
+        array.push_back(node("right", 0, 0, 100, 50, 0));
+        ElementTree tree;
+        tree.load(array);
+        expect(tree.size() == 3, "two children are still two levels",
+               QStringLiteral("kept %1").arg(tree.size()));
+    }
+
+    // A child that only partly covers its parent is not a wrapper: the parent
+    // is a real region of its own.
+    {
+        QJsonArray array;
+        array.push_back(node("outer", 0, 0, 100, 50, -1));
+        array.push_back(node("inner", 10, 10, 40, 20, 0));
+        ElementTree tree;
+        tree.load(array);
+        expect(tree.size() == 2, "a child that does not fill its parent is not collapsed",
+               QStringLiteral("kept %1").arg(tree.size()));
+        expect(tree.node(1)->parent == 0, "and stays a child of it");
+    }
+
+    // Collapsing keeps the rest of the tree's shape: a sibling of the wrapper
+    // still hangs off the wrapper's parent.
+    {
+        QJsonArray array;
+        array.push_back(node("root", 0, 0, 100, 100, -1));
+        array.push_back(node("wrapper", 0, 0, 50, 100, 0));
+        array.push_back(node("inside", 0, 0, 50, 100, 1));
+        array.push_back(node("sibling", 50, 0, 50, 100, 0));
+        ElementTree tree;
+        tree.load(array);
+        expect(tree.size() == 3, "the wrapper collapses and the sibling stays",
+               QStringLiteral("kept %1").arg(tree.size()));
+        expect(tree.node(1)->label == QStringLiteral("inside"), "the wrapper's child takes its place");
+        expect(tree.node(1)->parent == 0, "and hangs off the wrapper's parent");
+        expect(tree.node(2)->label == QStringLiteral("sibling"), "the sibling is untouched");
+        expect(tree.node(2)->parent == 0, "and still hangs off the root");
+    }
+
     std::printf("\n%s\n", failures == 0 ? "all element-pick checks passed"
                                         : "ELEMENT-PICK CHECKS FAILED");
     return failures == 0 ? 0 : 1;
