@@ -2359,3 +2359,129 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod pixel_probe {
+    use super::*;
+
+    /// Every window `hyprctl clients` reports, as a candidate the detector can
+    /// be pointed at.  Deliberately not the provider: that one is filtered to
+    /// the visible workspace, and the point here is to look at any window.
+    fn compositor_windows_for_probe() -> Vec<capture::WindowCandidate> {
+        let output = match std::process::Command::new("hyprctl")
+            .args(["clients", "-j"])
+            .output()
+        {
+            Ok(output) => output,
+            Err(_) => return Vec::new(),
+        };
+        let clients = match serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .ok()
+            .and_then(|value| value.as_array().cloned())
+        {
+            Some(clients) => clients,
+            None => return Vec::new(),
+        };
+        clients
+            .iter()
+            .filter_map(|client| {
+                let at = client.get("at")?.as_array()?;
+                let size = client.get("size")?.as_array()?;
+                let class = client.get("class").and_then(|v| v.as_str()).unwrap_or("");
+                let title = client.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                Some(capture::WindowCandidate {
+                    geometry: Rect::new(
+                        i32::try_from(at.first()?.as_i64()?).ok()?,
+                        i32::try_from(at.get(1)?.as_i64()?).ok()?,
+                        u32::try_from(size.first()?.as_u64()?).ok()?,
+                        u32::try_from(size.get(1)?.as_u64()?).ok()?,
+                    ),
+                    label: format!("{class} — {title}"),
+                    app_id: class.to_string(),
+                    title: title.to_string(),
+                    pid: client.get("pid").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                    handle: None,
+                })
+            })
+            .collect()
+    }
+
+    /// Runs the element detector against the live desktop, for tuning it.
+    ///
+    /// `cargo test -- --ignored pixel_probe --nocapture` with `VSHOT_PIXEL_DEBUG=1`
+    /// prints what the detector found inside every window the compositor lists.
+    /// It captures the screen, so it is ignored by default and belongs to the
+    /// same family as the other live-desktop checks.
+    #[test]
+    #[ignore = "captures the live desktop"]
+    fn the_live_desktop_through_the_element_detector() {
+        let mut wayland = match WaylandSession::connect() {
+            Ok(wayland) => wayland,
+            Err(error) => {
+                println!("no wayland connection: {error}");
+                return;
+            }
+        };
+        let output_infos = match wayland.output_infos() {
+            Ok(output_infos) => output_infos,
+            Err(error) => {
+                println!("no topology: {error}");
+                return;
+            }
+        };
+        let mut capture = match Capturer::connect() {
+            Ok(capture) => capture,
+            Err(error) => {
+                println!("no capture: {error}");
+                return;
+            }
+        };
+        let scene = capture_scene(&mut capture, &output_infos, false).expect("scene");
+        // Every window the compositor knows, not only the ones on the visible
+        // workspace: the detector is what is being looked at here, and it does
+        // not care which workspace a window is on.
+        let windows = compositor_windows_for_probe();
+        println!("\n{} window(s) on the live desktop", windows.len());
+        for window in &windows {
+            let request = element::ElementRequest {
+                window,
+                scene: &scene,
+            };
+            let elements = element::elements_of(&request);
+            match elements {
+                Some(nodes) => {
+                    fn count(node: &selection_region::RegionNode) -> usize {
+                        1 + node.children.iter().map(count).sum::<usize>()
+                    }
+                    let total: usize = nodes.iter().map(count).sum();
+                    println!(
+                        "\n{:?}: {} top-level, {} total",
+                        window.label,
+                        nodes.len(),
+                        total
+                    );
+                    fn dump(node: &selection_region::RegionNode, depth: usize) {
+                        if depth > 4 {
+                            return;
+                        }
+                        println!(
+                            "{}  {}x{}+{}+{}",
+                            "  ".repeat(depth),
+                            node.rect.size.width,
+                            node.rect.size.height,
+                            node.rect.left(),
+                            node.rect.top()
+                        );
+                        for child in &node.children {
+                            dump(child, depth + 1);
+                        }
+                    }
+                    for node in nodes.iter().take(6) {
+                        dump(node, 0);
+                    }
+                }
+                None => println!("\n{:?}: no elements", window.label),
+            }
+        }
+    }
+}
