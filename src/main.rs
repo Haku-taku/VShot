@@ -2361,7 +2361,23 @@ mod pixel_probe {
         // not care which workspace a window is on.
         let windows = compositor_windows_for_probe();
         println!("\n{} window(s) on the live desktop", windows.len());
+        // Dump each window as a PNG beside the analysis, so what the detector
+        // sees can be looked at rather than guessed at.
+        let dump = std::env::var_os("VSHOT_PIXEL_DUMP").map(std::path::PathBuf::from);
         for window in &windows {
+            if let Some(directory) = &dump {
+                let _ = std::fs::create_dir_all(directory);
+                if let Ok(crop) = scene.crop(window.geometry) {
+                    if let Ok(png) = crop.encode_png(None, model::PngCompression::default()) {
+                        let name = format!(
+                            "{}-{}.png",
+                            window.app_id.replace('/', "_"),
+                            window.geometry.size.width
+                        );
+                        let _ = std::fs::write(directory.join(name), png);
+                    }
+                }
+            }
             let request = element::ElementRequest {
                 window,
                 scene: &scene,
