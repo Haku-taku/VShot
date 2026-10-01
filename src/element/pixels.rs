@@ -47,21 +47,32 @@ const MAX_ANALYSIS_PIXELS: u64 = 512 * 1024;
 /// that a border line is not swallowed.
 const SAME_COLOR: i32 = 12;
 
-/// A colour change of at least this in one channel is an edge.
+/// How much a line's centre must differ from its surround, in luminance, to
+/// count as a line.
 ///
-/// Measured on a real window, the separators between its panes clear 32 and the
-/// answer is the same at 8, 16 and 32 — the lines that divide an interface are
-/// drawn to be seen, so the exact value is not delicate.  It is set above the
-/// dithering and gradient noise of a themed background, and below a real line.
-const EDGE_THRESHOLD: i32 = 16;
+/// Measured on a real window: the separators between its panes answer 60 to 75
+/// through the matched filter, while a themed background's own texture answers
+/// under 4.  The lines that divide an interface are drawn to be seen, so the
+/// value between those is not delicate.
+const LINE_THRESHOLD: f64 = 16.0;
 
-/// How much of a line has to show an edge before it is a division of the region
-/// rather than a detail inside it.
+/// The widest a line may be and still be a line.
 ///
-/// Not 1.0: a separator interrupted by the text it separates is still the
-/// separator.  Not low either, or the ragged edge of a paragraph would read as
-/// a cut.
-const CUT_FRACTION: f64 = 0.75;
+/// A divider is one pixel wide on one toolkit and three on another, so the
+/// filter is tried at each width and the best answer kept.  Past a few pixels
+/// the "line" is a pane's own edge, which the cut does not need told about.
+const MAX_LINE_WIDTH: u32 = 4;
+
+/// How much of a line has to run through a region before it divides it.
+///
+/// Not 1.0: a divider interrupted by the content it separates is still the
+/// divider, and a sidebar's own tab bar crosses only 65% of the sidebar before
+/// its list of commits begins.  Not low either, or a paragraph's ragged edge
+/// would read as a cut.
+///
+/// Measured on a real window: 0.75 leaves a sidebar whole, 0.65 divides it into
+/// its tab bar and its list, and 0.55 shatters the window into 78 regions.
+const CUT_FRACTION: f64 = 0.65;
 
 /// The smallest region worth offering or cutting.
 ///
@@ -175,7 +186,11 @@ impl Analysis {
             .clamp(0, i64::from(source.height));
         let device_width = u32::try_from(right - left).ok()?;
         let device_height = u32::try_from(bottom - top).ok()?;
-        if device_width == 0 || device_height == 0 {
+        // A window the compositor lists but the screen does not show — one
+        // parked off the edge, or on a workspace that is not visible — has
+        // almost nothing to analyse.  Below a couple of regions' worth there is
+        // nothing here to find, and saying so is cheaper than walking a sliver.
+        if device_width < MIN_REGION_EDGE || device_height < MIN_REGION_EDGE {
             return None;
         }
 
@@ -454,37 +469,145 @@ impl Analysis {
         }
     }
 
-    /// The per-column and per-row edge strengths of the whole analysis grid.
+    /// Where a line runs, as a response map for each axis.
     ///
-    /// Computed once for the window rather than per region: the strength of a
-    /// line is a property of the pixels, and asking again inside every
-    /// sub-region would walk the same pixels over and over.  A region's cut
-    /// then reads a slice of this and scales it to the region's own length.
+    /// The response is a *convolution*, not a difference between neighbouring
+    /// pixels.  A divider is a run of one colour a few pixels wide with a
+    /// different colour on both sides, and the kernel that answers to exactly
+    /// that shape is a centre band flanked by two bands of the opposite sign —
+    /// a matched filter for a line.  It responds where the centre differs from
+    /// *both* flanks, which is what a drawn border, a colour step between two
+    /// panes, and the edge of a toolbar all are.
+    ///
+    /// What that buys over an adjacent-pixel difference:
+    ///
+    /// * an anti-aliased line is spread over two or three pixels, each a weak
+    ///   step; the centre band averages them back into one strong response;
+    /// * a glyph's stroke is as sharp as a divider but has background on one
+    ///   side only, so requiring *both* flanks to differ drops it;
+    /// * the response is a contrast in luminance, so it means the same thing on
+    ///   a light theme as on a dark one, and two colours that differ in hue but
+    ///   not in brightness are not mistaken for a line.
+    ///
+    /// Computed once for the window and kept as a map: a cut then reads the
+    /// slice belonging to its own region, which is what lets a line be found
+    /// inside a pane where it does not cross the window.
     fn edges(&self) -> Edges {
-        let mut vertical = vec![0u32; self.width as usize];
-        let mut horizontal = vec![0u32; self.height as usize];
-        for x in 1..self.width {
-            let mut count = 0;
-            for y in 0..self.height {
-                if differs(self.at(x, y), self.at(x - 1, y)) {
-                    count += 1;
-                }
-            }
-            vertical[x as usize] = count;
-        }
-        for y in 1..self.height {
-            let mut count = 0;
+        let luma: Vec<f64> = self
+            .pixels
+            .iter()
+            .map(|pixel| luminance(*pixel))
+            .collect();
+        let table = Integral::of(&luma, self.width, self.height);
+        let mut vertical = vec![false; (self.width * self.height) as usize];
+        let mut horizontal = vec![false; (self.width * self.height) as usize];
+
+        for y in 0..self.height {
             for x in 0..self.width {
-                if differs(self.at(x, y), self.at(x, y - 1)) {
-                    count += 1;
-                }
+                let index = (y * self.width + x) as usize;
+                vertical[index] = self.line_response(&table, x, y, Axis::Vertical);
+                horizontal[index] = self.line_response(&table, x, y, Axis::Horizontal);
             }
-            horizontal[y as usize] = count;
         }
         Edges {
+            width: self.width,
+            height: self.height,
             vertical,
             horizontal,
         }
+    }
+
+    /// Whether a line of some plausible width runs through `(x, y)`, along one
+    /// axis.
+    ///
+    /// The best answer over the widths tried, because a divider is one pixel
+    /// wide on one toolkit and three on another; the caller wants to know that
+    /// *a* line is here, not how wide it is.
+    fn line_response(&self, table: &Integral, x: u32, y: u32, axis: Axis) -> bool {
+        (1..=MAX_LINE_WIDTH)
+            .any(|width| self.response_at_width(table, x, y, axis, width) >= LINE_THRESHOLD)
+    }
+
+    /// The matched filter at one width, as `min(|centre − left|, |centre −
+    /// right|)` in luminance.
+    ///
+    /// The *minimum* of the two sides rather than the nearer one: a line has a
+    /// different colour on both sides, while a glyph stroke has background on
+    /// one side and more glyph on the other.  Taking the minimum is what tells
+    /// them apart, and it is the whole reason this beats an adjacent-pixel test.
+    ///
+    /// Zero at the edges, where a flank would fall outside the window: a line
+    /// the window cuts off is not a line it draws.
+    fn response_at_width(
+        &self,
+        table: &Integral,
+        x: u32,
+        y: u32,
+        axis: Axis,
+        width: u32,
+    ) -> f64 {
+        let (across, along, at) = match axis {
+            Axis::Vertical => (self.width, self.height, x),
+            Axis::Horizontal => (self.height, self.width, y),
+        };
+        if at < 3 * width || at + 3 * width > across {
+            return 0.0;
+        }
+        let band = |from: u32, to: u32| -> f64 {
+            match axis {
+                Axis::Vertical => table.mean(from, 0, to, along),
+                Axis::Horizontal => table.mean(0, from, along, to),
+            }
+        };
+        let centre = band(at - width, at + width);
+        let left = band(at - 3 * width, at - width);
+        let right = band(at + width, at + 3 * width);
+        (centre - left).abs().min((centre - right).abs())
+    }
+}
+
+/// Rec. 709 luminance: the grey the eye would see.
+///
+/// Not a plain average of the channels — green carries most of the perceived
+/// brightness, and two colours that average the same can look very different,
+/// which is exactly the distinction a line detector needs.
+fn luminance(pixel: [u8; 4]) -> f64 {
+    0.2126 * f64::from(pixel[0]) + 0.7152 * f64::from(pixel[1]) + 0.0722 * f64::from(pixel[2])
+}
+
+/// A summed-area table: the sum of any axis-aligned box, in constant time.
+///
+/// This is what makes the convolution cheap.  Each position asks for three band
+/// means, and a band mean is four lookups and three additions however wide the
+/// band is — so trying several line widths costs nothing worth counting.
+struct Integral {
+    width: u32,
+    /// `(width + 1) × (height + 1)` partial sums, with a zero row and column so
+    /// that a box touching the edge needs no special case.
+    sums: Vec<f64>,
+}
+
+impl Integral {
+    fn of(values: &[f64], width: u32, height: u32) -> Self {
+        let stride = width as usize + 1;
+        let mut sums = vec![0f64; stride * (height as usize + 1)];
+        for y in 0..height as usize {
+            let mut row = 0f64;
+            for x in 0..width as usize {
+                row += values[y * width as usize + x];
+                sums[(y + 1) * stride + (x + 1)] = sums[y * stride + (x + 1)] + row;
+            }
+        }
+        Self { width, sums }
+    }
+
+    /// The mean of `[x0, x1) × [y0, y1)`.
+    fn mean(&self, x0: u32, y0: u32, x1: u32, y1: u32) -> f64 {
+        let stride = self.width as usize + 1;
+        let at = |x: u32, y: u32| self.sums[y as usize * stride + x as usize];
+        let sum = at(x1, y1) - at(x0, y1) - at(x1, y0) + at(x0, y0);
+        let area = f64::from((x1 - x0).max(1) * (y1 - y0).max(1));
+        sum / area
     }
 }
 
@@ -604,14 +727,6 @@ fn close_enough(a: [u8; 4], b: [u8; 4]) -> bool {
         && channel(3) <= SAME_COLOR
 }
 
-/// Whether two pixels differ enough to be an edge between them.
-fn differs(a: [u8; 4], b: [u8; 4]) -> bool {
-    let channel = |i: usize| (i32::from(a[i]) - i32::from(b[i])).abs();
-    // Alpha is deliberately not compared: a window's own alpha is uniform
-    // where it matters, and an opaque background under a translucent overlay
-    // would otherwise read as an edge everywhere.
-    channel(0).max(channel(1)).max(channel(2)) >= EDGE_THRESHOLD
-}
 
 /// Which way a cut runs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -627,9 +742,18 @@ enum Axis {
 /// `vertical[x]` counts the rows where column `x` differs from `x - 1`, and
 /// `horizontal[y]` the columns where row `y` differs from `y - 1`.  A divider
 /// shows up as a column (or row) with a count near the region's length.
+/// Where a line runs, as a response map per axis.
+///
+/// One entry per analysis pixel, in row-major order: `vertical[i]` is true when
+/// the pixel at `i` looks like part of a vertical line, `horizontal[i]` the
+/// same across.  Kept as maps rather than as per-column counts so a *region*
+/// can ask about its own slice — which is the difference between finding a
+/// divider that crosses a pane and one that crosses the whole window.
 struct Edges {
-    vertical: Vec<u32>,
-    horizontal: Vec<u32>,
+    width: u32,
+    height: u32,
+    vertical: Vec<bool>,
+    horizontal: Vec<bool>,
 }
 
 impl Edges {
@@ -639,22 +763,20 @@ impl Edges {
     /// a vertical cut, so the line itself stays with the left-hand region
     /// rather than being lost between the two.
     ///
-    /// Ties go to the earlier position, which keeps the walk deterministic.  A
-    /// line that only covers part of the region is scaled to the region's own
-    /// length, so the same divider reads the same inside a pane as it does in
-    /// the window.
+    /// The strength is measured *within the region*: how much of the line's
+    /// length inside `(x0, y0, x1, y1)` is a line.  Measuring over the whole
+    /// window instead would miss every divider that crosses a pane without
+    /// crossing the window — an editor's toolbar line, for one, which stops at
+    /// the sidebar.
+    ///
+    /// Ties go to the earlier position, which keeps the walk deterministic.
     fn strongest(&self, x0: u32, y0: u32, x1: u32, y1: u32) -> Option<(Axis, u32)> {
         let height = f64::from(y1 - y0).max(1.0);
         let width = f64::from(x1 - x0).max(1.0);
         let mut best: Option<(f64, Axis, u32)> = None;
 
         for x in (x0 + MIN_REGION_EDGE)..(x1.saturating_sub(MIN_REGION_EDGE)) {
-            let count = self.vertical.get(x as usize).copied().unwrap_or(0);
-            // A line has to cross the whole region, and the count is for the
-            // whole window: a divider that spans the region but not the window
-            // is scaled up, one that spans the window but not the region is
-            // scaled down.
-            let fraction = f64::from(count) / height;
+            let fraction = self.column_strength(x, y0, y1) / height;
             if fraction < CUT_FRACTION {
                 continue;
             }
@@ -663,8 +785,7 @@ impl Edges {
             }
         }
         for y in (y0 + MIN_REGION_EDGE)..(y1.saturating_sub(MIN_REGION_EDGE)) {
-            let count = self.horizontal.get(y as usize).copied().unwrap_or(0);
-            let fraction = f64::from(count) / width;
+            let fraction = self.row_strength(y, x0, x1) / width;
             if fraction < CUT_FRACTION {
                 continue;
             }
@@ -673,6 +794,35 @@ impl Edges {
             }
         }
         best.map(|(_, axis, at)| (axis, at))
+    }
+
+    /// How much of column `x` between `y0` and `y1` is part of a vertical line.
+    fn column_strength(&self, x: u32, y0: u32, y1: u32) -> f64 {
+        if x >= self.width {
+            return 0.0;
+        }
+        let mut count = 0u32;
+        for y in y0..y1.min(self.height) {
+            if self.vertical[(y * self.width + x) as usize] {
+                count += 1;
+            }
+        }
+        f64::from(count)
+    }
+
+    /// How much of row `y` between `x0` and `x1` is part of a horizontal line.
+    fn row_strength(&self, y: u32, x0: u32, x1: u32) -> f64 {
+        if y >= self.height {
+            return 0.0;
+        }
+        let row = (y * self.width) as usize;
+        let mut count = 0u32;
+        for x in x0..x1.min(self.width) {
+            if self.horizontal[row + x as usize] {
+                count += 1;
+            }
+        }
+        f64::from(count)
     }
 }
 
