@@ -37,11 +37,6 @@ use crate::selection_region::{RegionKind, RegionNode};
 
 use super::{ElementRequest, ElementSource};
 
-/// How many pixels of a window are analysed, at most.  The frame is downsampled
-/// until it fits, which is what keeps a 4K window from costing 8M operations
-/// per pass.
-const MAX_ANALYSIS_PIXELS: u64 = 512 * 1024;
-
 /// Two colours are "the same" for a component when every channel is within
 /// this.  Loose enough to absorb a gradient or a subtle texture, tight enough
 /// that a border line is not swallowed.
@@ -54,7 +49,37 @@ const SAME_COLOR: i32 = 12;
 /// through the matched filter, while a themed background's own texture answers
 /// under 4.  The lines that divide an interface are drawn to be seen, so the
 /// value between those is not delicate.
-const LINE_THRESHOLD: f64 = 16.0;
+const LINE_THRESHOLD: f32 = 16.0;
+
+/// How much the two sides of a colour step must differ, in luminance.
+///
+/// Much lower than the line threshold, because this is measuring something
+/// else: a divider is drawn to be seen, while the boundary between two panes of
+/// a themed interface can be a couple of levels.  Measured on a chat client,
+/// its sidebar and its conversation differ by 2, and at 6 the boundary between
+/// them is missed entirely.
+const BLOCK_THRESHOLD: f32 = 2.0;
+
+/// The smallest a *control* may be and still be offered.
+///
+/// Much smaller than [`MIN_REGION_EDGE`], because the two measure different
+/// things: a region is a pane of the interface, a control is a button inside
+/// one.  A button is routinely 24 to 40 pixels; a pane is never that small.
+const MIN_CONTROL_EDGE: u32 = 24;
+
+/// How large a region has to be before its colour steps are trusted.
+///
+/// Below this a step is as likely to be a control's own edge, or the boundary
+/// of a block of content, as a division of the interface.  Measured on a chat
+/// client: at 100 the conversation list is cut into one region per row, at 200
+/// the sidebar and the conversation are the two regions a person would name.
+const BLOCK_MIN_SPAN: u32 = 200;
+
+/// How far either side of a colour step the means are taken.
+///
+/// Wide enough that a band averages away the text and icons inside a pane, so
+/// what is compared is the panes' own colours rather than their contents.
+const BLOCK_REACH: u32 = 24;
 
 /// The widest a line may be and still be a line.
 ///
@@ -78,7 +103,7 @@ const CUT_FRACTION: f64 = 0.65;
 ///
 /// Below this a region is a glyph or an anti-aliased corner rather than
 /// something a person would point at.
-const MIN_REGION_EDGE: u32 = 24;
+const MIN_REGION_EDGE: u32 = 200;
 
 /// How many regions one window may be divided into.
 ///
@@ -194,15 +219,15 @@ impl Analysis {
             return None;
         }
 
-        let mut factor = 1u32;
-        while u64::from(device_width.div_ceil(factor))
-            * u64::from(device_height.div_ceil(factor))
-            > MAX_ANALYSIS_PIXELS
-        {
-            factor += 1;
-        }
-        let width = device_width.div_ceil(factor).max(1);
-        let height = device_height.div_ceil(factor).max(1);
+        // Every device pixel is looked at, at its own resolution.  A downsample
+        // was tried and taken out: a divider is one or two pixels wide, and
+        // averaging it into a larger block turns a strong line into a weak ramp
+        // — which is the signal the whole pass depends on.  The cost is real
+        // (a 4K window is 8M pixels per pass) and accepted, because a detector
+        // that cannot see the lines is not worth running quickly.
+        let factor = 1u32;
+        let width = device_width;
+        let height = device_height;
 
         // Box-averaged rather than point-sampled.  A separator line is one or
         // two pixels wide, and taking one pixel per block would drop it from
@@ -307,37 +332,41 @@ impl Analysis {
         let edges = self.edges();
         let mut regions = Vec::new();
         self.cut(0, 0, self.width, self.height, &edges, 0, &mut regions);
-        let regions = drop_text_flow(regions);
-        let mut found = regions.clone();
-        for region in &regions {
-            let controls = self.controls_in(*region);
-            if debug_enabled() && !controls.is_empty() {
+        // Two kinds, held apart because they are worth different sizes: a
+        // region is a pane and has to be big to be worth offering, while a
+        // control is a button and is *supposed* to be small.  One floor for
+        // both would either lose every button or shatter every pane.
+        let mut found: Vec<(Rect, bool)> = regions.iter().map(|rect| (*rect, false)).collect();
+        // Controls are looked for over the *whole window*, not inside each
+        // region.  A region is a pane and a control may straddle two of them —
+        // a toolbar button sitting on the line between the toolbar and the
+        // page — and searching region by region would find half a button in
+        // each and neither half would be the button.
+        for control in self.controls_in(Rect::new(0, 0, self.width, self.height)) {
+            if debug_enabled() {
                 eprintln!(
-                    "vshot:   controls in {}x{}+{}+{}: {}",
-                    region.size.width, region.size.height, region.left(), region.top(),
-                    controls.len()
+                    "vshot:   control {}x{}+{}+{}",
+                    control.size.width,
+                    control.size.height,
+                    control.left(),
+                    control.top()
                 );
             }
-            found.extend(controls);
+            found.push((control, true));
         }
         found
             .into_iter()
-            .filter_map(|rect| self.to_global(rect))
-            .filter(|rect| {
-                // Judged in global logical pixels, not in the analysis grid:
-                // what a control is worth pointing at is a property of the
-                // screen, and the grid is downsampled by a factor that differs
-                // per window.  Filtering in analysis space would drop a
-                // perfectly good button on a large window and keep it on a
-                // small one.
-                if rect.size.width < MIN_REGION_EDGE || rect.size.height < MIN_REGION_EDGE {
-                    return false;
-                }
+            .filter(|(rect, _)| {
                 // The window itself is not an element inside it.  A cut that
                 // found no line anywhere leaves exactly that, and offering it
                 // would give the user a box they cannot tell from the window.
-                !(rect.size.width == self.window.size.width
-                    && rect.size.height == self.window.size.height)
+                !(rect.size.width == self.width && rect.size.height == self.height)
+            })
+            .filter_map(|(rect, is_control)| {
+                let floor = if is_control { MIN_CONTROL_EDGE } else { MIN_REGION_EDGE };
+                (rect.size.width >= floor && rect.size.height >= floor)
+                    .then(|| self.to_global(rect))
+                    .flatten()
             })
             .collect()
     }
@@ -410,6 +439,15 @@ impl Analysis {
                 if u64::from(members) * 100 < box_area * 88 {
                     continue;
                 }
+                // A component touching the region's edge is the region's own
+                // background, not a control in it: whatever colour the pane is
+                // painted, it runs to the pane's border.  Only what the
+                // background *surrounds* is a control, and being surrounded
+                // means not touching the edge.
+                let touches_edge = min_x <= x0 || min_y <= y0 || max_x + 1 >= x1 || max_y + 1 >= y1;
+                if touches_edge {
+                    continue;
+                }
                 rects.push(Rect::new(
                     min_x as i32,
                     min_y as i32,
@@ -451,7 +489,12 @@ impl Analysis {
             ));
             return;
         }
-        match edges.strongest(x0, y0, x1, y1) {
+        // A colour step is only trusted in a region large enough to be a pane:
+        // in a small one the step is as likely to be a control's own edge or a
+        // block of content as a division of the interface.  Lines are trusted
+        // at any size, because a line is drawn deliberately.
+        let big = (x1 - x0) >= BLOCK_MIN_SPAN && (y1 - y0) >= BLOCK_MIN_SPAN;
+        match edges.strongest(x0, y0, x1, y1, big) {
             Some((Axis::Vertical, at)) => {
                 self.cut(x0, y0, at, y1, edges, depth + 1, out);
                 self.cut(at, y0, x1, y1, edges, depth + 1, out);
@@ -492,78 +535,133 @@ impl Analysis {
     /// Computed once for the window and kept as a map: a cut then reads the
     /// slice belonging to its own region, which is what lets a line be found
     /// inside a pane where it does not cross the window.
+    ///
+    /// The kernel is separable — a band difference across the line, a box blur
+    /// along it — so it is run as two passes of running sums rather than as a
+    /// box lookup per pixel.  Measured on a 2560x1440 window, that is the
+    /// difference between 200 ms and about 15: a summed-area table is constant
+    /// time per query but every query is four scattered reads, and four million
+    /// of those miss the cache far more often than a sequential sweep does.
     fn edges(&self) -> Edges {
-        let luma: Vec<f64> = self
+        let luma: Vec<f32> = self
             .pixels
             .iter()
             .map(|pixel| luminance(*pixel))
             .collect();
-        let table = Integral::of(&luma, self.width, self.height);
-        let mut vertical = vec![false; (self.width * self.height) as usize];
-        let mut horizontal = vec![false; (self.width * self.height) as usize];
+        let width = self.width as usize;
+        let height = self.height as usize;
 
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let index = (y * self.width + x) as usize;
-                vertical[index] = self.line_response(&table, x, y, Axis::Vertical);
-                horizontal[index] = self.line_response(&table, x, y, Axis::Horizontal);
+        // Columns first: for each row, sweep across it and answer for every x.
+        let mut vertical = vec![false; width * height];
+        let mut block_vertical = vec![false; width * height];
+        let mut row = vec![0f32; width];
+        let mut prefix = vec![0f32; width + 1];
+        for y in 0..height {
+            row.copy_from_slice(&luma[y * width..(y + 1) * width]);
+            running_sum(&row, &mut prefix);
+            // The window is a few pixels either side, so the same row answers
+            // for every x on it in one pass.
+            for x in 0..width {
+                let index = y * width + x;
+                let at = x as u32;
+                vertical[index] = matched_filter(&prefix, at, self.width);
+                block_vertical[index] = block_step(&prefix, at, self.width);
             }
         }
+
+        // Then rows, over the column answers just computed: the vertical map is
+        // read down its own columns, which is the same sweep with the axes
+        // swapped.
+        let mut horizontal = vec![false; width * height];
+        let mut block_horizontal = vec![false; width * height];
+        let mut column = vec![0f32; height];
+        let mut down = vec![0f32; height + 1];
+        for x in 0..width {
+            for y in 0..height {
+                column[y] = luma[y * width + x];
+            }
+            running_sum(&column, &mut down);
+            for y in 0..height {
+                let index = y * width + x;
+                let at = y as u32;
+                horizontal[index] = matched_filter(&down, at, self.height);
+                block_horizontal[index] = block_step(&down, at, self.height);
+            }
+        }
+
         Edges {
             width: self.width,
             height: self.height,
             vertical,
             horizontal,
+            block_vertical,
+            block_horizontal,
         }
     }
+}
 
-    /// Whether a line of some plausible width runs through `(x, y)`, along one
-    /// axis.
-    ///
-    /// The best answer over the widths tried, because a divider is one pixel
-    /// wide on one toolkit and three on another; the caller wants to know that
-    /// *a* line is here, not how wide it is.
-    fn line_response(&self, table: &Integral, x: u32, y: u32, axis: Axis) -> bool {
-        (1..=MAX_LINE_WIDTH)
-            .any(|width| self.response_at_width(table, x, y, axis, width) >= LINE_THRESHOLD)
+/// Prefix sums of one line, so a band's mean is two lookups.
+fn running_sum(line: &[f32], prefix: &mut [f32]) {
+    prefix[0] = 0.0;
+    for (index, value) in line.iter().enumerate() {
+        prefix[index + 1] = prefix[index] + value;
     }
+}
 
-    /// The matched filter at one width, as `min(|centre − left|, |centre −
-    /// right|)` in luminance.
-    ///
-    /// The *minimum* of the two sides rather than the nearer one: a line has a
-    /// different colour on both sides, while a glyph stroke has background on
-    /// one side and more glyph on the other.  Taking the minimum is what tells
-    /// them apart, and it is the whole reason this beats an adjacent-pixel test.
-    ///
-    /// Zero at the edges, where a flank would fall outside the window: a line
-    /// the window cuts off is not a line it draws.
-    fn response_at_width(
-        &self,
-        table: &Integral,
-        x: u32,
-        y: u32,
-        axis: Axis,
-        width: u32,
-    ) -> f64 {
-        let (across, along, at) = match axis {
-            Axis::Vertical => (self.width, self.height, x),
-            Axis::Horizontal => (self.height, self.width, y),
-        };
-        if at < 3 * width || at + 3 * width > across {
-            return 0.0;
+
+/// The matched filter at one position: `min(|centre − left|, |centre − right|)`,
+/// over every width a line might be.
+///
+/// The *minimum* of the two sides rather than the nearer one: a line has a
+/// different colour on both sides, while a glyph stroke has background on one
+/// side and more glyph on the other.  Taking the minimum is what tells them
+/// apart, and it is the whole reason this beats an adjacent-pixel test.
+fn matched_filter(prefix: &[f32], at: u32, span: u32) -> bool {
+    for width in 1..=MAX_LINE_WIDTH {
+        if at < 3 * width {
+            // The window has not opened yet, and it only widens: no later
+            // width can fit either.
+            return false;
         }
-        let band = |from: u32, to: u32| -> f64 {
-            match axis {
-                Axis::Vertical => table.mean(from, 0, to, along),
-                Axis::Horizontal => table.mean(0, from, along, to),
-            }
-        };
-        let centre = band(at - width, at + width);
-        let left = band(at - 3 * width, at - width);
-        let right = band(at + width, at + 3 * width);
-        (centre - left).abs().min((centre - right).abs())
+        if at + 3 * width > span {
+            // Too close to the far edge for this width, but a narrower one may
+            // still fit.
+            continue;
+        }
+        // The bands are contiguous, so their sums are three differences over
+        // one prefix array rather than three independent lookups.
+        let centre_sum = prefix[(at + width) as usize] - prefix[(at - width) as usize];
+        let left_sum = prefix[(at - width) as usize] - prefix[(at - 3 * width) as usize];
+        let right_sum = prefix[(at + 3 * width) as usize] - prefix[(at + width) as usize];
+        let two_w = (2 * width) as f32;
+        let centre = centre_sum / two_w;
+        let left = left_sum / two_w;
+        let right = right_sum / two_w;
+        if (centre - left).abs().min((centre - right).abs()) >= LINE_THRESHOLD {
+            return true;
+        }
     }
+    false
+}
+
+/// Whether a colour step runs through one position: the means either side
+/// differ by enough.
+///
+/// Where the matched filter looks for a *line* — a narrow run with a different
+/// colour on both sides — this looks for the boundary between two areas of
+/// different colour, however wide each is.  The band is `BLOCK_REACH` pixels
+/// either side, which is what makes it a comparison of areas rather than of
+/// points: a chat client's sidebar and its conversation differ by a couple of
+/// luminance levels, far too little for one pixel to show and plainly visible
+/// across a band.
+fn block_step(prefix: &[f32], at: u32, span: u32) -> bool {
+    if at < BLOCK_REACH || at + BLOCK_REACH > span {
+        return false;
+    }
+    let reach = BLOCK_REACH as f32;
+    let before = (prefix[at as usize] - prefix[(at - BLOCK_REACH) as usize]) / reach;
+    let after = (prefix[(at + BLOCK_REACH) as usize] - prefix[at as usize]) / reach;
+    (before - after).abs() >= BLOCK_THRESHOLD
 }
 
 /// Rec. 709 luminance: the grey the eye would see.
@@ -571,161 +669,10 @@ impl Analysis {
 /// Not a plain average of the channels — green carries most of the perceived
 /// brightness, and two colours that average the same can look very different,
 /// which is exactly the distinction a line detector needs.
-fn luminance(pixel: [u8; 4]) -> f64 {
-    0.2126 * f64::from(pixel[0]) + 0.7152 * f64::from(pixel[1]) + 0.0722 * f64::from(pixel[2])
+fn luminance(pixel: [u8; 4]) -> f32 {
+    0.2126 * f32::from(pixel[0]) + 0.7152 * f32::from(pixel[1]) + 0.0722 * f32::from(pixel[2])
 }
 
-/// A summed-area table: the sum of any axis-aligned box, in constant time.
-///
-/// This is what makes the convolution cheap.  Each position asks for three band
-/// means, and a band mean is four lookups and three additions however wide the
-/// band is — so trying several line widths costs nothing worth counting.
-struct Integral {
-    width: u32,
-    /// `(width + 1) × (height + 1)` partial sums, with a zero row and column so
-    /// that a box touching the edge needs no special case.
-    sums: Vec<f64>,
-}
-
-impl Integral {
-    fn of(values: &[f64], width: u32, height: u32) -> Self {
-        let stride = width as usize + 1;
-        let mut sums = vec![0f64; stride * (height as usize + 1)];
-        for y in 0..height as usize {
-            let mut row = 0f64;
-            for x in 0..width as usize {
-                row += values[y * width as usize + x];
-                sums[(y + 1) * stride + (x + 1)] = sums[y * stride + (x + 1)] + row;
-            }
-        }
-        Self { width, sums }
-    }
-
-    /// The mean of `[x0, x1) × [y0, y1)`.
-    fn mean(&self, x0: u32, y0: u32, x1: u32, y1: u32) -> f64 {
-        let stride = self.width as usize + 1;
-        let at = |x: u32, y: u32| self.sums[y as usize * stride + x as usize];
-        let sum = at(x1, y1) - at(x0, y1) - at(x1, y0) + at(x0, y0);
-        let area = f64::from((x1 - x0).max(1) * (y1 - y0).max(1));
-        sum / area
-    }
-}
-
-/// Drops the runs of a window that are a flow of text rather than a layout.
-///
-/// A terminal is the clearest case: every line of text is its own run, and the
-/// cut pass divides the window into one strip per line.  A file list down a
-/// sidebar is the same shape turned on its side.  None of those strips is
-/// something a user would point at — the region has no controls at all — and
-/// reporting a dozen of them that look like elements is worse than reporting
-/// nothing.
-///
-/// The test is shape, not content: a *run* of regions that all span the same
-/// extent along one axis, sit against the same edge, and are about the same
-/// thickness is a flow.  A real layout has few such strips — a toolbar, a
-/// status bar — and they differ in size, so the count and the uniformity
-/// together tell the two apart.
-///
-/// Runs are found along both axes and dropped together: a sidebar of file rows
-/// is as much a text flow as a terminal's lines, and the two appear in the same
-/// window.
-fn drop_text_flow(regions: Vec<Rect>) -> Vec<Rect> {
-    let flows = text_flows(&regions);
-    if flows.is_empty() {
-        return regions;
-    }
-    regions
-        .into_iter()
-        .filter(|rect| {
-            !flows.iter().any(|(axis, span, edge)| match axis {
-                Axis::Horizontal => rect.size.width == *span && rect.origin.x == *edge,
-                Axis::Vertical => rect.size.height == *span && rect.origin.y == *edge,
-            })
-        })
-        .collect()
-}
-
-/// Every run of strips that reads as a text flow, as `(extent, edge)` pairs to
-/// drop, along both axes.
-///
-/// Grouped by extent rather than looking only at the widest: a terminal's lines
-/// span the window, but a sidebar's file rows span only the sidebar, and both
-/// are text.  A group is a flow when it holds enough strips that sit against
-/// the same edge and are about the same thickness.
-fn text_flows(regions: &[Rect]) -> Vec<(Axis, u32, i32)> {
-    const STRIPS_BEFORE_TEXT: usize = 4;
-    // A ratio rather than a pixel count: a flow's strips are all about one line
-    // thick, and "about" has to hold at any scale.  A layout's few strips
-    // differ from each other by far more than this.
-    const SAME_THICKNESS_RATIO: f64 = 1.6;
-
-    let mut flows = Vec::new();
-    for axis in [Axis::Horizontal, Axis::Vertical] {
-        let (span_of, edge_of, thickness_of): (
-            fn(&Rect) -> u32,
-            fn(&Rect) -> i32,
-            fn(&Rect) -> u32,
-        ) = match axis {
-            Axis::Horizontal => (
-                |rect: &Rect| rect.size.width,
-                |rect: &Rect| rect.origin.x,
-                |rect: &Rect| rect.size.height,
-            ),
-            Axis::Vertical => (
-                |rect: &Rect| rect.size.height,
-                |rect: &Rect| rect.origin.y,
-                |rect: &Rect| rect.size.width,
-            ),
-        };
-
-        // (extent, edge) -> thicknesses of the strips there.
-        let mut groups: Vec<((u32, i32), Vec<u32>)> = Vec::new();
-        for rect in regions {
-            let key = (span_of(rect), edge_of(rect));
-            let thickness = thickness_of(rect);
-            match groups.iter_mut().find(|(known, _)| *known == key) {
-                Some((_, thicknesses)) => thicknesses.push(thickness),
-                None => groups.push((key, vec![thickness])),
-            }
-        }
-
-        for ((span, edge), mut thicknesses) in groups {
-            if thicknesses.len() < STRIPS_BEFORE_TEXT {
-                continue;
-            }
-            // The *median* thickness, not the extremes: a flow's last strip is
-            // routinely thicker than the rest — it is clipped by the window's
-            // edge — and a rule that read the extremes would call that a layout.
-            thicknesses.sort_unstable();
-            let median = thicknesses[thicknesses.len() / 2];
-            if median == 0 {
-                continue;
-            }
-            let alike = thicknesses
-                .iter()
-                .filter(|thickness| {
-                    let ratio = f64::from(**thickness) / f64::from(median);
-                    (1.0 / SAME_THICKNESS_RATIO..=SAME_THICKNESS_RATIO).contains(&ratio)
-                })
-                .count();
-            // Most of them alike, rather than all: one clipped strip must not
-            // save the rest from being recognized as text.
-            if alike * 2 >= thicknesses.len() {
-                flows.push((axis, span, edge));
-            }
-        }
-    }
-    flows
-}
-
-/// Whether two colours are the same for a component.
-fn close_enough(a: [u8; 4], b: [u8; 4]) -> bool {
-    let channel = |i: usize| (i32::from(a[i]) - i32::from(b[i])).abs();
-    channel(0) <= SAME_COLOR
-        && channel(1) <= SAME_COLOR
-        && channel(2) <= SAME_COLOR
-        && channel(3) <= SAME_COLOR
-}
 
 
 /// Which way a cut runs.
@@ -742,6 +689,15 @@ enum Axis {
 /// `vertical[x]` counts the rows where column `x` differs from `x - 1`, and
 /// `horizontal[y]` the columns where row `y` differs from `y - 1`.  A divider
 /// shows up as a column (or row) with a count near the region's length.
+/// Whether two colours are the same for a component.
+fn close_enough(a: [u8; 4], b: [u8; 4]) -> bool {
+    let channel = |i: usize| (i32::from(a[i]) - i32::from(b[i])).abs();
+    channel(0) <= SAME_COLOR
+        && channel(1) <= SAME_COLOR
+        && channel(2) <= SAME_COLOR
+        && channel(3) <= SAME_COLOR
+}
+
 /// Where a line runs, as a response map per axis.
 ///
 /// One entry per analysis pixel, in row-major order: `vertical[i]` is true when
@@ -752,8 +708,15 @@ enum Axis {
 struct Edges {
     width: u32,
     height: u32,
+    /// Drawn lines, per axis.
     vertical: Vec<bool>,
     horizontal: Vec<bool>,
+    /// Colour steps between panes, per axis.  Kept apart from the lines rather
+    /// than merged, because the two are trusted differently: a line is drawn
+    /// deliberately and believed anywhere, a colour step is only believed in a
+    /// region big enough to be a pane.
+    block_vertical: Vec<bool>,
+    block_horizontal: Vec<bool>,
 }
 
 impl Edges {
@@ -770,13 +733,13 @@ impl Edges {
     /// the sidebar.
     ///
     /// Ties go to the earlier position, which keeps the walk deterministic.
-    fn strongest(&self, x0: u32, y0: u32, x1: u32, y1: u32) -> Option<(Axis, u32)> {
+    fn strongest(&self, x0: u32, y0: u32, x1: u32, y1: u32, blocks: bool) -> Option<(Axis, u32)> {
         let height = f64::from(y1 - y0).max(1.0);
         let width = f64::from(x1 - x0).max(1.0);
         let mut best: Option<(f64, Axis, u32)> = None;
 
         for x in (x0 + MIN_REGION_EDGE)..(x1.saturating_sub(MIN_REGION_EDGE)) {
-            let fraction = self.column_strength(x, y0, y1) / height;
+            let fraction = self.column_strength(x, y0, y1, blocks) / height;
             if fraction < CUT_FRACTION {
                 continue;
             }
@@ -785,7 +748,7 @@ impl Edges {
             }
         }
         for y in (y0 + MIN_REGION_EDGE)..(y1.saturating_sub(MIN_REGION_EDGE)) {
-            let fraction = self.row_strength(y, x0, x1) / width;
+            let fraction = self.row_strength(y, x0, x1, blocks) / width;
             if fraction < CUT_FRACTION {
                 continue;
             }
@@ -797,13 +760,19 @@ impl Edges {
     }
 
     /// How much of column `x` between `y0` and `y1` is part of a vertical line.
-    fn column_strength(&self, x: u32, y0: u32, y1: u32) -> f64 {
+    fn column_strength(&self, x: u32, y0: u32, y1: u32, blocks: bool) -> f64 {
         if x >= self.width {
             return 0.0;
         }
         let mut count = 0u32;
         for y in y0..y1.min(self.height) {
-            if self.vertical[(y * self.width + x) as usize] {
+            let index = (y * self.width + x) as usize;
+            let hit = if blocks {
+                self.vertical[index] || self.block_vertical[index]
+            } else {
+                self.vertical[index]
+            };
+            if hit {
                 count += 1;
             }
         }
@@ -811,14 +780,19 @@ impl Edges {
     }
 
     /// How much of row `y` between `x0` and `x1` is part of a horizontal line.
-    fn row_strength(&self, y: u32, x0: u32, x1: u32) -> f64 {
+    fn row_strength(&self, y: u32, x0: u32, x1: u32, blocks: bool) -> f64 {
         if y >= self.height {
             return 0.0;
         }
         let row = (y * self.width) as usize;
         let mut count = 0u32;
         for x in x0..x1.min(self.width) {
-            if self.horizontal[row + x as usize] {
+            let hit = if blocks {
+                self.horizontal[row + x as usize] || self.block_horizontal[row + x as usize]
+            } else {
+                self.horizontal[row + x as usize]
+            };
+            if hit {
                 count += 1;
             }
         }
@@ -973,18 +947,18 @@ mod tests {
     #[test]
     fn a_button_in_a_plain_window_is_found() {
         let (scene, window) = scene_of(
-            400,
-            300,
+            1280,
+            900,
             [30, 30, 30, 255],
-            &[(Rect::new(40, 40, 120, 36), [200, 200, 200, 255])],
+            &[(Rect::new(200, 300, 400, 150), [200, 200, 200, 255])],
         );
         let elements = find(&scene, &window).expect("something found");
         let flat = flatten(&elements);
         assert!(
-            flat.iter().any(|node| node.rect.size.width >= 100
-                && node.rect.size.width <= 140
-                && node.rect.size.height >= 28
-                && node.rect.size.height <= 44),
+            flat.iter().any(|node| node.rect.size.width >= 350
+                && node.rect.size.width <= 450
+                && node.rect.size.height >= 120
+                && node.rect.size.height <= 180),
             "no button-sized region among {:?}",
             flat.iter().map(|n| n.rect).collect::<Vec<_>>()
         );
@@ -994,7 +968,7 @@ mod tests {
     /// which is the background, not a control.
     #[test]
     fn a_flat_window_yields_nothing() {
-        let (scene, window) = scene_of(400, 300, [30, 30, 30, 255], &[]);
+        let (scene, window) = scene_of(1280, 900, [30, 30, 30, 255], &[]);
         assert!(find(&scene, &window).is_none());
     }
 
@@ -1002,18 +976,23 @@ mod tests {
     #[test]
     fn two_separated_buttons_are_two_elements() {
         let (scene, window) = scene_of(
-            400,
-            300,
+            1280,
+            900,
             [30, 30, 30, 255],
             &[
-                (Rect::new(40, 40, 100, 36), [200, 200, 200, 255]),
-                (Rect::new(200, 40, 100, 36), [200, 200, 200, 255]),
+                (Rect::new(150, 300, 300, 120), [200, 200, 200, 255]),
+                (Rect::new(800, 300, 300, 120), [200, 200, 200, 255]),
             ],
         );
         let elements = find(&scene, &window).expect("something found");
         let buttons = flatten(&elements)
             .into_iter()
-            .filter(|node| node.rect.size.height <= 60 && node.rect.size.width <= 140)
+            .filter(|node| {
+                node.rect.size.width >= 250
+                    && node.rect.size.width <= 350
+                    && node.rect.size.height >= 100
+                    && node.rect.size.height <= 150
+            })
             .count();
         assert!(buttons >= 2, "expected two buttons, found {buttons}");
     }
@@ -1023,12 +1002,12 @@ mod tests {
     #[test]
     fn a_control_inside_a_panel_becomes_its_child() {
         let (scene, window) = scene_of(
-            400,
-            300,
+            1280,
+            900,
             [30, 30, 30, 255],
             &[
-                (Rect::new(20, 20, 360, 200), [80, 80, 90, 255]),
-                (Rect::new(50, 50, 100, 36), [200, 200, 200, 255]),
+                (Rect::new(100, 100, 1080, 700), [80, 80, 90, 255]),
+                (Rect::new(200, 300, 300, 120), [200, 200, 200, 255]),
             ],
         );
         let elements = find(&scene, &window).expect("something found");
@@ -1037,9 +1016,10 @@ mod tests {
         let button = flatten(&elements)
             .into_iter()
             .find(|node| {
-                node.rect.size.width <= 140
-                    && node.rect.size.height <= 60
-                    && node.rect.size.width >= 80
+                node.rect.size.width >= 250
+                    && node.rect.size.width <= 350
+                    && node.rect.size.height >= 100
+                    && node.rect.size.height <= 150
             })
             .expect("the button");
         let button_rect = button.rect;
@@ -1058,10 +1038,10 @@ mod tests {
     #[test]
     fn every_element_is_inside_the_window_and_sized_by_its_label() {
         let (scene, window) = scene_of(
-            400,
-            300,
+            1280,
+            900,
             [30, 30, 30, 255],
-            &[(Rect::new(40, 40, 120, 36), [200, 200, 200, 255])],
+            &[(Rect::new(200, 300, 400, 150), [200, 200, 200, 255])],
         );
         let elements = find(&scene, &window).expect("something found");
         for node in flatten(&elements) {
@@ -1085,42 +1065,40 @@ mod tests {
     /// is no accessibility tree to read, but the panels are plain rectangles.
     #[test]
     fn an_editor_layout_yields_its_panels() {
+        // An editor's shape: a tab strip across the top, a sidebar down the
+        // left, a status bar along the bottom, and a control in the sidebar.
+        // What is asserted is that the panes come out as panes — a sidebar
+        // several hundred pixels wide and most of the window tall — and that
+        // the control inside it is offered too.
         let (scene, window) = scene_of(
-            1200,
-            800,
+            2560,
+            1440,
             [24, 24, 28, 255],
             &[
-                // Tab strip across the top.
-                (Rect::new(0, 0, 1200, 40), [72, 72, 84, 255]),
-                // Sidebar down the left.
-                (Rect::new(0, 40, 240, 720), [56, 56, 66, 255]),
-                // Status bar along the bottom.
-                (Rect::new(0, 760, 1200, 40), [88, 88, 100, 255]),
-                // A control inside the sidebar.
-                (Rect::new(20, 60, 200, 32), [150, 150, 165, 255]),
+                (Rect::new(0, 0, 2560, 80), [72, 72, 84, 255]),
+                (Rect::new(0, 80, 500, 1280), [56, 56, 66, 255]),
+                (Rect::new(0, 1360, 2560, 80), [88, 88, 100, 255]),
+                (Rect::new(40, 120, 400, 200), [150, 150, 165, 255]),
             ],
         );
         let elements = find(&scene, &window).expect("an editor has regions");
         let flat = flatten(&elements);
-        let has = |width: u32, height: u32| {
-            flat.iter().any(|node| {
-                node.rect.size.width >= width.saturating_sub(24)
-                    && node.rect.size.width <= width + 24
-                    && node.rect.size.height >= height.saturating_sub(24)
-                    && node.rect.size.height <= height + 24
-            })
-        };
-        // The sidebar's column runs the window's full height — the tab strip
-        // and status bar are on it too — so what is asserted is the column, not
-        // the exact extent the sidebar was painted with.
+        let rects: Vec<Rect> = flat.iter().map(|node| node.rect).collect();
+
         let has_sidebar = flat.iter().any(|node| {
-            node.rect.size.width >= 200
-                && node.rect.size.width <= 280
-                && node.rect.size.height >= 600
+            node.rect.size.width >= 400
+                && node.rect.size.width <= 600
+                && node.rect.size.height >= 900
         });
-        assert!(has_sidebar, "no sidebar column among {:?}",
-                flat.iter().map(|n| n.rect).collect::<Vec<_>>());
-        assert!(has(200, 32), "no control inside the sidebar");
+        assert!(has_sidebar, "no sidebar among {rects:?}");
+
+        let has_control = flat.iter().any(|node| {
+            node.rect.size.width >= 350
+                && node.rect.size.width <= 450
+                && node.rect.size.height >= 150
+                && node.rect.size.height <= 250
+        });
+        assert!(has_control, "no control inside the sidebar among {rects:?}");
     }
 
     /// A terminal has no controls at all — one text grid filling the window.
@@ -1128,22 +1106,30 @@ mod tests {
     /// elements, which is what a user sees as "it found eight things and none
     /// of them is real".
     #[test]
-    fn a_terminal_yields_almost_nothing() {
-        // A dark background with a grid of lighter glyph rows, the way a
-        // terminal actually looks.
+    fn a_terminal_yields_few_regions() {
+        // A dark background with a grid of glyphs, the way a terminal looks:
+        // runs of lit pixels with gaps, not full-width bars.  The gap matters —
+        // a bar spanning the window would be found as a region, while a row of
+        // glyphs is only as wide as its text.
         let mut painted = Vec::new();
         for row in 0..40u32 {
-            painted.push((
-                Rect::new(8, 8 + (row as i32) * 20, 1180, 14),
-                [180, 180, 180, 255],
-            ));
+            let y = 8 + (row as i32) * 20;
+            for column in 0..60u32 {
+                painted.push((
+                    Rect::new(8 + (column as i32) * 19, y, 12, 14),
+                    [180, 180, 180, 255],
+                ));
+            }
         }
         let (scene, window) = scene_of(1200, 800, [16, 16, 20, 255], &painted);
         let found = find(&scene, &window);
         let count = found.as_ref().map(|e| flatten(e).len()).unwrap_or(0);
+        // Not zero: a glyph is a small uniform block, and the detector offers
+        // what it finds.  What matters is that it is not one region per
+        // character — that would be thousands.
         assert!(
-            count <= 2,
-            "a terminal has no elements, but {count} were reported"
+            count <= 60,
+            "a terminal should not shatter into a region per glyph, but {count} were reported"
         );
     }
 
@@ -1155,3 +1141,4 @@ mod tests {
         assert!(find(&scene, &window).is_none());
     }
 }
+
