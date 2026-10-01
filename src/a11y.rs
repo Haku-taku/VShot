@@ -289,10 +289,28 @@ impl Accessibility {
         self.property(accessible, "org.a11y.atspi.Accessible", "Name")
     }
 
-    /// The process behind an accessible.  AT-SPI puts it on the application
-    /// object, which is why this is read there rather than per frame.
+    /// The process behind an application, asked of the bus rather than of the
+    /// application.
+    ///
+    /// AT-SPI has no property for this.  Its `org.a11y.atspi.Application.Id`
+    /// reads like one and is not: measured, it answers 143 for an Edge whose
+    /// pid is 205344 — it is the application's own sequence number.  The pid
+    /// comes from the bus daemon instead, which knows the process behind every
+    /// connection: `GetConnectionUnixProcessID` on the application's unique
+    /// name.  Verified against `pgrep` for two Edge processes.
     fn pid(&self, accessible: &Accessible) -> Option<i32> {
-        self.property(accessible, "org.a11y.atspi.Accessible", "ProcessId")
+        let reply = self
+            .connection
+            .call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "GetConnectionUnixProcessID",
+                &(accessible.bus.as_str()),
+            )
+            .ok()?;
+        let pid: u32 = reply.body().deserialize().ok()?;
+        i32::try_from(pid).ok()
     }
 
     fn child_at(&self, accessible: &Accessible, index: i32) -> Option<Accessible> {
@@ -714,4 +732,5 @@ impl<'a> Flatten<'a> for Vec<RegionNode> {
         all
     }
 }
+
 
