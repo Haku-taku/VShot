@@ -569,10 +569,25 @@ int ElementTree::indexAt(std::int32_t x, std::int32_t y) const
         if (x < rect.x || y < rect.y || x >= rect.right() || y >= rect.bottom()) {
             continue;
         }
-        // Not "the smallest one": a node drawn over a sibling is not always the
-        // smaller of the two, and picking the smaller would hand back what sits
-        // underneath.  The last hit is the one on top.
-        best = index;
+        if (best < 0) {
+            best = index;
+            continue;
+        }
+        // The *smallest* hit, not the last one.  This is the opposite of the
+        // rule the window level uses, and deliberately so: an element tree is
+        // full of containers that cover the whole window -- the web-content
+        // area, a layout panel -- and a browser's toolbar buttons sit declared
+        // after them in pre-order, so "last one wins" picks a full-window box
+        // instead of the button under the pointer.
+        //
+        // Equal areas keep the later one, which is what makes a sibling drawn
+        // over another win.
+        const LogicalRect &chosen = nodes_.at(best).rect;
+        const std::int64_t mine = static_cast<std::int64_t>(rect.width) * rect.height;
+        const std::int64_t theirs = static_cast<std::int64_t>(chosen.width) * chosen.height;
+        if (mine < theirs || (mine == theirs && index > best)) {
+            best = index;
+        }
     }
     return best;
 }
