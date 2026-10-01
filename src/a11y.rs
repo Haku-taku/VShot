@@ -26,6 +26,7 @@ use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
 
 use crate::error::Result;
+use crate::capture::window::WindowCandidate;
 use crate::geometry::{Point, Rect, Size};
 use crate::selection_region::{RegionKind, RegionNode};
 
@@ -284,15 +285,22 @@ fn to_rect(x: i32, y: i32, width: i32, height: i32) -> Option<Rect> {
 
 /// The elements of one window, as a source for the picker.
 ///
-/// Returns `None` when accessibility cannot answer at all, so the caller keeps
-/// offering whole windows rather than failing the session.
-pub fn elements_for_window(window: &RegionNode) -> Option<Vec<RegionNode>> {
+/// Returns `None` when accessibility cannot answer at all — no bus, no frame
+/// matching this window, no tree under it — so the caller keeps offering whole
+/// windows rather than failing the session.
+///
+/// The window is the compositor's own description of it: its `title` is what
+/// names the accessibility frame, and its `geometry` is the origin AT-SPI
+/// cannot supply.  Both halves are needed and neither source has both.
+pub fn elements_for_window(window: &WindowCandidate) -> Option<Vec<RegionNode>> {
+    if window.title.is_empty() {
+        return None;
+    }
     let accessibility = Accessibility::connect().ok()?;
     let frames = accessibility.frames().ok()?;
-    // AT-SPI names a window; the compositor places it.  The frame whose title
-    // matches is the one whose elements these are.
-    let frame = frames.iter().find(|frame| !frame.title.is_empty() && frame.title == window.label)?;
-    accessibility.elements(frame, Point::new(window.rect.left(), window.rect.top())).ok()
+    let frame = frames.iter().find(|frame| frame.title == window.title)?;
+    let origin = Point::new(window.geometry.left(), window.geometry.top());
+    accessibility.elements(frame, origin).ok()
 }
 
 /// Whether accessibility is up and answering, for a caller deciding whether to

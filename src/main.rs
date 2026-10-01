@@ -561,17 +561,29 @@ fn run() -> Result<()> {
                         ),
                     });
                 }
-                let picked = qt_overlay::pick_window(&scene, &candidates, || {
-                    // The picker re-lists the windows as the pointer travels:
-                    // picking runs on a live desktop, and a workspace switch or a
-                    // moved window would otherwise leave the highlight pointing at
-                    // where a window used to be.  The pixel fallback has no window
-                    // list to re-read, so it keeps what it started with.
-                    if *pixel_detect {
-                        return None;
-                    }
-                    ProcessWindowProvider.windows().ok()
-                })?;
+                let picked = qt_overlay::pick_window(
+                    &scene,
+                    &candidates,
+                    || {
+                        // The picker re-lists the windows as the pointer travels:
+                        // picking runs on a live desktop, and a workspace switch or a
+                        // moved window would otherwise leave the highlight pointing at
+                        // where a window used to be.  The pixel fallback has no window
+                        // list to re-read, so it keeps what it started with.
+                        if *pixel_detect {
+                            return None;
+                        }
+                        ProcessWindowProvider.windows().ok()
+                    },
+                    // The pixel fallback invents its windows from border bands,
+                    // so they have no title for AT-SPI to match against and no
+                    // elements to offer.
+                    (!*pixel_detect).then_some(
+                        &|window: &WindowCandidate| -> Option<Vec<crate::selection_region::RegionNode>> {
+                            a11y::elements_for_window(window)
+                        },
+                    ),
+                )?;
                 // Picking runs on the live desktop and only decides *what* to
                 // capture, so the pixels have to come from now: wait for the
                 // compositor to drop the picker's surfaces (they are hidden, but

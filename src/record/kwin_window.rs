@@ -285,9 +285,13 @@ fn pick(rows: &[KwinRow]) -> Result<usize> {
         })
         .collect();
     let scene = super::window::picker_scene_standalone()?;
-    let picked = crate::qt_overlay::pick_window(&scene, &candidates, || {
-        ProcessWindowProvider.windows().ok()
-    })?;
+    let picked = crate::qt_overlay::pick_window(
+        &scene,
+        &candidates,
+        || ProcessWindowProvider.windows().ok(),
+        // Recording names a window, never an element inside one.
+        None,
+    )?;
     let handle = picked
         .point
         .and_then(|point| ProcessWindowProvider.candidate_at(point))
