@@ -30,6 +30,23 @@ use crate::capture::window::WindowCandidate;
 use crate::geometry::{Point, Rect, Size};
 use crate::selection_region::{RegionKind, RegionNode};
 
+/// How long one query may take before the answer is given up on.
+///
+/// An application that registers with AT-SPI and then never answers holds a
+/// D-Bus method call open indefinitely, and the tree walk is a call per node --
+/// so without this a single unresponsive window stops the picker dead instead
+/// of simply having no elements.  Measured against a well-behaved tree the
+/// whole walk takes a few milliseconds, so this is generous.
+const METHOD_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How many nodes a whole walk may visit.
+///
+/// A tree is not unbounded in practice, but a misreporting one -- a child
+/// count read as a huge number, or a cycle -- would otherwise keep the walk
+/// going for as long as the desktop is up.  The cap turns that into an
+/// ordinary "no elements" answer.
+const MAX_NODES: usize = 4096;
+
 /// Well-behaved trees stop here.  A tree that nests deeper than this is not
 /// offering the user anything they can point at, and walking it costs a D-Bus
 /// round trip per node, so the walk is capped rather than left to run.
@@ -87,6 +104,9 @@ impl Accessibility {
             .map_err(|error| format!("the a11y bus address was not a string: {error}"))?;
         let connection = Builder::address(address.as_str())
             .map_err(|error| format!("the a11y bus address was unusable: {error}"))?
+            // Without this an application that registers and then never answers
+            // holds a call open forever, and the tree walk is a call per node.
+            .method_timeout(METHOD_TIMEOUT)
             .build()
             .map_err(|error| format!("cannot reach the a11y bus: {error}"))?;
         Ok(Self { connection })
@@ -141,13 +161,17 @@ impl Accessibility {
             return Ok(Vec::new());
         };
         let mut elements = Vec::new();
+        let mut budget = MAX_NODES;
         let count = self.child_count(&frame.accessible).unwrap_or(0);
         for index in 0..count {
             let Some(child) = self.child_at(&frame.accessible, index) else {
                 continue;
             };
-            if let Some(node) = self.node(&child, origin, frame_rect, 0) {
+            if let Some(node) = self.node(&child, origin, frame_rect, 0, &mut budget) {
                 elements.push(node);
+            }
+            if budget == 0 {
+                break;
             }
         }
         Ok(elements)
@@ -163,7 +187,15 @@ impl Accessibility {
         origin: Point,
         frame: Rect,
         depth: u32,
+        // Nodes left to visit across the whole walk.  A tree that misreports
+        // its size would otherwise keep the walk going indefinitely; spending
+        // the budget ends it as an ordinary short answer.
+        budget: &mut usize,
     ) -> Option<RegionNode> {
+        *budget = budget.saturating_sub(1);
+        if *budget == 0 {
+            return None;
+        }
         let (x, y, width, height) = self.extents(accessible)?;
         let mut rect = to_rect(x, y, width, height)?;
         rect = rect.translate(origin).ok()?;
@@ -189,8 +221,11 @@ impl Accessibility {
                 let Some(child) = self.child_at(accessible, index) else {
                     continue;
                 };
-                if let Some(child_node) = self.node(&child, origin, frame, depth + 1) {
+                if let Some(child_node) = self.node(&child, origin, frame, depth + 1, budget) {
                     children.push(child_node);
+                }
+                if *budget == 0 {
+                    break;
                 }
             }
             node = node.with_children(children);
@@ -301,22 +336,6 @@ pub fn elements_for_window(window: &WindowCandidate) -> Option<Vec<RegionNode>> 
     let frame = frames.iter().find(|frame| frame.title == window.title)?;
     let origin = Point::new(window.geometry.left(), window.geometry.top());
     accessibility.elements(frame, origin).ok()
-}
-
-/// Whether accessibility is up and answering, for a caller deciding whether to
-/// offer element picking at all.
-pub fn available() -> bool {
-    Accessibility::connect()
-        .and_then(|accessibility| accessibility.frames().map(|frames| !frames.is_empty()))
-        .unwrap_or(false)
-}
-
-/// Why accessibility is not available, for an error that has to say.
-pub fn unavailable_reason() -> String {
-    match Accessibility::connect() {
-        Err(reason) => reason,
-        Ok(_) => "no application exposes an accessibility tree".to_string(),
-    }
 }
 
 /// Keeps [`Result`] honest: this module is best-effort and returns `Option`s.
@@ -486,6 +505,7 @@ mod tests {
 
 /// Walks a node and everything under it, for callers that want the whole tree
 /// flat — a test counting every element, say.
+#[cfg(test)]
 trait Flatten<'a> {
     fn flatten(&'a self) -> Vec<&'a RegionNode>;
 }
@@ -506,3 +526,4 @@ impl<'a> Flatten<'a> for Vec<RegionNode> {
         all
     }
 }
+
