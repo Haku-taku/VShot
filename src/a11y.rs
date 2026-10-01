@@ -47,10 +47,19 @@ const METHOD_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500
 /// ordinary "no elements" answer.
 const MAX_NODES: usize = 4096;
 
-/// Well-behaved trees stop here.  A tree that nests deeper than this is not
-/// offering the user anything they can point at, and walking it costs a D-Bus
-/// round trip per node, so the walk is capped rather than left to run.
-const MAX_DEPTH: u32 = 8;
+/// How deep a walk may go.
+///
+/// A web page's content is genuinely deep — measured on a Chromium tab, HTML
+/// elements sit between 9 and 23 levels down, and the tree reached 26 — so a
+/// small cap here is what decides whether the *inside of a page* can be picked
+/// at all.  This is set past what a browser produces rather than at what looks
+/// reasonable for a native app.
+///
+/// Depth alone is not the guard against a runaway walk; `MAX_NODES` is, since
+/// it bounds the work however the tree is shaped.  Measured on that same tab,
+/// the whole 753-node tree takes about a tenth of a second, so the budget is
+/// what a pathological tree would run into long before this.
+const MAX_DEPTH: u32 = 32;
 
 /// An extent wider or taller than this is not a widget.  Hidden pages of a
 /// notebook report their size as uninitialized memory — one measured at
@@ -153,20 +162,22 @@ impl Accessibility {
 
     /// The elements inside `frame`, as regions in global logical pixels.
     ///
-    /// `origin` is the frame's own global position, which AT-SPI cannot supply:
-    /// every rect here is the window-relative extent shifted by it, and then
-    /// clipped to the frame so a widget that hangs outside its window does not
-    /// offer a region off the side of it.
+    /// `bounds` is the window's own global rectangle — the compositor's, not
+    /// the frame's.  Every rect here is the window-relative extent shifted to
+    /// global, then clipped to `bounds` so a widget that hangs outside its
+    /// window does not offer a region off the side of it.
+    ///
+    /// Clipping to the compositor's rectangle rather than the frame's own
+    /// extent matters: a frame may report itself larger than the window the
+    /// compositor placed — one measured at 58 pixels above its window's top —
+    /// and clipping to that would keep exactly the out-of-window rects the
+    /// clip is for.
     pub fn elements(
         &self,
         frame: &AccessibilityFrame,
-        origin: Point,
+        bounds: Rect,
     ) -> std::result::Result<Vec<RegionNode>, String> {
-        let Some(frame_rect) = frame.rect.and_then(|rect| rect.translate(origin).ok()) else {
-            // No frame geometry means nothing to clip to and nothing to place a
-            // child against.
-            return Ok(Vec::new());
-        };
+        let origin = bounds.origin;
         let mut elements = Vec::new();
         let mut budget = MAX_NODES;
         let count = self.child_count(&frame.accessible).unwrap_or(0);
@@ -174,7 +185,7 @@ impl Accessibility {
             let Some(child) = self.child_at(&frame.accessible, index) else {
                 continue;
             };
-            if let Some(node) = self.node(&child, origin, frame_rect, 0, &mut budget) {
+            if let Some(node) = self.node(&child, origin, bounds, 0, &mut budget) {
                 elements.push(node);
             }
             if budget == 0 {
@@ -346,9 +357,8 @@ fn to_rect(x: i32, y: i32, width: i32, height: i32) -> Option<Rect> {
 pub fn elements_for_window(window: &WindowCandidate) -> Option<Vec<RegionNode>> {
     let accessibility = Accessibility::connect().ok()?;
     let frames = accessibility.frames().ok()?;
-    let origin = Point::new(window.geometry.left(), window.geometry.top());
     let frame = match_frame(&frames, window)?;
-    accessibility.elements(frame, origin).ok()
+    accessibility.elements(frame, window.geometry).ok()
 }
 
 /// Which accessibility frame is this compositor window.
@@ -607,7 +617,7 @@ mod tests {
                 continue;
             };
             let origin = Point::new(geometry.left(), geometry.top());
-            let elements = accessibility.elements(frame, origin).expect("elements");
+            let elements = accessibility.elements(frame, *geometry).expect("elements");
             let flat = Flatten::flatten(&elements);
             println!("window {title:?} at {origin:?}: {} elements", flat.len());
             for element in flat {
