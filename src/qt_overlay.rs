@@ -2211,3 +2211,33 @@ read -r answer
         assert!(parsed.get("result_path").is_none());
     }
 }
+
+#[cfg(test)]
+mod regress {
+    use super::*;
+
+    /// A picked element's rectangle has to survive: the caller re-resolves the
+    /// click against the window list when the helper reports a *point*, and
+    /// that re-resolution gives back the whole window -- which is exactly what
+    /// an element-level pick must not end up with.  So an element pick
+    /// reports no point, and the rectangle is taken as it stands.
+    #[test]
+    fn a_result_with_no_point_keeps_its_own_rectangle() {
+        let bytes = br#"{"status":"ok","selection":{"x":10,"y":20,"width":30,"height":40}}"#;
+        let picked = parse_picked_window(bytes.to_vec(), Rect::new(0, 0, 1000, 1000))
+            .expect("a pick with no point");
+        assert_eq!(picked.rect, Rect::new(10, 20, 30, 40));
+        assert!(picked.point.is_none(), "no point means no re-resolution");
+    }
+
+    /// The window-level case, unchanged: the point is reported so the caller
+    /// can re-resolve a window that moved between the click and the capture.
+    #[test]
+    fn a_result_with_a_point_carries_it_for_re_resolution() {
+        let bytes = br#"{"status":"ok","selection":{"x":10,"y":20,"width":30,"height":40},
+                         "point":{"x":15,"y":25}}"#;
+        let picked = parse_picked_window(bytes.to_vec(), Rect::new(0, 0, 1000, 1000))
+            .expect("a pick with a point");
+        assert_eq!(picked.point, Some(Point::new(15, 25)));
+    }
+}

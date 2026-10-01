@@ -5319,11 +5319,14 @@ bool OverlayController::applyCandidateHover(Point point, CaptureOverlay *overlay
     const int index = candidateIndexAt(point);
     overlay->setCursor(index >= 0 ? Qt::PointingHandCursor : Qt::ArrowCursor);
     if (index == hoveredCandidate_ && selection_.has_value() == (index >= 0)) {
-        // The window did not change.  The element under the pointer may still
-        // have: follow it, now that this window's tree is known.
+        // The window did not change.  Follow the pointer only when it has
+        // actually landed on a *different* element: a wheel gesture set the
+        // level deliberately, and re-deriving it from every pointer move
+        // within the same element would undo it on the smallest twitch.
         if (index >= 0 && !elements_.isEmpty()) {
             const int element = elements_.indexAt(point.x, point.y);
-            if (element != elements_.current()) {
+            if (element != pointerElement_) {
+                pointerElement_ = element;
                 applyElementHover(element);
                 return true;
             }
@@ -5526,7 +5529,8 @@ void OverlayController::readElementReplies(const QJsonObject &object)
     elements_.load(object.value(QStringLiteral("elements")).toArray());
     // Point the highlight at what is under the pointer now, which is the
     // element the user was already aiming at before the answer arrived.
-    applyElementHover(elements_.indexAt(pointer_.x, pointer_.y));
+    pointerElement_ = elements_.indexAt(pointer_.x, pointer_.y);
+    applyElementHover(pointerElement_);
     updateAll();
 }
 
@@ -5556,6 +5560,7 @@ void OverlayController::clearElements()
     }
     elements_.clear();
     elementsForWindow_ = -1;
+    pointerElement_ = -1;
     elementPending_ = false;
 }
 
@@ -6988,7 +6993,15 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
         const int index = candidateIndexAt(point);
         if (index >= 0) {
             hoveredCandidate_ = index;
-            selection_ = candidates_.at(index).rect;
+            // The click takes what the highlight is on, which is an element when
+            // the wheel brought the picker down into one.  Re-deriving it from
+            // the window would undo the level the user chose.
+            const ElementTree::Node *element = elements_.node(elements_.current());
+            if (element != nullptr) {
+                selection_ = element->rect;
+            } else {
+                selection_ = candidates_.at(index).rect;
+            }
             pointer_ = point;
             // Take the highlight off the screen first: the compositor destroys
             // these surfaces asynchronously, and a lingering copy of the
@@ -10518,8 +10531,14 @@ QJsonDocument OverlayController::resultDocument(QString *error) const
     }
     // Picking reports the click position as well: it runs on a live desktop,
     // so the caller re-resolves there which window the click actually landed
-    // on before it captures the frame.
-    if (pickMode_) {
+    // on before it captures the frame -- a window may have moved or the user
+    // may have switched workspace under it between the click and the capture.
+    //
+    // Not, though, when the click took an *element*: re-resolving a point
+    // against the window list would give back the whole window and undo the
+    // level the wheel had just chosen, so an element-level pick reports no
+    // point and the caller keeps the rectangle as it stands.
+    if (pickMode_ && elements_.node(elements_.current()) == nullptr) {
         QJsonObject point;
         point.insert(QStringLiteral("x"), static_cast<qint64>(pointer_.x));
         point.insert(QStringLiteral("y"), static_cast<qint64>(pointer_.y));

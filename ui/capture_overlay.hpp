@@ -709,6 +709,11 @@ private:
     /// exposes no tree still counts as known: it is asked once and remembered
     /// as empty, so the pointer moving within it does not ask again.
     int elementsForWindow_ = -1;
+    /// The element the pointer itself is over, which is not always the one the
+    /// highlight is on: a wheel gesture moves the highlight off it on purpose,
+    /// and a pointer that then twitches within the same element must not drag
+    /// it back.  Only a pointer that reaches a *different* element re-aims.
+    int pointerElement_ = -1;
     bool elementPending_ = false;
 
     // Live candidate refresh: the picker's stdin carries fresh lists from the
