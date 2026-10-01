@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 VShot contributors
 
+mod a11y;
 mod annotate;
 mod capture;
 mod cli;
@@ -23,6 +24,7 @@ mod pixel_fd;
 mod qt_overlay;
 mod record;
 mod selection;
+mod selection_region;
 mod stitch;
 mod translate;
 mod wayland;
