@@ -114,9 +114,11 @@ impl Accessibility {
 
     /// The frames of every application, with the tree under each.
     ///
-    /// A frame is matched to a window by its title, which is why the caller
-    /// passes the windows it already has: AT-SPI knows names, the compositor
-    /// knows positions, and only the pair is a region the user can point at.
+    /// Each frame carries the pid of the application that owns it, which is how
+    /// the caller matches a frame to a compositor window: both sides know the
+    /// process, and only the pair of them is a region the user can point at.
+    /// A title is carried too, as the fallback for a compositor that reports no
+    /// pid.
     pub fn frames(&self) -> std::result::Result<Vec<AccessibilityFrame>, String> {
         let root = Accessible::root("org.a11y.atspi.Registry");
         let count = self.child_count(&root).unwrap_or(0);
@@ -125,6 +127,10 @@ impl Accessibility {
             let Some(application) = self.child_at(&root, index) else {
                 continue;
             };
+            // The pid belongs to the application, not to each of its frames:
+            // one process can own several toplevels (a browser's windows, its
+            // popovers), and every one of them is that process.
+            let pid = self.pid(&application).unwrap_or(0);
             let application_count = self.child_count(&application).unwrap_or(0);
             for frame_index in 0..application_count {
                 let Some(frame) = self.child_at(&application, frame_index) else {
@@ -137,6 +143,7 @@ impl Accessibility {
                 frames.push(AccessibilityFrame {
                     accessible: frame,
                     title: name,
+                    pid,
                     rect,
                 });
             }
@@ -271,6 +278,12 @@ impl Accessibility {
         self.property(accessible, "org.a11y.atspi.Accessible", "Name")
     }
 
+    /// The process behind an accessible.  AT-SPI puts it on the application
+    /// object, which is why this is read there rather than per frame.
+    fn pid(&self, accessible: &Accessible) -> Option<i32> {
+        self.property(accessible, "org.a11y.atspi.Accessible", "ProcessId")
+    }
+
     fn child_at(&self, accessible: &Accessible, index: i32) -> Option<Accessible> {
         let proxy = self.proxy(accessible, "org.a11y.atspi.Accessible")?;
         let reply = proxy.call_method("GetChildAtIndex", &(index)).ok()?;
@@ -302,6 +315,9 @@ pub struct AccessibilityFrame {
     accessible: Accessible,
     /// The frame's name, which is the window's title.
     pub title: String,
+    /// The pid of the application that owns this frame, or 0 when it reported
+    /// none.  This is what identifies the window: see [`elements_for_window`].
+    pub pid: i32,
     /// The frame's own extent, which is its size and — only by accident — a
     /// position.  Callers use the size and take the position from the
     /// compositor.
@@ -324,18 +340,94 @@ fn to_rect(x: i32, y: i32, width: i32, height: i32) -> Option<Rect> {
 /// matching this window, no tree under it — so the caller keeps offering whole
 /// windows rather than failing the session.
 ///
-/// The window is the compositor's own description of it: its `title` is what
-/// names the accessibility frame, and its `geometry` is the origin AT-SPI
-/// cannot supply.  Both halves are needed and neither source has both.
+/// The window is the compositor's own description of it: the pid says *which*
+/// window, and its `geometry` is the origin AT-SPI cannot supply.  Both halves
+/// are needed and neither source has both.
 pub fn elements_for_window(window: &WindowCandidate) -> Option<Vec<RegionNode>> {
+    let accessibility = Accessibility::connect().ok()?;
+    let frames = accessibility.frames().ok()?;
+    let origin = Point::new(window.geometry.left(), window.geometry.top());
+    let frame = match_frame(&frames, window)?;
+    accessibility.elements(frame, origin).ok()
+}
+
+/// Which accessibility frame is this compositor window.
+///
+/// The pid is the answer, and it is asked first: both sides mean the same
+/// process, so a match cannot be wrong.  A title is not — an application names
+/// its toplevel twice, once for the compositor and once for AT-SPI, and is free
+/// to say different things.  Chromium does exactly that: a pinned tab is
+/// `… - 已固定 - Chromium` to AT-SPI while the compositor reports
+/// `… - Chromium`.  Requiring the titles to be equal there failed the match,
+/// the window got no elements, and picking silently kept offering the whole
+/// window — the bug this function exists to not have.
+///
+/// The title is still used, as a fallback, because a compositor that reports no
+/// pid leaves nothing else to match on (KWin without `kdotool`).  Then the
+/// frame has to agree about the size as well, since two windows of one
+/// application easily share a title.
+fn match_frame<'a>(
+    frames: &'a [AccessibilityFrame],
+    window: &WindowCandidate,
+) -> Option<&'a AccessibilityFrame> {
+    // Every branch below insists the size agrees.  An accessibility frame's
+    // extent is the toplevel's own size, which is what the compositor reports
+    // for the window, so a frame of another size is another window however its
+    // name reads -- and this is what keeps one application's several toplevels
+    // apart when their titles are alike or empty.
+    let same_size = |frame: &AccessibilityFrame| {
+        frame
+            .rect
+            .is_some_and(|rect| rect.size == window.geometry.size)
+    };
+
+    if window.pid > 0 {
+        if let Some(frame) = frames
+            .iter()
+            .find(|frame| frame.pid == window.pid && frame.title == window.title && same_size(frame))
+        {
+            return Some(frame);
+        }
+        // One process can own several toplevels — a browser's windows and its
+        // popovers — and the compositor's own title for this one may be the
+        // decorated form AT-SPI does not use.  The size settles it.
+        if let Some(frame) = frames
+            .iter()
+            .find(|frame| frame.pid == window.pid && same_size(frame))
+        {
+            return Some(frame);
+        }
+    }
+
     if window.title.is_empty() {
         return None;
     }
-    let accessibility = Accessibility::connect().ok()?;
-    let frames = accessibility.frames().ok()?;
-    let frame = frames.iter().find(|frame| frame.title == window.title)?;
-    let origin = Point::new(window.geometry.left(), window.geometry.top());
-    accessibility.elements(frame, origin).ok()
+    if let Some(frame) = frames
+        .iter()
+        .find(|frame| frame.title == window.title && same_size(frame))
+    {
+        return Some(frame);
+    }
+    // A title that only starts with the same stem, with the size to confirm it.
+    let stem = title_stem(&window.title);
+    if stem.is_empty() {
+        return None;
+    }
+    frames.iter().find(|frame| {
+        let frame_stem = title_stem(&frame.title);
+        !frame_stem.is_empty() && frame_stem.starts_with(&stem) && same_size(frame)
+    })
+}
+
+/// A title with its trailing ` - <something>` suffix removed, which is how an
+/// application appends its own name to a document's title — and, for a browser,
+/// how it appends a tab's state too: a pinned tab is `… - 已固定 - Chromium`
+/// to AT-SPI while the compositor reports `… - Chromium`.
+fn title_stem(title: &str) -> String {
+    match title.rfind(" - ") {
+        Some(at) if at > 0 && at + 3 < title.len() => title[..at].trim().to_string(),
+        _ => title.trim().to_string(),
+    }
 }
 
 /// Keeps [`Result`] honest: this module is best-effort and returns `Option`s.
@@ -345,6 +437,92 @@ type Unused = Result<()>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// The bug this matching exists for: Chromium names a pinned tab's toplevel
+    /// `… - 已固定 - Chromium` to AT-SPI while the compositor reports
+    /// `… - Chromium`.  Requiring equal titles dropped the window's whole
+    /// element tree, and picking silently kept offering the whole window.
+    #[test]
+    fn a_browser_that_renames_its_toplevel_is_still_matched() {
+        let window = candidate("WorkBuddy 用量看板 - Chromium", 4117827, 2550, 1397);
+        let frames = vec![
+            frame("WorkBuddy 用量看板 - 已固定 - Chromium", 4117827, 2550, 1397),
+            frame("", 4117827, 1790, 88),
+        ];
+        let matched = match_frame(&frames, &window).expect("the pinned tab's window");
+        assert_eq!(matched.title, "WorkBuddy 用量看板 - 已固定 - Chromium");
+    }
+
+    #[test]
+    fn the_pid_answers_before_the_title_is_looked_at() {
+        // A title that matches another window's, but the wrong pid: the pid is
+        // the identity, so the frame of that pid is the window.
+        let window = candidate("shared title", 100, 800, 600);
+        let frames = vec![
+            frame("shared title", 200, 800, 600),
+            frame("different title entirely", 100, 800, 600),
+        ];
+        let matched = match_frame(&frames, &window).expect("matched by pid");
+        assert_eq!(matched.pid, 100);
+    }
+
+    /// One process owns several toplevels -- a browser's windows and its
+    /// popovers.  The size is what says which of them the compositor listed.
+    #[test]
+    fn one_process_with_several_toplevels_is_split_by_size() {
+        let window = candidate("anything", 100, 800, 600);
+        let frames = vec![
+            frame("popover", 100, 200, 100),
+            frame("the window", 100, 800, 600),
+        ];
+        let matched = match_frame(&frames, &window).expect("the size agrees");
+        assert_eq!(matched.title, "the window");
+    }
+
+    /// A compositor that reports no pid (KWin without `kdotool`) leaves the
+    /// title as the only thing to match on, and then the size has to confirm it.
+    #[test]
+    fn without_a_pid_the_title_still_matches_when_the_size_agrees() {
+        let window = candidate("a document - App", 0, 800, 600);
+        let frames = vec![frame("a document - App", 0, 800, 600)];
+        assert!(match_frame(&frames, &window).is_some());
+
+        // Same stem, different size: a different window of the same app, and
+        // not the one the compositor listed.
+        let frames = vec![frame("a document - App", 0, 400, 300)];
+        assert!(match_frame(&frames, &window).is_none());
+    }
+
+    #[test]
+    fn an_empty_title_with_no_pid_matches_nothing() {
+        let window = candidate("", 0, 800, 600);
+        let frames = vec![frame("", 0, 800, 600)];
+        assert!(match_frame(&frames, &window).is_none());
+    }
+
+    fn candidate(title: &str, pid: i32, width: u32, height: u32) -> WindowCandidate {
+        WindowCandidate {
+            geometry: Rect::new(0, 0, width, height),
+            label: String::new(),
+            app_id: String::new(),
+            title: title.to_string(),
+            pid,
+            handle: None,
+        }
+    }
+
+    fn frame(title: &str, pid: i32, width: u32, height: u32) -> AccessibilityFrame {
+        AccessibilityFrame {
+            accessible: Accessible {
+                bus: ":1.0".into(),
+                path: "/org/a11y/atspi/accessible/1".into(),
+            },
+            title: title.to_string(),
+            pid,
+            rect: Some(Rect::new(0, 0, width, height)),
+        }
+    }
 
     #[test]
     fn degenerate_extents_are_not_regions() {
