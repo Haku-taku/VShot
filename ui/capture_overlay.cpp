@@ -5375,6 +5375,18 @@ void OverlayController::enableCandidateRefresh()
         requestCandidateRefresh();
     });
     candidateTimer_->start();
+    // The pointer may already be resting on a window when the session opens, and
+    // the element request otherwise only happens on a move -- so a picker the
+    // user opened without jiggling the mouse would never offer an element
+    // level.  Now that the pipe exists, ask once for whatever is under the
+    // pointer already.
+    if (hoveredCandidate_ < 0) {
+        hoveredCandidate_ = candidateIndexAt(pointer_);
+        if (hoveredCandidate_ >= 0) {
+            selection_ = candidates_.at(hoveredCandidate_).rect;
+        }
+    }
+    requestElements(hoveredCandidate_);
 }
 
 void OverlayController::enablePointerWarp()
@@ -5661,6 +5673,11 @@ void OverlayController::applyCandidates(QVector<WindowCandidate> candidates)
     hoveredCandidate_ = candidateIndexAt(pointer_);
     if (hoveredCandidate_ >= 0) {
         selection_ = candidates_.at(hoveredCandidate_).rect;
+        // Ask for this window's elements here as well as on a pointer move: the
+        // pointer may already be sitting on a window when the session opens, and
+        // a picker that only asked on a move would offer no element level until
+        // the user happened to jiggle the mouse.
+        requestElements(hoveredCandidate_);
     } else {
         selection_.reset();
     }

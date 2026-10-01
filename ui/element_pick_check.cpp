@@ -25,6 +25,7 @@
 #include <QJsonObject>
 #include <QString>
 
+#include <algorithm>
 #include <cstdio>
 
 namespace {
@@ -274,6 +275,123 @@ int main()
         expect(tree.node(1)->parent == 0, "and hangs off the wrapper's parent");
         expect(tree.node(2)->label == QStringLiteral("sibling"), "the sibling is untouched");
         expect(tree.node(2)->parent == 0, "and still hangs off the root");
+    }
+
+    // --- A real Chromium tree --------------------------------------------
+    //
+    // Captured from a live `vshot window pick` against a Chromium window
+    // launched with --force-renderer-accessibility: 76 nodes.  It is here
+    // because its top is three nested `panel`s all covering the window
+    // exactly -- the wrapper shape toolkits produce, and the reason a wheel
+    // appeared to do nothing: without collapsing, the first three levels are
+    // the same full-window box.
+    {
+        QJsonArray array;
+        array.push_back(node("panel", 5, 38, 2550, 1397, -1));
+        array.push_back(node("panel", 5, 38, 2550, 1397, 0));
+        array.push_back(node("panel", 5, 38, 2550, 1397, 1));
+        array.push_back(node("panel", 245, 84, 2310, 1351, 2));
+        array.push_back(node("panel", 245, 38, 2310, 46, 2));
+        array.push_back(node("tool bar", 279, 38, 2276, 46, 4));
+        array.push_back(node("button 返回", 279, 44, 40, 34, 5));
+        array.push_back(node("button 前进", 321, 44, 34, 34, 5));
+        array.push_back(node("button 重新加载", 357, 44, 34, 34, 5));
+        array.push_back(node("panel", 400, 44, 1746, 34, 5));
+        array.push_back(node("button 查看网站信息", 405, 49, 24, 24, 9));
+        array.push_back(node("entry 地址和搜索栏", 437, 49, 1633, 24, 9));
+        array.push_back(node("panel", 2078, 49, 56, 24, 9));
+        array.push_back(node("button 安装“DeepSeek”", 2078, 49, 24, 24, 12));
+        array.push_back(node("button 为此标签页修改书签", 2110, 49, 24, 24, 12));
+        array.push_back(node("panel", 2155, 44, 250, 34, 5));
+        array.push_back(node("button Tampermonkey Editors", 2227, 44, 34, 34, 15));
+        array.push_back(node("button Shazam：在浏览器中直接识别歌曲", 2299, 44, 34, 34, 15));
+        array.push_back(node("button 扩展程序", 2371, 44, 34, 34, 15));
+        array.push_back(node("panel", 2414, 53, 2, 16, 5));
+        array.push_back(node("panel", 2425, 44, 52, 34, 5));
+        array.push_back(node("toggle button 下载内容 - 已固定", 2425, 44, 34, 34, 20));
+        array.push_back(node("panel", 2468, 53, 2, 16, 20));
+        array.push_back(node("button 工作", 2479, 44, 34, 34, 5));
+        array.push_back(node("button Chromium", 2515, 44, 40, 34, 5));
+        array.push_back(node("panel", 245, 84, 2310, 1351, 2));
+        array.push_back(node("panel", 245, 84, 2310, 1351, 25));
+        array.push_back(node("panel", 245, 85, 2310, 1350, 25));
+        array.push_back(node("panel", 245, 85, 2310, 1350, 27));
+        array.push_back(node("panel", 245, 85, 2310, 1350, 28));
+        array.push_back(node("panel", 245, 85, 2310, 1350, 27));
+        array.push_back(node("document web DeepSeek - 探索未至之境", 245, 85, 2310, 1350, 27));
+        array.push_back(node("panel", 245, 85, 2310, 1350, 27));
+        array.push_back(node("panel", 245, 85, 2310, 1350, 27));
+        array.push_back(node("panel", 245, 85, 2310, 1350, 27));
+        array.push_back(node("panel", 245, 85, 2310, 1350, 27));
+        array.push_back(node("panel", 245, 85, 2310, 1350, 27));
+        array.push_back(node("panel", 2387, 1411, 168, 24, 27));
+        array.push_back(node("static chat.deepseek.com", 2409, 1411, 116, 23, 37));
+        array.push_back(node("button 关闭此视图", 2531, 1411, 24, 24, 37));
+        array.push_back(node("panel", 245, 85, 2310, 1350, 27));
+        array.push_back(node("panel", 245, 85, 2310, 1350, 27));
+        array.push_back(node("panel", 245, 84, 2310, 1, 25));
+        array.push_back(node("panel", 245, 84, 2310, 1351, 25));
+        array.push_back(node("panel", 245, 84, 2310, 1351, 2));
+        array.push_back(node("panel", 244, 83, 10, 10, 44));
+        array.push_back(node("panel", 2546, 83, 9, 10, 44));
+        array.push_back(node("panel", 244, 1426, 10, 9, 44));
+        array.push_back(node("panel", 2546, 1426, 9, 9, 44));
+        array.push_back(node("panel", 245, 84, 2310, 1351, 44));
+        array.push_back(node("page tab list", 5, 38, 240, 1397, 2));
+        array.push_back(node("panel", 17, 38, 216, 46, 50));
+        array.push_back(node("button 收起标签页", 17, 45, 32, 32, 51));
+        array.push_back(node("panel", 175, 47, 58, 28, 51));
+        array.push_back(node("button 标签页分组", 175, 47, 28, 28, 53));
+        array.push_back(node("button 标签页搜索", 205, 47, 28, 28, 53));
+        array.push_back(node("panel", 17, 84, 216, 1, 50));
+        array.push_back(node("panel", 5, 93, 240, 70, 50));
+        array.push_back(node("panel", 17, 93, 228, 32, 57));
+        array.push_back(node("panel", 17, 93, 228, 32, 58));
+        array.push_back(node("panel", 17, 93, 228, 32, 59));
+        array.push_back(node("panel", 5, 133, 240, 30, 57));
+        array.push_back(node("panel", 5, 133, 240, 30, 61));
+        array.push_back(node("panel", 5, 133, 240, 30, 62));
+        array.push_back(node("panel", 17, 171, 216, 1252, 50));
+        array.push_back(node("button 打开新的标签页", 17, 171, 216, 32, 64));
+        array.push_back(node("slider 垂直标签栏大小调整手柄（可拖动）", 240, 38, 5, 1397, 50));
+        array.push_back(node("panel", 5, 38, 240, 1397, 50));
+        array.push_back(node("panel", 244, 38, 10, 8, 2));
+        array.push_back(node("panel", 244, 1427, 10, 8, 2));
+        array.push_back(node("panel", 5, 38, 2550, 1397, 2));
+        array.push_back(node("panel", 5, 38, 2550, 1397, 0));
+        ElementTree tree;
+        tree.load(array);
+
+        // The three same-sized wrappers at the top are one level, not three.
+        expect(tree.size() > 0, "the real tree loads at all");
+        expect(tree.size() < 76, "wrappers in the real tree are collapsed",
+               QStringLiteral("kept %1 of 76").arg(tree.size()));
+        const vshot::ElementTree::Node *top = tree.node(0);
+        expect(top != nullptr && top->rect.width == 2550 && top->rect.height == 1397,
+               "the top of the collapsed tree is still the window-sized panel");
+        // And the tree still has real depth below it: a browser's toolbar and
+        // page are levels a user can actually choose.
+        int depth = 0;
+        for (int i = 0; i < tree.size(); ++i) {
+            int d = 0;
+            for (int p = tree.node(i)->parent; p >= 0; p = tree.node(p)->parent) {
+                ++d;
+                if (d > 32) {
+                    break;
+                }
+            }
+            depth = std::max(depth, d);
+        }
+        expect(depth >= 4, "the collapsed tree still has levels to step through",
+               QStringLiteral("deepest %1").arg(depth));
+        // A point in the toolbar area lands on something smaller than the
+        // window, which is the whole point of the element level.
+        const int hit = tree.indexAt(300, 55);
+        const vshot::ElementTree::Node *found = tree.node(hit);
+        expect(hit >= 0 && found != nullptr && found->rect.width < 2550,
+               "a point in the toolbar picks a toolbar-sized element",
+               found == nullptr ? QStringLiteral("no hit")
+                                : QStringLiteral("%1x%2").arg(found->rect.width).arg(found->rect.height));
     }
 
     std::printf("\n%s\n", failures == 0 ? "all element-pick checks passed"
