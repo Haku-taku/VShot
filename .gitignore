@@ -13,3 +13,4 @@
 /models/
 # The scratch area OCR work was measured in.
 /.ocr-lab/
+/build-qt2/
