@@ -281,6 +281,7 @@ fn pick(rows: &[KwinRow]) -> Result<usize> {
             label: crate::capture::window::join_label(&row.app_id, &row.title),
             app_id: row.app_id.clone(),
             title: row.title.clone(),
+            pid: row.pid,
             handle: (!row.handle.is_empty()).then(|| row.handle.clone()),
         })
         .collect();
