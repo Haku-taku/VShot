@@ -161,8 +161,12 @@ pub(crate) struct RenderedCapture {
 /// What a caller does when the editor asks to be let go: the session's result
 /// JSON and the capture it rendered, for the caller to put where it belongs
 /// before the editor's surface comes down.  See [`HelperRequest::Release`].
+///
+/// The render is borrowed rather than moved: a caller whose destination the
+/// command line named still has to write it after the handoff has put the pin
+/// on the screen, and the two need the same pixels.
 pub(crate) type ReleaseHandler<'a> =
-    dyn FnMut(&[u8], Option<RenderedCapture>) -> Result<String> + 'a;
+    dyn FnMut(&[u8], Option<&RenderedCapture>) -> Result<String> + 'a;
 
 /// A request the helper makes of the CLI while a session is open, as one line
 /// of JSON on the helper's stdout.  Anything that is not one of these is the
@@ -339,7 +343,7 @@ fn run_helper_dialogue(
                 // The render goes with it: the handoff is what puts these
                 // pixels in the pin, and the editor is holding them up on the
                 // screen until it is told they landed.
-                match release(result, composite.take()) {
+                match release(result, composite.as_ref()) {
                     Ok(reply) => reply,
                     Err(error) => {
                         // The handoff could not be made, but the helper is

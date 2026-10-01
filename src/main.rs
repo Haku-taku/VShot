@@ -369,12 +369,12 @@ fn run() -> Result<()> {
                 let mut handoff_error: Option<VshotError> = None;
                 let outcome =
                     qt_overlay::select_and_edit(&scene, &backdrop, &mut |result, render| {
-                        if let Err(error) =
-                            pin_from_editor(&scene, &hdr_outputs, &request, result, render)
-                        {
-                            handoff_error = Some(error);
-                        } else {
-                            handed_over = true;
+                        // `false` is the ordinary OK: the editor drew on the
+                        // capture and left it to the destination the command
+                        // line named, which is still to be written below.
+                        match pin_from_editor(&scene, &hdr_outputs, &request, result, render) {
+                            Ok(pinned) => handed_over = pinned,
+                            Err(error) => handoff_error = Some(error),
                         }
                         Ok("{}".to_string())
                     })?;
@@ -595,12 +595,12 @@ fn run() -> Result<()> {
                     geometry,
                     &backdrop,
                     &mut |result, render| {
-                        if let Err(error) =
-                            pin_from_editor(&scene, &hdr_outputs, &request, result, render)
-                        {
-                            handoff_error = Some(error);
-                        } else {
-                            handed_over = true;
+                        // `false` is the ordinary OK: the editor drew on the
+                        // capture and left it to the destination the command
+                        // line named, which is still to be written below.
+                        match pin_from_editor(&scene, &hdr_outputs, &request, result, render) {
+                            Ok(pinned) => handed_over = pinned,
+                            Err(error) => handoff_error = Some(error),
                         }
                         Ok("{}".to_string())
                     },
@@ -646,12 +646,17 @@ fn run() -> Result<()> {
 
     // A pin the editor handed over is already on the screen: the daemon held
     // its answer until the frame carrying it was presented, and the editor
-    // stopped on that answer.  There is nothing left to write -- least of all
-    // to the pin, which would only replace the pixels that are up with a second
-    // copy of themselves.
-    if handed_over {
+    // stopped on that answer.  Only a session whose destination *was* the pin
+    // is finished here; one the command line also named a file for is still
+    // owed that file, so it falls through to the write below.
+    if handed_over && matches!(&request.destination, cli::Destination::Pin) {
         return wayland.destroy_overlays();
     }
+    // The handoff already put this image on the screen, so pinning it again
+    // would only replace the pixels that are up with a second copy of
+    // themselves.  The Pin button says where the image also goes, not that the
+    // capture stops being written.
+    let pin_result = pin_result && !handed_over;
 
     if let Some(rendered) = rendered {
         return finish_rendered_capture(
@@ -1128,13 +1133,20 @@ fn run_translate_overlay(
 /// path its own working directory cannot change the meaning of.
 fn absolute_output_path(path: &std::path::Path) -> Result<std::path::PathBuf> {
     let expanded = output::expanded_output_path(path);
-    if expanded.is_absolute() {
-        return Ok(expanded);
-    }
-    let directory = std::env::current_dir().map_err(|error| {
-        VshotError::Translate(format!("cannot resolve the output path: {error}"))
-    })?;
-    Ok(directory.join(expanded))
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        let directory = std::env::current_dir().map_err(|error| {
+            VshotError::Translate(format!("cannot resolve the output path: {error}"))
+        })?;
+        directory.join(expanded)
+    };
+    // The helper opens this path itself, so the directory has to be there before
+    // the session starts rather than at some write of ours afterwards.  A
+    // strftime pattern routinely names one that does not exist yet — see
+    // `output::create_parent_directories`.
+    output::create_parent_directories(&absolute)?;
+    Ok(absolute)
 }
 
 /// Says a translation finished, or failed, using the same switch `vshot ocr`
@@ -1204,22 +1216,63 @@ fn finish_capture(
     // close, and nothing below needs those surfaces, so they go first.
     let cleanup = wayland.destroy_overlays();
     let (sdr, hdr_out) = sdr_and_hdr(Some(edits), frame, hdr, request.tone_map)?;
-    let pinned = cli::Destination::Pin;
-    let destination = if pin { &pinned } else { &request.destination };
-    let result = output::write_frame_with_hdr(
+    let result = write_capture_and_pin(
         &sdr,
         hdr_out.as_ref(),
-        destination,
         density,
-        request.compression,
-        request.hdr_format,
-        capture_rect.map(|rect| rect.origin),
+        capture_rect,
         marks,
         // A route that rendered on this side has no session marks and so no
         // pristine base to keep them against.
         None,
+        request,
+        pin,
     );
     result.and(cleanup)
+}
+
+/// Writes the capture to whatever the command line asked for, and then to the
+/// screen when the toolbar's Pin button was pressed.
+///
+/// The two are not alternatives.  `-o` names a file the user asked for, and the
+/// Pin button says the image *also* goes on the screen; pressing it used to
+/// replace the destination outright, so a capture pinned from the editor was
+/// never written anywhere.  A command line that already named the pin as its
+/// destination has had it, and is not pinned a second time.
+#[allow(clippy::too_many_arguments)] // the capture, its two halves, its place and its marks
+fn write_capture_and_pin(
+    sdr: &Frame,
+    hdr: Option<&HdrHalf>,
+    density: u32,
+    capture_rect: Option<crate::geometry::Rect>,
+    marks: Option<&serde_json::Value>,
+    // The capture before the marks were drawn on it, for a pin that carries
+    // them; `None` on every route that never opened an editor.
+    base: Option<&[u8]>,
+    request: &cli::Request,
+    pin: bool,
+) -> Result<()> {
+    let write = |destination: &cli::Destination| {
+        output::write_frame_with_hdr(
+            sdr,
+            hdr,
+            destination,
+            density,
+            request.compression,
+            request.hdr_format,
+            capture_rect.map(|rect| rect.origin),
+            marks,
+            base,
+        )
+    };
+    let result = write(&request.destination);
+    if pin && !matches!(request.destination, cli::Destination::Pin) {
+        // Both are attempted even when the first failed: a full disk that lost
+        // the file is no reason to also lose the pin, and the error that
+        // surfaces is the first one, which is the one the user asked for.
+        return result.and(write(&cli::Destination::Pin));
+    }
+    result
 }
 
 /// The pin half of a region session's handoff: the editor has finished drawing
@@ -1244,19 +1297,22 @@ fn pin_from_editor(
     hdr_outputs: &[HdrOutput],
     request: &cli::Request,
     result: &[u8],
-    rendered: Option<qt_overlay::RenderedCapture>,
+    rendered: Option<&qt_overlay::RenderedCapture>,
 ) -> Result<bool> {
+    // Parsed without the render, which is borrowed from the dialogue rather
+    // than moved out of it: a destination the command line named still has to
+    // be written once this handoff is done, and it wants these same pixels.
     let outcome = qt_overlay::parse_outcome_with_render(
         qt_overlay::HelperOutput {
             json: result.to_vec(),
-            composite: rendered,
+            composite: None,
         },
         scene.bounds(),
     )?;
     if !outcome.pin {
         return Ok(false);
     }
-    let Some(rendered) = outcome.composite else {
+    let Some(rendered) = rendered else {
         // The Pin button was pressed and the editor rendered nothing, which
         // only happens when its own render failed; it reported that through its
         // status, so there is nothing here to put on the screen.
@@ -1319,24 +1375,23 @@ fn finish_rendered_capture(
         }
         None => None,
     };
-    let pinned = cli::Destination::Pin;
-    let destination = if pin { &pinned } else { &request.destination };
-    let result = output::write_frame_with_hdr(
+    // The base is only needed by the pin destination, and encoding it costs a
+    // PNG; a session that drew nothing has no marks to carry it for.  It is
+    // read only when the pin really is one of the two destinations.
+    let pin_wanted = pin && !matches!(request.destination, cli::Destination::Pin);
+    let base_png = match (marks, pin_wanted) {
+        (Some(_), true) => Some(base.to_png()?),
+        _ => None,
+    };
+    let result = write_capture_and_pin(
         &sdr,
         hdr_out.as_ref(),
-        destination,
         density,
-        request.compression,
-        request.hdr_format,
-        capture_rect.map(|rect| rect.origin),
+        capture_rect,
         marks,
-        // The base is only needed by the pin destination, and encoding it costs
-        // a PNG; a session that drew nothing has no marks to carry it for.
-        match (marks, pin) {
-            (Some(_), true) => Some(base.to_png()?),
-            _ => None,
-        }
-        .as_deref(),
+        base_png.as_deref(),
+        request,
+        pin,
     );
     result.and(cleanup)
 }
@@ -2176,5 +2231,34 @@ mod tests {
         for target in &refusers {
             assert!(!target_wants_hdr(target), "{target:?} should not");
         }
+    }
+
+    /// A release that did not press Pin hands nothing over, and the caller has
+    /// to read that as "the capture is still to be written".
+    ///
+    /// `pin_from_editor` answers `false` for an ordinary OK, which is what tells
+    /// the caller apart from the one release that really did put the image on
+    /// the screen.  Reading any non-error release as a handoff skipped the write
+    /// entirely: an interactive region capture through the editor exited 0 and
+    /// saved nothing at all.
+    #[test]
+    fn a_release_without_the_pin_button_leaves_the_capture_to_be_written() {
+        let (scene, hdr_outputs) = hdr_scene();
+        let request = cli::Request {
+            target: CaptureTarget::RegionInteractive,
+            destination: cli::Destination::File(PathBuf::from("/dev/null")),
+            cursor: false,
+            compression: crate::model::PngCompression::default(),
+            hdr_format: crate::output::HdrFormat::default(),
+            tone_map: crate::model::hdr::ToneMapOptions::default(),
+        };
+        // The editor's ordinary answer: a selection, no `pin` flag.  The
+        // composite is absent because this session rendered nothing, which is
+        // the shape a cancelled render has too -- the difference is the status.
+        let answer = br#"{"status":"ok","selection":{"x":0,"y":0,"width":8,"height":8}}"#;
+        assert!(
+            !pin_from_editor(&scene, &hdr_outputs, &request, answer, None).unwrap(),
+            "an OK without Pin must leave the capture for the destination"
+        );
     }
 }

@@ -38,6 +38,16 @@ pub enum VshotError {
         #[source]
         source: std::io::Error,
     },
+    /// Making the directory an `--output` path names.  Separate from
+    /// [`VshotError::WriteFile`] because the path that failed is a directory
+    /// rather than the file, and saying so is the difference between "your
+    /// output path is wrong" and "the write went wrong".
+    #[error("failed to create the output directory {path}: {source}")]
+    CreateOutputDirectory {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("Wayland connection failed: {0}")]
     WaylandConnection(String),
     #[error("Wayland capability `{0}` is required for strict freeze mode")]

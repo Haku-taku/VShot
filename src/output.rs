@@ -123,6 +123,7 @@ pub fn write_frame_with_hdr(
     match destination {
         Destination::File(path) => {
             let path = expand_output_path(path, Local::now());
+            create_parent_directories(&path)?;
             write_capture_files(&path, frame, hdr, density, compression, format)?;
             copy_file_to_clipboard(&path)
         }
@@ -218,6 +219,30 @@ fn png_sibling_path(path: &Path) -> PathBuf {
 fn expand_output_path(path: &Path, now: DateTime<Local>) -> PathBuf {
     let pattern = path.to_string_lossy();
     PathBuf::from(now.format(&pattern).to_string())
+}
+
+/// Makes the directory an `--output` path names, so a pattern can place its file
+/// in a directory that only comes into being as the pattern expands.
+///
+/// A strftime pattern is a path *recipe*, not a path: `Screenshots/%Y%m/shot.png`
+/// names a different directory every month, and the user cannot pre-create next
+/// month's.  So the directory is made here rather than left to `File::create`,
+/// whose "No such file or directory" says nothing about which part was missing.
+/// This is the rule the recording paths already follow for vshot's own videos
+/// directory, applied to every `-o` path.
+pub fn create_parent_directories(path: &Path) -> Result<()> {
+    // A bare file name has no directory to make; an empty parent (`/shot.png`)
+    // is the root and already exists.
+    let Some(directory) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    if directory.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(directory).map_err(|source| VshotError::CreateOutputDirectory {
+        path: directory.to_path_buf(),
+        source,
+    })
 }
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -344,6 +369,51 @@ mod tests {
             path,
             PathBuf::from(format!("shots/vshot-{expected_date}.final.png"))
         );
+    }
+
+    /// The directory a strftime pattern names comes into being with the pattern.
+    ///
+    /// `Screenshots/%Y%m/shot.png` names a different directory every month, and
+    /// the user cannot pre-create next month's — so the write has to make it.
+    /// Before this, such a pattern failed with a bare "No such file or
+    /// directory" that named neither the missing part nor the way out.
+    #[test]
+    fn a_pattern_whose_directory_does_not_exist_yet_is_still_writable() {
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "vshot-output-dir-test-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        // Two levels that do not exist, the shape `Screenshots/%Y%m/` has.
+        let path = expand_output_path(&root.join("%Y%m/shot.png"), Local::now());
+        assert!(
+            !path.parent().unwrap().exists(),
+            "the fixture starts absent"
+        );
+
+        create_parent_directories(&path).unwrap();
+        assert!(
+            path.parent().unwrap().is_dir(),
+            "the month directory is made"
+        );
+
+        let frame = Frame::solid(Size::new(1, 1), [1, 2, 3, 255]).unwrap();
+        write_file(&path, &frame.to_png().unwrap()).unwrap();
+        assert!(std::fs::read(&path).unwrap().starts_with(b"\x89PNG"));
+
+        // A second write into the same month is not an error: an existing
+        // directory is left alone rather than refused.
+        create_parent_directories(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A bare file name has no directory to make, and the root is not made
+    /// either — it is already there.
+    #[test]
+    fn a_path_with_no_directory_is_left_alone() {
+        create_parent_directories(Path::new("shot.png")).unwrap();
+        create_parent_directories(Path::new("/shot.png")).unwrap();
     }
 
     #[test]

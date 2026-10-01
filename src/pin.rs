@@ -574,7 +574,7 @@ pub(crate) fn hand_off_region_pin(
     hdr: Option<&HdrHalf>,
     density: u32,
     rect: crate::geometry::Rect,
-    rendered: crate::qt_overlay::RenderedCapture,
+    rendered: &crate::qt_overlay::RenderedCapture,
     marks: Option<&serde_json::Value>,
     tone_map: crate::model::hdr::ToneMapOptions,
 ) -> Result<()> {
@@ -582,7 +582,7 @@ pub(crate) fn hand_off_region_pin(
     // lands back where the capture came from, exactly as a fixed-region pin
     // does.
     let at = Some(rect.origin);
-    let sdr = rendered.composite;
+    let sdr = &rendered.composite;
     let marked = match hdr {
         Some(HdrHalf {
             frame,
@@ -855,7 +855,7 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
     let mut handoff_error: Option<VshotError> = None;
     let output = {
         let mut handoff = |result: &[u8],
-                           composite: Option<crate::qt_overlay::RenderedCapture>|
+                           composite: Option<&crate::qt_overlay::RenderedCapture>|
          -> Result<String> {
             released = true;
             if let Err(error) =
@@ -882,7 +882,7 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
     // instead -- and a cancelled one applies nothing.
     apply_edit_result(
         &output.json,
-        output.composite,
+        output.composite.as_ref(),
         window,
         id,
         hdr_half,
@@ -900,7 +900,7 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
 /// replaces it.
 fn apply_edit_result(
     result: &[u8],
-    composite: Option<crate::qt_overlay::RenderedCapture>,
+    composite: Option<&crate::qt_overlay::RenderedCapture>,
     window: crate::geometry::Rect,
     id: u64,
     half: Option<HdrHalf>,
