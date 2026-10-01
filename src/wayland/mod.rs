@@ -15,6 +15,7 @@ use wayland_client::protocol::{
     wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+use wayland_protocols::wp::color_management::v1::client::wp_color_manager_v1::TransferFunction;
 use wayland_protocols::wp::color_management::v1::client::{
     wp_color_management_output_v1, wp_color_management_surface_v1, wp_color_manager_v1,
     wp_image_description_info_v1, wp_image_description_v1,
@@ -30,7 +31,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_l
 
 use crate::error::{Result, VshotError};
 use crate::geometry::{Point, Rect};
-use crate::model::{HdrFrame, Primaries, SceneSnapshot};
+use crate::model::{HdrFrame, Primaries, SceneSnapshot, Transfer};
 
 use self::freeze_overlay::{
     release_buffer_if_current, BufferToken, BufferUserData, LayerSurfaceUserData, OverlayColor,
@@ -54,11 +55,13 @@ pub struct WaylandSession {
 }
 
 /// One output that was given a colour description, as the HDR pin helper needs
-/// it: the gamut the output's own description names, and the light one unit of
-/// content stands for there.  A surface shows codes written in that gamut and
-/// against that white, so a pin from elsewhere — or a plain sRGB one — has to be
-/// written in both before it goes on.
-pub type PinOutputColor = (String, Option<Primaries>, Option<f32>);
+/// it: the gamut the output's own description names, the light one unit of
+/// content stands for there, and whether the output is an HDR one at all.  A
+/// surface shows codes written in that gamut and against that white, so a pin
+/// from elsewhere — or a plain sRGB one — has to be written in both before it
+/// goes on; and a PQ surface only means what it says on an output whose own
+/// curve is PQ, so the third says whether to draw one at all.
+pub type PinOutputColor = (String, Option<Primaries>, Option<f32>, bool);
 
 /// One output's HDR half, as a backdrop surface needs it: the frozen frame and
 /// the light level its `1.0` stands for — the output's own SDR white — which is
@@ -114,6 +117,14 @@ struct ColorInfo {
     /// BT.2408's 203 cd/m², and a code written against the wrong one comes out
     /// at the wrong light.
     reference_nits: Option<f32>,
+    /// The transfer function the description names, from its `tf_named` or its
+    /// `tf_power`.  This is the one field that says whether the output is an
+    /// HDR one: an output in PQ or HLG is showing HDR, and an output in the
+    /// sRGB curve is not, whatever its gamut or its white.  A description that
+    /// names no curve — including one that names it as a `tf_curve`, which is
+    /// left unread — leaves this `None` rather than assuming one; see
+    /// [`WaylandSession::apply_pin_color`].
+    transfer: Option<Transfer>,
 }
 
 /// The gamut a description's chromaticities describe, in the millionth-unit
@@ -130,6 +141,45 @@ fn primaries_of(r_x: i32, r_y: i32, g_x: i32, g_y: i32, b_x: i32, b_y: i32) -> P
         (g_x as f32 / SCALE, g_y as f32 / SCALE),
         (b_x as f32 / SCALE, b_y as f32 / SCALE),
     )
+}
+
+/// The transfer function one of the protocol's names stands for, or `None` for
+/// a curve this pipeline has no name for.
+///
+/// The three that matter are the ones that decide what a surface's pixels mean:
+/// PQ and HLG are the HDR curves, and everything the protocol calls an SDR curve
+/// — `srgb`, `ext_srgb`, `bt1886`, `gamma22`, `compound_power_2_4` — is the SDR
+/// one, since they differ only in the gamma below the point where a pin's codes
+/// are decided.  A name this does not know is left unknown rather than folded
+/// into the nearest one: reading an unfamiliar curve as sRGB is exactly the
+/// mistake that shows a PQ buffer as a dark SDR picture.
+fn transfer_of_named(named: TransferFunction) -> Option<Transfer> {
+    match named {
+        TransferFunction::St2084Pq => Some(Transfer::Pq),
+        TransferFunction::Hlg => Some(Transfer::Hlg),
+        TransferFunction::ExtLinear => Some(Transfer::Linear),
+        TransferFunction::Srgb
+        | TransferFunction::ExtSrgb
+        | TransferFunction::Bt1886
+        | TransferFunction::Gamma22
+        | TransferFunction::CompoundPower24 => Some(Transfer::Srgb),
+        _ => None,
+    }
+}
+
+/// Whether an output whose description named `transfer` is showing HDR.
+///
+/// Only the curve answers this: PQ and HLG are the HDR ones, and an output in
+/// any SDR curve is an SDR output whatever its gamut or its white.  An output
+/// whose description never named a curve at all counts as HDR, which is what the
+/// pin helper assumed before it could read the curve — a compositor that does
+/// not answer the question keeps the behaviour it had rather than losing its
+/// pins.
+fn is_hdr(transfer: Option<Transfer>) -> bool {
+    match transfer {
+        Some(transfer) => matches!(transfer, Transfer::Pq | Transfer::Hlg),
+        None => true,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -162,6 +212,12 @@ struct WaylandState {
     /// surface, so its codes have to be written against this level rather than
     /// a fixed one.
     cm_white: HashMap<u32, f32>,
+    /// The transfer function each output's own description names, from the same
+    /// description.  An output whose curve is PQ or HLG is showing HDR and can
+    /// take a pin's PQ codes as they are; one whose curve is the sRGB curve is
+    /// an SDR output, and a PQ surface there is read as sRGB — which is what
+    /// made every pin on an SDR output dark and its highlights clip.
+    cm_transfer: HashMap<u32, Transfer>,
     /// The description being read, between `get_information` and its `done`,
     /// keyed by the output the answer belongs to.
     cm_info: HashMap<u32, ColorInfo>,
@@ -263,6 +319,8 @@ impl WaylandState {
         self.cm_ready.clear();
         self.cm_failed.clear();
         self.cm_gamut.clear();
+        self.cm_white.clear();
+        self.cm_transfer.clear();
         self.cm_info.clear();
         self.pending_color.clear();
     }
@@ -1185,10 +1243,24 @@ impl WaylandSession {
 
     /// Gives the pin surfaces their output's own colour description, now that
     /// they have buffers.  Answers each output that was given one, with the
-    /// gamut its own description names and the light one unit of content stands
-    /// for there: the surface shows codes written in that gamut and against
-    /// that white, so a picture captured elsewhere has to be re-encoded into
-    /// both.
+    /// gamut its own description names, the light one unit of content stands for
+    /// there, and whether the output is an HDR one.
+    ///
+    /// The surface carries the output's own description, so a PQ buffer written
+    /// into it is passed through as the light it stands for — but only on an
+    /// output whose own curve *is* PQ.  On an output described with the sRGB
+    /// curve the same buffer is decoded as sRGB, which is what made every pin on
+    /// an SDR output come out dark with its highlights clipped: the codes are
+    /// PQ, the surface read them as if they were not.  The transfer function is
+    /// therefore reported, and the caller keeps its SDR picture on an output
+    /// that is not HDR — the same rule the capture side already follows in
+    /// [`crate::capture::wlr`], where a 10-bit buffer is only decoded as HDR on
+    /// an output whose description says PQ or HLG.
+    ///
+    /// An output whose description named no curve at all is reported as HDR:
+    /// that is what the helper did before it could read the curve, so a
+    /// compositor that does not answer the question keeps the behaviour it had
+    /// rather than losing its pins.
     pub fn apply_pin_color(&mut self) -> Result<Vec<PinOutputColor>> {
         let colored = self.apply_surface_color()?;
         Ok(self
@@ -1198,10 +1270,12 @@ impl WaylandSession {
             .filter(|id| colored.contains(id))
             .filter_map(|id| {
                 let name = self.state.topology.outputs.get(id)?.name.clone()?;
+                let hdr = is_hdr(self.state.cm_transfer.get(id).copied());
                 Some((
                     name,
                     self.state.cm_gamut.get(id).copied(),
                     self.state.cm_white.get(id).copied(),
+                    hdr,
                 ))
             })
             .collect())
@@ -1765,6 +1839,30 @@ impl Dispatch<wp_image_description_info_v1::WpImageDescriptionInfoV1, u32> for W
             {
                 info.reference_nits = Some(reference_lum as f32);
             }
+            // The curve the description names, which is the only thing that says
+            // whether this output is an HDR one.  Its gamut and its white say
+            // nothing about that: a wide-gamut SDR output and a PQ one can agree
+            // on both, and only the transfer tells them apart.  Reading it is
+            // what stops a PQ pin surface being put on an output that would
+            // decode those codes as sRGB.
+            wp_image_description_info_v1::Event::TfNamed {
+                tf: WEnum::Value(named),
+            } => info.transfer = transfer_of_named(named),
+            // A parametric curve is still an answer: a pure power curve with the
+            // sRGB exponent is sRGB, and one with PQ's is not representable that
+            // way at all (PQ is not a power curve), so only the two that map
+            // cleanly are read.  Anything else leaves the transfer unknown, and
+            // an unknown transfer keeps the output on the HDR path — see
+            // [`is_hdr`] — rather than being guessed at.
+            wp_image_description_info_v1::Event::TfPower { eexp } => {
+                // 2.2 and the sRGB curve's nominal 2.4 both name the SDR curve
+                // this pipeline writes; the protocol carries four decimals.
+                if eexp == 24_000 || eexp == 22_000 {
+                    info.transfer = Some(Transfer::Srgb);
+                } else if eexp == 10_000 {
+                    info.transfer = Some(Transfer::Linear);
+                }
+            }
             wp_image_description_info_v1::Event::Done => {
                 // Taking the entry out is what tells the wait above this
                 // output has answered.
@@ -1774,6 +1872,9 @@ impl Dispatch<wp_image_description_info_v1::WpImageDescriptionInfoV1, u32> for W
                     }
                     if let Some(white) = info.reference_nits {
                         state.cm_white.insert(*data, white);
+                    }
+                    if let Some(transfer) = info.transfer {
+                        state.cm_transfer.insert(*data, transfer);
                     }
                 }
             }
@@ -2373,13 +2474,59 @@ impl Dispatch<wl_buffer::WlBuffer, BufferUserData> for WaylandState {
 #[cfg(test)]
 mod tests {
     use super::{
-        cursor_shape_for_handle, decode_wayland_keycode, selection_cursor_shape, RedrawTarget,
-        SelectionEvent, SelectionResult, WaylandState,
+        cursor_shape_for_handle, decode_wayland_keycode, is_hdr, selection_cursor_shape,
+        transfer_of_named, RedrawTarget, SelectionEvent, SelectionResult, WaylandState,
     };
     use crate::geometry::{Point, Rect};
+    use crate::model::Transfer;
     use crate::wayland::input::ResizeHandle;
     use crate::wayland::input::{EditorState, BTN_LEFT, KEY_ESC};
+    use wayland_protocols::wp::color_management::v1::client::wp_color_manager_v1::TransferFunction;
     use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::Shape;
+
+    #[test]
+    fn only_pq_and_hlg_name_an_hdr_output() {
+        assert_eq!(
+            transfer_of_named(TransferFunction::St2084Pq),
+            Some(Transfer::Pq)
+        );
+        assert_eq!(
+            transfer_of_named(TransferFunction::Hlg),
+            Some(Transfer::Hlg)
+        );
+        // Every SDR curve the protocol names, including the two deprecated ones
+        // and the two that differ from sRGB only below the point a pin's codes
+        // are decided.  Folding these into the SDR curve is what keeps an SDR
+        // output from being handed a PQ buffer.
+        for named in [
+            TransferFunction::Srgb,
+            TransferFunction::ExtSrgb,
+            TransferFunction::Bt1886,
+            TransferFunction::Gamma22,
+            TransferFunction::CompoundPower24,
+        ] {
+            assert_eq!(transfer_of_named(named), Some(Transfer::Srgb), "{named:?}");
+        }
+        assert_eq!(
+            transfer_of_named(TransferFunction::ExtLinear),
+            Some(Transfer::Linear)
+        );
+        // A curve this pipeline has no name for stays unknown rather than being
+        // read as the nearest one.
+        assert_eq!(transfer_of_named(TransferFunction::St428), None);
+        assert_eq!(transfer_of_named(TransferFunction::Log100), None);
+    }
+
+    #[test]
+    fn an_output_is_hdr_only_when_its_own_curve_is() {
+        assert!(is_hdr(Some(Transfer::Pq)));
+        assert!(is_hdr(Some(Transfer::Hlg)));
+        assert!(!is_hdr(Some(Transfer::Srgb)));
+        assert!(!is_hdr(Some(Transfer::Linear)));
+        // An output whose description never answered keeps the behaviour the
+        // helper had before it could ask.
+        assert!(is_hdr(None));
+    }
 
     #[test]
     fn pointer_motion_keeps_using_the_grabbed_output() {

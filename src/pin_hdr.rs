@@ -723,8 +723,8 @@ impl Surfaces {
         let colored = self.session.apply_pin_color()?;
         self.hdr_outputs = colored
             .into_iter()
-            .filter(|(name, _, _)| self.targets.contains_key(name))
-            .map(|(name, gamut, white)| {
+            .filter(|(name, _, _, _)| self.targets.contains_key(name))
+            .filter_map(|(name, gamut, white, hdr)| {
                 match gamut {
                     Some(gamut) => {
                         if let Some(output) = self.outputs.iter_mut().find(|out| out.name == name) {
@@ -750,7 +750,24 @@ impl Surfaces {
                     ),
                     None => {}
                 }
-                name
+                // An output whose own curve is not an HDR one is left to the Qt
+                // daemon's SDR copy.  Its surface carries the output's own
+                // description, which for an SDR output is the sRGB curve — so a
+                // PQ buffer written into it would be decoded as sRGB, and every
+                // pin would come out dark with its highlights clipped.  The
+                // output is still reported to the caller above, so an SDR pin
+                // there is drawn against the right white; it is only the HDR
+                // path that has nothing to do on this output.
+                if !hdr {
+                    if debug {
+                        eprintln!(
+                            "vshot: pin-hdr: {name}: the output's own curve is not PQ or HLG; \
+                             it is an SDR output and pins stay on the daemon's SDR surface"
+                        );
+                    }
+                    return None;
+                }
+                Some(name)
             })
             .collect();
         if debug {
