@@ -8,6 +8,12 @@
 //! that turns them into [`RegionNode`]s, so the picker offers a button or a
 //! panel the way it already offers a window.
 //!
+//! This is the source that is asked first, because it is the only one that
+//! *knows* rather than guesses: a toolkit's tree names its widgets and reports
+//! their real bounds.  It is also the one that most often cannot answer at all —
+//! a program that draws its own UI has no tree to expose, and Chromium and
+//! Electron only build one when launched with `--force-renderer-accessibility`.
+//!
 //! Two things about AT-SPI on Wayland shape everything here.
 //!
 //! First, **its coordinates are window-relative**, whatever the coordinate type
@@ -25,10 +31,12 @@ use zbus::blocking::connection::Builder;
 use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
 
-use crate::error::Result;
 use crate::capture::window::WindowCandidate;
+use crate::error::Result;
 use crate::geometry::{Point, Rect, Size};
 use crate::selection_region::{RegionKind, RegionNode};
+
+use super::{ElementRequest, ElementSource};
 
 /// How long one query may take before the answer is given up on.
 ///
@@ -363,20 +371,28 @@ fn to_rect(x: i32, y: i32, width: i32, height: i32) -> Option<Rect> {
     Some(Rect::new(x, y, size.width, size.height))
 }
 
-/// The elements of one window, as a source for the picker.
+/// The accessibility source: the tree a toolkit exposes for its window.
 ///
-/// Returns `None` when accessibility cannot answer at all — no bus, no frame
-/// matching this window, no tree under it — so the caller keeps offering whole
-/// windows rather than failing the session.
-///
-/// The window is the compositor's own description of it: the pid says *which*
-/// window, and its `geometry` is the origin AT-SPI cannot supply.  Both halves
-/// are needed and neither source has both.
-pub fn elements_for_window(window: &WindowCandidate) -> Option<Vec<RegionNode>> {
-    let accessibility = Accessibility::connect().ok()?;
-    let frames = accessibility.frames().ok()?;
-    let frame = match_frame(&frames, window)?;
-    accessibility.elements(frame, window.geometry).ok()
+/// The one source that knows rather than guesses, and therefore the first one
+/// asked.  It declines — `None` — for a window with no tree, which is the
+/// common case: a program that draws its own UI has none, and Chromium and
+/// Electron only build one when launched with `--force-renderer-accessibility`.
+pub struct AccessibilitySource;
+
+impl ElementSource for AccessibilitySource {
+    /// The elements of one window, or `None` when accessibility cannot answer.
+    ///
+    /// The window is the compositor's own description of it: the pid says
+    /// *which* window, and its `geometry` is the origin AT-SPI cannot supply.
+    /// Both halves are needed and neither source has both.  The frame is not
+    /// used — this source reads the toolkit, not the screen.
+    fn elements(&self, request: &ElementRequest<'_>) -> Option<Vec<RegionNode>> {
+        let window = request.window;
+        let accessibility = Accessibility::connect().ok()?;
+        let frames = accessibility.frames().ok()?;
+        let frame = match_frame(&frames, window)?;
+        accessibility.elements(frame, window.geometry).ok()
+    }
 }
 
 /// Which accessibility frame is this compositor window.
