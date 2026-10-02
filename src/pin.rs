@@ -149,6 +149,14 @@ pub(crate) enum PinCommand {
         #[serde(default)]
         text: bool,
     },
+    /// Writes one pin out to a file the user names.
+    ///
+    /// The dialog is the Qt helper's -- the daemon is a layer-shell client and
+    /// a layer surface cannot parent a popup -- and the writing is the
+    /// daemon's, which holds the pixels and the codecs.
+    Save {
+        id: u64,
+    },
     /// Which of the daemon's outputs are showing HDR.
     ///
     /// The daemon is the only side that knows: it has the colour-management
@@ -985,7 +993,7 @@ impl PqPin {
     /// The file body the surface helper reads: the magic, the size, the white,
     /// the gamut's six chromaticity coordinates as the protocol's millionth-unit
     /// integers, and the words in little-endian order.
-    fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(44 + self.words.len() * 4);
         bytes.extend_from_slice(b"VSHTPQ02");
         bytes.extend_from_slice(&self.width.to_le_bytes());

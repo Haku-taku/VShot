@@ -36,7 +36,7 @@ use serde_json::json;
 use crate::error::{Result, VshotError};
 use crate::geometry::{Point, Rect, Size};
 use crate::model::picture::{self, Picture};
-use crate::pin::PinCommand;
+use crate::pin::{PinCommand, PqPin};
 use crate::pin_hdr::{OutputPlacement, Pin, Surfaces};
 
 /// How long a client may take to send its request before the connection is
@@ -658,6 +658,84 @@ fn clipboard_image_type(listed: &str) -> Option<&str> {
         })
 }
 
+/// The formats the save dialog may offer, as the `name/suffix,...` argument it
+/// parses.
+///
+/// Built from the registry rather than from a list kept here: which formats a
+/// build can write is the codecs' answer, and a dialog that knew names of its
+/// own would eventually offer one the binary cannot write.
+fn save_format_argument(hdr: bool) -> String {
+    let codecs: Vec<(&str, &str, &[&str])> = if hdr {
+        crate::model::codec::codecs()
+            .into_iter()
+            .map(|codec| (codec.name(), codec.extension(), codec.suffixes()))
+            .collect()
+    } else {
+        crate::model::codec::sdr_codecs()
+            .into_iter()
+            .map(|codec| (codec.name(), codec.extension(), codec.suffixes()))
+            .collect()
+    };
+    codecs
+        .into_iter()
+        .map(|(name, extension, suffixes)| {
+            // A format spelled one way reports no suffixes and is named by its
+            // extension -- which is what the registry's own JSON does, and the
+            // dialog reads both the same way.  Reading the empty list as "no
+            // suffix at all" would drop every format but JPEG.
+            if suffixes.is_empty() {
+                format!("{name}/{extension}")
+            } else {
+                format!("{name}/{}", suffixes.join("/"))
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(",")
+}
+
+/// Runs the save dialog and answers what the user chose: the path, and whether
+/// the SDR copy was asked for beside it.
+///
+/// `None` when the dialog was cancelled or could not run, which are the same
+/// thing from here: nothing was asked for.  A daemon that reported a failure
+/// for a closed dialog would be telling the user something went wrong when
+/// they simply changed their mind.
+fn run_save_dialog(
+    helper: &Path,
+    suggested: &str,
+    output_name: &str,
+    formats: &str,
+    hdr: bool,
+) -> Result<Option<(PathBuf, bool)>> {
+    let output = std::process::Command::new(helper)
+        .arg("--save-dialog")
+        .arg(suggested)
+        .arg(output_name)
+        .arg(formats)
+        .arg(if hdr { "hdr" } else { "sdr" })
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|source| VshotError::Pin(format!("cannot run the save dialog: {source}")))?;
+    let reply: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+    if !reply
+        .get("ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    let Some(path) = reply.get("path").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    // The SDR copy is only ever asked about for content that has an HDR half;
+    // for anything else the answer is "there is nothing to copy beside".
+    let copy = reply
+        .get("sdrCopy")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Ok(Some((PathBuf::from(path), copy)))
+}
+
 /// Where the chrome process listens: beside the daemon's own socket, with a
 /// name of its own, so both can live in the runtime directory a session owns
 /// without either having to be told about the other.
@@ -1034,6 +1112,7 @@ impl Daemon {
             })),
             // Answered by the caller, which is the loop that has to stop.
             PinCommand::Edit { id, text } => self.start_edit(id, text),
+            PinCommand::Save { id } => self.save(id),
             PinCommand::Quit => Ok(json!({"ok": true})),
             PinCommand::AddClipboard {
                 density,
@@ -1041,6 +1120,134 @@ impl Daemon {
                 ..
             } => self.add_clipboard(density, output_name.as_deref()),
         }
+    }
+
+    /// Writes one pin out to a file the user names.
+    ///
+    /// The dialog is a Qt process of its own, like the editor: this daemon is a
+    /// layer-shell client and a layer surface cannot parent a popup, so the
+    /// window has to be somebody else's.  It answers with a path and a format,
+    /// and the writing is this side's -- it is the side holding the pixels, and
+    /// the side with the codecs.
+    fn save(&mut self, id: u64) -> Result<serde_json::Value> {
+        let Some(index) = self.stack.pins.iter().position(|pin| pin.id == id) else {
+            return Err(VshotError::Pin(
+                "save names a pin that is not pinned".to_string(),
+            ));
+        };
+        let Some(helper) = helper_program() else {
+            return Err(VshotError::Pin(
+                "cannot locate vshot-qt-ui for the save dialog; set VSHOT_QT_HELPER".into(),
+            ));
+        };
+        let pin = &self.stack.pins[index];
+        let size = Stack::drawn(pin.picture.size(), pin.scale);
+        let rect = Rect::new(pin.origin.x, pin.origin.y, size.width, size.height);
+        // The name the dialog opens with: the file the pin came from, so a
+        // re-save lands beside the original, and otherwise a timestamped name
+        // in the same shape the CLI writes.
+        let suggested = pin
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| {
+                format!("vshot-{}.png", chrono::Local::now().format("%Y%m%d-%H%M%S"))
+            });
+        // The formats the dialog may offer: what this content can be written
+        // as, which is the same question the CLI answers for a capture.
+        let hdr = pin.picture.as_hdr().is_some();
+        let formats = save_format_argument(hdr);
+        let output_name = self.surfaces.output_name_at(rect).unwrap_or("").to_string();
+        let Some((destination, sdr_copy)) =
+            run_save_dialog(&helper, &suggested, &output_name, &formats, hdr)?
+        else {
+            // The user closed the dialog: nothing was asked for, and nothing is
+            // wrong.
+            return Ok(json!({"ok": true, "saved": false}));
+        };
+        self.write_pin(index, &destination, sdr_copy)?;
+        Ok(json!({
+            "ok": true,
+            "saved": true,
+            "path": destination.to_string_lossy(),
+        }))
+    }
+
+    /// Writes one pin's picture out, through the CLI's own export path.
+    ///
+    /// Not by encoding here: `vshot pin --export` already does exactly this --
+    /// it takes the SDR picture and, for a pin that has one, the `VSHTPQ02`
+    /// half, and writes them the way a capture writes its own two files, at the
+    /// formats and settings the config names.  A second implementation here
+    /// would be a second answer to "what does saving a pin produce", and the
+    /// two would drift.
+    ///
+    /// So the picture goes out as the two files that path expects, in a
+    /// directory this daemon owns and removes when the write is done.
+    fn write_pin(&self, index: usize, destination: &Path, sdr_copy: bool) -> Result<()> {
+        let pin = &self.stack.pins[index];
+        let directory = tempfile::Builder::new()
+            .prefix("vshot-pin-save-")
+            .tempdir()
+            .map_err(|error| VshotError::Pin(format!("cannot make a save directory: {error}")))?;
+        // The SDR picture: the codes as they are for a picture that has no
+        // light of its own, and the tone map for one that has.
+        let frame = match &pin.picture {
+            Picture::Sdr(frame) => frame.clone(),
+            Picture::Hdr(image) => image
+                .frame
+                .tone_map_to_srgb_with(crate::config::tone_map_options())?,
+        };
+        let png = directory.path().join("pin.png");
+        std::fs::write(
+            &png,
+            frame.encode_png(crate::model::frame::PngCompression::Fast)?,
+        )
+        .map_err(|source| VshotError::Pin(format!("cannot write the picture to save: {source}")))?;
+        let Some(program) = std::env::current_exe().ok() else {
+            return Err(VshotError::Pin(
+                "cannot find the vshot binary to save with".into(),
+            ));
+        };
+        let mut command = std::process::Command::new(program);
+        command
+            .arg("pin")
+            .arg("--export")
+            .arg(&png)
+            .arg(destination);
+        if let Some(image) = pin.picture.as_hdr() {
+            // The half the CLI reads back: the same light, in the container this
+            // program hands a pin over in.
+            let half = PqPin {
+                words: image
+                    .frame
+                    .to_rgb10_pq_in(image.frame.primaries(), image.white()),
+                width: image.frame.size().width,
+                height: image.frame.size().height,
+                reference_nits: image.white(),
+                primaries: image.frame.primaries(),
+            };
+            let pq = directory.path().join("pin.pq");
+            std::fs::write(&pq, half.encode()).map_err(|source| {
+                VshotError::Pin(format!("cannot write the HDR half to save: {source}"))
+            })?;
+            command
+                .arg("--hdr-source")
+                .arg(&pq)
+                .arg("--sdr-copy")
+                .arg(if sdr_copy { "true" } else { "false" });
+        }
+        let status = command
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|source| VshotError::Pin(format!("cannot run the save: {source}")))?;
+        if !status.status.success() {
+            let reason = String::from_utf8_lossy(&status.stderr).trim().to_string();
+            return Err(VshotError::Pin(format!(
+                "could not save the picture: {reason}"
+            )));
+        }
+        Ok(())
     }
 
     /// The whole desktop as the layout places it, for the editor's session.
@@ -1757,6 +1964,40 @@ mod tests {
         // The marks described the old pixels, and a picture that arrives
         // without any of its own has none to keep.
         assert!(stack.pins[0].annotations.is_none());
+    }
+
+    /// The save dialog is offered what this build can write, built from the
+    /// registry rather than from a list kept here: a dialog with names of its
+    /// own would eventually offer one the binary cannot write.
+    #[test]
+    fn the_save_dialog_is_offered_the_formats_this_build_has() {
+        let sdr = save_format_argument(false);
+        // Every entry is `name/suffix/...`, and every format that has a suffix
+        // is in there.
+        for entry in sdr.split(',') {
+            let mut parts = entry.split('/');
+            assert!(parts.next().is_some_and(|name| !name.is_empty()), "{entry}");
+            assert!(
+                parts.next().is_some_and(|suffix| !suffix.is_empty()),
+                "{entry}"
+            );
+        }
+        assert!(sdr.starts_with("png/png"), "{sdr}");
+        assert!(sdr.contains("jpeg/jpg/jpeg"), "{sdr}");
+        // Every format in the registry is in the list, spelled one way or two.
+        for name in crate::model::codec::sdr_names() {
+            assert!(
+                sdr.contains(&format!("{name}/")),
+                "{name} missing from {sdr}"
+            );
+        }
+        // The HDR half is a different list, and it is not the SDR one.
+        let hdr = save_format_argument(true);
+        assert!(!hdr.contains("png/"), "{hdr}");
+        assert!(
+            hdr.contains("jxl/jxl") || hdr.contains("avif/avif"),
+            "{hdr}"
+        );
     }
 
     /// The clipboard's own list decides which type is read, and the order is

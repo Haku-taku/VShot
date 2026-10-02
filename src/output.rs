@@ -499,7 +499,7 @@ pub fn create_parent_directories(path: &Path) -> Result<()> {
     })
 }
 
-fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = File::create(path).map_err(|source| VshotError::WriteFile {
         path: path.to_path_buf(),
         source,
