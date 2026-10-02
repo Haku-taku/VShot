@@ -180,6 +180,33 @@ fn parse_density(token: &str) -> Option<u32> {
     ((1.0..=4.0).contains(&rounded) && (value - rounded).abs() <= 0.05).then_some(rounded as u32)
 }
 
+/// How well one output holds a pin: the area they overlap by, or the negative
+/// of the gap between them when they do not meet.  Overlap beats any gap, and
+/// among gaps the smallest wins -- which is what makes a pin dragged past every
+/// edge come back to the nearest screen rather than to whichever happened to be
+/// checked first.
+fn hold_score(bounds: Rect, rect: Rect) -> i64 {
+    let area = bounds.intersection(rect).map_or(0, |overlap| {
+        i64::from(overlap.size.width) * i64::from(overlap.size.height)
+    });
+    if area > 0 {
+        area
+    } else {
+        -i64::from(chebyshev_gap(bounds, rect))
+    }
+}
+
+/// How far apart two rectangles are on their worst axis, and zero when they
+/// meet: the Chebyshev distance, which is the one a rectangle's own edges are
+/// measured in.
+fn chebyshev_gap(a: Rect, b: Rect) -> i32 {
+    let right = |rect: Rect| rect.origin.x + rect.size.width as i32 - 1;
+    let bottom = |rect: Rect| rect.origin.y + rect.size.height as i32 - 1;
+    let dx = (a.origin.x - right(b)).max(b.origin.x - right(a)).max(0);
+    let dy = (a.origin.y - bottom(b)).max(b.origin.y - bottom(a)).max(0);
+    dx.max(dy)
+}
+
 /// How long the daemon stays up with nothing pinned.
 ///
 /// It is resident so that pins outlive the command that made them, and with
@@ -195,6 +222,10 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// How much one wheel notch scales a pin by.  Multiplicative rather than
 /// additive, so a notch feels the same at any size.
 const ZOOM_PER_NOTCH: f64 = 1.1;
+
+/// How much of a pin has to stay on the output it overlaps most, so that it can
+/// always be grabbed back.  The same margin the daemon this replaces used.
+const GRAB_MARGIN: i32 = 32;
 
 /// The range a pin may be zoomed to, on the same reasoning as the Qt daemon's:
 /// below a tenth a pin is a speck, and above eight times a screenshot is a
@@ -238,26 +269,70 @@ struct Stack {
     next_id: u64,
     all_visible: bool,
     pointer: Pointer,
+    /// Where a pin may be put, which is what keeps one from being dragged past
+    /// every screen.  Read once when the daemon comes up: a pin lives as long
+    /// as the daemon does, and so does the arrangement it was placed against.
+    outputs: Vec<OutputPlacement>,
 }
 
 impl Stack {
-    fn new() -> Self {
+    fn new(outputs: Vec<OutputPlacement>) -> Self {
         Self {
             pins: Vec::new(),
             next_id: 1,
             all_visible: true,
             pointer: Pointer::default(),
+            outputs,
         }
+    }
+
+    /// The size a pin of `source` pixels is drawn at, at `scale`.
+    fn drawn(source: Size, scale: f64) -> Size {
+        Size::new(
+            (f64::from(source.width) * scale).round().max(1.0) as u32,
+            (f64::from(source.height) * scale).round().max(1.0) as u32,
+        )
     }
 
     /// A pin's rectangle in global logical pixels.
     fn rect_of(pin: &Pinned) -> Rect {
-        let size = pin.picture.size();
-        Rect::new(
-            pin.origin.x,
-            pin.origin.y,
-            (f64::from(size.width) * pin.scale).round().max(1.0) as u32,
-            (f64::from(size.height) * pin.scale).round().max(1.0) as u32,
+        let size = Self::drawn(pin.picture.size(), pin.scale);
+        Rect::new(pin.origin.x, pin.origin.y, size.width, size.height)
+    }
+
+    /// Where a pin may be dragged to.
+    ///
+    /// At least [`GRAB_MARGIN`] of it has to stay on the output it overlaps
+    /// most.  A drag that overshoots every screen lands back on the nearest one
+    /// rather than somewhere it can never be reached from again -- which is
+    /// what an unclamped drag does the first time someone flicks a pin off the
+    /// edge.
+    fn clamp_origin(&self, origin: Point, size: Size) -> Point {
+        let rect = Rect::new(origin.x, origin.y, size.width, size.height);
+        let Some(best) = self
+            .outputs
+            .iter()
+            .map(|output| output.geometry)
+            .max_by_key(|bounds| hold_score(*bounds, rect))
+        else {
+            return origin;
+        };
+        // Two ways of saying the same thing -- "the far edge is a margin inside
+        // the near one" and the other way round -- taken as a range, so that a
+        // pin wider than the output is still allowed to be placed somewhere.
+        let across = [
+            best.origin.x - size.width as i32 + GRAB_MARGIN,
+            best.origin.x + best.size.width as i32 - GRAB_MARGIN,
+        ];
+        let down = [
+            best.origin.y - size.height as i32 + GRAB_MARGIN,
+            best.origin.y + best.size.height as i32 - GRAB_MARGIN,
+        ];
+        Point::new(
+            origin
+                .x
+                .clamp(across[0].min(across[1]), across[0].max(across[1])),
+            origin.y.clamp(down[0].min(down[1]), down[0].max(down[1])),
         )
     }
 
@@ -307,15 +382,19 @@ impl Stack {
         let Some((id, from, origin)) = self.pointer.drag else {
             return Change::default();
         };
-        let Some(pin) = self.pins.iter_mut().find(|pin| pin.id == id) else {
+        let Some(index) = self.pins.iter().position(|pin| pin.id == id) else {
             self.pointer.drag = None;
             return Change::default();
         };
-        let moved = Point::new(origin.x + (point.x - from.x), origin.y + (point.y - from.y));
-        if pin.origin == moved {
+        let drawn = Self::rect_of(&self.pins[index]).size;
+        let moved = self.clamp_origin(
+            Point::new(origin.x + (point.x - from.x), origin.y + (point.y - from.y)),
+            drawn,
+        );
+        if self.pins[index].origin == moved {
             return Change::default();
         }
-        pin.origin = moved;
+        self.pins[index].origin = moved;
         Change {
             redraw: true,
             closed: false,
@@ -340,24 +419,32 @@ impl Stack {
             return Change::default();
         };
         let factor = ZOOM_PER_NOTCH.powi(notches);
-        let pin = &mut self.pins[index];
-        let next = (pin.scale * factor).clamp(MIN_SCALE, MAX_SCALE);
-        if next == pin.scale {
+        let source = self.pins[index].picture.size();
+        let corner = self.pins[index].origin;
+        let before = Self::drawn(source, self.pins[index].scale);
+        let next = (self.pins[index].scale * factor).clamp(MIN_SCALE, MAX_SCALE);
+        if next == self.pins[index].scale {
             return Change::default();
         }
         // The centre is what stays put: the pin is resized about it, so the
-        // point under the cursor is the point the user aimed at.
-        let before = Self::rect_of(pin);
+        // point the user aimed at is the point that grows under the cursor.  A
+        // pin grown past the edge of its output is pulled back like a dragged
+        // one, so the wheel cannot put a corner somewhere unreachable either.
         let centre = Point::new(
-            before.origin.x + before.size.width as i32 / 2,
-            before.origin.y + before.size.height as i32 / 2,
+            corner.x + before.width as i32 / 2,
+            corner.y + before.height as i32 / 2,
         );
+        let after = Self::drawn(source, next);
+        let origin = self.clamp_origin(
+            Point::new(
+                centre.x - after.width as i32 / 2,
+                centre.y - after.height as i32 / 2,
+            ),
+            after,
+        );
+        let pin = &mut self.pins[index];
         pin.scale = next;
-        let after = Self::rect_of(pin);
-        pin.origin = Point::new(
-            centre.x - after.size.width as i32 / 2,
-            centre.y - after.size.height as i32 / 2,
-        );
+        pin.origin = origin;
         Change {
             redraw: true,
             closed: false,
@@ -395,7 +482,7 @@ impl Daemon {
         let mut surfaces = Surfaces::new()?;
         surfaces.start()?;
         Ok(Self {
-            stack: Stack::new(),
+            stack: Stack::new(surfaces.placements()),
             surfaces,
             idle: None,
         })
@@ -887,10 +974,10 @@ mod tests {
 
     // --- what a gesture means ---------------------------------------------
 
-    /// A stack of `count` pins, each 100x50 at 1:1, laid out in a row so that
-    /// they do not overlap unless a test makes them.
+    /// A stack of `count` pins on one 1920x1080 output, each 100x50 at 1:1,
+    /// laid out in a row so that they do not overlap unless a test makes them.
     fn stack_of(count: usize) -> Stack {
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(vec![output(1920, 1080, 1)]);
         for index in 0..count {
             let id = stack.next_id;
             stack.next_id += 1;
@@ -1010,41 +1097,53 @@ mod tests {
 
     /// The wheel scales the pin under it by a tenth a notch, about the pin's
     /// own centre, and stops at the ends of the range.
+    ///
+    /// The pin sits in the middle of the output on purpose: one against an edge
+    /// is held there by the grab margin, so a wheel at the corner moves it as
+    /// well as resizing it, and that is a different test.
     #[test]
     fn the_wheel_scales_about_the_pins_centre() {
         let mut stack = stack_of(1);
-        stack.pins[0].origin = Point::new(0, 0);
-        let change = stack.scroll(1, Point::new(50, 25));
+        stack.pins[0].origin = Point::new(910, 515);
+        let change = stack.scroll(1, Point::new(960, 540));
         assert!(change.redraw);
         assert!((stack.pins[0].scale - ZOOM_PER_NOTCH).abs() < 1e-9);
-        // 100x50 about its centre (50, 25) at 1.1 is 110x55, so the top-left
+        // 100x50 about its centre (960, 540) at 1.1 is 110x55, so the top-left
         // moves back by five and two and a half.
-        assert_eq!(stack.pins[0].origin, Point::new(-5, -2));
+        assert_eq!(stack.pins[0].origin, Point::new(905, 513));
 
         // One notch back and it is where it started.
-        stack.scroll(-1, Point::new(50, 25));
+        stack.scroll(-1, Point::new(960, 540));
         assert!((stack.pins[0].scale - 1.0).abs() < 1e-9);
+        assert_eq!(stack.pins[0].origin, Point::new(910, 515));
 
         // The ends of the range hold.
         for _ in 0..200 {
-            stack.scroll(1, Point::new(50, 25));
+            stack.scroll(1, Point::new(960, 540));
         }
         assert_eq!(stack.pins[0].scale, MAX_SCALE);
         for _ in 0..300 {
-            stack.scroll(-1, Point::new(50, 25));
+            stack.scroll(-1, Point::new(960, 540));
         }
         assert_eq!(stack.pins[0].scale, MIN_SCALE);
     }
 
-    /// The wheel over nothing, and a wheel that lands on a pin already at the
-    /// end of its range, are both nothing to repaint.
+    /// A drag that overshoots every screen leaves a corner of the pin behind,
+    /// so it can always be grabbed back.  Without this the first flick off the
+    /// edge loses the pin for good.
     #[test]
-    fn a_wheel_that_changes_nothing_is_not_a_repaint() {
+    fn a_drag_off_the_edge_leaves_the_pin_reachable() {
         let mut stack = stack_of(1);
-        assert_eq!(stack.scroll(1, Point::new(5000, 5000)), Change::default());
-        assert_eq!(stack.scroll(0, Point::new(10, 10)), Change::default());
-        stack.pins[0].scale = MAX_SCALE;
-        assert_eq!(stack.scroll(1, Point::new(10, 10)), Change::default());
+        let start = Instant::now();
+        stack.press(Point::new(10, 10), start);
+        // Far past the right edge, and far above the top.
+        stack.motion(Point::new(9000, -9000));
+        let origin = stack.pins[0].origin;
+        // A 100x50 pin: a margin's worth of it is still on the 1920x1080 output
+        // at 0,0, on both axes.
+        assert_eq!(origin, Point::new(1920 - GRAB_MARGIN, -50 + GRAB_MARGIN));
+        // And it is still hit-testable, which is the point of the margin.
+        assert!(stack.index_at(Point::new(1919, 0)).is_some());
     }
 
     /// Hiding and showing is the whole stack at once, which is what the CLI's
