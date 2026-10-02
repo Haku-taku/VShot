@@ -138,6 +138,14 @@ pub(crate) enum PinCommand {
     Close,
     Quit,
     List,
+    /// Which of the daemon's outputs are showing HDR.
+    ///
+    /// The daemon is the only side that knows: it has the colour-management
+    /// session and has already read every output's curve, so asking it is one
+    /// short round trip.  A client that built a session of its own to ask the
+    /// same question would be a second answer to it, and two answers can
+    /// disagree about which screen the user is on.
+    Outputs,
 }
 
 /// An output's global logical rect on the wire.
@@ -185,6 +193,16 @@ pub(crate) struct PinReply {
     pub count: Option<u64>,
     #[serde(default)]
     pub visible: Option<bool>,
+    /// The outputs that are showing HDR, for `Outputs`.  Absent from every
+    /// other reply, and from a daemon that does not know the question.
+    #[serde(default)]
+    pub hdr: Option<Vec<String>>,
+    /// How many outputs the daemon has a picture surface on.  Zero is a
+    /// session that cannot show a pinned picture at all -- no colour
+    /// management, or no half-float buffer -- and it is what tells "none of my
+    /// outputs is HDR" apart from "I have no outputs to speak of".
+    #[serde(default)]
+    pub outputs: Option<usize>,
 }
 
 impl PinReply {
@@ -464,8 +482,33 @@ fn pin_file(
     // `--hdr-half false` and `cli.pin.hdr-half` turn the search off, and then
     // the SDR file is pinned as it stands -- which is what a caller wants when
     // the half beside it is not the picture they meant (a stale one from an
-    // earlier capture, or a file that merely shares its name).
-    let half = match hdr_half {
+    // earlier capture, or a file that merely shares its name).  And the search
+    // only happens where the half can be shown: on an output that cannot show
+    // HDR, the file the user named is the picture.
+    let wants_half = hdr_half && on_hdr_output(output_name.as_deref());
+    if rust_daemon() {
+        // That daemon decodes the file it is given and encodes it for each
+        // output, so the substitution is what it sounds like: the sibling
+        // *becomes* the path, and there is no second file to name.  A sibling
+        // it cannot read is no sibling at all, and the file as given stands.
+        let path = match wants_half {
+            true => hdr_sibling_path(&path).unwrap_or(path),
+            false => path,
+        };
+        return execute(PinCommand::Add {
+            path,
+            hdr: None,
+            density,
+            output,
+            output_name,
+            at: None,
+            annotations: None,
+            base: None,
+            ack: false,
+        })
+        .map(|_| ());
+    }
+    let half = match wants_half {
         true => match hdr_half_beside(&path, reference_nits) {
             Some(pq) => Some(PinHalf::write(&pq)?),
             None => None,
@@ -526,6 +569,45 @@ fn hdr_sibling_path(path: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Whether a capture's HDR half is worth pinning on the output this pin is
+/// about to land on.
+///
+/// The setting asks for the half a capture wrote beside the file; it only means
+/// something where the half can be *shown*, which is an output whose own curve
+/// is an HDR one.  On any other the pin would carry light it never displays,
+/// and would offer to save an HDR file from a picture the user is looking at in
+/// SDR.
+///
+/// Which outputs those are is the daemon's to answer: it holds the session and
+/// has already read every output's curve, so this is one short round trip
+/// rather than a second colour-management client that could disagree with it.
+/// A daemon that cannot answer at all -- one that does not know the question,
+/// or one with no picture surface anywhere -- is read as "yes", which is what
+/// this did before it could ask.
+fn hdr_half_is_worth_it(name: Option<&str>, reply: Option<&PinReply>) -> bool {
+    let Some(reply) = reply else {
+        return true;
+    };
+    let (Some(hdr), Some(outputs)) = (reply.hdr.as_ref(), reply.outputs) else {
+        return true;
+    };
+    if outputs == 0 {
+        return true;
+    }
+    match name {
+        Some(name) => hdr.iter().any(|known| known == name),
+        // Nothing named: the pin lands on whichever output the daemon chooses,
+        // so the half is worth having unless none of them can show it.
+        None => !hdr.is_empty(),
+    }
+}
+
+/// Whether the output this pin lands on is showing HDR, as the daemon sees it.
+fn on_hdr_output(name: Option<&str>) -> bool {
+    let reply = execute(PinCommand::Outputs).ok();
+    hdr_half_is_worth_it(name, reply.as_ref())
 }
 
 /// The HDR half a capture wrote beside `path`, as the PQ codes a pin travels
@@ -738,11 +820,21 @@ fn keep_daemon_stderr() -> bool {
 
 /// Starts the resident daemon detached: no pipes are inherited, so the CLI
 /// returns immediately while the surfaces live on.
+/// Whether the daemon being rewritten is the one to run.
+///
+/// Opt-in while both exist: a session that sets nothing keeps the daemon it has
+/// always had, and the differences between them -- which file a pin is given,
+/// and whether it is told about an HDR half at all -- hang off this one answer
+/// rather than off a guess.
+fn rust_daemon() -> bool {
+    std::env::var_os("VSHOT_PIN_DAEMON").as_deref() == Some(std::ffi::OsStr::new("rust"))
+}
+
 fn spawn_daemon() -> Result<()> {
     // The daemon that is being rewritten: this same binary, holding the pins
     // and drawing them itself.  Opt-in while the two exist side by side, so a
     // session that sets nothing keeps the daemon it has always had.
-    if std::env::var_os("VSHOT_PIN_DAEMON").as_deref() == Some(std::ffi::OsStr::new("rust")) {
+    if rust_daemon() {
         let program = std::env::current_exe().map_err(|source| VshotError::CommandIo {
             program: "vshot".into(),
             source,
@@ -1849,6 +1941,50 @@ mod tests {
         assert!((white[0] - 1.0).abs() < 0.01, "{white:?}");
         let bright = decoded.frame.pixel(1, 0).unwrap();
         assert!((bright[0] - 4.0).abs() < 0.05, "{bright:?}");
+    }
+
+    /// The half a capture wrote beside a file is pinned only where it can be
+    /// shown.  Every way of not knowing the answer is read as "pin it", because
+    /// that is what this did before it could ask, and a question that cannot be
+    /// answered must not quietly change what a pin is.
+    #[test]
+    fn the_hdr_half_is_only_worth_pinning_on_an_hdr_output() {
+        let says = |hdr: &[&str], outputs: usize| PinReply {
+            ok: true,
+            error: None,
+            count: None,
+            visible: None,
+            hdr: Some(hdr.iter().map(|name| (*name).to_string()).collect()),
+            outputs: Some(outputs),
+        };
+
+        // The ordinary HDR session, and the SDR one.
+        let hdr_session = says(&["DP-6"], 1);
+        assert!(hdr_half_is_worth_it(Some("DP-6"), Some(&hdr_session)));
+        let sdr_session = says(&[], 1);
+        assert!(!hdr_half_is_worth_it(Some("WAYLAND-1"), Some(&sdr_session)));
+
+        // A pin that names no output lands on whichever the daemon picks: the
+        // half is worth having if any output can show it.
+        assert!(hdr_half_is_worth_it(None, Some(&hdr_session)));
+        assert!(!hdr_half_is_worth_it(None, Some(&sdr_session)));
+
+        // A session with no picture surface at all cannot show a pin, let
+        // alone an HDR one, so it is not an answer about this question.
+        assert!(hdr_half_is_worth_it(Some("WAYLAND-1"), Some(&says(&[], 0))));
+
+        // And every way of not being answered: no daemon, or one that does not
+        // know the question.
+        assert!(hdr_half_is_worth_it(Some("DP-6"), None));
+        let old = PinReply {
+            ok: true,
+            error: None,
+            count: None,
+            visible: None,
+            hdr: None,
+            outputs: None,
+        };
+        assert!(hdr_half_is_worth_it(Some("DP-6"), Some(&old)));
     }
 
     /// The daemon parses what the client writes, from the one definition both

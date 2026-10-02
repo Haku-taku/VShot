@@ -829,13 +829,13 @@ impl Surfaces {
         Ok(())
     }
 
-    /// The covered outputs whose own curve is an HDR one.
+    /// The outputs whose own curve is an HDR one.
     ///
     /// Reported beside the full list rather than instead of it: "this side
     /// draws here" and "what is shown here is HDR" are different questions, and
     /// the daemon needs both — the first to know which pins to leave alone, the
     /// second to mark one as being shown in HDR.
-    fn hdr_outputs(&self) -> Vec<String> {
+    pub(crate) fn hdr_outputs(&self) -> Vec<String> {
         self.picture_outputs
             .iter()
             .filter(|name| {

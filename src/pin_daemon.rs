@@ -639,6 +639,16 @@ impl Daemon {
                 "count": self.stack.pins.len(),
                 "visible": self.stack.all_visible,
             })),
+            // Which of this side's outputs are showing HDR.  Read from the
+            // surfaces' own picture of them, which is where the colour layer's
+            // answer landed: a client asking this is deciding whether to pin a
+            // capture's HDR half, and only the side that holds the session can
+            // answer.
+            PinCommand::Outputs => Ok(json!({
+                "ok": true,
+                "hdr": self.surfaces.hdr_outputs(),
+                "outputs": self.surfaces.surface_count(),
+            })),
             // Answered by the caller, which is the loop that has to stop.
             PinCommand::Quit => Ok(json!({"ok": true})),
             PinCommand::AddClipboard { .. } => Err(VshotError::Pin(
