@@ -58,6 +58,15 @@ struct Pinned {
     /// Logical pixels per source pixel.
     scale: f64,
     visible: bool,
+    /// The marks the pixels carry, as the editor reported them, when the pin
+    /// came out of an editing session that had any.
+    ///
+    /// Kept so the pin can be opened for editing again with the user's marks
+    /// still on them: they are the marks *as data*, which the flattened pixels
+    /// no longer are.  Nothing reads them yet -- the editor's handoff is not
+    /// wired -- but a write-back that dropped them would throw away the only
+    /// copy there is.
+    annotations: Option<serde_json::Value>,
 }
 
 impl Pinned {
@@ -451,6 +460,23 @@ impl Stack {
         }
     }
 
+    /// Gives the pin at `index` a new picture, read from `path`.
+    ///
+    /// Everything else about the pin stays: where it is, how big it is drawn,
+    /// whether it is hidden.  The editor replaced the *pixels*, and a
+    /// write-back that also moved the pin would undo the drag the user did
+    /// before opening it.
+    ///
+    /// The marks go with the picture they described: one that arrives with its
+    /// own gets them from the request that carried it, and one that arrives
+    /// without any has none to keep.
+    fn replace(&mut self, index: usize, picture: Picture, path: &Path) {
+        let pin = &mut self.pins[index];
+        pin.picture = picture;
+        pin.path = path.to_path_buf();
+        pin.annotations = None;
+    }
+
     /// Moves the pin at `index` to the front, answering where it ended up.
     fn raise(&mut self, index: usize) -> usize {
         if index + 1 == self.pins.len() {
@@ -603,13 +629,35 @@ impl Daemon {
                 base: _,
                 ack: _,
             } => self.add(&path, density, output_name.as_deref(), at),
-            PinCommand::Move { id, x, y, .. } => {
-                let Some(pin) = self.stack.pins.iter_mut().find(|pin| pin.id == id) else {
+            PinCommand::Move {
+                id,
+                x,
+                y,
+                path,
+                annotations,
+                ..
+            } => {
+                let Some(index) = self.stack.pins.iter().position(|pin| pin.id == id) else {
                     return Err(VshotError::Pin(format!(
                         "move names a pin that is not pinned"
                     )));
                 };
-                pin.origin = Point::new(x, y);
+                // The pixels first: a replacement that cannot be read must not
+                // leave the pin half-moved, and the position is the part a
+                // retry can afford to repeat.
+                if let Some(path) = path {
+                    let bytes = std::fs::read(&path).map_err(|source| {
+                        VshotError::Pin(format!("cannot read `{}`: {source}", path.display()))
+                    })?;
+                    let reference_nits = crate::config::hdr_reference_white_default()
+                        .unwrap_or(crate::model::hdr::REFERENCE_WHITE_NITS);
+                    let picture = picture::decode_bytes(&bytes, reference_nits)?;
+                    self.stack.replace(index, picture, &path);
+                }
+                if let Some(marks) = annotations {
+                    self.stack.pins[index].annotations = Some(marks);
+                }
+                self.stack.pins[index].origin = Point::new(x, y);
                 self.refresh()?;
                 Ok(json!({"ok": true}))
             }
@@ -714,6 +762,7 @@ impl Daemon {
             origin,
             scale,
             visible,
+            annotations: None,
         });
         self.refresh()?;
         Ok(json!({"ok": true, "id": id}))
@@ -1001,6 +1050,7 @@ mod tests {
                 origin: Point::new(index as i32 * 200, 0),
                 scale: 1.0,
                 visible: true,
+                annotations: None,
             });
         }
         stack
@@ -1136,6 +1186,29 @@ mod tests {
             stack.scroll(-1, Point::new(960, 540));
         }
         assert_eq!(stack.pins[0].scale, MIN_SCALE);
+    }
+
+    /// A write-back replaces the pixels and nothing else: where the pin is and
+    /// how big it is drawn are the user's, and a replacement that reset them
+    /// would undo the drag they did before opening the editor.
+    #[test]
+    fn replacing_a_picture_leaves_the_rest_of_the_pin_alone() {
+        let mut stack = stack_of(1);
+        stack.pins[0].origin = Point::new(40, 50);
+        stack.pins[0].scale = 0.5;
+        stack.pins[0].annotations = Some(serde_json::json!([{"kind": "rect"}]));
+        let replacement = Picture::Sdr(
+            crate::model::Frame::solid(Size::new(8, 4), [1, 2, 3, 255]).expect("frame"),
+        );
+        stack.replace(0, replacement, Path::new("/tmp/edited.png"));
+
+        assert_eq!(stack.pins[0].picture.size(), Size::new(8, 4));
+        assert_eq!(stack.pins[0].path, PathBuf::from("/tmp/edited.png"));
+        assert_eq!(stack.pins[0].origin, Point::new(40, 50));
+        assert_eq!(stack.pins[0].scale, 0.5);
+        // The marks described the old pixels, and a picture that arrives
+        // without any of its own has none to keep.
+        assert!(stack.pins[0].annotations.is_none());
     }
 
     /// A drag that overshoots every screen leaves a corner of the pin behind,
