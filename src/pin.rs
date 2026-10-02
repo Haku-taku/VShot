@@ -734,7 +734,7 @@ fn uri_list_path(list: &str) -> Option<PathBuf> {
 /// that was asked for (which `wl-paste` reports by exiting non-zero), or when
 /// it fails for any other reason.  All of those mean the same thing here: this
 /// side cannot resolve the clipboard, so the daemon is left to.
-fn paste(args: &[&str]) -> Option<Vec<u8>> {
+pub(crate) fn paste(args: &[&str]) -> Option<Vec<u8>> {
     let output = Command::new("wl-paste").args(args).output().ok()?;
     output.status.success().then_some(output.stdout)
 }

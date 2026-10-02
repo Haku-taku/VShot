@@ -602,6 +602,35 @@ fn helper_program() -> Option<PathBuf> {
     .find(|candidate| candidate.is_file())
 }
 
+/// The clipboard type to read an image from, out of what the clipboard offers.
+///
+/// The preferred types first, because a clipboard usually offers several and
+/// they are not equal: PNG is lossless and is what every screenshot path here
+/// writes, while the same picture as JPEG has been through a lossy encoder
+/// already.  Anything else under `image/` is taken when none of those is on
+/// offer, and it is up to the decoder to say whether it can read it -- a
+/// refusal from there names the type, which is more use than a guess here.
+fn clipboard_image_type(listed: &str) -> Option<&str> {
+    const PREFERRED: [&str; 5] = [
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/bmp",
+        "image/tiff",
+    ];
+    let offered = |wanted: &str| listed.lines().any(|line| line.trim() == wanted);
+    PREFERRED
+        .iter()
+        .copied()
+        .find(|kind| offered(kind))
+        .or_else(|| {
+            listed
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with("image/"))
+        })
+}
+
 /// Where the chrome process listens: beside the daemon's own socket, with a
 /// name of its own, so both can live in the runtime directory a session owns
 /// without either having to be told about the other.
@@ -953,10 +982,49 @@ impl Daemon {
             })),
             // Answered by the caller, which is the loop that has to stop.
             PinCommand::Quit => Ok(json!({"ok": true})),
-            PinCommand::AddClipboard { .. } => Err(VshotError::Pin(
-                "this daemon cannot pin the clipboard yet; name a file instead".into(),
-            )),
+            PinCommand::AddClipboard {
+                density,
+                output_name,
+                ..
+            } => self.add_clipboard(density, output_name.as_deref()),
         }
+    }
+
+    /// Pins whatever the clipboard holds as an image.
+    ///
+    /// Only the image: a copied *file* is resolved to a path by the CLI, which
+    /// has the same `wl-paste` and can hand this side something to decode, and
+    /// text and colours become cards, which are Qt's to render.  So what is
+    /// left here is bytes in one of the image types, which is the one case the
+    /// CLI cannot resolve for itself -- there is no path to name.
+    ///
+    /// The clipboard is read with `wl-paste` rather than through anything of
+    /// this program's: it is the one reader that works whatever the compositor
+    /// offers, and the capture side already writes it that way.
+    fn add_clipboard(
+        &mut self,
+        density: Option<u32>,
+        output_name: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let Some(listed) = crate::pin::paste(&["--list-types"]) else {
+            return Err(VshotError::Pin(
+                "`wl-paste` was not found, so the clipboard cannot be read; it comes from the \
+                 wl-clipboard package"
+                    .into(),
+            ));
+        };
+        let listed = String::from_utf8_lossy(&listed);
+        let Some(wanted) = clipboard_image_type(&listed) else {
+            return Err(VshotError::Pin(
+                "the clipboard holds no image this build can read".into(),
+            ));
+        };
+        let Some(bytes) = crate::pin::paste(&["--type", wanted, "--no-newline"]) else {
+            return Err(VshotError::Pin(format!(
+                "the clipboard offers {wanted} but would not hand it over"
+            )));
+        };
+        self.add_bytes(&bytes, density, output_name, None, None)
     }
 
     fn add(
@@ -971,20 +1039,37 @@ impl Daemon {
         let bytes = std::fs::read(path).map_err(|source| {
             VshotError::Pin(format!("cannot read `{}`: {source}", path.display()))
         })?;
+        self.add_bytes(&bytes, density, output_name, Some(path), at)
+    }
+
+    /// The rest of an add, once the bytes are in hand: decode, size, place.
+    ///
+    /// Shared by the two ways a pin arrives -- a file the user named, and bytes
+    /// off the clipboard -- because everything after the read is the same
+    /// question, and a second copy of the sizing would be a second answer to
+    /// it.
+    fn add_bytes(
+        &mut self,
+        bytes: &[u8],
+        density: Option<u32>,
+        output_name: Option<&str>,
+        source: Option<&Path>,
+        at: Option<crate::pin::WirePoint>,
+    ) -> Result<serde_json::Value> {
         let reference_nits = crate::config::hdr_reference_white_default()
             .unwrap_or(crate::model::hdr::REFERENCE_WHITE_NITS);
-        let picture = picture::decode_bytes(&bytes, reference_nits)?;
+        let picture = picture::decode_bytes(bytes, reference_nits)?;
         let size = picture.size();
         let placements = self.surfaces.placements();
         let target = self
             .surfaces
             .placement_of(output_name)
             .or_else(|| placements.first().copied());
-        let (density, source) = match target {
+        let (density, decided) = match target {
             Some(target) => resolve_density(
                 density,
-                picture::declared_scale(&bytes),
-                recorded_density(path, &source_record_path()),
+                picture::declared_scale(bytes),
+                source.and_then(|path| recorded_density(path, &source_record_path())),
                 size,
                 target,
                 &placements,
@@ -993,13 +1078,13 @@ impl Daemon {
             // word is the only one there is.
             None => (
                 density
-                    .or_else(|| picture::declared_scale(&bytes))
+                    .or_else(|| picture::declared_scale(bytes))
                     .unwrap_or(1),
                 "the request",
             ),
         };
         if std::env::var_os("VSHOT_PIN_DEBUG").is_some() {
-            eprintln!("vshot-pin: density {density} from {source}");
+            eprintln!("vshot-pin: density {density} from {decided}");
         }
         let scale = 1.0 / f64::from(density);
         let origin = match at {
@@ -1012,7 +1097,7 @@ impl Daemon {
         self.stack.pins.push(Pinned {
             id,
             picture,
-            path: path.to_path_buf(),
+            path: source.map(Path::to_path_buf).unwrap_or_default(),
             origin,
             scale,
             density,
@@ -1465,6 +1550,26 @@ mod tests {
         // The marks described the old pixels, and a picture that arrives
         // without any of its own has none to keep.
         assert!(stack.pins[0].annotations.is_none());
+    }
+
+    /// The clipboard's own list decides which type is read, and the order is
+    /// not arbitrary: the same picture is usually on offer as several, and PNG
+    /// is the one that has not been through a lossy encoder.
+    #[test]
+    fn the_best_image_type_the_clipboard_offers_is_the_one_read() {
+        let listed = "text/plain\nimage/jpeg\nimage/png\n";
+        assert_eq!(clipboard_image_type(listed), Some("image/png"));
+        // JPEG when that is all there is, rather than nothing.
+        assert_eq!(
+            clipboard_image_type("text/plain\nimage/jpeg\n"),
+            Some("image/jpeg")
+        );
+        // Anything under `image/` beats refusing: the decoder names what it
+        // cannot read, which is more use than a guess made here.
+        assert_eq!(clipboard_image_type("image/avif\n"), Some("image/avif"));
+        // Text and files are the CLI's to resolve, and this says so.
+        assert_eq!(clipboard_image_type("text/plain\ntext/uri-list\n"), None);
+        assert_eq!(clipboard_image_type(""), None);
     }
 
     /// A drag that overshoots every screen leaves a corner of the pin behind,
