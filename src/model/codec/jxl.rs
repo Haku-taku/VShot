@@ -58,7 +58,7 @@ impl ScaleMetadata for Jxl {
         // has none: appending one past the image would put bytes where a reader
         // expects the end of the file.  Every file this program writes goes
         // through libjxl, which containerises.
-        if bytes.len() < 12 || &bytes[..12] != kJxlSignature {
+        if bytes.len() < 12 || &bytes[..12] != JXL_SIGNATURE {
             return Ok(bytes);
         }
         // The box's payload is the four-byte offset of the TIFF header from the
@@ -70,7 +70,7 @@ impl ScaleMetadata for Jxl {
         let exif = scale::exif_tiff(density);
         let payload = (6u32).to_be_bytes().len() + b"Exif\0\0".len() + exif.len();
         bytes.extend_from_slice(&((payload + 8) as u32).to_be_bytes());
-        bytes.extend_from_slice(kExifBox);
+        bytes.extend_from_slice(EXIF_BOX);
         bytes.extend_from_slice(&6u32.to_be_bytes());
         bytes.extend_from_slice(b"Exif\0\0");
         bytes.extend_from_slice(&exif);
@@ -78,7 +78,7 @@ impl ScaleMetadata for Jxl {
     }
 
     fn declared_scale(&self, bytes: &[u8]) -> Option<u32> {
-        if bytes.len() < 12 || &bytes[..12] != kJxlSignature {
+        if bytes.len() < 12 || &bytes[..12] != JXL_SIGNATURE {
             return None;
         }
         let mut at = 12;
@@ -87,7 +87,7 @@ impl ScaleMetadata for Jxl {
             if length < 8 || at + length > bytes.len() {
                 return None;
             }
-            if bytes.get(at + 4..at + 8)? == kExifBox.as_slice() {
+            if bytes.get(at + 4..at + 8)? == EXIF_BOX.as_slice() {
                 let payload = bytes.get(at + 8..at + length)?;
                 // The offset counts from the end of its own four bytes, which
                 // is where the EXIF data would begin in a JPEG's APP1 segment:
@@ -103,9 +103,9 @@ impl ScaleMetadata for Jxl {
 }
 
 /// The twelve bytes every JPEG XL container opens with.
-const kJxlSignature: &[u8; 12] = b"\0\0\0\x0cJXL \r\n\x87\n";
+const JXL_SIGNATURE: &[u8; 12] = b"\0\0\0\x0cJXL \r\n\x87\n";
 /// The box this program records the scale in.
-const kExifBox: &[u8; 4] = b"Exif";
+const EXIF_BOX: &[u8; 4] = b"Exif";
 
 /// What `distance` is when nothing says otherwise: zero, which is lossless.
 ///
@@ -350,7 +350,7 @@ mod tests {
         // the TIFF header, then the EXIF as a JPEG APP1 segment carries it.
         let box_at = bytes
             .windows(4)
-            .position(|window| window == kExifBox)
+            .position(|window| window == EXIF_BOX)
             .expect("the Exif box is in the container");
         assert_eq!(&bytes[box_at + 4..box_at + 8], b"\0\0\0\x06");
         assert_eq!(&bytes[box_at + 8..box_at + 14], b"Exif\0\0");

@@ -120,7 +120,7 @@ impl ScaleMetadata for Webp {
             // The EXIF flag, and nothing else: a file that already carried
             // alpha or a profile would already have the extended header, so
             // reaching here means it has neither.
-            header.push(kExifFlag);
+            header.push(EXIF_FLAG);
             header.extend_from_slice(&[0, 0, 0]);
             // The canvas is stored one less than it is, in three bytes.
             let width = (size.width.saturating_sub(1) & 0x00ff_ffff).to_le_bytes();
@@ -136,7 +136,7 @@ impl ScaleMetadata for Webp {
         // A file that already had the extended header -- one with alpha in it
         // -- has to be told the metadata is there too, or a reader that trusts
         // the flags skips the chunk.
-        out[20] |= kExifFlag;
+        out[20] |= EXIF_FLAG;
         let chunk = riff_chunk(b"EXIF", &scale::exif_tiff(density));
         added += chunk.len();
         out.extend_from_slice(&chunk);
@@ -167,7 +167,7 @@ impl ScaleMetadata for Webp {
 
 /// The `EXIF` bit of the extended header's flag byte: the third bit down, as
 /// the container specifies and as `webp/mux_types.h` names it.
-const kExifFlag: u8 = 0x08;
+const EXIF_FLAG: u8 = 0x08;
 
 /// One RIFF chunk: its tag, its length and its payload, padded to an even
 /// length the way the container requires.
@@ -270,7 +270,7 @@ mod tests {
         assert_eq!(&bytes[12..16], b"VP8X");
         // And it has to say the metadata is there, or a reader that trusts the
         // flags looks right past the chunk.
-        assert_eq!(bytes[20] & kExifFlag, kExifFlag, "the EXIF flag is set");
+        assert_eq!(bytes[20] & EXIF_FLAG, EXIF_FLAG, "the EXIF flag is set");
         // The chunk is named `EXIF`, and what it holds is a bare TIFF blob:
         // no `Exif\0\0`, which is the spelling libwebp itself writes.
         assert!(bytes.windows(4).any(|window| window == b"EXIF"));

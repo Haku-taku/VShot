@@ -6,6 +6,7 @@ pub mod color;
 pub mod document;
 pub mod frame;
 pub mod hdr;
+pub mod picture;
 pub mod scene;
 
 pub use document::ImageDocument;

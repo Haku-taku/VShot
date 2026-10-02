@@ -532,9 +532,14 @@ fn hdr_sibling_path(path: &Path) -> Option<PathBuf> {
 /// not worth failing a pin over.
 fn hdr_half_beside(path: &Path, reference_nits: f32) -> Option<PqPin> {
     let sibling = hdr_sibling_path(path)?;
-    let codec = crate::model::codec::from_extension(&sibling)?;
-    match codec.decode_path(&sibling, reference_nits) {
-        Ok(image) => {
+    // Read through the one door every image comes in by, so the sibling is
+    // decoded exactly the way the same file would be if it had been pinned on
+    // its own.  It has to come back as light: a sibling that is not really an
+    // HDR file -- a PNG under an HDR name, which a capture can be asked to
+    // write -- is not the half the name promised.
+    match crate::model::picture::decode_path(&sibling, reference_nits) {
+        Ok(picture) => {
+            let image = picture.as_hdr()?;
             // The codes go out in the file's own gamut and at the file's own
             // reference white, which is what makes the round trip exact: the
             // white cancels when the surface helper re-encodes, and the pin
