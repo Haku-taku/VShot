@@ -356,8 +356,9 @@ PinPreferences loadPinPreferences();
 /// "which colour is this pin" cannot be answered two ways in two places.
 ///
 /// The corner radius has no such reader: it is clamped against the painted
-/// image's size, which only the surface knows -- see `paintRadius` in
-/// `pin_surface.cpp`.
+/// image's size, which only the renderer knows -- see `paintRadius` in
+/// `pin_label.cpp`, and `Style::from_config` in `pin_hdr.rs` for the reader
+/// that hands the value over.
 QColor resolvePinBorderColor(const PinPreferences &preferences, bool active);
 
 /// The radius a dialog should use, never past what its own size can carry.  A

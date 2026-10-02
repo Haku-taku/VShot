@@ -20,8 +20,12 @@ const DAEMON_STARTUP: Duration = Duration::from_secs(3);
 /// Budget for a single request/response round trip with a live daemon.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// One request to the resident pin daemon; a single JSON object per
-/// connection, matching the `--pin-server` protocol in `ui/pin_server.cpp`.
+/// One request to the resident pin daemon; a single JSON object per connection.
+///
+/// Both ends are this program, so the shape is derived in both directions from
+/// this one definition: a field added here reaches the daemon without a second
+/// edit, and one renamed here cannot leave the two halves disagreeing about a
+/// name that only shows up as a pin that will not appear.
 ///
 /// Both ends of that connection are this program, so the shape is derived in
 /// both directions from this one definition: a field added here reaches the
