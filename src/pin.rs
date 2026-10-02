@@ -138,6 +138,17 @@ pub(crate) enum PinCommand {
     Close,
     Quit,
     List,
+    /// Opens the annotation editor on a pin.
+    ///
+    /// The editor is a process of its own -- it draws a toolbar and a live
+    /// annotation layer, none of which the daemon has -- so this asks for it
+    /// rather than doing it.  `text` opens it on the pin's recognized text
+    /// instead of on its marks, which is the menu's `Recognize text…` row.
+    Edit {
+        id: u64,
+        #[serde(default)]
+        text: bool,
+    },
     /// Which of the daemon's outputs are showing HDR.
     ///
     /// The daemon is the only side that knows: it has the colour-management

@@ -198,7 +198,7 @@ fn parse_density(token: &str) -> Option<u32> {
 /// among gaps the smallest wins -- which is what makes a pin dragged past every
 /// edge come back to the nearest screen rather than to whichever happened to be
 /// checked first.
-fn hold_score(bounds: Rect, rect: Rect) -> i64 {
+pub(crate) fn hold_score(bounds: Rect, rect: Rect) -> i64 {
     let area = bounds.intersection(rect).map_or(0, |overlap| {
         i64::from(overlap.size.width) * i64::from(overlap.size.height)
     });
@@ -259,6 +259,27 @@ pub(crate) struct ChromeLabel {
     pub(crate) visible: bool,
 }
 
+/// One open editing session: the pin it is about, and the files it was handed.
+///
+/// Kept so the daemon knows an edit is running -- two editors on one stack
+/// would each be drawing marks the other knows nothing about -- and so that the
+/// session's directory lives exactly as long as the edit does.
+struct EditSession {
+    #[allow(dead_code)] // read when the editor's write-back lands
+    id: u64,
+    _directory: tempfile::TempDir,
+}
+
+/// One rectangle as the editor's session file spells it.
+fn rect_json(rect: Rect) -> serde_json::Value {
+    json!({
+        "x": rect.origin.x,
+        "y": rect.origin.y,
+        "width": rect.size.width,
+        "height": rect.size.height,
+    })
+}
+
 /// How much of a pin has to stay on the output it overlaps most, so that it can
 /// always be grabbed back.  The same margin the daemon this replaces used.
 const GRAB_MARGIN: i32 = 32;
@@ -309,6 +330,11 @@ struct Stack {
     pins: Vec<Pinned>,
     next_id: u64,
     all_visible: bool,
+    /// How wide a pin's rim is drawn, in logical pixels.  The editor wants it
+    /// because the stroke reaches half this far outside the image, and a drag
+    /// starting on it should move the pin rather than read as a click on the
+    /// canvas.
+    border_width: i32,
     pointer: Pointer,
     /// Where a pin may be put, which is what keeps one from being dragged past
     /// every screen.  Read once when the daemon comes up: a pin lives as long
@@ -317,11 +343,12 @@ struct Stack {
 }
 
 impl Stack {
-    fn new(outputs: Vec<OutputPlacement>) -> Self {
+    fn new(outputs: Vec<OutputPlacement>, border_width: i32) -> Self {
         Self {
             pins: Vec::new(),
             next_id: 1,
             all_visible: true,
+            border_width,
             pointer: Pointer::default(),
             outputs,
         }
@@ -752,6 +779,11 @@ struct Daemon {
     stack: Stack,
     surfaces: Surfaces,
     chrome: Chrome,
+    /// The open editing session, if any.
+    editing: Option<EditSession>,
+    /// The socket clients reach this daemon on.  The editor is told about it
+    /// because it drives the real pin over it rather than drawing a copy.
+    socket: PathBuf,
     /// When this daemon should give up, once it has nothing to hold.
     idle: Option<Instant>,
 }
@@ -762,9 +794,11 @@ impl Daemon {
         surfaces.start()?;
         let chrome = Chrome::start(&chrome_socket(socket), helper_program().as_deref());
         Ok(Self {
-            stack: Stack::new(surfaces.placements()),
+            stack: Stack::new(surfaces.placements(), surfaces.border_width()),
             surfaces,
             chrome,
+            editing: None,
+            socket: socket.to_path_buf(),
             idle: None,
         })
     }
@@ -860,6 +894,24 @@ impl Daemon {
                 crate::wayland::PinEvent::Release => self.stack.release(),
                 crate::wayland::PinEvent::Scroll { notches, at } => self.stack.scroll(notches, at),
                 crate::wayland::PinEvent::Leave => self.stack.leave(),
+                // Space opens the editor on the pin under the pointer, which
+                // is the one the tag is up on.  Everything else the pins do
+                // not answer to is left to the compositor: a key swallowed
+                // here would be a key no other window ever sees.
+                crate::wayland::PinEvent::Key { key, pressed }
+                    if pressed && key == crate::wayland::input::KEY_SPACE =>
+                {
+                    if let Some(id) = self.stack.pointer.hovered {
+                        // Reported rather than returned: a key is not a gesture
+                        // that changes the stack, and a failure to start the
+                        // editor must not take the daemon down.
+                        if let Err(error) = self.start_edit(id, false) {
+                            eprintln!("vshot-pin: {error}");
+                        }
+                    }
+                    Change::default()
+                }
+                crate::wayland::PinEvent::Key { .. } => Change::default(),
             };
             changed.redraw |= change.redraw;
             changed.closed |= change.closed;
@@ -981,6 +1033,7 @@ impl Daemon {
                 "outputs": self.surfaces.surface_count(),
             })),
             // Answered by the caller, which is the loop that has to stop.
+            PinCommand::Edit { id, text } => self.start_edit(id, text),
             PinCommand::Quit => Ok(json!({"ok": true})),
             PinCommand::AddClipboard {
                 density,
@@ -988,6 +1041,160 @@ impl Daemon {
                 ..
             } => self.add_clipboard(density, output_name.as_deref()),
         }
+    }
+
+    /// The whole desktop as the layout places it, for the editor's session.
+    ///
+    /// The editor's keyboard cursor walks a pointer of its own and asks the CLI
+    /// to move the real one there, and a pointer position is expressed in this
+    /// space -- the CLI subtracts this origin and scales to this size.  The
+    /// session's own `bounds` is the pin, which is not the screen, so the
+    /// desktop has to travel separately or a warp on a multi-monitor layout
+    /// would land at a fraction of where it belongs.
+    fn desktop_json(&self) -> serde_json::Value {
+        let placements = self.surfaces.placements();
+        let Some(first) = placements.first() else {
+            return json!({"x": 0, "y": 0, "width": 0, "height": 0});
+        };
+        let mut bounds = first.geometry;
+        for output in &placements[1..] {
+            let other = output.geometry;
+            let left = bounds.origin.x.min(other.origin.x);
+            let top = bounds.origin.y.min(other.origin.y);
+            let right = (bounds.origin.x + bounds.size.width as i32)
+                .max(other.origin.x + other.size.width as i32);
+            let bottom = (bounds.origin.y + bounds.size.height as i32)
+                .max(other.origin.y + other.size.height as i32);
+            bounds = Rect::new(left, top, (right - left) as u32, (bottom - top) as u32);
+        }
+        rect_json(bounds)
+    }
+
+    /// Opens the annotation editor on one pin.
+    ///
+    /// The editor is a Qt process of its own -- it draws a toolbar and a live
+    /// annotation layer, which is not something this side has any of -- and it
+    /// is handed a session file describing what to open on.  It draws the pin
+    /// itself while it is up, so the pin's picture has to be the pristine one
+    /// the marks were placed on: handing it the flattened pixels would put the
+    /// editor's live marks over a baked copy of themselves.
+    ///
+    /// The editor writes its result back as a `Move` over this same socket,
+    /// which is what `Move`'s `path` and `annotations` are for.
+    fn start_edit(&mut self, id: u64, text: bool) -> Result<serde_json::Value> {
+        let Some(index) = self.stack.pins.iter().position(|pin| pin.id == id) else {
+            return Err(VshotError::Pin(
+                "edit names a pin that is not pinned".to_string(),
+            ));
+        };
+        // One session at a time: two editors on one stack would each be drawing
+        // marks the other knows nothing about.
+        if self.editing.is_some() {
+            return Err(VshotError::Pin("an edit is already open".into()));
+        }
+        let Some(helper) = helper_program() else {
+            return Err(VshotError::Pin(
+                "cannot locate vshot-qt-ui for the pin editor; set VSHOT_QT_HELPER".into(),
+            ));
+        };
+        let pin = &self.stack.pins[index];
+        let size = Stack::drawn(pin.picture.size(), pin.scale);
+        let rect = Rect::new(pin.origin.x, pin.origin.y, size.width, size.height);
+        // The picture the editor draws on: the pin's own, written where the
+        // editor can read it.  It is a private file in a directory this daemon
+        // owns, so nothing else has to be able to name it.
+        let directory = tempfile::Builder::new()
+            .prefix("vshot-pin-edit-")
+            .tempdir()
+            .map_err(|error| {
+                VshotError::Pin(format!("cannot make a session directory: {error}"))
+            })?;
+        let image = directory.path().join("pin.png");
+        let png = match &pin.picture {
+            Picture::Sdr(frame) => frame.to_png()?,
+            // An HDR picture is written back as the same light in the one
+            // format the editor reads, and read again on the way back: the
+            // round trip through the PQ curve costs at most a code per channel,
+            // and the alternative is an editor that cannot open an HDR pin.
+            Picture::Hdr(image) => {
+                let bytes = crate::model::codec::by_name("jxl")
+                    .map(|codec| codec.encode(image))
+                    .transpose()?;
+                match bytes {
+                    Some(bytes) => bytes,
+                    None => crate::model::codec::HdrCodec::encode(
+                        &crate::model::codec::radiance::Radiance,
+                        image,
+                    )?,
+                }
+            }
+        };
+        std::fs::write(&image, &png).map_err(|source| {
+            VshotError::Pin(format!("cannot write the editor's picture: {source}"))
+        })?;
+
+        let session = json!({
+            "version": 1,
+            "mode": "pin-edit",
+            // Absent for the Space-key edit, which opens the ordinary
+            // annotation editor; only the menu's `Recognize text…` asks for
+            // the text mode.
+            "action": if text { Some("text") } else { None },
+            "id": id,
+            "bounds": rect_json(rect),
+            // How wide this pin's rim is drawn, so the editor can treat the
+            // stroke as part of the pin: it is centred on the image's edge and
+            // reaches half this far outside it, and a drag starting there
+            // should move the pin rather than read as a click on the canvas.
+            "border_width": self.stack.border_width,
+            // The editor drives the real pin over this socket rather than
+            // rendering a second copy of the picture.
+            "socket": self.socket.to_string_lossy(),
+            // The marks the last edit left, so the editor opens on them and
+            // they stay editable.  Absent on a pin that has never been
+            // annotated, which is what makes a first edit open blank.
+            "annotations": pin.annotations.clone(),
+            "outputs": [{
+                "id": 0,
+                "name": self.surfaces.output_name_at(rect).unwrap_or(""),
+                "x": rect.origin.x, "y": rect.origin.y,
+                "width": rect.size.width, "height": rect.size.height,
+                "surface": {
+                    "x": rect.origin.x, "y": rect.origin.y,
+                    "width": rect.size.width, "height": rect.size.height,
+                },
+                "scale": 1,
+                "pixel_width": pin.picture.size().width,
+                "pixel_height": pin.picture.size().height,
+                "path": image.to_string_lossy(),
+            }],
+            "desktop": self.desktop_json(),
+        });
+        let session_path = directory.path().join("session.json");
+        std::fs::write(&session_path, session.to_string())
+            .map_err(|source| VshotError::Pin(format!("cannot write the session: {source}")))?;
+
+        let child = std::process::Command::new(&helper)
+            .arg("--pin-edit")
+            .arg(&session_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn();
+        if child.is_err() {
+            return Err(VshotError::Pin(
+                "the pin editor could not be started".into(),
+            ));
+        }
+        // The directory has to outlive the editor, and nothing here waits for
+        // it: the editor writes its result back over the socket, and the
+        // session's files are the editor's while it runs.  Kept so the daemon
+        // can drop them when the session ends.
+        self.editing = Some(EditSession {
+            id,
+            _directory: directory,
+        });
+        Ok(json!({"ok": true}))
     }
 
     /// Pins whatever the clipboard holds as an image.
@@ -1376,7 +1583,7 @@ mod tests {
     /// A stack of `count` pins on one 1920x1080 output, each 100x50 at 1:1,
     /// laid out in a row so that they do not overlap unless a test makes them.
     fn stack_of(count: usize) -> Stack {
-        let mut stack = Stack::new(vec![output(1920, 1080, 1)]);
+        let mut stack = Stack::new(vec![output(1920, 1080, 1)], 2);
         for index in 0..count {
             let id = stack.next_id;
             stack.next_id += 1;

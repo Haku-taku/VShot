@@ -19,6 +19,9 @@ pub const BTN_RIGHT: u32 = 0x111;
 // Linux evdev key codes.  Wayland's wl_keyboard::key event carries these raw
 // codes (without the XKB +8 offset used by some higher-level APIs).
 pub const KEY_ESC: u32 = 1;
+/// Space: the key that opens the annotation editor on the pin under the
+/// pointer, the same shortcut the pin surface's own keyboard answers to.
+pub const KEY_SPACE: u32 = 57;
 pub const KEY_ENTER: u32 = 28;
 pub const KEY_RETURN: u32 = KEY_ENTER;
 pub const KEY_KPENTER: u32 = 96;

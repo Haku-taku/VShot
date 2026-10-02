@@ -829,6 +829,21 @@ impl Surfaces {
         Ok(())
     }
 
+    /// How wide a pin's rim is drawn, from the style this side read.
+    pub(crate) fn border_width(&self) -> i32 {
+        self.style.border.as_ref().map_or(0, |border| border.width)
+    }
+
+    /// The name of the output a pin's rectangle falls on, for the editor's
+    /// session: it opens on the screen the pin is on, and it names that screen
+    /// the way the compositor does.
+    pub(crate) fn output_name_at(&self, rect: Rect) -> Option<&str> {
+        self.outputs
+            .iter()
+            .max_by_key(|output| crate::pin_daemon::hold_score(output.geometry, rect))
+            .map(|output| output.name.as_str())
+    }
+
     /// The outputs whose own curve is an HDR one.
     ///
     /// Reported beside the full list rather than instead of it: "this side

@@ -202,6 +202,9 @@ pub enum PinEvent {
     /// says a hover has ended: a motion that lands on no pin is not the same
     /// event, and a tag that waited for one would stay up for ever.
     Leave,
+    /// A key went down or came up on a pin surface.  `key` is a Linux evdev
+    /// code, which is what Wayland's keyboard carries.
+    Key { key: u32, pressed: bool },
     /// The button came up.
     Release,
     /// The wheel turned `notches`, positive away from the user, at `at`.
@@ -1148,10 +1151,11 @@ impl WaylandSession {
             layer_surface.set_anchor(zwlr_layer_surface_v1::Anchor::all());
             layer_surface.set_exclusive_zone(-1);
             layer_surface
-                .set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
-            // A picture takes no input, and this one sits above every window:
-            // an empty input region is what keeps a click outside the pin
-            // going to what is under it instead of to us.
+                .set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand);
+            // A picture takes no input of its own, and this one sits above
+            // every window: the input region is what keeps a click outside the
+            // pin going to what is under it instead of to us.  It is set by
+            // `set_pin_input_rects` as the stack changes, and starts empty.
             let region = compositor.create_region(&qh, ());
             surface.set_input_region(Some(&region));
             region.destroy();
@@ -2411,6 +2415,13 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
             } => {
                 let pressed = matches!(key_state, wl_keyboard::KeyState::Pressed);
                 let key = decode_wayland_keycode(key);
+                if state.pin_input {
+                    // The pins' own keys: Space opens the editor on the pin
+                    // under the pointer, and everything else is left to the
+                    // compositor rather than swallowed here.
+                    state.pin_events.push(PinEvent::Key { key, pressed });
+                    return;
+                }
                 let event = SelectionEvent::Key { key, pressed };
                 if state.editor.is_some() {
                     state.process_editor_event(event);
