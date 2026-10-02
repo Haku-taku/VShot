@@ -44,6 +44,12 @@ add_executable(vshot-qt-ui
     ui/settings_window.hpp
     ui/pin_density.cpp
     ui/pin_density.hpp
+    ui/pin_label.cpp
+    ui/pin_label.hpp
+    ui/pin_chrome.cpp
+    ui/pin_chrome.hpp
+    ui/pin_chrome_server.cpp
+    ui/pin_chrome_server.hpp
     ui/pin_surface.cpp
     ui/pin_surface.hpp
     ui/pin_server.cpp
@@ -176,6 +182,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/pin_outline_check.cpp
         ui/pin_surface.cpp
         ui/pin_surface.hpp
+        ui/pin_label.cpp
+        ui/pin_label.hpp
         ui/i18n.cpp
         ui/i18n.hpp
         ui/shadow.cpp
@@ -200,6 +208,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/pin_hdr_check.cpp
         ui/pin_surface.cpp
         ui/pin_surface.hpp
+        ui/pin_label.cpp
+        ui/pin_label.hpp
         ui/i18n.cpp
         ui/i18n.hpp
         ui/shadow.cpp
@@ -241,6 +251,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/pin_menu_check.cpp
         ui/pin_surface.cpp
         ui/pin_surface.hpp
+        ui/pin_label.cpp
+        ui/pin_label.hpp
         ui/color_card.cpp
         ui/color_card.hpp
         ui/i18n.cpp

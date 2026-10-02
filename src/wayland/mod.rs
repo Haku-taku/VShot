@@ -198,6 +198,10 @@ pub enum PinEvent {
     Press { at: Point, time: u32 },
     /// The pointer moved to `at` with a button down.
     Motion { at: Point },
+    /// The pointer left the pins.  Queued because it is the only thing that
+    /// says a hover has ended: a motion that lands on no pin is not the same
+    /// event, and a tag that waited for one would stay up for ever.
+    Leave,
     /// The button came up.
     Release,
     /// The wheel turned `notches`, positive away from the user, at `at`.
@@ -2223,6 +2227,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 }
             }
             wl_pointer::Event::Leave { surface, .. } => {
+                if state.pin_input {
+                    state.pin_events.push(PinEvent::Leave);
+                }
                 state.topology.cursor_enter_serial = None;
                 state.topology.cursor_shape = None;
                 if state.pointer_grab_output.is_none() {

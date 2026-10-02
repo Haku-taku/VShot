@@ -3,6 +3,8 @@
 
 #include "pin_surface.hpp"
 
+#include "pin_label.hpp"
+
 #include "i18n.hpp"
 
 #include <LayerShellQt/Window>
@@ -115,77 +117,6 @@ QRect expandOutline(const QRect &rect, int bleed)
 
 
 // The label both the transient badge and the HDR marker wear: a short tag in a
-// translucent box, large enough to read over any image and no larger.  The font
-// is a constant rather than the pin's: a tag says what the pin *is*, and it has
-// to stay legible on a pin zoomed down to a thumbnail.
-constexpr int kLabelPixelSize = 16;
-constexpr qreal kLabelRadius = 6.0;
-const QColor kLabelBox(0, 0, 0, 160);
-
-// The HDR tag's two inks.  A pinned HDR capture and the SDR half the daemon
-// keeps beside it are the same picture to the eye -- what differs is light no
-// photograph of a screen reproduces -- so the tag is the only thing that says
-// which of the two this output is showing: white while the pixels are the
-// helper's HDR ones, muted grey while this surface is showing the SDR copy
-// itself.  Either way the pin *is* an HDR capture, which is why the tag is up
-// at all.
-const QColor kHdrTagShown(255, 255, 255);
-const QColor kHdrTagFallback(192, 192, 192);
-
-/// The corner radius a pin can actually carry: never past half the shorter side
-/// of the painted image, where a corner would stop being a corner and start
-/// being a lozenge.  The same rule the dialog's rim follows, against the
-/// image's own size -- which changes with every zoom step, so this is asked at
-/// paint time rather than stored.
-int paintRadius(std::uint32_t radius, const QSize &size)
-{
-    const int most = std::max(0, std::min(size.width(), size.height()) / 2);
-    return std::min(static_cast<int>(radius), most);
-}
-
-// The box a label needs: the text's own bounds grown by the same padding on
-// every side, so every tag of the same font comes out the same height whatever
-// it says.
-QRect labelBox(const QFontMetrics &metrics, const QString &text)
-{
-    const int pad = metrics.height() / 3;
-    return metrics.boundingRect(text).adjusted(-pad, -pad / 2, pad, pad / 2);
-}
-
-// The font every corner tag is drawn with -- the `HDR` marker and the badge
-// that reports a zoom or a copy.  Fixed, so a tag does not grow with the image
-// it is drawn over.
-QFont tagFont()
-{
-    QFont font;
-    font.setPixelSize(kLabelPixelSize);
-    font.setBold(true);
-    return font;
-}
-
-// The marker's text: the pin under the pointer is one whose light comes from a
-// shape of its own.
-const QString kHdrTag = QStringLiteral("HDR");
-
-// Where a tag of `text` lands when it is anchored at `corner`: just inside the
-// pin's top-left for the marker, just inside its bottom-right for the badge.
-// One definition, because the painter and the repaint region both ask it -- on
-// a pin too small to hold the tag, the tag reaches past the pin, and a repaint
-// region computed without it leaves the tag's outer pixels at the old
-// position every time the pin is zoomed or dragged.
-QRect tagBox(const QString &text, const QPoint &corner, bool atBottomRight, const QRect &bounds)
-{
-    const QFontMetrics metrics(tagFont());
-    const int pad = metrics.height() / 3;
-    QRect box = labelBox(metrics, text);
-    if (atBottomRight) {
-        box.moveBottomRight(corner - QPoint(pad, pad));
-    } else {
-        box.moveTopLeft(corner + QPoint(pad, pad));
-    }
-    return box.intersected(bounds.adjusted(0, 0, -1, -1));
-}
-
 // Wayland has no "no input here" request: an unset input region means the
 // whole surface is interactive, and Qt sends no request at all for an empty
 // mask, which is exactly that default. A region parked outside the surface is

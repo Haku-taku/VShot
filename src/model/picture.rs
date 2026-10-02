@@ -26,7 +26,9 @@ use crate::error::{Result, VshotError};
 use crate::geometry::Size;
 use crate::model::codec::{self, HdrImage};
 use crate::model::frame::Frame;
-use crate::model::hdr::{pq_encode, srgb_eotf, OutputColor, Primaries, ToneMapOptions};
+use crate::model::hdr::{
+    pq_encode, srgb_eotf, HdrDecision, OutputColor, Primaries, ToneMapOptions,
+};
 
 /// An image as the pin side holds it, whichever format it was written in.
 #[derive(Clone, Debug, PartialEq)]
@@ -156,6 +158,24 @@ impl Picture {
                 words: srgb_codes(&image.frame.tone_map_to_srgb_with(options)?),
                 encoding: Encoding::Srgb,
             }),
+        }
+    }
+
+    /// Whether the picture holds light above SDR white.
+    ///
+    /// `decision` is where the line is drawn -- an area share rather than a
+    /// frame peak, so one specular pixel does not make a whole capture an HDR
+    /// one (see [`HdrDecision`]).  An SDR picture is never above it: its codes
+    /// cannot express more than SDR white in the first place.
+    ///
+    /// This is what the `HDR` tag over a pin is about, and it is deliberately a
+    /// question about the *picture* rather than about the format it arrived in:
+    /// a JPEG XL may hold a picture with no light above white at all, and a tag
+    /// that said otherwise would be claiming something the pixels do not.
+    pub fn carries_hdr(&self, decision: HdrDecision) -> bool {
+        match self {
+            Self::Sdr(_) => false,
+            Self::Hdr(image) => image.frame.carries_hdr(decision),
         }
     }
 

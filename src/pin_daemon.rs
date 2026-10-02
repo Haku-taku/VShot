@@ -57,6 +57,10 @@ struct Pinned {
     origin: Point,
     /// Logical pixels per source pixel.
     scale: f64,
+    /// Device pixels per logical pixel of the picture, as the sizing decided.
+    /// The zoom badge reports its factor relative to this, so a 4K capture
+    /// pinned at its natural size on a 4K output reads as 100%.
+    density: u32,
     visible: bool,
     /// The marks the pixels carry, as the editor reported them, when the pin
     /// came out of an editing session that had any.
@@ -232,6 +236,29 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// additive, so a notch feels the same at any size.
 const ZOOM_PER_NOTCH: f64 = 1.1;
 
+/// One pin as the chrome needs it: where it is, how big it is drawn, and what
+/// is worth saying about it.
+///
+/// Deliberately not the pin itself.  The chrome draws labels and no pictures,
+/// so the pixels would be a copy of something that side can never show -- and
+/// the daemon is the one holding them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ChromeLabel {
+    pub(crate) id: u64,
+    pub(crate) origin: Point,
+    pub(crate) size: Size,
+    /// Whether this pin is an HDR capture, whatever is showing it.
+    pub(crate) captured_hdr: bool,
+    /// Whether the pixels on screen are the capture's own light, as opposed to
+    /// the same capture mapped down for an SDR output.  The tag is drawn in a
+    /// different ink for each.
+    pub(crate) shown_as_hdr: bool,
+    /// Whether the pointer is over this pin, which is the only one whose tag is
+    /// up.
+    pub(crate) hovered: bool,
+    pub(crate) visible: bool,
+}
+
 /// How much of a pin has to stay on the output it overlaps most, so that it can
 /// always be grabbed back.  The same margin the daemon this replaces used.
 const GRAB_MARGIN: i32 = 32;
@@ -255,6 +282,11 @@ struct Pointer {
     /// The pin the pointer last pressed, and when, for telling a double-click
     /// from two clicks on the same pin.
     pressed: Option<(u64, Instant)>,
+    /// The pin the pointer is over, which is the only one whose `HDR` tag is
+    /// up.  Kept here rather than in the chrome because it is a fact about the
+    /// stack: a pin that goes away, or moves out from under the pointer, stops
+    /// being hovered without the pointer moving at all.
+    hovered: Option<u64>,
 }
 
 /// What a gesture changed, so the daemon knows what to do about it.
@@ -372,6 +404,9 @@ impl Stack {
         if double {
             self.pointer.pressed = None;
             self.pointer.drag = None;
+            if self.pointer.hovered == Some(id) {
+                self.pointer.hovered = None;
+            }
             self.pins.remove(index);
             return Change {
                 redraw: true,
@@ -380,6 +415,35 @@ impl Stack {
         }
         self.pointer.pressed = Some((id, now));
         self.pointer.drag = Some((id, point, self.pins[index].origin));
+        Change {
+            redraw: true,
+            closed: false,
+        }
+    }
+
+    /// The pointer moved to `point`, with or without a button down.
+    ///
+    /// The hover is what the tag follows, so it is worked out on every motion:
+    /// a drag that carries a pin out from under the pointer takes the tag with
+    /// it, and one that brings a pin under it raises the tag.
+    fn hover(&mut self, point: Point) -> Change {
+        let hovered = self.index_at(point).map(|index| self.pins[index].id);
+        if hovered == self.pointer.hovered {
+            return Change::default();
+        }
+        self.pointer.hovered = hovered;
+        Change {
+            redraw: true,
+            closed: false,
+        }
+    }
+
+    /// The pointer left the pins, so nothing is hovered any more.
+    fn leave(&mut self) -> Change {
+        if self.pointer.hovered.is_none() {
+            return Change::default();
+        }
+        self.pointer.hovered = None;
         Change {
             redraw: true,
             closed: false,
@@ -470,6 +534,28 @@ impl Stack {
     /// The marks go with the picture they described: one that arrives with its
     /// own gets them from the request that carried it, and one that arrives
     /// without any has none to keep.
+    /// The labels the chrome should draw, back to front.
+    ///
+    /// Every pin contributes the same two facts -- whether it is an HDR capture
+    /// and whether what is on screen is its own light -- and the hover picks
+    /// which of them shows a tag.
+    fn labels(&self) -> Vec<ChromeLabel> {
+        self.pins
+            .iter()
+            .map(|pin| ChromeLabel {
+                id: pin.id,
+                origin: pin.origin,
+                size: Self::drawn(pin.picture.size(), pin.scale),
+                captured_hdr: pin
+                    .picture
+                    .carries_hdr(crate::model::hdr::HdrDecision::default()),
+                shown_as_hdr: pin.picture.as_hdr().is_some(),
+                hovered: self.pointer.hovered == Some(pin.id),
+                visible: pin.visible,
+            })
+            .collect()
+    }
+
     fn replace(&mut self, index: usize, picture: Picture, path: &Path) {
         let pin = &mut self.pins[index];
         pin.picture = picture;
@@ -495,21 +581,161 @@ impl Stack {
     }
 }
 
+/// The Qt helper that can draw the labels, if this machine has one.
+///
+/// Resolved the way every other helper is, so a build tree and an installed
+/// copy both find theirs: `VSHOT_QT_HELPER` first, then the binary beside this
+/// one and the two build layouts under it.
+fn helper_program() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("VSHOT_QT_HELPER") {
+        let path = PathBuf::from(path);
+        return path.is_file().then_some(path);
+    }
+    let directory = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    [
+        directory.join("vshot-qt-ui"),
+        directory.join("../build-qt/vshot-qt-ui"),
+        directory.join("../../build-qt/vshot-qt-ui"),
+        PathBuf::from("/usr/bin/vshot-qt-ui"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
+}
+
+/// Where the chrome process listens: beside the daemon's own socket, with a
+/// name of its own, so both can live in the runtime directory a session owns
+/// without either having to be told about the other.
+fn chrome_socket(socket: &Path) -> PathBuf {
+    let mut name = socket.as_os_str().to_os_string();
+    name.push(".chrome");
+    PathBuf::from(name)
+}
+
+/// The Qt process that draws the pins' corner labels.
+///
+/// The pictures are this side's -- a half-float surface has light in it and no
+/// glyphs -- so the text is somebody else's, on a transparent layer surface
+/// mapped after ours.  The connection is one way and lossy on purpose: a label
+/// is decoration, and a chrome process that has died or never started leaves
+/// every pin drawn exactly as it was, minus its tags.
+struct Chrome {
+    stream: Option<UnixStream>,
+    /// What was last sent, so a stack that has not changed is not sent again.
+    /// A drag sends one update per motion event, and every one of them would
+    /// otherwise be a line and a repaint on the other side.
+    sent: Option<Vec<ChromeLabel>>,
+}
+
+impl Chrome {
+    /// Starts the Qt process that draws the labels, then connects to it.
+    ///
+    /// Started rather than required: the daemon owns no Qt, so a session where
+    /// the helper cannot come up -- no Qt, no layer shell -- keeps every pin
+    /// and loses only its tags.  The process is waited for briefly, because the
+    /// first stack it is told about should be the one that is already up.
+    fn start(socket: &Path, program: Option<&Path>) -> Self {
+        let mut chrome = Self {
+            stream: None,
+            sent: None,
+        };
+        let Some(program) = program else {
+            return chrome;
+        };
+        // A socket left behind by a chrome that was killed makes every later
+        // connect fail; the path is this daemon's own, so clearing it is safe.
+        let _ = std::fs::remove_file(socket);
+        let spawned = std::process::Command::new(program)
+            .arg("--pin-chrome")
+            .arg(socket)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn();
+        if spawned.is_err() {
+            return chrome;
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if let Ok(stream) = UnixStream::connect(socket) {
+                chrome.stream = Some(stream);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        chrome
+    }
+
+    /// Tells the chrome what to draw, if that is not what it is already drawing.
+    fn sync(&mut self, labels: &[ChromeLabel], visible: bool) {
+        if self.sent.as_deref() == Some(labels) {
+            return;
+        }
+        let Some(stream) = self.stream.as_mut() else {
+            return;
+        };
+        let message = json!({
+            "cmd": "labels",
+            "visible": visible,
+            "pins": labels
+                .iter()
+                .map(|label| json!({
+                    "id": label.id,
+                    "x": label.origin.x,
+                    "y": label.origin.y,
+                    "width": label.size.width,
+                    "height": label.size.height,
+                    "hdr": label.captured_hdr,
+                    "shown": label.shown_as_hdr,
+                    "hovered": label.hovered,
+                }))
+                .collect::<Vec<serde_json::Value>>(),
+        })
+        .to_string();
+        // A chrome that has gone away is not an error worth reporting: the
+        // labels are missing and every pin is still there.
+        if stream.write_all(message.as_bytes()).is_err()
+            || stream.write_all(b"\n").is_err()
+            || stream.flush().is_err()
+        {
+            self.stream = None;
+            return;
+        }
+        self.sent = Some(labels.to_vec());
+    }
+
+    /// Puts `text` on one pin's corner for a moment.
+    fn badge(&mut self, id: u64, text: &str) {
+        let Some(stream) = self.stream.as_mut() else {
+            return;
+        };
+        let message = json!({"cmd": "badge", "id": id, "text": text}).to_string();
+        if stream.write_all(message.as_bytes()).is_err()
+            || stream.write_all(b"\n").is_err()
+            || stream.flush().is_err()
+        {
+            self.stream = None;
+        }
+    }
+}
+
 /// The daemon: the pins, and what is showing them.
 struct Daemon {
     stack: Stack,
     surfaces: Surfaces,
+    chrome: Chrome,
     /// When this daemon should give up, once it has nothing to hold.
     idle: Option<Instant>,
 }
 
 impl Daemon {
-    fn new() -> Result<Self> {
+    fn new(socket: &Path) -> Result<Self> {
         let mut surfaces = Surfaces::new()?;
         surfaces.start()?;
+        let chrome = Chrome::start(&chrome_socket(socket), helper_program().as_deref());
         Ok(Self {
             stack: Stack::new(surfaces.placements()),
             surfaces,
+            chrome,
             idle: None,
         })
     }
@@ -556,7 +782,10 @@ impl Daemon {
             .filter(|pin| pin.visible)
             .map(|pin| Stack::rect_of(pin))
             .collect::<Vec<Rect>>();
-        self.surfaces.set_input_rects(&rects)
+        self.surfaces.set_input_rects(&rects)?;
+        self.chrome
+            .sync(&self.stack.labels(), self.stack.all_visible);
+        Ok(())
     }
 
     /// When this daemon should give up, or `None` while it has something to
@@ -589,12 +818,37 @@ impl Daemon {
         for event in events {
             let change = match event {
                 crate::wayland::PinEvent::Press { at, .. } => self.stack.press(at, now),
-                crate::wayland::PinEvent::Motion { at } => self.stack.motion(at),
+                crate::wayland::PinEvent::Motion { at } => {
+                    // The hover first: it is what the tag follows, and a motion
+                    // with no button down still changes it.
+                    let hovered = self.stack.hover(at);
+                    let dragged = self.stack.motion(at);
+                    Change {
+                        redraw: hovered.redraw || dragged.redraw,
+                        closed: dragged.closed,
+                    }
+                }
                 crate::wayland::PinEvent::Release => self.stack.release(),
                 crate::wayland::PinEvent::Scroll { notches, at } => self.stack.scroll(notches, at),
+                crate::wayland::PinEvent::Leave => self.stack.leave(),
             };
             changed.redraw |= change.redraw;
             changed.closed |= change.closed;
+            // The wheel's own report: the factor it just applied, relative to
+            // the picture's native density, on the corner of the pin it was
+            // aimed at.  A drag has no such thing to say.
+            if let crate::wayland::PinEvent::Scroll { at, .. } = event {
+                if let Some(id) = self
+                    .stack
+                    .index_at(at)
+                    .map(|index| self.stack.pins[index].id)
+                {
+                    if let Some(pin) = self.stack.pins.iter().find(|pin| pin.id == id) {
+                        let percent = (pin.scale * f64::from(pin.density) * 100.0).round() as i64;
+                        self.chrome.badge(id, &format!("{percent}%"));
+                    }
+                }
+            }
         }
         if std::env::var_os("VSHOT_PIN_DEBUG").is_some() {
             eprintln!(
@@ -761,6 +1015,7 @@ impl Daemon {
             path: path.to_path_buf(),
             origin,
             scale,
+            density,
             visible,
             annotations: None,
         });
@@ -798,7 +1053,7 @@ pub fn run(socket: &Path) -> Result<()> {
         VshotError::Pin(format!("cannot make the pin socket non-blocking: {source}"))
     })?;
     let debug = std::env::var_os("VSHOT_PIN_DEBUG").is_some();
-    let mut daemon = Daemon::new()?;
+    let mut daemon = Daemon::new(socket)?;
     daemon.surfaces.set_pin_input(true);
     if debug {
         eprintln!(
@@ -1049,6 +1304,7 @@ mod tests {
                 path: PathBuf::from("(none)"),
                 origin: Point::new(index as i32 * 200, 0),
                 scale: 1.0,
+                density: 1,
                 visible: true,
                 annotations: None,
             });
