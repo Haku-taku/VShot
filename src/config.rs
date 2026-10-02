@@ -405,6 +405,99 @@ pub struct PinDefaults {
 #[serde(default)]
 struct ConfigFile {
     cli: CliDefaults,
+    #[serde(default)]
+    pin: PinFile,
+}
+
+/// The `pin` section as the file spells it.
+///
+/// The keys and their defaults are `ui/config.hpp`'s: the settings window
+/// writes this section, and the daemon that draws the pins reads it, so the two
+/// have to agree on every name or the window would offer a setting nothing
+/// obeys.  `None` is "the file says nothing", which is what each key's default
+/// below fills in.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+struct PinFile {
+    radius: Option<u32>,
+    shadow: Option<bool>,
+    #[serde(rename = "shadowSize")]
+    shadow_size: Option<u32>,
+    #[serde(rename = "shadowOffset")]
+    shadow_offset: Option<i32>,
+    #[serde(rename = "shadowOpacity")]
+    shadow_opacity: Option<u32>,
+    #[serde(rename = "borderWidth")]
+    border_width: Option<u32>,
+    #[serde(rename = "borderColor")]
+    border_colour: Option<String>,
+    #[serde(rename = "activeBorderColor")]
+    active_border_colour: Option<String>,
+}
+
+/// How a pinned image looks: its corner radius, its shadow and its rim.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PinStyle {
+    pub radius: u32,
+    pub shadow: Option<PinShadow>,
+    pub border_width: u32,
+    /// The rim's colour on every pin that is not the one the keyboard would act
+    /// on, and on the one it would.  `None` is "the file says nothing", which
+    /// leaves the renderer's own built-in pair in place -- the same two the Qt
+    /// surface draws with.
+    pub border_colour: Option<[u8; 4]>,
+    pub active_border_colour: Option<[u8; 4]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PinShadow {
+    pub size: u32,
+    pub offset: i32,
+    pub opacity: u32,
+}
+
+/// The `pin` section, with the defaults `ui/config.hpp` documents.
+pub fn pin_style() -> PinStyle {
+    let file = load_file().map(|file| file.pin).unwrap_or_default();
+    let shadow = file.shadow.unwrap_or(true);
+    PinStyle {
+        radius: file.radius.unwrap_or(0),
+        shadow: shadow.then(|| PinShadow {
+            size: file.shadow_size.unwrap_or(14),
+            offset: file.shadow_offset.unwrap_or(3),
+            opacity: file.shadow_opacity.unwrap_or(120).min(255),
+        }),
+        border_width: file.border_width.unwrap_or(2),
+        border_colour: file.border_colour.as_deref().and_then(parse_css_colour),
+        active_border_colour: file
+            .active_border_colour
+            .as_deref()
+            .and_then(parse_css_colour),
+    }
+}
+
+/// A colour as the config spells it: `#rrggbb`, or `#rrggbbaa` when it is not
+/// opaque.  This is the CSS order, alpha last -- which is *not* Qt's own
+/// eight-digit `#aarrggbb`, so a colour is read here rather than handed to
+/// anything that would guess.
+fn parse_css_colour(text: &str) -> Option<[u8; 4]> {
+    let digits = text.trim().strip_prefix('#')?;
+    let byte = |at: usize| u8::from_str_radix(digits.get(at..at + 2)?, 16).ok();
+    match digits.len() {
+        6 => Some([byte(0)?, byte(2)?, byte(4)?, 255]),
+        8 => Some([byte(0)?, byte(2)?, byte(4)?, byte(6)?]),
+        _ => None,
+    }
+}
+
+/// The whole file, or `None` when there is nowhere to read it from or it does
+/// not parse.  A file this build cannot read is not an error anywhere: every
+/// caller has a default, and refusing to start over a stray byte would cost the
+/// user their screenshot.
+fn load_file() -> Option<ConfigFile> {
+    let path = config_path()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str::<ConfigFile>(&text).ok()
 }
 
 /// The path of the config file: `$XDG_CONFIG_HOME/vshot/config.json`, falling
@@ -421,15 +514,7 @@ pub fn config_path() -> Option<PathBuf> {
 /// Reads the remembered command-line defaults.  Every failure — no file, no
 /// path, unreadable, unparseable — is the built-in default.
 pub fn load() -> CliDefaults {
-    let Some(path) = config_path() else {
-        return CliDefaults::default();
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return CliDefaults::default();
-    };
-    serde_json::from_str::<ConfigFile>(&text)
-        .map(|file| file.cli)
-        .unwrap_or_default()
+    load_file().map(|file| file.cli).unwrap_or_default()
 }
 
 /// The compression the config file remembers, or `None` when it says nothing

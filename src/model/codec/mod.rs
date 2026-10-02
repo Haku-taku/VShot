@@ -61,6 +61,7 @@ pub mod avif;
 pub mod png;
 
 pub use params::{ParamKind, ParamSpec, ParamValue, ParamValues};
+pub use scale::ScaleMetadata;
 
 /// One HDR image as it travels between a codec and the rest of the program.
 ///

@@ -739,6 +739,31 @@ fn keep_daemon_stderr() -> bool {
 /// Starts the resident daemon detached: no pipes are inherited, so the CLI
 /// returns immediately while the surfaces live on.
 fn spawn_daemon() -> Result<()> {
+    // The daemon that is being rewritten: this same binary, holding the pins
+    // and drawing them itself.  Opt-in while the two exist side by side, so a
+    // session that sets nothing keeps the daemon it has always had.
+    if std::env::var_os("VSHOT_PIN_DAEMON").as_deref() == Some(std::ffi::OsStr::new("rust")) {
+        let program = std::env::current_exe().map_err(|source| VshotError::CommandIo {
+            program: "vshot".into(),
+            source,
+        })?;
+        Command::new(program)
+            .arg("--pin-server")
+            .arg(socket_path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(if keep_daemon_stderr() {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
+            .spawn()
+            .map_err(|source| VshotError::CommandIo {
+                program: "vshot --pin-server".into(),
+                source,
+            })?;
+        return Ok(());
+    }
     let helper = helper_program()?;
     Command::new(&helper.path)
         .arg("--pin-server")

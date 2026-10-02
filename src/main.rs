@@ -18,6 +18,7 @@ mod ocr;
 mod output;
 mod parallel;
 mod pin;
+mod pin_daemon;
 mod pin_hdr;
 mod pin_hdr_fp16;
 mod pixel_fd;
@@ -84,6 +85,16 @@ fn run() -> Result<()> {
     // never appears in the command tree.
     let mut arguments = std::env::args_os().skip(1);
     if let Some(flag) = arguments.next() {
+        // The pin daemon itself: the process that owns the pins, the socket
+        // the CLI talks to and the surfaces they are drawn on.  Like the
+        // helper below it is read before the CLI parser, so it is not a
+        // subcommand and never appears in the command tree.
+        if flag == "--pin-server" {
+            let socket = arguments
+                .next()
+                .ok_or_else(|| VshotError::Pin("--pin-server needs a socket path".into()))?;
+            return pin_daemon::run(Path::new(&socket));
+        }
         if flag == "--pin-hdr-server" {
             let socket = arguments.next().ok_or_else(|| VshotError::HdrPin {
                 path: PathBuf::from("--pin-hdr-server"),

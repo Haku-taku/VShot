@@ -63,7 +63,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -100,9 +100,9 @@ const MASK_NAMESPACE: u64 = 1 << 63;
 /// of one picture, and re-deriving them needs the picture rather than one of
 /// its spellings.
 #[derive(Clone)]
-struct Pixels {
-    picture: Arc<Picture>,
-    path: PathBuf,
+pub(crate) struct Pixels {
+    pub(crate) picture: Arc<Picture>,
+    pub(crate) path: PathBuf,
 }
 
 impl Pixels {
@@ -124,21 +124,35 @@ impl Pixels {
 /// One pinned image: its pixels, and where the daemon wants them, in global
 /// logical pixels.
 #[derive(Clone)]
-struct Pin {
-    pixels: Pixels,
-    origin: Point,
+pub(crate) struct Pin {
+    pub(crate) pixels: Pixels,
+    pub(crate) origin: Point,
     /// Logical pixels per source pixel.
-    scale: f64,
-    visible: bool,
+    pub(crate) scale: f64,
+    pub(crate) visible: bool,
     /// Whether the keyboard would act on this pin, which is what picks the rim's
     /// colour.  The daemon sends this once for the whole stack rather than per
     /// pin — only the surface holding the keyboard knows it, and it is a fact
     /// about the pointer rather than about the stack — and [`apply_pins`] copies
     /// it onto every pin.
-    active: bool,
+    pub(crate) active: bool,
 }
 
 impl Pin {
+    /// One pin, holding `picture`, at the place and size the caller worked out.
+    pub(crate) fn new(picture: Picture, path: PathBuf, origin: Point, scale: f64) -> Self {
+        Self {
+            pixels: Pixels {
+                picture: Arc::new(picture),
+                path,
+            },
+            origin,
+            scale,
+            visible: true,
+            active: false,
+        }
+    }
+
     fn width(&self) -> u32 {
         self.pixels.width()
     }
@@ -354,13 +368,41 @@ fn read_primaries(bytes: &[u8]) -> Primaries {
 /// How every pin on this output is drawn: one style for the whole stack, the way
 /// the Qt side hands one to every surface.
 #[derive(Clone, Debug, Default, PartialEq)]
-struct Style {
+pub(crate) struct Style {
     /// Corner radius in logical pixels.
     radius: i32,
     /// The soft shadow behind every pin, or none.
     shadow: Option<Shadow>,
     /// The stroke around every pin, or none.
     border: Option<Border>,
+}
+
+impl Style {
+    /// The style the config file asks for, with the defaults `ui/config.hpp`
+    /// documents.
+    ///
+    /// Read here rather than handed over a socket because the daemon that draws
+    /// the pins is this process now: the settings window writes these keys and
+    /// this is the reader that has to agree with it, name for name.
+    fn from_config() -> Self {
+        let preferences = crate::config::pin_style();
+        let wide = |value: u32| i32::try_from(value).unwrap_or(i32::MAX);
+        Self {
+            radius: wide(preferences.radius),
+            shadow: preferences.shadow.map(|shadow| Shadow {
+                size: wide(shadow.size),
+                offset: shadow.offset,
+                opacity: wide(shadow.opacity).min(255),
+            }),
+            border: (preferences.border_width > 0).then(|| Border {
+                width: wide(preferences.border_width),
+                // The two colours a pin is drawn in when the file names
+                // neither, which is what the Qt surface draws with.
+                colour: preferences.border_colour.unwrap_or([192, 192, 192, 255]),
+                active: preferences.active_border_colour.unwrap_or([0, 0, 0, 255]),
+            }),
+        }
+    }
 }
 
 /// A soft shadow, in the same terms `ui/shadow.cpp` describes one.
@@ -554,7 +596,7 @@ struct Stage {
 
 /// The helper's wayland side: the session, the outputs that got a colour
 /// description, and the picture each of those is showing.
-struct Surfaces {
+pub(crate) struct Surfaces {
     session: WaylandSession,
     /// Outputs this side has a picture surface on, each described in that
     /// output's own curve.  Every output that could be given a buffer is here,
@@ -617,7 +659,7 @@ impl OutputRect {
 }
 
 impl Surfaces {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let session = WaylandSession::connect()?;
         Ok(Self {
             session,
@@ -626,7 +668,7 @@ impl Surfaces {
             targets: HashMap::new(),
             stages: HashMap::new(),
             outputs: Vec::new(),
-            style: Style::default(),
+            style: Style::from_config(),
             last_pins: Vec::new(),
         })
     }
@@ -635,7 +677,7 @@ impl Surfaces {
     /// description — which is what makes a PQ buffer a passthrough rather than
     /// something to tone-map — and hands it the half-float buffers the pictures
     /// are drawn into.
-    fn start(&mut self) -> Result<()> {
+    pub(crate) fn start(&mut self) -> Result<()> {
         let debug = std::env::var_os("VSHOT_PIN_DEBUG").is_some();
         self.tone_map = crate::config::tone_map_options();
         let candidates = self
@@ -888,7 +930,7 @@ impl Surfaces {
     }
 
     /// Dispatches whatever the compositor has already sent, without waiting.
-    fn pump(&mut self) -> Result<()> {
+    pub(crate) fn pump(&mut self) -> Result<()> {
         self.session.pump(Duration::ZERO)
     }
 
@@ -901,6 +943,30 @@ impl Surfaces {
     /// buffer release always wakes it, which is what a refused compose needs.
     fn wait(&mut self, stream: &UnixStream) -> Result<()> {
         self.session.pump_watching(Some(stream.as_fd()), None)
+    }
+
+    /// The same, woken by anything: a socket with something to say, or the
+    /// compositor handing a buffer back.  A daemon that owns its own listener
+    /// has no stream to hand over, and waiting on the listener's own descriptor
+    /// is what keeps a connection from sitting unread until the compositor
+    /// happens to speak.
+    pub(crate) fn wait_on(&mut self, fd: Option<BorrowedFd<'_>>) -> Result<()> {
+        self.session.pump_watching(fd, None)
+    }
+
+    /// The geometry of the output a new pin should land on: the one the caller
+    /// named, or the first output there is.  `None` when this side has no
+    /// output at all, which is a session with nothing to pin onto.
+    pub(crate) fn target_geometry(&self, name: Option<&str>) -> Option<Rect> {
+        name.and_then(|name| self.outputs.iter().find(|output| output.name == name))
+            .or_else(|| self.outputs.first())
+            .map(|output| output.geometry)
+    }
+
+    /// How many outputs this side has a picture surface on, for the daemon's
+    /// own bookkeeping -- a pin cannot be shown at all without one.
+    pub(crate) fn surface_count(&self) -> usize {
+        self.targets.len()
     }
 }
 
@@ -1455,49 +1521,68 @@ fn apply_pins(command: &serde_json::Value, surfaces: &mut Surfaces, debug: bool)
     let reference_nits = crate::config::hdr_reference_white_default()
         .unwrap_or(crate::model::hdr::REFERENCE_WHITE_NITS);
     let wanted = stack_of(command, incoming, &previous, reference_nits)?;
-    if debug {
-        let names = wanted
-            .iter()
-            .map(|(id, pin)| {
-                format!(
-                    "{id}@{}x{}+{},{}",
-                    pin.width(),
-                    pin.height(),
-                    pin.origin.x,
-                    pin.origin.y
-                )
-            })
-            .collect::<Vec<String>>()
-            .join(" ");
-        eprintln!(
-            "vshot: pin-hdr: {} pin(s): {names} [radius {} shadow {:?} border {:?}]",
-            wanted.len(),
-            surfaces.style.radius,
-            surfaces.style.shadow,
-            surfaces.style.border,
-        );
+    surfaces.set_pins(wanted, Some(style), debug)
+}
+
+impl Surfaces {
+    /// Replaces the stack and asks the session to show it.
+    ///
+    /// `pins` is back to front: the last entry is drawn last, so it is the
+    /// frontmost.  `style` is `None` to keep the one this side is drawing with,
+    /// which is what a caller that has not changed anything about the look
+    /// wants.
+    pub(crate) fn set_pins(
+        &mut self,
+        wanted: Vec<(u64, Pin)>,
+        style: Option<Style>,
+        debug: bool,
+    ) -> Result<()> {
+        let previous = std::mem::take(&mut self.last_pins);
+        let style = style.unwrap_or_else(|| self.style.clone());
+        if debug {
+            let names = wanted
+                .iter()
+                .map(|(id, pin)| {
+                    format!(
+                        "{id}@{}x{}+{},{}",
+                        pin.width(),
+                        pin.height(),
+                        pin.origin.x,
+                        pin.origin.y
+                    )
+                })
+                .collect::<Vec<String>>()
+                .join(" ");
+            eprintln!(
+                "vshot: pin-hdr: {} pin(s): {names} [radius {} shadow {:?} border {:?}]",
+                wanted.len(),
+                self.style.radius,
+                self.style.shadow,
+                self.style.border,
+            );
+        }
+        // The stack the daemon repeats while nothing about it changes — a style
+        // reload, a pin coming to the front — is not worth recomposing, and the
+        // pixels here are derived from these fields alone.
+        let unchanged = previous.len() == wanted.len()
+            && previous
+                .iter()
+                .zip(&wanted)
+                .all(|((old_id, old), (new_id, new))| {
+                    old_id == new_id
+                        && old.pixels.source() == new.pixels.source()
+                        && old.origin == new.origin
+                        && old.scale == new.scale
+                        && old.visible == new.visible
+                        && old.active == new.active
+                });
+        self.style = style;
+        self.last_pins = wanted;
+        if !unchanged {
+            self.show();
+        }
+        Ok(())
     }
-    // The stack the daemon repeats while nothing about it changes — a style
-    // reload, a pin coming to the front — is not worth recomposing, and the
-    // pixels here are derived from these fields alone.
-    let unchanged = previous.len() == wanted.len()
-        && previous
-            .iter()
-            .zip(&wanted)
-            .all(|((old_id, old), (new_id, new))| {
-                old_id == new_id
-                    && old.pixels.source() == new.pixels.source()
-                    && old.origin == new.origin
-                    && old.scale == new.scale
-                    && old.visible == new.visible
-                    && old.active == new.active
-            });
-    surfaces.style = style;
-    surfaces.last_pins = wanted;
-    if !unchanged {
-        surfaces.show();
-    }
-    Ok(())
 }
 
 /// The stack one command describes, in the daemon's own paint order.

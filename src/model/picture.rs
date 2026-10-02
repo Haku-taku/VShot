@@ -40,6 +40,49 @@ pub enum Picture {
     Hdr(HdrImage),
 }
 
+/// The scale an image file declares about itself, or `None` when it declares
+/// none.
+///
+/// Read from the bytes rather than from the decoded picture, because a decoded
+/// image cannot show the difference: every reader reports *some* density for a
+/// file that declares none, and the declaration is the only thing that says
+/// what the picture's own scale is.  Which reader is asked follows the file's
+/// own magic, the same way the decode does.
+pub fn declared_scale(bytes: &[u8]) -> Option<u32> {
+    // The formats the byte sniffer knows name themselves in their first line or
+    // their first box; the SDR ones carry a signature instead.
+    let name = match codec::detect(bytes) {
+        Some(codec) => codec.name(),
+        None if bytes.starts_with(b"\x89PNG\r\n\x1a\n") => "png",
+        None if bytes.starts_with(&[0xff, 0xd8]) => "jpeg",
+        None if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" => "webp",
+        None => return None,
+    };
+    declared_scale_of(name, bytes)
+}
+
+/// One format's own reader, by the name the registry gives it.
+///
+/// The name rather than the codec because the byte sniffer answers with a
+/// trait object, and `declared_scale` is not on that trait: it is on
+/// [`crate::model::codec::ScaleMetadata`], which every codec here implements
+/// but which nothing hands back as one.
+fn declared_scale_of(name: &str, bytes: &[u8]) -> Option<u32> {
+    use crate::model::codec::ScaleMetadata;
+    match name {
+        #[cfg(feature = "png")]
+        "png" => crate::model::codec::png::Png.declared_scale(bytes),
+        "jpeg" => crate::model::codec::jpeg::Jpeg.declared_scale(bytes),
+        "webp" => crate::model::codec::webp::Webp.declared_scale(bytes),
+        "jxl" => crate::model::codec::jxl::Jxl.declared_scale(bytes),
+        #[cfg(feature = "avif")]
+        "avif" => crate::model::codec::avif::Avif.declared_scale(bytes),
+        #[cfg(feature = "radiance")]
+        "hdr" => crate::model::codec::radiance::Radiance.declared_scale(bytes),
+        _ => None,
+    }
+}
+
 /// What the ten-bit codes a surface is given mean.
 ///
 /// A surface is passed through untouched only when its pixels hold what its own
