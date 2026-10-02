@@ -954,6 +954,17 @@ impl Surfaces {
         self.session.pump_watching(fd, None)
     }
 
+    /// The same, giving up after `timeout` so the caller can look at its own
+    /// clock: a daemon with nothing pinned has to notice that, and nothing the
+    /// compositor or the socket says will tell it.
+    pub(crate) fn wait_on_until(
+        &mut self,
+        fd: Option<BorrowedFd<'_>>,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
+        self.session.pump_watching(fd, timeout)
+    }
+
     /// Lets the pin surfaces take the pointer, or stops them.
     pub(crate) fn set_pin_input(&mut self, on: bool) {
         self.session.set_pin_input(on);

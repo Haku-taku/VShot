@@ -74,6 +74,14 @@ impl Pinned {
     }
 }
 
+/// How long the daemon stays up with nothing pinned.
+///
+/// It is resident so that pins outlive the command that made them, and with
+/// nothing pinned there is nothing to hold: the next `vshot pin` starts one
+/// again.  Half a second, the same as the daemon this replaces, which is long
+/// enough for a close and the next request to be one session's work.
+const IDLE_QUIT: Duration = Duration::from_millis(500);
+
 /// How long two presses on one pin have to be apart to be one gesture rather
 /// than two.  Qt's own double-click interval, so the two daemons feel alike.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
@@ -272,6 +280,8 @@ impl Stack {
 struct Daemon {
     stack: Stack,
     surfaces: Surfaces,
+    /// When this daemon should give up, once it has nothing to hold.
+    idle: Option<Instant>,
 }
 
 impl Daemon {
@@ -281,6 +291,7 @@ impl Daemon {
         Ok(Self {
             stack: Stack::new(),
             surfaces,
+            idle: None,
         })
     }
 
@@ -327,6 +338,20 @@ impl Daemon {
             .map(|pin| Stack::rect_of(pin))
             .collect::<Vec<Rect>>();
         self.surfaces.set_input_rects(&rects)
+    }
+
+    /// When this daemon should give up, or `None` while it has something to
+    /// hold.
+    ///
+    /// Arming on the first look at an empty stack and clearing on the first pin
+    /// is what makes it a deadline: a pin made inside it, or a second request
+    /// that arrives inside it, keeps the session going.
+    fn idle_at(&mut self) -> Option<Instant> {
+        if !self.stack.pins.is_empty() {
+            self.idle = None;
+            return None;
+        }
+        Some(*self.idle.get_or_insert_with(|| Instant::now() + IDLE_QUIT))
     }
 
     /// Applies whatever the pointer did, drawing once at the end.
@@ -496,6 +521,12 @@ pub fn run(socket: &Path) -> Result<()> {
     let listener = UnixListener::bind(socket).map_err(|source| {
         VshotError::Pin(format!("cannot listen on {}: {source}", socket.display()))
     })?;
+    // Non-blocking, so the drain loop below can accept everything that is
+    // waiting and then get back to the wait: a blocking `accept` would hold the
+    // loop here and the daemon would never look at its own clock again.
+    listener.set_nonblocking(true).map_err(|source| {
+        VshotError::Pin(format!("cannot make the pin socket non-blocking: {source}"))
+    })?;
     let debug = std::env::var_os("VSHOT_PIN_DEBUG").is_some();
     let mut daemon = Daemon::new()?;
     daemon.surfaces.set_pin_input(true);
@@ -515,7 +546,23 @@ pub fn run(socket: &Path) -> Result<()> {
             .as_fd()
             .try_clone_to_owned()
             .map_err(|source| VshotError::Pin(format!("cannot watch the pin socket: {source}")))?;
-        daemon.surfaces.wait_on(Some(wake.as_fd()))?;
+        match daemon.idle_at() {
+            // Nothing pinned: wait out the deadline and give up when it passes.
+            // Nothing the compositor or the socket says announces an empty
+            // stack, so the clock is the only thing that can.
+            Some(deadline) => match deadline.checked_duration_since(Instant::now()) {
+                Some(left) => daemon
+                    .surfaces
+                    .wait_on_until(Some(wake.as_fd()), Some(left))?,
+                None => {
+                    if debug {
+                        eprintln!("vshot-pin: nothing pinned; giving up");
+                    }
+                    return Ok(());
+                }
+            },
+            None => daemon.surfaces.wait_on(Some(wake.as_fd()))?,
+        }
         // Whatever the compositor had queued, before anything else looks at the
         // stack: a drag is a stream of these, and each one is a repaint.
         daemon.gestures()?;
