@@ -37,7 +37,7 @@ use crate::error::{Result, VshotError};
 use crate::geometry::{Point, Rect, Size};
 use crate::model::picture::{self, Picture};
 use crate::pin::PinCommand;
-use crate::pin_hdr::{Pin, Surfaces};
+use crate::pin_hdr::{OutputPlacement, Pin, Surfaces};
 
 /// How long a client may take to send its request before the connection is
 /// dropped.  It is one short line, and a client that stops halfway must not
@@ -72,6 +72,112 @@ impl Pinned {
         pin.visible = self.visible;
         pin
     }
+}
+
+/// The density a pin is shown at, and what decided it.
+///
+/// In the order the README gives, which is the order of how much each source
+/// knows: what the caller asked for, what the file says about itself, what a
+/// screenshot tool left beside it, and finally what the picture's own size
+/// implies about the screen it came from.  A pin that ignored the last of those
+/// would come out larger than it ever was on screen -- which is the whole
+/// complaint the sizing exists to answer.
+fn resolve_density(
+    requested: Option<u32>,
+    declared: Option<u32>,
+    recorded: Option<u32>,
+    size: Size,
+    target: OutputPlacement,
+    others: &[OutputPlacement],
+) -> (u32, &'static str) {
+    if let Some(value) = requested {
+        return (value.clamp(1, 4), "the request");
+    }
+    if let Some(value) = declared {
+        return (value.clamp(1, 4), "the file's own statement");
+    }
+    if let Some(value) = recorded {
+        return (value.clamp(1, 4), "the producer's record");
+    }
+    (
+        infer_density(size, target, others),
+        "the picture's size and the output it lands on",
+    )
+}
+
+/// The density to assume for a picture that states none.
+///
+/// A picture cannot hold more pixels than the screen it was captured on, so one
+/// that does not fit the target's native resolution was not captured there: it
+/// came from a bigger or denser output, and pinning it one to one would make it
+/// larger than it ever was on screen.  The density of the screen that could
+/// have produced it is used instead -- the smallest one that still holds every
+/// pixel.  One that does fit keeps the target's own density, which is exactly
+/// one picture pixel per screen pixel.
+fn infer_density(size: Size, target: OutputPlacement, others: &[OutputPlacement]) -> u32 {
+    let fits = |output: &OutputPlacement| {
+        size.width <= output.pixel_size.width && size.height <= output.pixel_size.height
+    };
+    if fits(&target) {
+        return target.scale.max(1);
+    }
+    others
+        .iter()
+        .filter(|output| fits(output))
+        .min_by_key(|output| {
+            u64::from(output.pixel_size.width) * u64::from(output.pixel_size.height)
+        })
+        .map(|output| output.scale.max(1))
+        .unwrap_or_else(|| target.scale.max(1))
+}
+
+/// The file a screenshot tool records its captures in, unless one is named.
+fn source_record_path() -> PathBuf {
+    std::env::var_os("VSHOT_PIN_SOURCE_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp/screenshot-path"))
+}
+
+/// The density a screenshot tool recorded beside `path`, or `None`.
+///
+/// Two spellings, because two kinds of tool write one: a `<path>.scale` sidecar
+/// whose last field is the number, and a shared record file holding one
+/// `<path> <scale>` line per capture.  Both are how a program that is not vshot
+/// tells a pin how dense the file it wrote is.
+fn recorded_density(path: &Path, record: &Path) -> Option<u32> {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(".scale");
+    if let Ok(text) = std::fs::read_to_string(PathBuf::from(sidecar)) {
+        if let Some(value) = text.split_whitespace().last().and_then(parse_density) {
+            return Some(value);
+        }
+    }
+    let text = std::fs::read_to_string(record).ok()?;
+    let wanted = std::path::absolute(path).ok()?;
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(named), Some(value)) = (fields.next(), fields.next()) else {
+            // A bare number is only meaningful in a per-image file, which the
+            // sidecar above is.
+            continue;
+        };
+        if std::path::absolute(named).ok() != Some(wanted.clone()) {
+            continue;
+        }
+        if let Some(value) = parse_density(value) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// A density as one of those records spells it: a whole number in 1..=4, or a
+/// value within a twentieth of one, so a tool that wrote `2.0` is believed and
+/// one that wrote `300` -- a print resolution -- is not.
+fn parse_density(token: &str) -> Option<u32> {
+    let value: f64 = token.parse().ok()?;
+    let rounded = value.round();
+    ((1.0..=4.0).contains(&rounded) && (value - rounded).abs() <= 0.05).then_some(rounded as u32)
 }
 
 /// How long the daemon stays up with nothing pinned.
@@ -469,16 +575,34 @@ impl Daemon {
         let reference_nits = crate::config::hdr_reference_white_default()
             .unwrap_or(crate::model::hdr::REFERENCE_WHITE_NITS);
         let picture = picture::decode_bytes(&bytes, reference_nits)?;
-        // The scale the pin is shown at: what the caller said, then what the
-        // file says about itself, then the natural size.  A capture on a 2x
-        // output declares 192 DPI, and a pin that ignored that would come out
-        // twice the size it had on screen.
-        let density = density
-            .or_else(|| picture::declared_scale(&bytes))
-            .unwrap_or(1)
-            .clamp(1, 4);
-        let scale = 1.0 / f64::from(density);
         let size = picture.size();
+        let placements = self.surfaces.placements();
+        let target = self
+            .surfaces
+            .placement_of(output_name)
+            .or_else(|| placements.first().copied());
+        let (density, source) = match target {
+            Some(target) => resolve_density(
+                density,
+                picture::declared_scale(&bytes),
+                recorded_density(path, &source_record_path()),
+                size,
+                target,
+                &placements,
+            ),
+            // No output at all: nothing to size it against, so the file's own
+            // word is the only one there is.
+            None => (
+                density
+                    .or_else(|| picture::declared_scale(&bytes))
+                    .unwrap_or(1),
+                "the request",
+            ),
+        };
+        if std::env::var_os("VSHOT_PIN_DEBUG").is_some() {
+            eprintln!("vshot-pin: density {density} from {source}");
+        }
+        let scale = 1.0 / f64::from(density);
         let origin = match at {
             Some(point) => Point::new(point.x, point.y),
             None => self.centred(size, scale, output_name),
@@ -658,6 +782,107 @@ mod tests {
         };
         assert_eq!(path, PathBuf::from("/tmp/shot.png"));
         assert_eq!(density, Some(2));
+    }
+
+    // --- how big a pin comes out ------------------------------------------
+
+    fn output(width: u32, height: u32, scale: u32) -> OutputPlacement {
+        OutputPlacement {
+            geometry: Rect::new(0, 0, width / scale, height / scale),
+            pixel_size: Size::new(width, height),
+            scale,
+        }
+    }
+
+    /// The order the sources are asked in: the caller's word beats the file's,
+    /// the file's beats a screenshot tool's record, and all three beat a guess.
+    #[test]
+    fn the_density_sources_are_asked_in_order() {
+        let target = output(1920, 1080, 1);
+        let size = Size::new(100, 100);
+        let (value, source) = resolve_density(Some(3), Some(2), Some(4), size, target, &[target]);
+        assert_eq!((value, source), (3, "the request"));
+        let (value, _) = resolve_density(None, Some(2), Some(4), size, target, &[target]);
+        assert_eq!(value, 2);
+        let (value, _) = resolve_density(None, None, Some(4), size, target, &[target]);
+        assert_eq!(value, 4);
+        // Nothing stated: the picture's own size decides, and one that fits the
+        // target lands at exactly one picture pixel per screen pixel.
+        let (value, source) = resolve_density(None, None, None, size, target, &[target]);
+        assert_eq!(
+            (value, source),
+            (1, "the picture's size and the output it lands on")
+        );
+    }
+
+    /// A picture too big for the output it is landing on came from a denser
+    /// one, and is shown at the density of the smallest screen that could have
+    /// produced it -- so it is never larger than it was on screen.
+    #[test]
+    fn a_picture_too_big_for_its_output_is_sized_from_the_one_it_came_from() {
+        let small = output(1920, 1080, 1);
+        let large = output(3840, 2160, 2);
+        let huge = output(7680, 4320, 4);
+        let arrangements = [small, large, huge];
+
+        // 2560x1440 fits the 4K screen's native pixels but not the 1080p one's.
+        let size = Size::new(2560, 1440);
+        assert_eq!(infer_density(size, small, &arrangements), 2);
+        // And on the screen it fits, it is one to one.
+        assert_eq!(infer_density(size, large, &arrangements), 2);
+        // A picture nothing can hold keeps the target's own density rather
+        // than being scaled to a screen that does not exist.
+        let enormous = Size::new(16_000, 16_000);
+        assert_eq!(infer_density(enormous, large, &arrangements), 2);
+    }
+
+    /// A density in a record is a whole number in range, or a value close
+    /// enough to one; a print resolution is not a density.
+    #[test]
+    fn only_a_screen_density_is_read_from_a_record() {
+        assert_eq!(parse_density("2"), Some(2));
+        assert_eq!(parse_density("2.0"), Some(2));
+        assert_eq!(parse_density("2.05"), Some(2));
+        assert_eq!(parse_density("300"), None);
+        assert_eq!(parse_density("0"), None);
+        assert_eq!(parse_density("5"), None);
+        assert_eq!(parse_density("two"), None);
+    }
+
+    /// Both spellings of a screenshot tool's record are read: the sidecar
+    /// beside the file, and the shared file with one line per capture.
+    #[test]
+    fn a_screenshot_tools_record_is_read_in_both_spellings() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let shot = directory.path().join("shot.png");
+        std::fs::write(&shot, b"png").unwrap();
+
+        // The sidecar first, which is the one that travels with the file.
+        let mut sidecar = shot.as_os_str().to_os_string();
+        sidecar.push(".scale");
+        std::fs::write(PathBuf::from(&sidecar), b"2\n").unwrap();
+        assert_eq!(
+            recorded_density(&shot, &directory.path().join("none")),
+            Some(2)
+        );
+        std::fs::remove_file(&sidecar).unwrap();
+
+        // Then the shared record, which names the file on its line.  A line for
+        // another picture is not this one's.
+        let record = directory.path().join("screenshot-path");
+        let other = directory.path().join("other.png");
+        std::fs::write(&other, b"png").unwrap();
+        std::fs::write(
+            &record,
+            format!("{} 3\n{} 4\n", other.display(), shot.display()),
+        )
+        .unwrap();
+        assert_eq!(recorded_density(&shot, &record), Some(4));
+        // No record at all is no answer, not a wrong one.
+        assert_eq!(
+            recorded_density(&shot, &directory.path().join("none")),
+            None
+        );
     }
 
     // --- what a gesture means ---------------------------------------------

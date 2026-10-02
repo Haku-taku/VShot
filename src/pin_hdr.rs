@@ -641,6 +641,20 @@ struct OutputRect {
     white: f32,
 }
 
+/// An output as the sizing needs it: where it sits, how many native pixels it
+/// has, and what its own scale is.
+///
+/// A smaller view of [`OutputRect`] on purpose.  The picture is drawn from the
+/// gamut, the white and the curve; it is *placed* from its geometry, its native
+/// size and its scale, and a function that decides how big a pin is has no
+/// business with the first three.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OutputPlacement {
+    pub geometry: Rect,
+    pub pixel_size: Size,
+    pub scale: u32,
+}
+
 impl OutputRect {
     /// This output as the colour layer describes it.
     ///
@@ -988,6 +1002,32 @@ impl Surfaces {
         name.and_then(|name| self.outputs.iter().find(|output| output.name == name))
             .or_else(|| self.outputs.first())
             .map(|output| output.geometry)
+    }
+
+    /// Where this side can put a pin, and how big each output's native pixels
+    /// are: what the sizing needs to know about the screens, in the shape that
+    /// question wants rather than in the shape the renderer does.
+    pub(crate) fn placements(&self) -> Vec<OutputPlacement> {
+        self.outputs
+            .iter()
+            .map(|output| OutputPlacement {
+                geometry: output.geometry,
+                pixel_size: output.pixel_size,
+                scale: output.scale,
+            })
+            .collect()
+    }
+
+    /// The output a pin should land on: the one the caller named, or the first
+    /// there is.
+    pub(crate) fn placement_of(&self, name: Option<&str>) -> Option<OutputPlacement> {
+        name.and_then(|name| self.outputs.iter().find(|output| output.name == name))
+            .or_else(|| self.outputs.first())
+            .map(|output| OutputPlacement {
+                geometry: output.geometry,
+                pixel_size: output.pixel_size,
+                scale: output.scale,
+            })
     }
 
     /// How many outputs this side has a picture surface on, for the daemon's
