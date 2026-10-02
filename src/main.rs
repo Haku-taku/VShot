@@ -31,7 +31,9 @@ mod translate;
 mod wayland;
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -94,13 +96,6 @@ fn run() -> Result<()> {
                 .next()
                 .ok_or_else(|| VshotError::Pin("--pin-server needs a socket path".into()))?;
             return pin_daemon::run(Path::new(&socket));
-        }
-        if flag == "--pin-hdr-server" {
-            let socket = arguments.next().ok_or_else(|| VshotError::HdrPin {
-                path: PathBuf::from("--pin-hdr-server"),
-                reason: "no socket path was given".into(),
-            })?;
-            return pin_hdr::run(Path::new(&socket));
         }
     }
     let cli = cli::parse();

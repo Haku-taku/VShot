@@ -1445,12 +1445,6 @@ impl WaylandSession {
             .map(|(global_id, _)| *global_id)
     }
 
-    /// Pumps the connection for up to `timeout`: buffer releases, configure
-    /// events, anything the compositor has to say.  A timeout is not an error.
-    pub fn pump(&mut self, timeout: Duration) -> Result<()> {
-        self.pump_watching(None, Some(timeout))
-    }
-
     /// Pumps the connection until it or `extra` has something to say.
     ///
     /// A client that waits on its own socket as well as the compositor — the

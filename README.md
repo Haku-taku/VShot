@@ -506,7 +506,7 @@ EXIF 里**没有**「显示缩放」这个语义的字段——`XResolution` 按
 ### pin daemon
 layer-shell 浮层 surface 由创建它的进程拥有，因此需要一个常驻进程：
 
-- 复用 Qt 二进制：`vshot-qt-ui --pin-server <socket>` 即 daemon，首次 `vshot pin` 连不上 socket 时自动分离式拉起（不占终端）；CLI 是瘦客户端，通过 Unix socket 发送单行 JSON 请求，socket 默认 `$XDG_RUNTIME_DIR/vshot-pin-<uid>.sock`，可用 `VSHOT_PIN_SOCKET` 覆盖。关闭最后一张 pin（或 `--close-all`）约 0.5 s 后 daemon 自动退出，下次 pin 命令自动重新拉起；`vshot pin --quit` 可随时手动退出；
+- **daemon 就是 `vshot` 自己**（`vshot --pin-server <socket>`）：它持有 pin 表，也持有每块输出上那张半浮点画面 surface，图片由它直接画进面板，中间没有第二个进程、也没有中转文件。首次 `vshot pin` 连不上 socket 时自动分离式拉起（不占终端）；CLI 是瘦客户端，通过 Unix socket 发送单行 JSON 请求，socket 默认 `$XDG_RUNTIME_DIR/vshot-pin-<uid>.sock`，可用 `VSHOT_PIN_SOCKET` 覆盖。关闭最后一张 pin（或 `--close-all`）约 0.5 s 后 daemon 自动退出，下次 pin 命令自动重新拉起；`vshot pin --quit` 可随时手动退出；
 - **不要用 `pkill` / `kill -9` 结束 daemon**：它持有 layer-shell surface，被强杀时部分合成器（实测 Hyprland 0.56）会残留该 surface 与其截屏会话，导致**所有输出的 screencopy 永久阻塞**（`vshot` / `grim` 全部超时，`hyprctl reload` 也无法恢复，只能重启会话）。请始终用 `vshot pin --quit`，它会在退出前 unmap 全部浮层；daemon 也已处理 `SIGTERM` / `SIGINT` 走同样的优雅路径。
 
 Wayland 客户端收不到全局按键，所以"一键显隐"需要自己绑到合成器快捷键，例如 Hyprland：
@@ -569,7 +569,9 @@ bind = SUPER SHIFT, A, exec, vshot annotate quit
 
 冻结帧在交互界面上也按原样显示：VShot 在 overlay 下面另起一层 surface，挂的是**那块输出自己的 image description**（不是照着它造一个像的），所以合成器既不转换也不做色调映射，选中的区域就是屏幕上原本的光；overlay 自己只画遮罩（选区挖空）、标注与工具条。别的路线是造一份“像”的描述，那不够：compositor 会把它当成另一个空间，往面板自己的范围里做一次色调映射，整幅画面会一起变暗。
 
-**pin 到屏幕上的 HDR 图也是 HDR 的**，走的是同一条道理：pin daemon 随自己启动一个小进程（`vshot --pin-hdr-server`），它在每块输出上铺一张 overlay 层的 surface，挂上和冻结帧一样的那块输出自己的 image description，把标注后重新按 PQ 编码的十位像素写进去，于是合成器不转换、不色调映射，贴上去的就是原来那束光。Qt 的 pin 浮层做不到这一点——它是 Qt 窗口，描述由 `QColorSpace` 造出，没有亮度信息，合成器会当成另一个空间压暗。所以**每一张贴图都由这个 helper 画**，不只是 HDR 的那些——原因不是 HDR 本身，而是堆叠顺序：同一层的 surface 按**映射顺序**堆叠，协议没有 restack 请求，而 helper 的那张必须在 daemon 的第一张 surface 之前映射（它先报过到），于是它永远在所有 Qt surface 之下，Qt 浮层上画的任何东西都会盖到 helper 画的每一张贴图上，包括本该盖住它的、排在它前面的贴图——一条边框也会压过挡在它前面的那张图。所以整摞图（图像、阴影、边框）都是 helper 的，一张 surface、一次 commit：HDR 贴图按自己的 PQ 直通，SDR 贴图由 daemon 写成 PNG 交给它、由它按该输出自己的参考白编码成 PQ（见下），Qt 浮层只留**角标、右键菜单、`HDR` 标签和输入遮罩**，并把图像那块挖空留给它。顺带修掉的是 SDR 贴图在 HDR 输出上被合成器色调映射压暗的问题：交给 helper 的是一束光，而不是一张等着被转换的 sRGB 图。helper 必须在 daemon 的第一张 surface 之前映射，所以它在 daemon 启动时就被拉起。截下来的内容没有超过 SDR 白（按上面的面积判定，不写第二份）时没有 HDR 那一份，pin 就是普通 SDR pin，走的就是上面那条 PNG 的路；合成器不提供 `wp_color_manager_v1` 时 helper 干脆不铺 surface，整摞退回 Qt 浮层自己画（图像、阴影、边框都在它这边）。每个图片文件只读一次（按路径缓存），拖动时 daemon 每批只发最后一条位置，所以快速拖动不会每个鼠标事件都重画一遍。
+**pin 到屏幕上的图由 daemon 自己画进半浮点 surface**：每块输出一张 overlay 层的裸 `wl_surface`，挂的是**那块输出自己**的 image description，像素写进去的是 PQ 编码的十位值，于是合成器不转换、不色调映射，贴上去的就是那束光。Qt 做不到这一点——它的窗口描述由 `QColorSpace` 造出，只有 primaries 和 transfer function、**没有亮度**，而 HDR 输出那份描述带亮度，造不出来就直通不了，合成器会当成另一个空间压暗（实测 50→1000 cd/m² 出来是 40→188）。所以图片这条路整个在 daemon 里：它自己解码用户给的那**一个文件**，按落点输出现场编码——HDR 屏上原样输出那束光，SDR 屏上按 `tone-map` 色调映射；SDR 内容落在 HDR 屏上则按**那块屏自己的参考白**升映射。图像、阴影、边框是一张 surface、一次 commit，否则拖动时图会拖着自己的边。每个文件只解码一次（按路径缓存），拖动时每批只提交一次。
+
+**角标、右键菜单和 `HDR` 标记是 Qt 画的**，在 daemon 之上的一张透明 surface 里——那些要文字，而 daemon 的画布是半浮点像素、没有字形。它由 daemon 启动（`vshot-qt-ui --pin-chrome <socket>`），只听 daemon 的：daemon 说画什么，它把菜单里选中的行号回给 daemon。它不在了只是少一层标签，pin 都还在。
 
 ## 截图后端与 KDE 授权
 启动时探测一次：先连 `wlr-screencopy-unstable-v1`，只有它以「缺少 `zwlr_screencopy_manager_v1`」失败时才说明这个合成器不提供该协议；再试 **KWin ScreenShot2**——KWin 的私有会话总线服务 `org.kde.KWin.ScreenShot2`（KWin 既没有 screencopy，也没有 `ext-image-copy-capture`）。vshot 传一根管道的写端，KWin 把像素写进管道并在回复里给出 `width` / `height` / `stride` / `format` / `scale`；像素是预乘 alpha 的 BGRA，输出截图把 alpha 归一为 255，窗口截图原样保留。
@@ -866,7 +868,7 @@ pin 同样是 layer surface，里面只有图片，所以圆角、身下的阴�
 | `VSHOT_VULKAN_DEVICE=N` | 指定 Vulkan 编码用第 N 个物理设备（多显卡机器；默认第一个） |
 | `VSHOT_OCR_MODELS=<dir>` | OCR 模型目录，覆盖 `/usr/share/vshot/models` 与可执行文件旁的查找 |
 | `VSHOT_PIN_SOCKET` | pin daemon 监听的 socket 路径 |
-| `VSHOT_HDR_HELPER` | 指定画 pin 图像栈的 `vshot --pin-hdr-server` helper 进程的 `vshot` 路径（默认按 `vshot-qt-ui` 所在位置推断） |
+| `VSHOT_QT_HELPER` | 指定画 pin 角标与右键菜单的 `vshot-qt-ui` 路径（默认按 `vshot` 所在位置推断） |
 | `VSHOT_PIN_DENSITY=N` | 每张 pin 图的来源密度，等同 `--density` |
 | `VSHOT_PIN_DEBUG=1` | daemon 打印每张 pin 的密度判定 |
 | `VSHOT_PIN_FOCUS_DEBUG=1` | daemon 打印 pin 渲染面每一次焦点变化 |
