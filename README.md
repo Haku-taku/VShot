@@ -543,7 +543,7 @@ bind = SUPER SHIFT, A, exec, vshot annotate quit
 **落在单个输出内的矩形一律从那块输出自己那份原生帧裁剪，并按那块屏的 scale 写密度**：`region` 的 `--geometry` 与交互选择、`window active`、`window pick` 以及像素识别给出的矩形都走这条路，只有**跨接缝**的矩形才回落到合成场景；`all` 是整块桌面，只能由场景给出。内部帧统一为 RGBA8、top-left origin，多输出合成支持负 logical origin 和输出间空隙（场景画布用最高输出 scale，较低 scale 的输出用 nearest-neighbor 放大）。当前要求正整数 scale、`transform=normal` 以及可安全证明的 logical/pixel 映射；fractional scale、旋转和无法证明的映射会清晰失败，而不是生成疑似错误的截图。这个校验只在**需要把输出合成为场景**的路径上生效，所以 KWin 与 niri 直接给窗口像素的两条路在旋转/翻转输出上仍然可用。
 
 ### HDR
-**这一节没有经过真机验证。** 写它的机器上既没有 HDR 显示器，也没有能给出 HDR 输出的合成器，所以下面描述的路径**一次都没有在真实的 HDR 内容上跑过**：协议交互与像素换算只有离屏检查（`vshot-pin-hdr-check`、`vshot-backdrop-check`）覆盖，HDR 捕获、色调映射、`.hdr` 的写出和 HDR pin 都是照着协议写出来的，没有实测。SDR 输出不受影响——合成器不描述 HDR 时不写 `.hdr`，也不铺 backdrop surface。
+**这一节在真机上验证过。** 开发机接的是一块 HDR 输出（合成器把 DP-6 描述为 PQ、BT.2020、参考白 203 cd/m²），所以 HDR 捕获、色调映射、`.hdr` 的写出和 HDR pin 都在真实内容上跑过。**SDR 输出那一侧**另起一个嵌套 Hyprland（`hl.monitor({cm="srgb", bitdepth=10})`）验证：同一份 pin 在 HDR 屏上 pin 的是同名副本（那张 JXL），在 SDR 屏上 pin 的是用户指名的文件（那张 PNG），后者由 daemon 现场色调映射。离屏检查（`vshot-backdrop-check`）覆盖协议交互与像素换算中不依赖真实合成器的部分。
 
 输出自己被合成器描述为 HDR（PQ 或 HLG）时，一次截图产出**两份**（`--sdr-copy false` 可以只要 HDR 那一份，见下）：`<name>.png` 是同一份内容的 SDR 色调映射，第二份是 HDR 内容本身，与 PNG 同名、只有后缀不同（默认 `<name>.avif`；`--hdr-format hdr` 改成 Radiance RGBE 的 `<name>.hdr`）。有标注时标注在**线性光**里合成到 HDR 那一份上，SDR 那一份再由它映射而来，两份因此描述同一束光、同一批标记。SDR 那一份**不用合成器给普通客户端准备的那张画面**：Hyprland 把它按 `DEFAULT_SRGB_IMAGE_DESCRIPTION`（峰值 80 cd/m²）写出，而一张 SDR 图里「白」的含义是这块输出自己的参考白（这里是 203），于是普通 SDR 内容会被压到白以下而不是落在白上——实测取到的是 sRGB 220 而非 255（145 cd/m²），整幅画面一起变暗，而不只是高光。VShot 因此自己映射。**画面里没有超过 SDR 白的东西时，它就是一整幅 SDR 图，按原样显示**：白落在 255，白以下的每个码值都保持它自己的光。只有画面里确实有超过白的光时，白点才下移——移到 `SDR_WHITE_LEVEL`（0.8），把白以上的码值腾出来装高光——这时 SDR 白以内的光按这个系数等比落码，比例原样保留、色相不变；超过 SDR 白的光再按 Reinhard 滚降到 `ROLL_OFF_PEAK`（10 倍 SDR 白）处的满量程，单调且分离，一块更亮的高光不会被抹成纯白（8 倍 SDR 白落在 252，与白相差 21 个码值）——这正是过去按峰值归一那套做不到的：它把超过白的一切压成同一个码，testufo 的 HDR 测试里 `HDR`/`WCG` 字样于是与周围的 SDR 再也分不出来。代价是白点成了画面的属性而非固定值：同一束光会因为画面里有没有高光而落在不同的码上。这是与另一种取舍相反的取舍——固定白点会把 HDR 输出上**每一次** SDR 截图都压暗到 sRGB 231，也就是一张 SDR 窗口的截图出来是错的。**色域按输出自己报的色度坐标换算**：Hyprland 对一块 P3 面板报出的坐标既不是 BT.709 也不是 BT.2020，按「更接近哪个」去猜会把整幅画面的颜色算错；落在 BT.709 之外的颜色按**朝白点去饱和**映射进去，而不是把负分量截成 0——截断会挪动色相，去饱和只丢装不下的彩度。内容本身没有超过 SDR 白时不会写第二份——这一判定见下一段。
 
@@ -902,7 +902,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --release --locked
 ```
 
-Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**（默认不构建，加 `-DVSHOT_BUILD_CHECKS=ON`），覆盖配置读写与设置窗口、字号换算、剪贴板颜色解析与色卡渲染、文件对话框的样式表、缩略图与保存时的格式清单（按 SDR/HDR 分列、后缀对齐、SDR 副本开关）、pin 的图片自述密度（五种格式各自的容器都查）、描边与 HDR 标记、文字卡片留白、色卡右键菜单、贴图的导出格式、标注浮层的五个工具与撤销/清除/工具栏位置、overlay 是否把冻结帧留给 backdrop、工具栏的落位、标注渲染缓存的命中、高 DPI 屏上的缓存分辨率，以及文字层——它解析 `vshot ocr --json` 打印的 JSON（这套线格式一头在 `src/ocr.rs`、一头在 Qt 侧），并且不建控件，因此不需要 `QT_QPA_PLATFORM`：
+Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**（默认不构建，加 `-DVSHOT_BUILD_CHECKS=ON`），覆盖配置读写与设置窗口、字号换算、剪贴板颜色解析与色卡渲染、文件对话框的样式表、缩略图与保存时的格式清单（按 SDR/HDR 分列、后缀对齐、SDR 副本开关）、pin 的图片自述密度（五种格式各自的容器都查）、文字卡片留白、标注浮层的五个工具与撤销/清除/工具栏位置、overlay 是否把冻结帧留给 backdrop、工具栏的落位、标注渲染缓存的命中、高 DPI 屏上的缓存分辨率，以及文字层——它解析 `vshot ocr --json` 打印的 JSON（这套线格式一头在 `src/ocr.rs`、一头在 Qt 侧），并且不建控件，因此不需要 `QT_QPA_PLATFORM`：
 
 ```sh
 cmake -S . -B build-qt -DVSHOT_BUILD_CHECKS=ON && cmake --build build-qt
@@ -911,10 +911,7 @@ QT_QPA_PLATFORM=offscreen build-qt/vshot-settings-check
 build-qt/vshot-text-size-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-color-check
 build-qt/vshot-pin-density-check
-QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-outline-check
-QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-hdr-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-text-card-check
-QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-menu-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-paste-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-file-dialog-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-annotate-check
