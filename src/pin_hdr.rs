@@ -183,7 +183,11 @@ impl Pin {
     /// other end.
     fn words_in(&self, output: &OutputRect) -> Result<Vec<u32>> {
         match &self.pixels {
-            Pixels::Sdr { frame, .. } => Ok(srgb_frame_words(frame, output.white)),
+            Pixels::Sdr { frame, .. } => Ok(crate::model::picture::srgb_frame_words(
+                frame,
+                output.white,
+                output.primaries,
+            )),
             Pixels::Pq {
                 words,
                 width,
@@ -352,51 +356,6 @@ pub(crate) fn read_sdr_png(png: &Path) -> Result<crate::model::Frame> {
 
 /// The PQ words one sRGB frame stands for at `white_nits`.
 ///
-/// The decode is the sRGB EOTF, the encode is PQ against a 10 000 cd/m² peak,
-/// and the white is the only thing that ties the two scales together.  It is the
-/// light a code of `1.0` stands for on the output the picture is going onto —
-/// read from that output's own description — which is what makes the picture
-/// come out at the light it had on the SDR surface it was drawn for: codes
-/// written against BT.2408's default 203 on an output whose own white is 100
-/// would be shown twice as bright as they should be.
-///
-/// The codes are PQ, because the surface they go onto is described in PQ, and a
-/// surface's pixels are passed through untouched only when they hold what the
-/// description says.  Writing an SDR picture that way is exact: it is a
-/// different encoding of the same light, not a tone map.
-fn srgb_frame_words(frame: &crate::model::Frame, white_nits: f32) -> Vec<u32> {
-    let white = if white_nits.is_finite() && white_nits > 0.0 {
-        white_nits
-    } else {
-        crate::model::hdr::REFERENCE_WHITE_NITS
-    };
-    let code = |channel: u8| -> u32 {
-        let value = f32::from(channel) / 255.0;
-        let linear = if value <= 0.040_45 {
-            value / 12.92
-        } else {
-            ((value + 0.055) / 1.055).powf(2.4)
-        };
-        (crate::model::hdr::pq_encode(linear * white / 10_000.0) * 1023.0)
-            .round()
-            .clamp(0.0, 1023.0) as u32
-    };
-    frame
-        .pixels()
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|pixel| {
-            // The two bits of alpha are the surface buffer's real alpha, and a
-            // pinned picture is normally opaque: a zero would make it
-            // disappear.  A picture that really does carry alpha keeps it, so
-            // a card with a soft edge is not turned into a solid rectangle.
-            let alpha = (pixel[3] >> 6) as u32;
-            (alpha << 30) | (code(pixel[0]) << 20) | (code(pixel[1]) << 10) | code(pixel[2])
-        })
-        .collect()
-}
-
 /// The six chromaticity coordinates a PQ file's header carries, as the gamut
 /// they describe.  The same millionth-unit integers the protocol uses, so a
 /// description read from an output and written back out survives the round trip.
@@ -1710,68 +1669,6 @@ mod tests {
                 "channel {index} drifted by {drift} codes ({before} -> {after})"
             );
         }
-    }
-
-    #[test]
-    fn an_sdr_pin_is_written_against_the_outputs_own_white() {
-        // Mid grey, the byte an SDR surface would have painted.
-        let frame = crate::model::Frame::solid(Size::new(1, 1), [128, 128, 128, 255]).unwrap();
-        // The light a code stands for, relative to the white it was written
-        // against: the same decode the surface does, through the pipeline's own
-        // reader.
-        let light = |words: &[u32], white: f32| {
-            HdrFrame::from_rgb10(
-                words,
-                Size::new(1, 1),
-                Transfer::Pq,
-                Primaries::Bt709,
-                true,
-                white,
-            )
-            .unwrap()
-            .pixel(0, 0)
-            .unwrap()[0]
-        };
-        // sRGB mid grey is about 0.216 of white in linear light, and the code
-        // says exactly that: the picture reaches the panel at the light it had
-        // on the SDR surface it was drawn for.
-        let at_203 = srgb_frame_words(&frame, 203.0);
-        let decoded = light(&at_203, 203.0);
-        assert!(
-            (decoded - 0.2158).abs() < 0.01,
-            "mid grey came out at {decoded} of white"
-        );
-        // The same byte on an output whose white is 100 cd/m² is a *dimmer*
-        // light, so its code is lower -- and reading that code back against 100
-        // gives the same 0.216 of white.  This is the whole point of writing
-        // against the output: a fixed white would show the picture at the wrong
-        // brightness on every output that is not the one the constant was
-        // chosen for.
-        let at_100 = srgb_frame_words(&frame, 100.0);
-        assert!(
-            (at_100[0] >> 20) < (at_203[0] >> 20),
-            "{at_100:?} is not below {at_203:?}"
-        );
-        let decoded_100 = light(&at_100, 100.0);
-        assert!(
-            (decoded_100 - 0.2158).abs() < 0.01,
-            "mid grey on a 100 cd/m² output came out at {decoded_100} of white"
-        );
-        // White is white on either: the full byte lands on the output's own
-        // reference white, not above it.
-        let white = crate::model::Frame::solid(Size::new(1, 1), [255, 255, 255, 255]).unwrap();
-        let top = light(&srgb_frame_words(&white, 100.0), 100.0);
-        assert!((top - 1.0).abs() < 0.01, "white came out at {top} of white");
-    }
-
-    #[test]
-    fn an_sdr_pins_alpha_survives_the_encoding() {
-        // A card with a soft edge is not a solid rectangle: the surface buffer
-        // carries a real two-bit alpha, and an opaque picture has to fill it.
-        let opaque = crate::model::Frame::solid(Size::new(1, 1), [10, 20, 30, 255]).unwrap();
-        assert_eq!(srgb_frame_words(&opaque, 203.0)[0] >> 30, 3);
-        let clear = crate::model::Frame::solid(Size::new(1, 1), [10, 20, 30, 0]).unwrap();
-        assert_eq!(srgb_frame_words(&clear, 203.0)[0] >> 30, 0);
     }
 
     #[test]
