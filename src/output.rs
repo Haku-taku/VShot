@@ -425,6 +425,14 @@ pub(crate) fn write_capture_files(
 /// can expand into dotted parts that are not a suffix at all
 /// (`shot-%Y.%m.%d`), so replacing whatever follows the last dot would rename
 /// files nobody asked to have renamed.
+///
+/// The suffixes that are rewritten are every one this program writes, in
+/// either half.  A name ending in `.avif` while this build is writing PNG is
+/// the same lie as one ending in `.png` while it writes WebP, and it is worse
+/// to leave: the file would open as AVIF in every program that goes by the
+/// name, and fail.  When the suffix is the *chosen* HDR format's, the path
+/// never gets here -- `write_capture_files` has already taken it for the HDR
+/// half, which is where it belongs.
 fn align_sdr_suffix(path: &Path, format: SdrFormat) -> PathBuf {
     let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
         return path.to_path_buf();
@@ -436,8 +444,7 @@ fn align_sdr_suffix(path: &Path, format: SdrFormat) -> PathBuf {
     {
         return path.to_path_buf();
     }
-    // Another format's suffix, or a name this program does not write at all.
-    let ours = ["png", "jpg", "jpeg", "webp"]
+    let ours = ["png", "jpg", "jpeg", "webp", "avif", "jxl", "hdr"]
         .iter()
         .any(|known| extension.eq_ignore_ascii_case(known));
     if !ours {
@@ -790,6 +797,22 @@ mod tests {
         assert_eq!(
             hdr_sibling_path(Path::new("shot"), HdrFormat::Avif),
             PathBuf::from("shot.avif")
+        );
+    }
+
+    /// A name ending in an HDR format's suffix is rewritten too: the bytes
+    /// decide, and PNG written under `.avif` would open as AVIF everywhere and
+    /// fail.
+    #[test]
+    fn an_hdr_suffix_is_rewritten_like_any_other() {
+        let png = SdrFormat::parse("png").unwrap();
+        assert_eq!(
+            align_sdr_suffix(Path::new("shot.avif"), png),
+            PathBuf::from("shot.png")
+        );
+        assert_eq!(
+            align_sdr_suffix(Path::new("shot.JXL"), png),
+            PathBuf::from("shot.png")
         );
     }
 
