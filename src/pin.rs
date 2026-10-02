@@ -14,7 +14,6 @@ use crate::geometry::Size;
 use crate::model::hdr::Transfer;
 use crate::model::{Frame, HdrFrame};
 use crate::output::HdrHalf;
-use crate::qt_overlay::helper_program;
 
 /// Budget for the daemon to come up after we start it ourselves.
 const DAEMON_STARTUP: Duration = Duration::from_secs(3);
@@ -247,10 +246,6 @@ pub(crate) struct PinInvocation {
     /// Device density to stamp on the pinned images, overriding what the
     /// daemon would work out for itself. `None` leaves it to the daemon.
     pub density: Option<u32>,
-    /// The light in cd/m² an HDR half's `1.0` stands for, for the files that do
-    /// not say themselves. Resolved once here rather than at the decode, so the
-    /// flag, the config file and the built-in default are decided in one place.
-    pub reference_nits: f32,
     /// Whether to look for the HDR half a capture wrote beside the image and pin
     /// that instead.  On unless `--hdr-half false` or `cli.pin.hdr-half` says
     /// otherwise; see [`pin_file`] for what the half is.
@@ -333,10 +328,9 @@ impl PinInvocation {
         // Read off the output a capture came from is the first answer, and this
         // is the answer for the files that carry none: another writer's Radiance
         // file, or an AVIF with no VShot box naming one.
-        let reference_nits = reference_white
-            .or_else(crate::config::hdr_reference_white_default)
-            .map(crate::model::hdr::clamp_reference_nits)
-            .unwrap_or(crate::model::hdr::REFERENCE_WHITE_NITS);
+        // The white an HDR half naming none of its own is read at is the
+        // daemon's to resolve now: it is the side that reads the file.
+        let _ = reference_white;
         // The flag wins, then the config file, then on.  Looking for the half is
         // what a pin has always done, and a file written before this setting
         // existed says nothing about it rather than saying no.
@@ -362,7 +356,6 @@ impl PinInvocation {
             clipboard,
             command,
             density,
-            reference_nits,
             hdr_half,
         })
     }
@@ -375,7 +368,6 @@ pub(crate) fn run(invocation: PinInvocation) -> Result<()> {
         clipboard,
         command,
         density,
-        reference_nits,
         hdr_half,
     } = invocation;
     if let Some(command) = command {
@@ -407,14 +399,7 @@ pub(crate) fn run(invocation: PinInvocation) -> Result<()> {
                 .map_err(|error| VshotError::Pin(format!("failed to resolve cwd: {error}")))?
                 .join(file)
         };
-        pin_file(
-            absolute,
-            density,
-            reference_nits,
-            output,
-            output_name.clone(),
-            hdr_half,
-        )?;
+        pin_file(absolute, density, output, output_name.clone(), hdr_half)?;
     }
     if clipboard {
         // A capture puts its own file on the clipboard as a URI, so a clipboard
@@ -425,7 +410,7 @@ pub(crate) fn run(invocation: PinInvocation) -> Result<()> {
         // with no sibling -- is left to the daemon, which resolves the clipboard
         // the way it always has.
         match clipboard_source() {
-            Some(path) => pin_file(path, density, reference_nits, output, output_name, hdr_half)?,
+            Some(path) => pin_file(path, density, output, output_name, hdr_half)?,
             None => {
                 execute(PinCommand::AddClipboard {
                     density,
@@ -493,7 +478,6 @@ pub(crate) fn export(
 fn pin_file(
     path: PathBuf,
     density: Option<u32>,
-    reference_nits: f32,
     output: Option<WireOutputRect>,
     output_name: Option<String>,
     hdr_half: bool,
@@ -505,38 +489,17 @@ fn pin_file(
     // only happens where the half can be shown: on an output that cannot show
     // HDR, the file the user named is the picture.
     let wants_half = hdr_half && on_hdr_output(output_name.as_deref());
-    if rust_daemon() {
-        // That daemon decodes the file it is given and encodes it for each
-        // output, so the substitution is what it sounds like: the sibling
-        // *becomes* the path, and there is no second file to name.  A sibling
-        // it cannot read is no sibling at all, and the file as given stands.
-        let path = match wants_half {
-            true => hdr_sibling_path(&path).unwrap_or(path),
-            false => path,
-        };
-        return execute(PinCommand::Add {
-            path,
-            hdr: None,
-            density,
-            output,
-            output_name,
-            at: None,
-            annotations: None,
-            base: None,
-            ack: false,
-        })
-        .map(|_| ());
-    }
-    let half = match wants_half {
-        true => match hdr_half_beside(&path, reference_nits) {
-            Some(pq) => Some(PinHalf::write(&pq)?),
-            None => None,
-        },
-        false => None,
+    // The daemon decodes the file it is given and encodes it for each output,
+    // so the substitution is what it sounds like: the sibling *becomes* the
+    // path, and there is no second file to name.  A sibling it cannot read is
+    // no sibling at all, and the file as given stands.
+    let path = match wants_half {
+        true => hdr_sibling_path(&path).unwrap_or(path),
+        false => path,
     };
     execute(PinCommand::Add {
         path,
-        hdr: half.as_ref().map(|half| half.path.clone()),
+        hdr: None,
         density,
         output,
         output_name,
@@ -548,46 +511,6 @@ fn pin_file(
         ack: false,
     })
     .map(|_| ())
-}
-
-/// One pin's HDR half as it travels: the PQ file the daemon copies out of this
-/// directory, and the directory itself, which has to outlive the round trip
-/// because the daemon reads the file before it answers.
-struct PinHalf {
-    _directory: tempfile::TempDir,
-    path: PathBuf,
-}
-
-impl PinHalf {
-    fn write(pq: &PqPin) -> Result<Self> {
-        let directory = pin_tempdir()?;
-        let path = write_private_file(directory.path(), "capture.pq", &pq.encode())?;
-        Ok(Self {
-            _directory: directory,
-            path,
-        })
-    }
-}
-
-/// The file a capture wrote beside `path`: the same stem with an HDR codec's
-/// suffix.  `shot.png` and `shot.avif` are one capture's two halves, so this is
-/// the name `write_capture_files` would have used for the second one.
-///
-/// A file that is itself an HDR half has no sibling: the suffix it already
-/// carries is the one being looked for, and the file next to it with the other
-/// codec's suffix is a different image, not this one's second half.
-fn hdr_sibling_path(path: &Path) -> Option<PathBuf> {
-    if crate::model::codec::from_extension(path).is_some() {
-        return None;
-    }
-    let mut sibling = path.to_path_buf();
-    for codec in crate::model::codec::codecs() {
-        sibling.set_extension(codec.extension());
-        if sibling.is_file() {
-            return Some(sibling);
-        }
-    }
-    None
 }
 
 /// Whether a capture's HDR half is worth pinning on the output this pin is
@@ -629,52 +552,25 @@ fn on_hdr_output(name: Option<&str>) -> bool {
     hdr_half_is_worth_it(name, reply.as_ref())
 }
 
-/// The HDR half a capture wrote beside `path`, as the PQ codes a pin travels
-/// with: the file read back through the same codec layer that wrote it, so
-/// "encode then decode" is a round trip through one currency rather than a
-/// conversion between two.
+/// The file a capture wrote beside `path`: the same stem with an HDR codec's
+/// suffix.  `shot.png` and `shot.avif` are one capture's two halves, so this is
+/// the name `write_capture_files` would have used for the second one.
 ///
-/// `None` when there is no sibling, and also when there is one this build
-/// cannot read.  The sibling is found by name, and a file beside a PNG that
-/// merely shares its stem is not necessarily this program's HDR half; the pin
-/// then shows its SDR picture alone, which is what it did before there was an
-/// HDR half to find.  A half the user *named* is a different matter -- the
-/// daemon refuses that one rather than dropping it in silence -- but a guess is
-/// not worth failing a pin over.
-fn hdr_half_beside(path: &Path, reference_nits: f32) -> Option<PqPin> {
-    let sibling = hdr_sibling_path(path)?;
-    // Read through the one door every image comes in by, so the sibling is
-    // decoded exactly the way the same file would be if it had been pinned on
-    // its own.  It has to come back as light: a sibling that is not really an
-    // HDR file -- a PNG under an HDR name, which a capture can be asked to
-    // write -- is not the half the name promised.
-    match crate::model::picture::decode_path(&sibling, reference_nits) {
-        Ok(picture) => {
-            let image = picture.as_hdr()?;
-            // The codes go out in the file's own gamut and at the file's own
-            // reference white, which is what makes the round trip exact: the
-            // white cancels when the surface helper re-encodes, and the pin
-            // editor decodes them back to the light the capture held.
-            let white = image.white();
-            Some(PqPin {
-                words: image.frame.to_rgb10_pq_in(image.frame.primaries(), white),
-                width: image.frame.size().width,
-                height: image.frame.size().height,
-                reference_nits: white,
-                primaries: image.frame.primaries(),
-            })
-        }
-        Err(error) => {
-            if std::env::var_os("VSHOT_PIN_DEBUG").is_some() {
-                eprintln!(
-                    "vshot: pin: {} is not readable as an HDR half ({error}); \
-                     the pin is the SDR picture alone",
-                    sibling.display()
-                );
-            }
-            None
+/// A file that is itself an HDR half has no sibling: the suffix it already
+/// carries is the one being looked for, and the file next to it with the other
+/// codec's suffix is a different image, not this one's second half.
+fn hdr_sibling_path(path: &Path) -> Option<PathBuf> {
+    if crate::model::codec::from_extension(path).is_some() {
+        return None;
+    }
+    let mut sibling = path.to_path_buf();
+    for codec in crate::model::codec::codecs() {
+        sibling.set_extension(codec.extension());
+        if sibling.is_file() {
+            return Some(sibling);
         }
     }
+    None
 }
 
 /// The file the clipboard names, when it names one that has an HDR half beside
@@ -839,43 +735,17 @@ fn keep_daemon_stderr() -> bool {
 
 /// Starts the resident daemon detached: no pipes are inherited, so the CLI
 /// returns immediately while the surfaces live on.
-/// Whether the daemon that draws the pins itself is the one to run.
+/// Starts the daemon: this same binary, holding the pins and drawing them.
 ///
-/// It is the one that runs.  `VSHOT_PIN_DAEMON=qt` asks for the Qt daemon
-/// instead, which exists only while the two do: it cannot read the formats a
-/// capture writes an HDR half in, so on it a pin is a pair of files rather than
-/// one picture, and the escape hatch is there for a session where the new
-/// daemon will not come up.
-fn rust_daemon() -> bool {
-    std::env::var_os("VSHOT_PIN_DAEMON").as_deref() != Some(std::ffi::OsStr::new("qt"))
-}
-
+/// One process, not two.  The pictures are half-float surfaces this side owns,
+/// and the labels over them are a Qt process it starts -- but the pins
+/// themselves, and everything that decides what they look like, are here.
 fn spawn_daemon() -> Result<()> {
-    // The daemon: this same binary, holding the pins and drawing them itself.
-    if rust_daemon() {
-        let program = std::env::current_exe().map_err(|source| VshotError::CommandIo {
-            program: "vshot".into(),
-            source,
-        })?;
-        Command::new(program)
-            .arg("--pin-server")
-            .arg(socket_path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(if keep_daemon_stderr() {
-                Stdio::inherit()
-            } else {
-                Stdio::null()
-            })
-            .spawn()
-            .map_err(|source| VshotError::CommandIo {
-                program: "vshot --pin-server".into(),
-                source,
-            })?;
-        return Ok(());
-    }
-    let helper = helper_program()?;
-    Command::new(&helper.path)
+    let program = std::env::current_exe().map_err(|source| VshotError::CommandIo {
+        program: "vshot".into(),
+        source,
+    })?;
+    Command::new(program)
         .arg("--pin-server")
         .arg(socket_path())
         .stdin(Stdio::null())
@@ -886,19 +756,9 @@ fn spawn_daemon() -> Result<()> {
             Stdio::null()
         })
         .spawn()
-        .map_err(|source| {
-            if source.kind() == std::io::ErrorKind::NotFound {
-                VshotError::Pin(format!(
-                    "Qt helper `{}` was not found; build it with `cmake -S . -B build-qt && \
-                     cmake --build build-qt` or point VSHOT_QT_HELPER at the executable",
-                    helper.path.display()
-                ))
-            } else {
-                VshotError::CommandIo {
-                    program: helper.path.display().to_string(),
-                    source,
-                }
-            }
+        .map_err(|source| VshotError::CommandIo {
+            program: "vshot --pin-server".into(),
+            source,
         })?;
     Ok(())
 }
@@ -1045,23 +905,23 @@ pub(crate) fn hand_off_region_pin(
     let at = Some(rect.origin);
     let sdr = &rendered.composite;
     let marked = match hdr {
-        Some(HdrHalf {
-            frame,
-            reference_nits,
-        }) => {
-            let mut marked = frame.clone();
+        Some(half) => {
+            // The marks go onto the light itself: an HDR capture's annotations
+            // are composited in linear light, so both halves describe the same
+            // light with the same marks on it.
+            let mut marked = half.frame.clone();
             marked.composite_srgb_layer(&rendered.marks)?;
-            marked
-                .carries_hdr(tone_map.hdr)
-                .then_some((marked, *reference_nits))
+            marked.carries_hdr(tone_map.hdr).then_some(marked)
         }
         None => None,
     };
-    let pq = marked.map(|(frame, reference_nits)| PqPin {
-        words: frame.to_rgb10_pq_in(frame.primaries(), reference_nits),
+    // The white the codes are written against is the frame's own: a capture
+    // carries it, and the file this becomes carries it too.
+    let pq = marked.map(|frame| PqPin {
+        words: frame.to_rgb10_pq_in(frame.primaries(), crate::model::hdr::REFERENCE_WHITE_NITS),
         width: frame.size().width,
         height: frame.size().height,
-        reference_nits,
+        reference_nits: crate::model::hdr::REFERENCE_WHITE_NITS,
         primaries: frame.primaries(),
     });
     pin_png(
@@ -1552,105 +1412,6 @@ mod tests {
         let bare = directory.path().join("shot");
         std::fs::write(&bare, b"png").unwrap();
         assert_eq!(hdr_sibling_path(&bare), Some(avif));
-    }
-
-    /// The HDR half read back is the PQ codes the pin travels with: the same
-    /// codes a capture's own pin carries, which is what makes the two pins show
-    /// the same light.
-    #[cfg(feature = "radiance")]
-    #[test]
-    fn the_hdr_half_is_read_back_as_the_codes_a_pin_carries() {
-        use crate::geometry::Size;
-        use crate::model::codec::HdrImage;
-
-        let directory = tempfile::tempdir().unwrap();
-        let png = directory.path().join("shot.png");
-        std::fs::write(&png, b"png").unwrap();
-        // A capture's HDR half: two pixels of a known light, written by the
-        // codec layer the same way `write_capture_files` writes one.
-        let source = HdrImage::new(
-            HdrFrame::new(
-                Size::new(2, 1),
-                vec![[1.0, 0.5, 0.25, 1.0], [4.0, 2.0, 1.0, 1.0]],
-            )
-            .unwrap(),
-            203.0,
-        );
-        let codec = crate::model::codec::by_name("hdr").expect("the radiance codec");
-        codec
-            .encode_path(&source, &directory.path().join("shot.hdr"))
-            .unwrap();
-
-        let half = hdr_half_beside(&png, crate::model::hdr::REFERENCE_WHITE_NITS)
-            .expect("the half is found and read");
-        assert_eq!((half.width, half.height), (2, 1));
-        assert!((half.reference_nits - 203.0).abs() < 0.01);
-        // The codes are what the capture's own pin would carry: the same frame
-        // through the same encoder, so the two are byte for byte the same.
-        let expected = source
-            .frame
-            .to_rgb10_pq_in(source.frame.primaries(), source.reference_nits);
-        assert_eq!(half.words, expected);
-
-        // A sibling that is not readable as an HDR half is not a failure: the
-        // pin is the SDR picture alone, which is what it was before there was
-        // anything to look for.
-        std::fs::write(directory.path().join("shot.hdr"), b"not radiance").unwrap();
-        assert!(hdr_half_beside(&png, crate::model::hdr::REFERENCE_WHITE_NITS).is_none());
-    }
-
-    /// A half that names no white of its own is read at the setting, and the
-    /// codes it travels as are encoded against that same white — which is what
-    /// makes the pin show the light the file holds rather than the light of a
-    /// white the file never had.
-    #[cfg(feature = "radiance")]
-    #[test]
-    fn a_half_with_no_white_of_its_own_is_read_at_the_setting() {
-        use crate::geometry::Size;
-        use crate::model::codec::HdrImage;
-
-        let directory = tempfile::tempdir().unwrap();
-        let png = directory.path().join("shot.png");
-        std::fs::write(&png, b"png").unwrap();
-        // What another program's Radiance writer produces: no `REFERENCE_NITS=`
-        // and no `PRIMARIES=`, so both answers have to come from elsewhere.
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 2\n");
-        bytes.extend_from_slice(&[128, 128, 128, 129]);
-        bytes.extend_from_slice(&[64, 64, 64, 130]);
-        std::fs::write(directory.path().join("shot.hdr"), &bytes).unwrap();
-
-        let half = hdr_half_beside(&png, 250.0).expect("the half is found and read");
-        assert!(
-            (half.reference_nits - 250.0).abs() < 0.01,
-            "the setting is the white the file is read at, got {}",
-            half.reference_nits
-        );
-        // The codes are absolute PQ, so the white does not merely label them: it
-        // is what they were computed against.  A file read at a brighter white
-        // is a dimmer picture, and the codes have to say so.
-        let source = HdrImage::new(
-            HdrFrame::new(
-                Size::new(2, 1),
-                vec![[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]],
-            )
-            .unwrap(),
-            250.0,
-        );
-        let expected = source.frame.to_rgb10_pq_in(source.frame.primaries(), 250.0);
-        // The two RGBE pixels hold different light, so only the first is
-        // compared: 128/128/128/129 is exactly 1.0, the file's own white.
-        assert_eq!(
-            half.words[0], expected[0],
-            "1.0 in the file is the setting's white"
-        );
-
-        // And the setting is what decides it: the same file read at BT.2408's
-        // reference is a different picture.
-        let darker = hdr_half_beside(&png, crate::model::hdr::REFERENCE_WHITE_NITS)
-            .expect("the half is found and read");
-        assert!((darker.reference_nits - 203.0).abs() < 0.01);
-        assert_ne!(darker.words[0], half.words[0]);
     }
 
     /// The two shapes a clipboard carries a path in, and the shapes it does

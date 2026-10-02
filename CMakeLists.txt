@@ -50,10 +50,6 @@ add_executable(vshot-qt-ui
     ui/pin_chrome.hpp
     ui/pin_chrome_server.cpp
     ui/pin_chrome_server.hpp
-    ui/pin_surface.cpp
-    ui/pin_surface.hpp
-    ui/pin_server.cpp
-    ui/pin_server.hpp
     ui/file_dialog.cpp
     ui/file_dialog.hpp
     ui/shadow.cpp
@@ -178,53 +174,11 @@ if(VSHOT_BUILD_CHECKS)
     # edge is defined. It needs Widgets and the offscreen platform plugin, but
     # still no compositor: the surface is rendered straight into a QImage and
     # the layer-shell call is never made.
-    add_executable(vshot-pin-outline-check
-        ui/pin_outline_check.cpp
-        ui/pin_surface.cpp
-        ui/pin_surface.hpp
-        ui/pin_label.cpp
-        ui/pin_label.hpp
-        ui/i18n.cpp
-        ui/i18n.hpp
-        ui/shadow.cpp
-        ui/shadow.hpp
-    )
-    target_link_libraries(vshot-pin-outline-check PRIVATE
-        Qt6::Core
-        Qt6::Gui
-        Qt6::Widgets
-        LayerShellQt::Interface
-    )
-    target_compile_features(vshot-pin-outline-check PRIVATE cxx_std_17)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(vshot-pin-outline-check PRIVATE -Wall -Wextra -Wpedantic)
-    endif()
 
     # The HDR marker check: the `HDR` tag a pinned HDR capture wears while the
     # pointer is over it -- which pin gets it, and which of the two inks it is
     # drawn in. Renders the real surface offscreen and counts the pixels, so no
     # compositor and no pointer are needed.
-    add_executable(vshot-pin-hdr-check
-        ui/pin_hdr_check.cpp
-        ui/pin_surface.cpp
-        ui/pin_surface.hpp
-        ui/pin_label.cpp
-        ui/pin_label.hpp
-        ui/i18n.cpp
-        ui/i18n.hpp
-        ui/shadow.cpp
-        ui/shadow.hpp
-    )
-    target_link_libraries(vshot-pin-hdr-check PRIVATE
-        Qt6::Core
-        Qt6::Gui
-        Qt6::Widgets
-        LayerShellQt::Interface
-    )
-    target_compile_features(vshot-pin-hdr-check PRIVATE cxx_std_17)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(vshot-pin-hdr-check PRIVATE -Wall -Wextra -Wpedantic)
-    endif()
 
     # The text card check: it measures how much empty card surrounds the text
     # on a pinned text card, which is what decides whether the card reads as a
@@ -247,29 +201,6 @@ if(VSHOT_BUILD_CHECKS)
     # offers, the row under the pointer, the value a pick hands over, and how
     # it goes away. Needs Widgets and the offscreen platform plugin, no
     # compositor: the layer-shell call is never made.
-    add_executable(vshot-pin-menu-check
-        ui/pin_menu_check.cpp
-        ui/pin_surface.cpp
-        ui/pin_surface.hpp
-        ui/pin_label.cpp
-        ui/pin_label.hpp
-        ui/color_card.cpp
-        ui/color_card.hpp
-        ui/i18n.cpp
-        ui/i18n.hpp
-        ui/shadow.cpp
-        ui/shadow.hpp
-    )
-    target_link_libraries(vshot-pin-menu-check PRIVATE
-        Qt6::Core
-        Qt6::Gui
-        Qt6::Widgets
-        LayerShellQt::Interface
-    )
-    target_compile_features(vshot-pin-menu-check PRIVATE cxx_std_17)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(vshot-pin-menu-check PRIVATE -Wall -Wextra -Wpedantic)
-    endif()
 
     # The paste check: it builds a real editor controller over a made-up region
     # session, pastes a synthetic image and reads back the pixels and the JSON

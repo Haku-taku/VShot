@@ -7,7 +7,6 @@
 #include "i18n.hpp"
 #include "pin_edit.hpp"
 #include "pin_chrome_server.hpp"
-#include "pin_server.hpp"
 #include "file_dialog.hpp"
 #include "session_protocol.hpp"
 #include "settings_window.hpp"
@@ -114,17 +113,6 @@ int main(int argc, char **argv)
         vshot::initUiLanguage();
         return vshot::runSettingsWindow();
     }
-    if (argc == 3 && QString::fromLocal8Bit(argv[1]) == QStringLiteral("--pin-server")) {
-        const QString socketPath = QString::fromLocal8Bit(argv[2]);
-        if (!socketPath.startsWith(QLatin1Char('/'))) {
-            std::fprintf(stderr, "vshot-qt-ui: pin socket path must be absolute\n");
-            return 2;
-        }
-        QApplication app(argc, argv);
-        QApplication::setQuitOnLastWindowClosed(false);
-        vshot::initUiLanguage();
-        return vshot::runPinServer(socketPath);
-    }
     // The label surface of the pin stack: a transparent layer per output that
     // draws the corner tags the daemon's own picture surfaces cannot.  It is
     // started by the daemon and lives exactly as long as it does.
@@ -195,7 +183,7 @@ int main(int argc, char **argv)
                                    "       vshot-qt-ui --save-dialog <suggested-path> [output] "
                                    "[formats] [hdr|sdr]\n"
                                    "       vshot-qt-ui --open-dialog <suggested-path> [output]\n"
-                                   "       vshot-qt-ui --pin-server <absolute-socket-path>\n"
+
                                    "       vshot-qt-ui --annotate-server <absolute-socket-path>"));
         return 2;
     }

@@ -3163,7 +3163,6 @@ mod tests {
                 clipboard: false,
                 command: Some(crate::pin::PinCommand::Toggle),
                 density: None,
-                reference_nits: crate::model::hdr::REFERENCE_WHITE_NITS,
                 // The config file says nothing in this test, which reads as on.
                 hdr_half: true,
             })
@@ -3191,7 +3190,6 @@ mod tests {
                 clipboard: true,
                 command: None,
                 density: None,
-                reference_nits: crate::model::hdr::REFERENCE_WHITE_NITS,
                 // The config file says nothing in this test, which reads as on.
                 hdr_half: true,
             })

@@ -20,9 +20,7 @@
 //! may hold a picture with no light above SDR white at all, and a display has
 //! to be told what the content is rather than what the file was.
 
-use std::path::Path;
-
-use crate::error::{Result, VshotError};
+use crate::error::Result;
 use crate::geometry::Size;
 use crate::model::codec::{self, HdrImage};
 use crate::model::frame::Frame;
@@ -189,28 +187,6 @@ impl Picture {
             Self::Sdr(_) => None,
         }
     }
-}
-
-/// Reads one image file.
-///
-/// `fallback_nits` is the white to read a file at when it names none of its own
-/// — a Radiance file from another writer, or an HDR file with no reference
-/// white in it.  It is the `--hdr-reference-white` setting, and it is ignored
-/// by the formats that do name one.
-pub fn decode_path(path: &Path, fallback_nits: f32) -> Result<Picture> {
-    let bytes = std::fs::read(path).map_err(|source| VshotError::HdrDecode {
-        path: path.to_path_buf(),
-        reason: format!("cannot read the image: {source}"),
-    })?;
-    decode_bytes(&bytes, fallback_nits).map_err(|error| match error {
-        // The reader that failed did not know which file it was looking at, so
-        // the path is added here, where it is known.
-        VshotError::HdrDecode { reason, .. } => VshotError::HdrDecode {
-            path: path.to_path_buf(),
-            reason,
-        },
-        other => other,
-    })
 }
 
 /// The same for bytes already in memory: a clipboard payload, or a capture
@@ -586,14 +562,5 @@ mod tests {
         assert!(decode_bytes(b"", REFERENCE_WHITE_NITS).is_err());
         assert!(decode_bytes(b"not an image at all", REFERENCE_WHITE_NITS).is_err());
         assert!(decode_bytes(b"\x89PNG\r\n\x1a\n truncated", REFERENCE_WHITE_NITS).is_err());
-    }
-
-    /// A file that is not there is reported with its path, which is what a user
-    /// who mistyped one needs to see.
-    #[test]
-    fn a_file_that_is_not_there_names_itself() {
-        let error = decode_path(Path::new("/nonexistent/x.png"), REFERENCE_WHITE_NITS)
-            .expect_err("no such file");
-        assert!(error.to_string().contains("/nonexistent/x.png"), "{error}");
     }
 }
