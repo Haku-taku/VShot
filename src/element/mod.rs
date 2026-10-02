@@ -40,6 +40,43 @@ pub struct ElementRequest<'a> {
     /// accessibility source ignores it: its geometry comes from the toolkit,
     /// not from what is on the screen.
     pub scene: &'a SceneSnapshot,
+    /// Which way the pixel source reads the window, when it is the one asked.
+    ///
+    /// A choice rather than a constant because the two readers fail on
+    /// different interfaces and neither is a superset of the other: see
+    /// [`pixels`].
+    pub fallback: Fallback,
+}
+
+/// How the pixel source reads a window.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Fallback {
+    /// By the lines the interface draws.  The default.
+    #[default]
+    Lines,
+    /// By the areas of one colour.
+    Components,
+}
+
+impl Fallback {
+    /// The names `--element-fallback` and the config file accept.
+    pub const ALL: [(&'static str, Fallback); 2] = [
+        ("lines", Fallback::Lines),
+        ("components", Fallback::Components),
+    ];
+
+    /// The choice one of those names stands for.
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|(name, _)| *name == word)
+            .map(|(_, value)| value)
+    }
+
+    /// What a wrong name should be told it wanted.
+    pub fn names() -> Vec<&'static str> {
+        Self::ALL.into_iter().map(|(name, _)| name).collect()
+    }
 }
 
 /// One way of finding the elements inside a window.
@@ -60,8 +97,12 @@ pub trait ElementSource {
 /// can answer.  The pixel source is the fallback: it reads what is drawn, which
 /// works for any window at all but only ever guesses, and a guess is worth less
 /// than an answer.
-pub fn sources() -> Vec<&'static dyn ElementSource> {
-    vec![&accessibility::AccessibilitySource, &pixels::Pixels]
+pub fn sources(fallback: Fallback) -> Vec<&'static dyn ElementSource> {
+    let pixel: &'static dyn ElementSource = match fallback {
+        Fallback::Lines => &pixels::Pixels,
+        Fallback::Components => &pixels::Components,
+    };
+    vec![&accessibility::AccessibilitySource, pixel]
 }
 
 /// The elements of one window, from the first source that can answer.
@@ -69,7 +110,7 @@ pub fn sources() -> Vec<&'static dyn ElementSource> {
 /// `None` when no source could: the caller then offers the window alone, which
 /// is what picking did before there were elements.
 pub fn elements_of(request: &ElementRequest<'_>) -> Option<Vec<RegionNode>> {
-    for source in sources() {
+    for source in sources(request.fallback) {
         if let Some(elements) = source.elements(request) {
             if !elements.is_empty() {
                 return Some(elements);
@@ -89,7 +130,26 @@ mod tests {
     /// asked after it would never be reached — which is why it has to be last.
     #[test]
     fn there_are_two_sources() {
-        assert_eq!(sources().len(), 2, "the tree, then the pixels");
+        assert_eq!(sources(Fallback::default()).len(), 2, "the tree, then the pixels");
+    }
+
+    /// The fallback picks which pixel reader is asked, and the accessibility
+    /// tree is asked first either way.
+    #[test]
+    fn the_fallback_chooses_the_pixel_reader() {
+        for fallback in [Fallback::Lines, Fallback::Components] {
+            assert_eq!(sources(fallback).len(), 2);
+        }
+    }
+
+    /// Every name the command line and the config file accept parses back.
+    #[test]
+    fn every_fallback_name_parses() {
+        for (name, value) in Fallback::ALL {
+            assert_eq!(Fallback::parse(name), Some(value), "{name} did not parse");
+        }
+        assert_eq!(Fallback::parse("nonsense"), None);
+        assert_eq!(Fallback::names(), vec!["lines", "components"]);
     }
 }
 

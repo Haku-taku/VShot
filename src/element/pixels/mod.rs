@@ -36,7 +36,7 @@ use crate::geometry::{Point, Rect};
 use crate::model::SceneSnapshot;
 use crate::selection_region::RegionNode;
 
-use super::{ElementRequest, ElementSource};
+use super::{ElementRequest, ElementSource, Fallback};
 
 pub mod components;
 pub mod lines;
@@ -342,7 +342,11 @@ mod tests {
             ],
         );
         let roots = Pixels
-            .elements(&ElementRequest { window: &window, scene: &scene })
+            .elements(&ElementRequest {
+                window: &window,
+                scene: &scene,
+                fallback: Fallback::default(),
+            })
             .expect("a divider was drawn");
         let flat = flatten(&roots);
         assert!(
@@ -358,7 +362,11 @@ mod tests {
     #[test]
     fn a_flat_window_yields_nothing() {
         let (scene, window) = scene_of(1200, 800, [30, 30, 30, 255], &[]);
-        assert!(Pixels.elements(&ElementRequest { window: &window, scene: &scene }).is_none());
+        assert!(Pixels.elements(&ElementRequest {
+                window: &window,
+                scene: &scene,
+                fallback: Fallback::default(),
+            }).is_none());
     }
 
     /// The tree nests: a divider inside a pane makes a child, not a sibling.
@@ -376,7 +384,11 @@ mod tests {
             ],
         );
         let roots = Pixels
-            .elements(&ElementRequest { window: &window, scene: &scene })
+            .elements(&ElementRequest {
+                window: &window,
+                scene: &scene,
+                fallback: Fallback::default(),
+            })
             .expect("two dividers were drawn");
         assert!(depth(&roots) >= 2, "the cut tree is flat");
     }
@@ -397,7 +409,11 @@ mod tests {
         let (scene, window) = scene_of(1200, 800, [16, 16, 20, 255], &painted);
         // No divider was drawn, so nothing may be found: a glyph is 12 wide and
         // 14 tall, and a line has to be long one way and thin the other.
-        let found = Pixels.elements(&ElementRequest { window: &window, scene: &scene });
+        let found = Pixels.elements(&ElementRequest {
+                window: &window,
+                scene: &scene,
+                fallback: Fallback::default(),
+            });
         let count = found.as_ref().map(|roots| flatten(roots).len()).unwrap_or(0);
         assert!(count == 0, "text was read as structure: {count} region(s)");
     }
@@ -415,7 +431,11 @@ mod tests {
             ],
         );
         let roots = Pixels
-            .elements(&ElementRequest { window: &window, scene: &scene })
+            .elements(&ElementRequest {
+                window: &window,
+                scene: &scene,
+                fallback: Fallback::default(),
+            })
             .expect("a divider was drawn");
         for node in flatten(&roots) {
             assert!(
@@ -454,7 +474,11 @@ mod tests {
         // is that the component reader finds the *control*, which is what it
         // is for.
         let found = Components
-            .elements(&ElementRequest { window: &window, scene: &scene })
+            .elements(&ElementRequest {
+                window: &window,
+                scene: &scene,
+                fallback: Fallback::default(),
+            })
             .expect("the component reader reads colour");
         let flat = flatten(&found);
         assert!(
@@ -471,7 +495,15 @@ mod tests {
     #[test]
     fn a_tiny_window_yields_nothing() {
         let (scene, window) = scene_of(4, 4, [30, 30, 30, 255], &[]);
-        assert!(Pixels.elements(&ElementRequest { window: &window, scene: &scene }).is_none());
-        assert!(Components.elements(&ElementRequest { window: &window, scene: &scene }).is_none());
+        assert!(Pixels.elements(&ElementRequest {
+                window: &window,
+                scene: &scene,
+                fallback: Fallback::default(),
+            }).is_none());
+        assert!(Components.elements(&ElementRequest {
+                window: &window,
+                scene: &scene,
+                fallback: Fallback::default(),
+            }).is_none());
     }
 }
