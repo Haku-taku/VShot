@@ -130,7 +130,11 @@ mod tests {
     /// asked after it would never be reached — which is why it has to be last.
     #[test]
     fn there_are_two_sources() {
-        assert_eq!(sources(Fallback::default()).len(), 2, "the tree, then the pixels");
+        assert_eq!(
+            sources(Fallback::default()).len(),
+            2,
+            "the tree, then the pixels"
+        );
     }
 
     /// The fallback picks which pixel reader is asked, and the accessibility
@@ -152,4 +156,3 @@ mod tests {
         assert_eq!(Fallback::names(), vec!["lines", "components"]);
     }
 }
-

@@ -201,7 +201,7 @@ void checkBadValuesFallBackFieldByField()
     writeConfig(QStringLiteral(R"({
         "editor": {"tool": "scribble", "width": 900, "dash": "dashed", "color": "not-a-color",
                    "selectMode": "sometimes"},
-        "cli": {"sdr-format": "jpeg", "monitor": "DP-3"}
+        "cli": {"sdr-format": "tiff", "monitor": "DP-3"}
     })"));
     const vshot::Config config = vshot::loadConfig();
     expect(config.editor.tool.isEmpty(),
@@ -237,7 +237,7 @@ void checkTheHdrFormatRoundTripsAndIsCleared()
     expect(vshot::loadConfig().cli.hdrFormat == QStringLiteral("hdr"),
            "a known HDR format name is read", vshot::loadConfig().cli.hdrFormat);
 
-    writeConfig(QStringLiteral(R"({"cli": {"hdr-format": "webp", "future": 1}})"));
+    writeConfig(QStringLiteral(R"({"cli": {"hdr-format": "tiff", "future": 1}})"));
     expect(vshot::loadConfig().cli.hdrFormat.isEmpty(),
            "an unknown HDR format name falls back to the built-in default");
 
@@ -537,7 +537,10 @@ void checkClearingAValueRemovesIt()
     std::printf("--- clearing a value actually clears it ----------------------------\n");
     writeConfig(QStringLiteral(R"({
         "cli": {"sdr-format": "png", "monitor": "DP-2",
-                "format": {"png": {"compression": "high"}, "avif": {"quality": 40}},
+                "format": {"png": {"compression": "high"}, "avif": {"quality": 40},
+                           "jpeg": {"quality": 70}, "webp": {"lossless": "lossless",
+                                                            "quality": 60},
+                           "jxl": {"distance": 2, "effort": 3}},
                 "long": {"notches": 2, "max-height": 9000, "timeout": 30},
                 "pin": {"density": 2},
                 "record": {"encoder": "hevc", "encoder-backend": "nvenc", "fps": 30,

@@ -41,6 +41,7 @@ use rav1e::prelude::{
 use crate::error::{Result, VshotError};
 use crate::geometry::Size;
 use crate::model::codec::params::{ParamKind, ParamSpec, ParamValues};
+use crate::model::codec::scale::{self, ScaleMetadata, ScalePlace};
 use crate::model::codec::{HdrCodec, HdrImage};
 use crate::model::color::{ColorRange, MatrixCoefficients};
 use crate::model::hdr::{HdrFrame, Primaries, Transfer, REFERENCE_WHITE_NITS};
@@ -119,8 +120,38 @@ const BITS: u32 = 10;
 /// for everything that did not come from here.
 const REFERENCE_WHITE_UUID: [u8; 16] = *b"vshot.refwhite01";
 
+/// The light an HDR file's codes are read against is one thing this program has
+/// to say that AVIF has no field for, and the scale its picture is shown at is
+/// another: `colr` states the transfer function and the primaries, not a pixel
+/// size.  Both go in a `uuid` box of their own, the extension point the
+/// container provides.  See [`crate::model::codec::scale`] for why the scale is
+/// not written as EXIF, which AVIF can also carry.
+const SCALE_UUID: [u8; 16] = *b"vshot.scale00001";
+
 /// The AVIF codec.
 pub struct Avif;
+
+impl ScaleMetadata for Avif {
+    /// AVIF has no field of its own for a physical resolution, so the value
+    /// goes in a box of this program's own, beside the reference white and for
+    /// the same reason: the container's own colour description states the
+    /// transfer function and the primaries, not a pixel size.
+    fn scale_place(&self) -> ScalePlace {
+        ScalePlace::Private
+    }
+
+    fn with_scale(&self, bytes: Vec<u8>, density: u32, _size: Size) -> Result<Vec<u8>> {
+        Ok(grow_uuid(
+            bytes,
+            &SCALE_UUID,
+            &scale::private_payload(density),
+        ))
+    }
+
+    fn declared_scale(&self, bytes: &[u8]) -> Option<u32> {
+        scale::density_from_private(uuid_payload(bytes, &SCALE_UUID)?)
+    }
+}
 
 impl HdrCodec for Avif {
     fn extension(&self) -> &'static str {
@@ -139,13 +170,22 @@ impl HdrCodec for Avif {
         encode(&image.frame, image.white())
     }
 
-    fn encode_with(&self, image: &HdrImage, values: &ParamValues) -> Result<Vec<u8>> {
-        encode_at(
+    fn encode_with(
+        &self,
+        image: &HdrImage,
+        values: &ParamValues,
+        density: Option<u32>,
+    ) -> Result<Vec<u8>> {
+        let bytes = encode_at(
             &image.frame,
             image.white(),
             values.integer("quality", DEFAULT_QUALITY),
             values.integer("speed", DEFAULT_SPEED),
-        )
+        )?;
+        match density {
+            Some(density) => self.with_scale(bytes, density, image.frame.size()),
+            None => Ok(bytes),
+        }
     }
 
     fn decode(&self, bytes: &[u8], fallback_nits: f32) -> Result<HdrImage> {
@@ -613,7 +653,12 @@ fn top_level_box(bytes: &[u8], name: &[u8; 4]) -> Option<(usize, usize)> {
 /// where `iloc` says, the item still ends where its length says, and the box
 /// sits in the padding after it.  A reader that does not know the UUID never
 /// looks inside the media data at all.
-fn with_reference_white(mut avif: Vec<u8>, reference_nits: f32) -> Vec<u8> {
+fn with_reference_white(avif: Vec<u8>, reference_nits: f32) -> Vec<u8> {
+    grow_uuid(avif, &REFERENCE_WHITE_UUID, &reference_nits.to_be_bytes())
+}
+
+/// Appends one `uuid` box of this program's own, with `payload` in it.
+fn grow_uuid(mut avif: Vec<u8>, uuid: &[u8; 16], payload: &[u8]) -> Vec<u8> {
     let Some((at, size)) = top_level_box(&avif, b"mdat") else {
         return avif;
     };
@@ -625,26 +670,40 @@ fn with_reference_white(mut avif: Vec<u8>, reference_nits: f32) -> Vec<u8> {
     {
         return avif;
     }
-    let mut box_bytes = Vec::with_capacity(28);
-    box_bytes.extend_from_slice(&28u32.to_be_bytes());
+    let length = 24 + payload.len();
+    let mut box_bytes = Vec::with_capacity(length);
+    box_bytes.extend_from_slice(&(length as u32).to_be_bytes());
     box_bytes.extend_from_slice(b"uuid");
-    box_bytes.extend_from_slice(&REFERENCE_WHITE_UUID);
-    box_bytes.extend_from_slice(&reference_nits.to_be_bytes());
+    box_bytes.extend_from_slice(uuid);
+    box_bytes.extend_from_slice(payload);
     avif.extend_from_slice(&box_bytes);
     avif[at..at + 4].copy_from_slice(&((size + box_bytes.len()) as u32).to_be_bytes());
     avif
 }
 
-/// The reference white this program wrote into `bytes`, if it wrote one.
-fn reference_white(bytes: &[u8]) -> Option<f32> {
+/// The payload of the `uuid` box `uuid` names, if this program wrote one.
+fn uuid_payload<'a>(bytes: &'a [u8], uuid: &[u8; 16]) -> Option<&'a [u8]> {
     let (at, size) = top_level_box(bytes, b"mdat")?;
     // The payload, past `mdat`'s own header.
     let mdat = bytes.get(at + 8..at + size)?;
-    let magic = mdat
-        .windows(REFERENCE_WHITE_UUID.len())
-        .position(|window| window == REFERENCE_WHITE_UUID)?;
-    let value = mdat.get(magic + 16..magic + 20)?;
-    let found = f32::from_be_bytes(value.try_into().ok()?);
+    let magic = mdat.windows(uuid.len()).position(|window| window == uuid)?;
+    // `magic` is where the UUID itself starts; the box begins eight bytes
+    // earlier with its length and type, and the payload follows the sixteen
+    // bytes of the UUID and runs to wherever the box ends.
+    let length = u32::from_be_bytes(
+        mdat.get(magic.checked_sub(8)?..magic - 4)?
+            .try_into()
+            .ok()?,
+    ) as usize;
+    let start = magic.checked_add(16)?;
+    let end = magic.checked_sub(8)?.checked_add(length)?;
+    mdat.get(start..end)
+}
+
+/// The reference white this program wrote into `bytes`, if it wrote one.
+fn reference_white(bytes: &[u8]) -> Option<f32> {
+    let value = uuid_payload(bytes, &REFERENCE_WHITE_UUID)?;
+    let found = f32::from_be_bytes(value.get(..4)?.try_into().ok()?);
     (found.is_finite() && found > 0.0).then_some(found)
 }
 
@@ -809,7 +868,7 @@ mod tests {
         let image = HdrImage::new(frame(&ramp(), 16, 16), REFERENCE_WHITE_NITS);
         assert_eq!(
             Avif.encode(&image).unwrap(),
-            Avif.encode_with(&image, &ParamValues::defaults(specs))
+            Avif.encode_with(&image, &ParamValues::defaults(specs), None)
                 .unwrap()
         );
     }
@@ -853,7 +912,7 @@ mod tests {
         let at = |quality: i64| {
             let mut values = ParamValues::defaults(specs);
             values.set(specs, "quality", ParamValue::Integer(quality));
-            Avif.encode_with(&image, &values).unwrap()
+            Avif.encode_with(&image, &values, None).unwrap()
         };
         let low = at(20);
         let high = at(95);

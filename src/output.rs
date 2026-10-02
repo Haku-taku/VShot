@@ -50,13 +50,18 @@ impl std::fmt::Debug for HdrFormat {
 }
 
 impl Default for HdrFormat {
-    /// AVIF: small, lossy, and readable everywhere — and the format a capture
-    /// is written in unless the user says otherwise.  Falls back to whatever
-    /// codec the build does have, so a build with `avif` turned off still has a
-    /// default rather than failing every capture.
+    /// JPEG XL when this machine can write it, and otherwise AVIF.
+    ///
+    /// JPEG XL is the exact one -- it holds the light as it was captured -- so
+    /// it is the default where it exists.  Whether it exists is the machine's
+    /// answer, not the build's: a rolling release can ship a libavcodec whose
+    /// `libjxl` was left out, and a capture must not fail over that.  AVIF is
+    /// the fallback because it states its colour and every reader shows it
+    /// right, and after that whatever other codec this build has.
     fn default() -> Self {
         Self(
-            codec::by_name("avif")
+            codec::by_name("jxl")
+                .or_else(|| codec::by_name("avif"))
                 .or_else(|| codec::codecs().into_iter().next())
                 .expect("a build with no HDR codec cannot write an HDR half"),
         )
@@ -77,6 +82,12 @@ impl HdrFormat {
     #[cfg(feature = "radiance")]
     #[allow(non_upper_case_globals, dead_code)]
     pub const Radiance: Self = Self(&codec::radiance::Radiance);
+
+    /// The JPEG XL format.  Unlike the two above it is not gated on a feature
+    /// but on the machine, so it is offered as a constant only where the shim
+    /// says this ffmpeg can write it.
+    #[allow(non_upper_case_globals, dead_code)]
+    pub const Jxl: Self = Self(&codec::jxl::Jxl);
 
     /// Parses the `--hdr-format` value.  The names are the file extensions, so
     /// a value copied out of `vshot --help` names the file it produces.
@@ -112,9 +123,13 @@ impl HdrFormat {
         frame: &HdrFrame,
         reference_nits: f32,
         values: &codec::ParamValues,
+        density: Option<u32>,
     ) -> Result<Vec<u8>> {
-        self.0
-            .encode_with(&codec::HdrImage::new(frame.clone(), reference_nits), values)
+        self.0.encode_with(
+            &codec::HdrImage::new(frame.clone(), reference_nits),
+            values,
+            density,
+        )
     }
 }
 
@@ -175,6 +190,12 @@ impl SdrFormat {
         self.0.name()
     }
 
+    /// Every suffix this format's files are written with.  More than one for
+    /// JPEG, whose `.jpeg` is the same format as its `.jpg`.
+    pub fn suffixes(self) -> &'static [&'static str] {
+        self.0.suffixes()
+    }
+
     /// The type the clipboard carries this format under.
     pub fn mime(self) -> &'static str {
         self.0.mime()
@@ -230,6 +251,13 @@ pub type HdrHalf = codec::HdrImage;
 /// `sdr_format` and `sdr_values` are the SDR half's own settings, and
 /// `hdr_values` the HDR half's; both sets come from the codec registry, so a
 /// format this build does not have can never be asked for here.
+///
+/// `sdr_copy` decides whether a capture that carries HDR content writes the SDR
+/// half at all.  With it off only the HDR file is written, at the sibling path
+/// its suffix already names; a capture with no HDR content writes the SDR file
+/// whatever it says, because that file is then the only one there is.  stdout,
+/// the clipboard and the pin carry one image each and are not affected: the
+/// setting is about the files a capture leaves behind.
 #[allow(clippy::too_many_arguments)]
 pub fn write_frame_with_hdr(
     frame: &Frame,
@@ -237,6 +265,7 @@ pub fn write_frame_with_hdr(
     destination: &Destination,
     density: u32,
     sdr_format: SdrFormat,
+    sdr_copy: bool,
     sdr_values: &codec::ParamValues,
     format: HdrFormat,
     hdr_values: &codec::ParamValues,
@@ -261,10 +290,22 @@ pub fn write_frame_with_hdr(
         Destination::File(path) => {
             let path = expand_output_path(path, Local::now());
             create_parent_directories(&path)?;
-            write_capture_files(
-                &path, frame, hdr, density, sdr_format, sdr_values, format, hdr_values,
+            // The clipboard is given the file that was really written, which is
+            // not always the one that was named: the SDR half is written under
+            // its own format's suffix (see `write_capture_files`), and a URI
+            // pointing at the name the user typed would point at nothing.
+            let written = write_capture_files(
+                &path,
+                frame,
+                hdr,
+                Some(density),
+                sdr_format,
+                sdr_copy,
+                sdr_values,
+                format,
+                hdr_values,
             )?;
-            copy_file_to_clipboard(&path)
+            copy_file_to_clipboard(&written)
         }
         // Both of these carry the SDR half alone, in the format it was asked
         // for: the clipboard is told the type it is, and stdout is bytes with no
@@ -318,41 +359,93 @@ pub fn write_frame_with_hdr(
     }
 }
 
-/// Writes the SDR image and, when there is one, the HDR image beside it.  Split
-/// out so the offline test can exercise the pairing without `wl-copy`.
+/// Writes the SDR image and, when there is one, the HDR image beside it, and
+/// returns the path the SDR half went to.  Split out so the offline test can
+/// exercise the pairing without `wl-copy`.
 #[allow(clippy::too_many_arguments)]
-fn write_capture_files(
+pub(crate) fn write_capture_files(
     path: &Path,
     frame: &Frame,
     hdr: Option<&HdrHalf>,
-    density: u32,
+    density: Option<u32>,
     sdr_format: SdrFormat,
+    sdr_copy: bool,
     sdr_values: &codec::ParamValues,
     format: HdrFormat,
     hdr_values: &codec::ParamValues,
-) -> Result<()> {
+) -> Result<PathBuf> {
     // The SDR half is the destination the user named and the HDR half sits
     // beside it.  When the destination already ends in the HDR format's own
     // suffix the two names would be the same file, so the named path is taken
-    // for the HDR half and the PNG goes to its sibling — the pair still differs
-    // only in its suffix, and neither image overwrites the other.
-    let (png_path, hdr_path) = match hdr {
+    // for the HDR half and the SDR image goes to its sibling — the pair still
+    // differs only in its suffix, and neither image overwrites the other.
+    let (sdr_path, hdr_path) = match hdr {
         Some(_) if hdr_sibling_path(path, format) == path => {
             (sdr_sibling_path(path, sdr_format), path.to_path_buf())
         }
-        _ => (path.to_path_buf(), hdr_sibling_path(path, format)),
+        _ => (
+            align_sdr_suffix(path, sdr_format),
+            hdr_sibling_path(path, format),
+        ),
     };
-    write_file(
-        &png_path,
-        &sdr_format.encode(frame, Some(density), sdr_values)?,
-    )?;
+    // The SDR copy is skipped only when there is an HDR half to write instead:
+    // a capture that carries no HDR content has one file, and leaving it out
+    // would be a capture that saved nothing at all.
+    let write_sdr = sdr_copy || hdr.is_none();
+    if write_sdr {
+        write_file(&sdr_path, &sdr_format.encode(frame, density, sdr_values)?)?;
+    }
     if let Some(hdr) = hdr {
         write_file(
             &hdr_path,
-            &format.encode_with(&hdr.frame, hdr.reference_nits, hdr_values)?,
+            &format.encode_with(&hdr.frame, hdr.reference_nits, hdr_values, density)?,
         )?;
     }
-    Ok(())
+    // The file that exists, which is what the caller points the clipboard at:
+    // with the SDR copy off the HDR half is the only one there is.
+    Ok(if write_sdr { sdr_path } else { hdr_path })
+}
+
+/// The path the SDR half is really written at: the one the user named, with its
+/// suffix replaced when that suffix is one this program's own SDR formats use.
+///
+/// `--sdr-format webp -o shot.png` would otherwise write WebP bytes under a
+/// `.png` name, and everything downstream would believe the name: another
+/// program opening it by extension, a later `vshot pin shot.png`, and the file
+/// URI a capture puts on the clipboard would all be about a PNG that is not
+/// there.  The bytes are what decides, so the name is made to agree with them.
+///
+/// A suffix of the format being written is already in agreement and is left
+/// exactly as it was typed: `.jpeg` is JPEG, and a user whose save dialog
+/// offered them `shot.jpeg` gets a file called that rather than one silently
+/// renamed to `shot.jpg`.
+///
+/// A suffix this program never writes is left alone too.  `shot.final` and a
+/// bare `shot` are names a user chose to be their own, and a strftime pattern
+/// can expand into dotted parts that are not a suffix at all
+/// (`shot-%Y.%m.%d`), so replacing whatever follows the last dot would rename
+/// files nobody asked to have renamed.
+fn align_sdr_suffix(path: &Path, format: SdrFormat) -> PathBuf {
+    let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+        return path.to_path_buf();
+    };
+    if format
+        .suffixes()
+        .iter()
+        .any(|known| extension.eq_ignore_ascii_case(known))
+    {
+        return path.to_path_buf();
+    }
+    // Another format's suffix, or a name this program does not write at all.
+    let ours = ["png", "jpg", "jpeg", "webp"]
+        .iter()
+        .any(|known| extension.eq_ignore_ascii_case(known));
+    if !ours {
+        return path.to_path_buf();
+    }
+    let mut aligned = path.to_path_buf();
+    aligned.set_extension(format.extension());
+    aligned
 }
 
 /// The HDR half's path: the same file name with the extension replaced, so the
@@ -547,7 +640,9 @@ mod tests {
 
     #[test]
     fn an_sdr_format_name_no_codec_has_is_refused() {
-        let error = SdrFormat::parse("jpeg").unwrap_err().to_string();
+        // A name no codec here offers, so the test holds whatever this machine
+        // and this build happen to have: `tiff` is not one of them either way.
+        let error = SdrFormat::parse("tiff").unwrap_err().to_string();
         assert!(error.contains("--sdr-format"), "{error}");
         assert!(
             error.contains("png"),
@@ -655,12 +750,22 @@ mod tests {
         }
     }
 
-    /// AVIF is the default because it is the format every reader understands,
-    /// so a build that has it writes it unless the user says otherwise.
+    /// The default is the exact format where the machine can write it, and AVIF
+    /// where it cannot: JPEG XL holds the light as it was captured, while AVIF
+    /// is the one every reader understands.
+    ///
+    /// Which of the two it is depends on the *machine* -- a libavcodec without
+    /// `libjxl` is an ordinary thing to meet -- so the test states the rule
+    /// rather than a name, and holds either way.
     #[cfg(feature = "avif")]
     #[test]
-    fn the_default_hdr_format_is_avif() {
-        assert_eq!(HdrFormat::default(), HdrFormat::Avif);
+    fn the_default_hdr_format_is_the_exact_one_when_the_machine_has_it() {
+        let expected = if codec::ffmpeg_still::jxl_available() {
+            HdrFormat::Jxl
+        } else {
+            HdrFormat::Avif
+        };
+        assert_eq!(HdrFormat::default(), expected);
         assert_eq!(HdrFormat::parse("avif").unwrap(), HdrFormat::Avif);
         assert_eq!(HdrFormat::Avif.extension(), "avif");
     }
@@ -686,6 +791,40 @@ mod tests {
             hdr_sibling_path(Path::new("shot"), HdrFormat::Avif),
             PathBuf::from("shot.avif")
         );
+    }
+
+    /// The SDR half's suffix is made to agree with the bytes, and left alone
+    /// when it already does -- including when it is the format's *other*
+    /// spelling, which is the one a user may have just picked in the dialog.
+    #[test]
+    fn the_sdr_suffix_is_made_to_agree_with_the_bytes() {
+        let png = SdrFormat::parse("png").unwrap();
+        // Another format's suffix is replaced rather than appended to.
+        assert_eq!(
+            align_sdr_suffix(Path::new("shot.webp"), png),
+            PathBuf::from("shot.png")
+        );
+        // A name this program never writes is the user's own and stays.
+        assert_eq!(
+            align_sdr_suffix(Path::new("shot.final"), png),
+            PathBuf::from("shot.final")
+        );
+        if let Ok(jpeg) = SdrFormat::parse("jpeg") {
+            // The two spellings are one format, so neither is a lie and
+            // neither is renamed.
+            for name in ["shot.jpg", "shot.jpeg", "shot.JPEG"] {
+                assert_eq!(
+                    align_sdr_suffix(Path::new(name), jpeg),
+                    PathBuf::from(name),
+                    "{name}"
+                );
+            }
+            // And the other formats' suffixes still are.
+            assert_eq!(
+                align_sdr_suffix(Path::new("shot.png"), jpeg),
+                PathBuf::from("shot.jpg")
+            );
+        }
     }
 
     /// A path with more than one dot keeps everything but the last part.
@@ -716,8 +855,9 @@ mod tests {
             &path,
             &frame,
             Some(&hdr),
-            1,
+            Some(1),
             SdrFormat::default(),
+            true,
             &default_params(SdrFormat::default()),
             HdrFormat::Radiance,
             &default_params(HdrFormat::Radiance),
@@ -764,8 +904,9 @@ mod tests {
             &path,
             &frame,
             Some(&hdr),
-            1,
+            Some(1),
             SdrFormat::default(),
+            true,
             &default_params(SdrFormat::default()),
             HdrFormat::Avif,
             &default_params(HdrFormat::Avif),
@@ -800,8 +941,9 @@ mod tests {
             &path,
             &frame,
             Some(&hdr),
-            1,
+            Some(1),
             SdrFormat::default(),
+            true,
             &default_params(SdrFormat::default()),
             HdrFormat::Radiance,
             &default_params(HdrFormat::Radiance),
@@ -837,8 +979,9 @@ mod tests {
             &path,
             &frame,
             None,
-            1,
+            Some(1),
             SdrFormat::default(),
+            true,
             &default_params(SdrFormat::default()),
             format,
             &default_params(format),

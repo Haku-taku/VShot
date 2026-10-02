@@ -410,26 +410,76 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("Output"), QString::fromUtf8("输出")},
         {QStringLiteral("SDR format"), QString::fromUtf8("SDR 格式")},
         {QStringLiteral("The format the SDR half of a capture is written in, and the one "
-                        "the clipboard carries. PNG is lossless, so it is the only format "
-                        "this build has; the parameters of whichever format is chosen are "
-                        "on the Format settings page"),
+                        "the clipboard carries. PNG is lossless and always there; JPEG and "
+                        "WebP are smaller and lossy, and come from this machine's ffmpeg, so "
+                        "the list holds what it can write. The parameters of whichever "
+                        "format is chosen are on the Format settings page"),
          QString::fromUtf8("截图的 SDR 那一半写成什么格式，剪贴板也用它。"
-                           "PNG 无损，是本构建唯一的格式；所选格式的参数在「格式设置」页")},
+                           "PNG 无损且始终可用；JPEG 与 WebP 更小、有损，来自本机 ffmpeg，"
+                           "所以列表只列出它能写的。所选格式的参数在「格式设置」页")},
         {QStringLiteral("HDR format"), QString::fromUtf8("HDR 格式")},
         {QStringLiteral("The second file of a capture that carries HDR content, written "
-                        "beside the SDR one with the same name. AVIF is ten-bit BT.2020 PQ "
-                        "and says so in the file, so every reader shows it right, but it is "
-                        "lossy; Radiance RGBE is the light exactly as captured, and is read "
-                        "by few. Its parameters are on the Format settings page"),
+                        "beside the SDR one with the same name. JPEG XL holds the light "
+                        "exactly as captured and states its colour, and is written at every "
+                        "pixel unless asked otherwise; AVIF is ten-bit BT.2020 PQ, smaller "
+                        "and lossy but read everywhere; Radiance RGBE keeps the gamut it was "
+                        "captured in and is read by few. Its parameters are on the Format "
+                        "settings page"),
          QString::fromUtf8("截图带 HDR 内容时，与 SDR 那个同名并排写出的第二个文件。"
-                           "AVIF 是 10 位 BT.2020 PQ 并在文件里声明，所有读取器都能正确"
-                           "显示，但为有损；Radiance RGBE 是原样记录的光，但读取器很少。"
+                           "JPEG XL 原样记录光并声明色域，除非另有要求否则每个样本都不改；"
+                           "AVIF 是 10 位 BT.2020 PQ，更小、有损，但到处都能读；"
+                           "Radiance RGBE 保留截取时的色域，但读取器很少。"
                            "它的参数在「格式设置」页")},
+        {QStringLiteral("SDR copy"), QString::fromUtf8("SDR 副本")},
+        {QStringLiteral("Whether a capture that carries HDR content also writes the SDR half "
+                        "beside the HDR one. Off leaves the HDR file alone on disk, for an "
+                        "archival capture that does not need the tone-mapped copy; a capture "
+                        "with no HDR content always writes its SDR file, which is the only "
+                        "file it has"),
+         QString::fromUtf8("带 HDR 内容的截图是否也把 SDR 那一份写在 HDR 旁边。"
+                           "关闭时磁盘上只留 HDR 文件，适合不需要色调映射副本的归档截图；"
+                           "不带 HDR 内容的截图总会写出它的 SDR 文件，"
+                           "因为那是它唯一的一份")},
+        {QStringLiteral("Off: only the HDR file is written, at the destination under its own "
+                        "suffix"),
+         QString::fromUtf8("关闭：只写 HDR 文件，落在目标路径上、用它自己的后缀")},
+        {QStringLiteral("Also save the SDR copy"),
+         QString::fromUtf8("同时保存 SDR 副本")},
+        {QStringLiteral("Write the tone-mapped picture beside the HDR file, "
+                        "so a reader that cannot show HDR has something to open."),
+         QString::fromUtf8("把色调映射后的画面写在 HDR 文件旁边，"
+                           "让打不开 HDR 的读取器也有东西可看。")},
+        {QStringLiteral("%1 image (%2)"), QString::fromUtf8("%1 图像（%2）")},
+        {QStringLiteral("No tool"), QString::fromUtf8("不选工具")},
+        {QStringLiteral("Font height in pixels (7-448)"), QString::fromUtf8("字号，单位像素（7-448）")},
+        {QStringLiteral("The SDR half"), QString::fromUtf8("SDR 那一份")},
+        {QStringLiteral("What counts as HDR"), QString::fromUtf8("什么算 HDR")},
+        {QStringLiteral("%1 (%2)"), QString::fromUtf8("%1（%2）")},
+        {QStringLiteral("Element picking"), QString::fromUtf8("元素识别")},
+        {QStringLiteral("When the accessibility tree is unavailable"),
+         QString::fromUtf8("无障碍树用不了时")},
+        {QStringLiteral("How the picker reads a window's elements when the application exposes "
+                        "no accessibility tree. Lines finds the dividers the interface draws "
+                        "and the panes they enclose, which suits editors and terminals. Colour "
+                        "regions finds the areas of one colour instead, which suits an "
+                        "interface that draws no dividers and separates its panes by colour "
+                        "alone. Neither reads every window, which is why both are here"),
+         QString::fromUtf8("应用不暴露无障碍树时，选择器怎么读一个窗口里的元素。"
+                           "「分隔线」找界面自己画的分隔线以及被它们围出的面板，"
+                           "适合编辑器和终端；「颜色区块」改为找同一种颜色的区域，"
+                           "适合不画分隔线、只靠颜色区分面板的界面。"
+                           "两者都读不了所有窗口，所以两个都留着")},
+        {QStringLiteral("Automatic"), QString::fromUtf8("自动")},
+        {QStringLiteral("Automatic derives one from the colour scheme"),
+         QString::fromUtf8("自动：从配色方案推出来")},
+        {QStringLiteral("Automatic uses the built-in light grey"),
+         QString::fromUtf8("自动：用内置的浅灰")},
+        {QStringLiteral("Saved"), QString::fromUtf8("已保存")},
         {QStringLiteral("Format settings"), QString::fromUtf8("格式设置")},
         {QStringLiteral("How each file format writes. The formats listed are the ones "
-                        "this build was compiled with, and the settings under each are "
-                        "the ones that format itself declares."),
-         QString::fromUtf8("每种文件格式怎么写。列出的格式是本构建编译进来的，"
+                        "this build and this machine can write, and the settings under "
+                        "each are the ones that format itself declares."),
+         QString::fromUtf8("每种文件格式怎么写。列出的格式是本构建与本机都能写的，"
                            "每种格式下面的设置由该格式自己声明。")},
         {QStringLiteral("Asking this build which formats it has…"),
          QString::fromUtf8("正在询问本构建有哪些格式…")},
@@ -458,6 +508,31 @@ const QHash<QString, QString> &chineseTable()
                         "most of the time an HDR capture takes"),
          QString::fromUtf8("编码器用多大功夫，0（最慢、最小）到 10。"
                            "一次 HDR 截图的时间大半花在这里")},
+        {QStringLiteral("Higher keeps more of the picture and writes a bigger file. JPEG "
+                        "always loses something; this is how much"),
+         QString::fromUtf8("越高保留的画面越多、文件越大。JPEG 总有损失，"
+                           "这里决定损失多少")},
+        {QStringLiteral("Mode"), QString::fromUtf8("模式")},
+        {QStringLiteral("Lossless keeps every pixel and writes a bigger file; lossy is "
+                        "smaller and throws some away. Read by lossy too, where it sets how "
+                        "much"),
+         QString::fromUtf8("无损保留每个像素、文件更大；有损更小、会丢掉一些。"
+                           "选「有损」时下面那项才起作用，决定丢多少")},
+        {QStringLiteral("Higher keeps more of the picture and writes a bigger file. Ignored "
+                        "when the mode is lossless, which always keeps everything"),
+         QString::fromUtf8("越高保留的画面越多、文件越大。选「无损」时这一项不起作用，"
+                           "无损总是全部保留")},
+        {QStringLiteral("Distance"), QString::fromUtf8("距离")},
+        {QStringLiteral("How far the encoder may drift from the original. Zero keeps every "
+                        "sample exactly and is the default; above zero the file is smaller, "
+                        "and the picture is not what was captured"),
+         QString::fromUtf8("编码器可以偏离原图多远。0 表示每个样本都精确保留，也是默认值；"
+                           "大于 0 文件更小，但画面不再是截下来的样子")},
+        {QStringLiteral("Effort"), QString::fromUtf8("功夫")},
+        {QStringLiteral("How hard the encoder works, 1 (fast) to 9 (slow). Time against "
+                        "size; it does not change what the picture holds"),
+         QString::fromUtf8("编码器用多大功夫，1（快）到 9（慢）。"
+                           "以时间换体积，不改变画面内容")},
         {QStringLiteral("HDR to SDR"), QString::fromUtf8("HDR 转 SDR")},
         {QStringLiteral("How the SDR half of an HDR capture is made from the HDR one. "
                         "Auto reads each capture: an SDR picture comes out exactly as it "
@@ -666,12 +741,26 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("Follow the colour scheme instead of a colour of its own"),
          QString::fromUtf8("跟随配色方案，不用自己的颜色")},
         {QStringLiteral("Pin appearance"), QString::fromUtf8("Pin 浮层")},
-        {QStringLiteral("How a pinned image is drawn, and at what size. A pin is a layer "
-                        "surface with nothing but the image in it, so its corners, the "
-                        "shadow behind it and the line around it are all vshot's to "
-                        "draw."),
-         QString::fromUtf8("pin 图怎么画、按什么尺寸画。pin 是只装着图片的 layer surface，"
+        {QStringLiteral("How a pinned image is drawn, at what size, and what it is read "
+                        "from. A pin is a layer surface with nothing but the image in "
+                        "it, so its corners, the shadow behind it and the line around "
+                        "it are all vshot's to draw."),
+         QString::fromUtf8("pin 图怎么画、按什么尺寸画，以及读的是哪个文件。"
+                           "pin 是只装着图片的 layer surface，"
                            "所以它的圆角、身下的阴影和外面那道线都得 vshot 自己画。")},
+        {QStringLiteral("The HDR half"), QString::fromUtf8("HDR 那一份")},
+        {QStringLiteral("Pin the HDR half"), QString::fromUtf8("pin 时取 HDR 那一份")},
+        {QStringLiteral("A capture of HDR content writes a second file beside the SDR one, "
+                        "under the same name and another format's suffix. On, pinning the "
+                        "SDR file pins that half instead, so the pin holds the light the "
+                        "capture did; off, the file named is pinned as it is"),
+         QString::fromUtf8("带 HDR 内容的截图会在 SDR 那一份旁边再写一个文件，"
+                           "同名、换一个格式后缀。开启时，pin 一个 SDR 文件会改成 pin 那一份，"
+                           "于是 pin 上保留的是截图当时的光；关闭时，指名哪个文件就 pin 哪个，"
+                           "旁边的副本一概不看")},
+        {QStringLiteral("Off: the file named is pinned as it is, even when a half sits "
+                        "beside it"),
+         QString::fromUtf8("关闭：指名哪个文件就 pin 哪个，哪怕旁边就放着那份副本")},
         {QStringLiteral("Pin size"), QString::fromUtf8("Pin 尺寸")},
         {QStringLiteral("0 draws square corners, which is what a screenshot usually wants"),
          QString::fromUtf8("0 表示直角，截图一般就该是直角")},

@@ -103,6 +103,17 @@ fn run() -> Result<()> {
             // Internal: render a pin-edit session, no Wayland capture needed.
             return pin::apply_edit(&session);
         }
+        Action::PinExport {
+            sdr,
+            hdr,
+            destination,
+            formats,
+            density,
+        } => {
+            // Internal: the pin daemon's Save as…, which writes through the
+            // same codec layer a capture does.
+            return pin::export(&sdr, hdr.as_deref(), &destination, formats, density);
+        }
         Action::Annotate(action) => {
             // The annotation overlay is a resident daemon of its own: drawing on
             // the live screen needs no capture and no scene from here, only a
@@ -1352,6 +1363,7 @@ fn write_capture_and_pin(
             destination,
             density,
             request.sdr_format,
+            request.sdr_copy,
             &request.sdr_params,
             request.hdr_format,
             &request.hdr_params,
@@ -2352,6 +2364,7 @@ mod tests {
             hdr_params: crate::model::codec::ParamValues::defaults(
                 crate::output::HdrFormat::default().specs(),
             ),
+            sdr_copy: true,
             tone_map: crate::model::hdr::ToneMapOptions::default(),
         };
         // The editor's ordinary answer: a selection, no `pin` flag.  The
@@ -2454,7 +2467,7 @@ mod pixel_probe {
             if let Some(directory) = &dump {
                 let _ = std::fs::create_dir_all(directory);
                 if let Ok(crop) = scene.crop(window.geometry) {
-                    if let Ok(png) = crop.encode_png(None, model::PngCompression::default()) {
+                    if let Ok(png) = crop.encode_png(model::PngCompression::default()) {
                         let name = format!(
                             "{}-{}.png",
                             window.app_id.replace('/', "_"),

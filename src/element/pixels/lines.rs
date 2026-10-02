@@ -39,7 +39,7 @@
 use crate::geometry::Rect;
 use crate::selection_region::RegionNode;
 
-use super::{Analysis, leaf};
+use super::{leaf, Analysis};
 
 /// A change of this much luminance between neighbouring pixels is an edge.
 const EDGE_JUMP: f32 = 10.0;
@@ -135,7 +135,11 @@ pub(super) fn regions(analysis: &Analysis) -> Vec<RegionNode> {
 
 /// The luminance of every pixel, which is what all the passes read.
 fn luma(analysis: &Analysis) -> Vec<f32> {
-    analysis.pixels.iter().map(|pixel| super::luminance(*pixel)).collect()
+    analysis
+        .pixels
+        .iter()
+        .map(|pixel| super::luminance(*pixel))
+        .collect()
 }
 
 /// Where neighbouring pixels differ enough to be an edge.
@@ -250,7 +254,12 @@ fn collect(points: &[(u32, u32)], width: u32, height: u32, vertical: bool) -> Ve
                 match (on, start) {
                     (true, None) => start = Some(y),
                     (false, Some(from)) => {
-                        out.push(Segment { vertical: true, at: x, start: from, end: y - 1 });
+                        out.push(Segment {
+                            vertical: true,
+                            at: x,
+                            start: from,
+                            end: y - 1,
+                        });
                         start = None;
                     }
                     _ => {}
@@ -265,7 +274,12 @@ fn collect(points: &[(u32, u32)], width: u32, height: u32, vertical: bool) -> Ve
                 match (on, start) {
                     (true, None) => start = Some(x),
                     (false, Some(from)) => {
-                        out.push(Segment { vertical: false, at: y, start: from, end: x - 1 });
+                        out.push(Segment {
+                            vertical: false,
+                            at: y,
+                            start: from,
+                            end: x - 1,
+                        });
                         start = None;
                     }
                     _ => {}
@@ -342,11 +356,18 @@ fn merge_axis(analysis: &Analysis, items: Vec<Segment>, vertical: bool) -> Vec<S
                 };
                 let gap_start = first.end + 1;
                 let gap_end = second.start.saturating_sub(1);
-                let gap_length = if gap_end < gap_start { 0 } else { gap_end - gap_start + 1 };
+                let gap_length = if gap_end < gap_start {
+                    0
+                } else {
+                    gap_end - gap_start + 1
+                };
                 let joins = gap_end < gap_start
                     || gap_length <= 2
                     || (gap_length <= SHORT_GAP)
-                    || (gap_length <= MAX_MERGE_GAP && same_colour_across(analysis, vertical, kept.at, first, second, gap_start, gap_end));
+                    || (gap_length <= MAX_MERGE_GAP
+                        && same_colour_across(
+                            analysis, vertical, kept.at, first, second, gap_start, gap_end,
+                        ));
                 if joins {
                     kept.start = kept.start.min(item.start);
                     kept.end = kept.end.max(item.end);
@@ -377,8 +398,12 @@ fn same_colour_across(
     let flank = |segment: Segment| -> Option<f32> {
         band_mean(analysis, vertical, at, segment.start, segment.end)
     };
-    let Some(left) = flank(first) else { return false };
-    let Some(right) = flank(second) else { return false };
+    let Some(left) = flank(first) else {
+        return false;
+    };
+    let Some(right) = flank(second) else {
+        return false;
+    };
     let Some(gap) = band_mean(analysis, vertical, at, gap_start, gap_end) else {
         return false;
     };
@@ -452,13 +477,33 @@ fn step(segments: &[Segment], area: Rect, depth: u32, budget: &mut usize) -> Reg
     *budget -= 1;
     let children = if cut_at.vertical {
         vec![
-            step(segments, Rect::new(x0 as i32, y0 as i32, cut_at.at - x0, y1 - y0), depth + 1, budget),
-            step(segments, Rect::new(cut_at.at as i32, y0 as i32, x1 - cut_at.at, y1 - y0), depth + 1, budget),
+            step(
+                segments,
+                Rect::new(x0 as i32, y0 as i32, cut_at.at - x0, y1 - y0),
+                depth + 1,
+                budget,
+            ),
+            step(
+                segments,
+                Rect::new(cut_at.at as i32, y0 as i32, x1 - cut_at.at, y1 - y0),
+                depth + 1,
+                budget,
+            ),
         ]
     } else {
         vec![
-            step(segments, Rect::new(x0 as i32, y0 as i32, x1 - x0, cut_at.at - y0), depth + 1, budget),
-            step(segments, Rect::new(x0 as i32, cut_at.at as i32, x1 - x0, y1 - cut_at.at), depth + 1, budget),
+            step(
+                segments,
+                Rect::new(x0 as i32, y0 as i32, x1 - x0, cut_at.at - y0),
+                depth + 1,
+                budget,
+            ),
+            step(
+                segments,
+                Rect::new(x0 as i32, cut_at.at as i32, x1 - x0, y1 - cut_at.at),
+                depth + 1,
+                budget,
+            ),
         ]
     };
     RegionNode::leaf(

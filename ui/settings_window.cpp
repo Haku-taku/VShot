@@ -2182,9 +2182,10 @@ private:
         selectChoice(sdrFormatBox_, config_.cli.sdrFormat);
         addRow(output, uiTr("SDR format"),
                uiTr("The format the SDR half of a capture is written in, and the one "
-                    "the clipboard carries. PNG is lossless, so it is the only format "
-                    "this build has; the parameters of whichever format is chosen are "
-                    "on the Format settings page"),
+                    "the clipboard carries. PNG is lossless and always there; JPEG and "
+                    "WebP are smaller and lossy, and come from this machine's ffmpeg, so "
+                    "the list holds what it can write. The parameters of whichever "
+                    "format is chosen are on the Format settings page"),
                sdrFormatBox_, true);
 
         output = addCard(page, uiTr("HDR format"));
@@ -2194,11 +2195,27 @@ private:
         selectChoice(hdrFormatBox_, config_.cli.hdrFormat);
         addRow(output, uiTr("HDR format"),
                uiTr("The second file of a capture that carries HDR content, written "
-                    "beside the SDR one with the same name. AVIF is ten-bit BT.2020 PQ "
-                    "and says so in the file, so every reader shows it right, but it is "
-                    "lossy; Radiance RGBE is the light exactly as captured, and is read "
-                    "by few. Its parameters are on the Format settings page"),
+                    "beside the SDR one with the same name. JPEG XL holds the light "
+                    "exactly as captured and states its colour, and is written at every "
+                    "pixel unless asked otherwise; AVIF is ten-bit BT.2020 PQ, smaller "
+                    "and lossy but read everywhere; Radiance RGBE keeps the gamut it was "
+                    "captured in and is read by few. Its parameters are on the Format "
+                    "settings page"),
                hdrFormatBox_, true);
+
+        sdrCopySwitch_ = new ModernSwitch(output);
+        sdrCopySwitch_->setObjectName(QStringLiteral("sdrCopy"));
+        sdrCopySwitch_->setChecked(config_.cli.sdrCopy);
+        sdrCopySwitch_->setToolTip(
+            uiTr("Off: only the HDR file is written, at the destination under its own "
+                 "suffix"));
+        addRow(output, uiTr("SDR copy"),
+               uiTr("Whether a capture that carries HDR content also writes the SDR half "
+                    "beside the HDR one. Off leaves the HDR file alone on disk, for an "
+                    "archival capture that does not need the tone-mapped copy; a capture "
+                    "with no HDR content always writes its SDR file, which is the only "
+                    "file it has"),
+               sdrCopySwitch_, false);
 
         output = addCard(page, uiTr("Which output"));
         monitorEdit_ = new QLineEdit(output);
@@ -2355,8 +2372,8 @@ private:
         formatsPage_ = newPage(formatsScroll_);
         addPageHeading(formatsPage_, uiTr("Format settings"),
                        uiTr("How each file format writes. The formats listed are the ones "
-                            "this build was compiled with, and the settings under each are "
-                            "the ones that format itself declares."));
+                            "this build and this machine can write, and the settings under "
+                            "each are the ones that format itself declares."));
         fillFormatsPage();
         return formatsScroll_;
     }
@@ -2417,6 +2434,10 @@ private:
     void addFormatCard(const FormatInfo &format, const QString &half)
     {
         QWidget *card = addCard(formatsPage_, uiTr("%1 (%2)").arg(format.name, half));
+        // Named so the offline check can tell which formats the page has cards
+        // for: a format that declares no parameters still gets a card, so the
+        // parameter controls alone cannot answer that.
+        card->setObjectName(QStringLiteral("formatCard_%1").arg(format.name));
         // A format with nothing to tune still gets a card, saying so: a format
         // missing from the page entirely would read as a format this build does
         // not have, which is the one thing the registry's answer must not be
@@ -2529,13 +2550,27 @@ private:
     /// one entry per parameter that was changed from what the format declares.
     QMap<QString, QJsonObject> formatValues() const
     {
-        QMap<QString, QJsonObject> values;
+        // It starts from what the file remembered rather than from nothing, so
+        // that a format this machine cannot write keeps its parameters: the
+        // registry is *this machine's* answer, and a value written where the
+        // codec exists must not be erased by saving where it does not.
+        //
+        // A parameter the window actually drew is the window's to decide,
+        // including by having been cleared -- that is what the removal is, and
+        // why the owned-key list has to name every parameter of every codec.
+        QMap<QString, QJsonObject> values = config_.cli.format;
         for (const FormatWidget &widget : formatWidgets_) {
             const QJsonValue value = paramValue(widget);
             if (value.isUndefined()) {
-                continue;
+                values[widget.format].remove(widget.param);
+            } else {
+                values[widget.format].insert(widget.param, value);
             }
-            values[widget.format].insert(widget.param, value);
+        }
+        // A format whose last parameter was cleared leaves no empty object
+        // behind, the way the config layer prunes the sections it empties.
+        for (auto entry = values.begin(); entry != values.end();) {
+            entry = entry.value().isEmpty() ? values.erase(entry) : entry + 1;
         }
         return values;
     }
@@ -2547,6 +2582,7 @@ private:
             formatsProbe_ = new FormatProbe(this);
             formatsProbe_->onFinished = [this](bool) {
                 fillFormatsPage();
+                fillFormatSelectors();
                 // A property rather than a member, because the only thing that
                 // reads it is the offline check: it drives the rows the
                 // registry grew, and it has to know the answer has landed
@@ -2555,6 +2591,61 @@ private:
             };
         }
         formatsProbe_->start();
+    }
+
+    /// Narrows the two format selectors on the Output page to what this machine
+    /// can actually write.
+    ///
+    /// The page is built before the registry answers, so it opens on every
+    /// format this program knows rather than on a short list that would have to
+    /// be kept in step by hand.  When the answer lands this replaces those
+    /// entries with the registry's own -- the same list the Format settings
+    /// page's cards are built from, so the two can never disagree about what
+    /// exists.
+    ///
+    /// The leading "built-in default" entry comes from the registry too, and
+    /// that is the point of taking the order seriously: the first entry of each
+    /// half *is* the default, which is PNG for the SDR half always and JPEG XL
+    /// for the HDR half wherever this machine's ffmpeg has it.
+    ///
+    /// A name the file remembers is kept even when the registry does not offer
+    /// it.  The config may have been written on a machine with more codecs, and
+    /// dropping the entry would quietly rewrite the user's choice the next time
+    /// they saved.
+    void fillFormatSelectors()
+    {
+        if (formatsProbe_ == nullptr || !formatsProbe_->finished()) {
+            return;
+        }
+        const FormatRegistry &registry = formatsProbe_->registry();
+        refillFormatBox(sdrFormatBox_, registry.sdr, config_.cli.sdrFormat);
+        refillFormatBox(hdrFormatBox_, registry.hdr, config_.cli.hdrFormat);
+    }
+
+    /// One of those selectors, rebuilt from `formats`.
+    static void refillFormatBox(QComboBox *box, const QVector<FormatInfo> &formats,
+                                const QString &remembered)
+    {
+        // Nothing was answered: the list the page opened with is the better
+        // guess, and it stays.
+        if (box == nullptr || formats.isEmpty()) {
+            return;
+        }
+        QStringList names;
+        for (const FormatInfo &format : formats) {
+            names.append(format.name);
+        }
+        const QString chosen = box->currentData().toString();
+        const QString keep = chosen.isEmpty() ? remembered : chosen;
+        if (!keep.isEmpty() && !names.contains(keep)) {
+            names.append(keep);
+        }
+        box->clear();
+        box->addItem(uiTr("%1 (built-in default)").arg(formats.first().name), QString());
+        for (const QString &name : names) {
+            box->addItem(name, name);
+        }
+        selectChoice(box, keep);
     }
 
     QWidget *buildScrollingPage()
@@ -2965,10 +3056,10 @@ private:
         QScrollArea *scroll = newScrollPage(pages_);
         QWidget *page = newPage(scroll);
         addPageHeading(page, uiTr("Pin appearance"),
-                       uiTr("How a pinned image is drawn, and at what size. A pin is a layer "
-                            "surface with nothing but the image in it, so its corners, the "
-                            "shadow behind it and the line around it are all vshot's to "
-                            "draw."));
+                       uiTr("How a pinned image is drawn, at what size, and what it is read "
+                            "from. A pin is a layer surface with nothing but the image in "
+                            "it, so its corners, the shadow behind it and the line around "
+                            "it are all vshot's to draw."));
 
         // The pin's own size, which is a `cli` default rather than a `pin` one:
         // it is the density a pin is read at, not how the overlay paints.  It
@@ -2991,6 +3082,24 @@ private:
                uiTr("Device pixels per logical pixel, 1-4; `inferred` works it out from the "
                     "screen the pin is on"),
                densitySpin_, true);
+
+        // Which file a pin is read from, which is the one thing on this page
+        // that is not about drawing.  It is here because it is only ever the
+        // answer to "the pin did not come out the way I expected", which is what
+        // this page is opened for -- a capture of HDR content writes a second
+        // file beside the SDR one, and this is whether the pin takes it.
+        QWidget *half = addCard(page, uiTr("The HDR half"));
+        pinHdrHalfSwitch_ = new ModernSwitch(half);
+        pinHdrHalfSwitch_->setObjectName(QStringLiteral("pinHdrHalf"));
+        pinHdrHalfSwitch_->setChecked(config_.cli.pinHdrHalf);
+        pinHdrHalfSwitch_->setToolTip(
+            uiTr("Off: the file named is pinned as it is, even when a half sits beside it"));
+        addRow(half, uiTr("Pin the HDR half"),
+               uiTr("A capture of HDR content writes a second file beside the SDR one, under "
+                    "the same name and another format's suffix. On, pinning the SDR file "
+                    "pins that half instead, so the pin holds the light the capture did; off, "
+                    "the file named is pinned as it is"),
+               pinHdrHalfSwitch_, true);
 
         QWidget *shape = addCard(page, uiTr("Shape"));
         // The radius has no "unset" state, unlike the density row above: zero
@@ -3255,6 +3364,7 @@ private:
         CliPreferences &cli = config.cli;
         cli.sdrFormat = sdrFormatBox_->currentData().toString();
         cli.hdrFormat = hdrFormatBox_->currentData().toString();
+        cli.sdrCopy = sdrCopySwitch_->isChecked();
         // The encoding parameters are read back off the widgets the registry
         // grew, rather than out of named members: which parameters exist is the
         // codec layer's answer, and this side only knows what it drew.
@@ -3287,6 +3397,7 @@ private:
         // keeps an untouched default out of the file and lets a later version's
         // default reach anyone who never chose one.
         cli.pinDensity = spinValue(densitySpin_, kDefaultPinDensity);
+        cli.pinHdrHalf = pinHdrHalfSwitch_->isChecked();
         cli.longNotches = spinValue(notchesSpin_, kDefaultLongNotches);
         cli.longMaxHeight = spinValue(maxHeightSpin_, kDefaultLongMaxHeight);
         cli.longMaxFrames = spinValue(maxFramesSpin_, kDefaultLongMaxFrames);
@@ -3401,6 +3512,8 @@ private:
     QSpinBox *mosaicStrengthSpin_ = nullptr;
     QComboBox *sdrFormatBox_ = nullptr;
     QComboBox *hdrFormatBox_ = nullptr;
+    /// Whether an HDR capture also writes its SDR half (`cli.sdr-copy`).
+    ModernSwitch *sdrCopySwitch_ = nullptr;
     QComboBox *toneMapBox_ = nullptr;
     QComboBox *elementFallbackBox_ = nullptr;
     QDoubleSpinBox *toneMapWhiteSpin_ = nullptr;
@@ -3409,6 +3522,8 @@ private:
     QDoubleSpinBox *hdrReferenceWhiteSpin_ = nullptr;
     QLineEdit *monitorEdit_ = nullptr;
     QSpinBox *densitySpin_ = nullptr;
+    /// Whether a pinned file takes the HDR half beside it (`cli.pin.hdr-half`).
+    ModernSwitch *pinHdrHalfSwitch_ = nullptr;
     QSpinBox *notchesSpin_ = nullptr;
     QSpinBox *maxHeightSpin_ = nullptr;
     QSpinBox *maxFramesSpin_ = nullptr;

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Result, VshotError};
 use crate::geometry::Size;
 use crate::model::hdr::Transfer;
-use crate::model::HdrFrame;
+use crate::model::{Frame, HdrFrame};
 use crate::output::HdrHalf;
 use crate::qt_overlay::helper_program;
 
@@ -204,6 +204,10 @@ pub(crate) struct PinInvocation {
     /// not say themselves. Resolved once here rather than at the decode, so the
     /// flag, the config file and the built-in default are decided in one place.
     pub reference_nits: f32,
+    /// Whether to look for the HDR half a capture wrote beside the image and pin
+    /// that instead.  On unless `--hdr-half false` or `cli.pin.hdr-half` says
+    /// otherwise; see [`pin_file`] for what the half is.
+    pub hdr_half: bool,
 }
 
 /// Environment fallback for `--density`, so a screenshot hotkey can hand the
@@ -239,6 +243,7 @@ impl PinInvocation {
         list: bool,
         density: Option<u32>,
         reference_white: Option<f32>,
+        hdr_half: Option<bool>,
     ) -> Result<Self> {
         let selected = [toggle, show, hide, close_all, quit, list]
             .into_iter()
@@ -285,6 +290,11 @@ impl PinInvocation {
             .or_else(crate::config::hdr_reference_white_default)
             .map(crate::model::hdr::clamp_reference_nits)
             .unwrap_or(crate::model::hdr::REFERENCE_WHITE_NITS);
+        // The flag wins, then the config file, then on.  Looking for the half is
+        // what a pin has always done, and a file written before this setting
+        // existed says nothing about it rather than saying no.
+        let hdr_half =
+            hdr_half.unwrap_or_else(|| crate::config::load().pin.hdr_half.unwrap_or(true));
         let command = if !files.is_empty() || clipboard {
             None
         } else if quit {
@@ -306,6 +316,7 @@ impl PinInvocation {
             command,
             density,
             reference_nits,
+            hdr_half,
         })
     }
 }
@@ -318,6 +329,7 @@ pub(crate) fn run(invocation: PinInvocation) -> Result<()> {
         command,
         density,
         reference_nits,
+        hdr_half,
     } = invocation;
     if let Some(command) = command {
         let list = matches!(command, PinCommand::List);
@@ -354,6 +366,7 @@ pub(crate) fn run(invocation: PinInvocation) -> Result<()> {
             reference_nits,
             output,
             output_name.clone(),
+            hdr_half,
         )?;
     }
     if clipboard {
@@ -365,7 +378,7 @@ pub(crate) fn run(invocation: PinInvocation) -> Result<()> {
         // with no sibling -- is left to the daemon, which resolves the clipboard
         // the way it always has.
         match clipboard_source() {
-            Some(path) => pin_file(path, density, reference_nits, output, output_name)?,
+            Some(path) => pin_file(path, density, reference_nits, output, output_name, hdr_half)?,
             None => {
                 execute(PinCommand::AddClipboard {
                     density,
@@ -375,6 +388,53 @@ pub(crate) fn run(invocation: PinInvocation) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Writes one pinned image out, the way a capture writes its own halves.
+///
+/// The daemon holds a pin as a PNG of what the screen shows and, for one that
+/// came from an HDR capture, the `VSHTPQ02` file its surface helper reads.
+/// Saving it is therefore the capture's write path with the pixels already in
+/// hand: the SDR half is re-encoded from that PNG in the format the flags name,
+/// and the HDR half from the PQ file in its own.  That is what makes a pin
+/// saved as JPEG XL the file a capture would have written -- linear light, its
+/// gamut and its reference white included -- rather than a JPEG XL holding the
+/// tone map, which is what any writer working from the picture on screen would
+/// produce.
+pub(crate) fn export(
+    sdr_source: &Path,
+    hdr_source: Option<&Path>,
+    destination: &Path,
+    formats: crate::cli::WriteFormats,
+    density: Option<u32>,
+) -> Result<()> {
+    let bytes = std::fs::read(sdr_source).map_err(|source| VshotError::WriteFile {
+        path: sdr_source.to_path_buf(),
+        source,
+    })?;
+    let frame = Frame::from_png(&bytes)?;
+    let hdr = match hdr_source {
+        Some(path) => Some(decode_pq_half(path)?),
+        None => None,
+    };
+    crate::output::create_parent_directories(destination)?;
+    // The scale the pin was shown at, when the caller knows it: a file that
+    // declares nothing is sized from the output it next lands on, which is the
+    // one thing the declaration exists to avoid.  A caller with nothing to say
+    // -- one saving a picture that never had a scale -- leaves it out rather
+    // than claiming one.
+    crate::output::write_capture_files(
+        destination,
+        &frame,
+        hdr.as_ref(),
+        density,
+        formats.sdr,
+        formats.sdr_copy,
+        &formats.sdr_values,
+        formats.hdr,
+        &formats.hdr_values,
+    )?;
     Ok(())
 }
 
@@ -389,10 +449,18 @@ fn pin_file(
     reference_nits: f32,
     output: Option<WireOutputRect>,
     output_name: Option<String>,
+    hdr_half: bool,
 ) -> Result<()> {
-    let half = match hdr_half_beside(&path, reference_nits) {
-        Some(pq) => Some(PinHalf::write(&pq)?),
-        None => None,
+    // `--hdr-half false` and `cli.pin.hdr-half` turn the search off, and then
+    // the SDR file is pinned as it stands -- which is what a caller wants when
+    // the half beside it is not the picture they meant (a stale one from an
+    // earlier capture, or a file that merely shares its name).
+    let half = match hdr_half {
+        true => match hdr_half_beside(&path, reference_nits) {
+            Some(pq) => Some(PinHalf::write(&pq)?),
+            None => None,
+        },
+        false => None,
     };
     execute(PinCommand::Add {
         path,
@@ -1634,6 +1702,7 @@ mod tests {
                 false,
                 density,
                 None,
+                None,
             )
         };
         // Nothing stated: the daemon works the density out for itself.
@@ -1656,6 +1725,7 @@ mod tests {
             false,
             false,
             Some(2),
+            None,
             None,
         )
         .unwrap_err();

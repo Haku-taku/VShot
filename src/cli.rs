@@ -40,15 +40,16 @@ Destination (every capture above goes to exactly one)
 
 Shared modifiers
   -c, --cursor        draw the compositor cursor into the capture
-  --sdr-format        png (default), the format the SDR half is written in
-  --hdr-format        avif (default)|hdr, the file beside the SDR one when the
-                      capture carries HDR content
+  --sdr-format        png (default)|jpeg|webp, the format the SDR half is written in
+  --hdr-format        jxl|avif (fallback)|hdr, the file beside the SDR one when
+                      the capture carries HDR content
   --format-param      FORMAT.NAME=VALUE, one encoding parameter of one format;
                       repeatable, e.g. --format-param png.compression=high
-                      --format-param avif.quality=40
+                      --format-param jxl.distance=1
 
-Run `vshot formats` for the formats this build has and what each one lets you
-tune.
+Run `vshot formats` for the formats this machine can write and what each one
+lets you tune. JPEG, WebP and JPEG XL come from ffmpeg, so they are offered
+only where the libraries have them.
 
 Compositors: wlroots sessions (Hyprland, Sway, labwc, niri) through
 wlr-screencopy; KWin/Plasma through org.kde.KWin.ScreenShot2, granted only to a
@@ -84,9 +85,12 @@ pub struct Cli {
     /// Include the compositor cursor in each native screencopy capture.
     #[arg(short = 'c', long = "cursor", global = true)]
     pub cursor: bool,
-    /// Write the result to PATH, strftime-expanded (`-` writes to stdout): PNG
-    /// bytes, with the file's URI copied to the clipboard. For `record` it is the
-    /// video file: `-` is refused and `.mp4` is added when PATH has none.
+    /// Write the result to PATH, strftime-expanded (`-` writes to stdout): the
+    /// SDR half in the format `--sdr-format` chose, with the file's URI copied
+    /// to the clipboard. The suffix follows the format actually written, so
+    /// `--sdr-format webp -o shot.png` writes `shot.webp`; a name carrying any
+    /// other suffix is left as it is. For `record` it is the video file: `-` is
+    /// refused and `.mp4` is added when PATH has none.
     #[arg(
         short = 'o',
         long = "output",
@@ -107,16 +111,24 @@ pub struct Cli {
     )]
     pub pin: bool,
     /// Which format the SDR half is written in: `png` (the default), or
-    /// whatever else this build was compiled with. `vshot formats` lists them.
-    /// `--pin` writes no SDR file, and the clipboard and stdout always carry
-    /// PNG whatever this says.
+    /// whatever else this machine's ffmpeg can write -- `jpeg` or `webp`.
+    /// `vshot formats` lists them. It is the format stdout and the clipboard
+    /// carry too; `--pin` writes no SDR file at all.
     #[arg(long = "sdr-format", global = true, value_name = "FORMAT")]
     pub sdr_format: Option<String>,
-    /// Format of the HDR file written beside the PNG when the capture carries
-    /// HDR content: `avif` (the default) or `hdr` (Radiance RGBE). `avif` is
-    /// ten-bit BT.2020 PQ and states its colour in the file, but is lossy;
-    /// `hdr` is the light exactly as captured, in the output's own primaries.
-    /// Neither affects a capture without HDR content.
+    /// Also write the SDR half when the capture carries HDR content. Such a
+    /// capture writes two files -- the SDR view and the HDR content itself --
+    /// and with this off only the HDR one is written, at the destination under
+    /// its own format's suffix. A capture with no HDR content is unaffected:
+    /// the SDR file is the only one there is.
+    #[arg(long = "sdr-copy", global = true, value_name = "BOOL")]
+    pub sdr_copy: Option<bool>,
+    /// Format of the HDR file written beside the SDR one when the capture
+    /// carries HDR content: `jxl` (the default wherever this machine can write
+    /// it), `avif` or `hdr` (Radiance RGBE). `jxl` holds the light exactly as
+    /// captured and states its colour; `avif` is ten-bit BT.2020 PQ and states
+    /// its colour too, but is lossy; `hdr` keeps the output's own primaries and
+    /// is read by few. None of them affects a capture without HDR content.
     #[arg(long = "hdr-format", global = true, value_name = "FORMAT")]
     pub hdr_format: Option<String>,
     /// One encoding parameter of one format, as `FORMAT.NAME=VALUE`, repeatable.
@@ -331,9 +343,31 @@ VSHOT_PIN_FOCUS_DEBUG=1 trace density decisions and surface focus to stderr."#
         /// when the answer is wrong or unknown.
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=4))]
         density: Option<u32>,
+        /// Whether pinning a file also pins the HDR half a capture wrote beside
+        /// it. A capture of HDR content writes a second file next to the SDR
+        /// one, and without this the pin is the tone-mapped copy. Without the
+        /// flag `cli.pin.hdr-half` decides, which is on unless it was turned
+        /// off.
+        #[arg(long = "hdr-half", value_name = "BOOL")]
+        hdr_half: Option<bool>,
+        /// Internal: write one pinned image out, as `<SDR> <DEST>`. `<SDR>` is
+        /// the pin's picture as a PNG and `--hdr-source` the HDR half it also
+        /// holds; which formats those are written in comes from the same
+        /// `--sdr-format` / `--hdr-format` / `--sdr-copy` a capture uses. The
+        /// pin daemon's Save as… runs it. Not for interactive use.
+        #[arg(long = "export", hide = true, value_names = ["SDR", "DEST"], num_args = 2)]
+        export: Option<Vec<PathBuf>>,
+        /// Internal: the HDR half the pin holds, as the daemon keeps it.
+        #[arg(
+            long = "hdr-source",
+            hide = true,
+            value_name = "PATH",
+            requires = "export"
+        )]
+        hdr_source: Option<PathBuf>,
         /// Internal: render one pin-edit session JSON written by the daemon
         /// and write the result back onto the pin. Not for interactive use.
-        #[arg(long = "apply", hide = true, conflicts_with_all = ["toggle", "show", "hide", "close_all", "quit", "list", "density"])]
+        #[arg(long = "apply", hide = true, conflicts_with_all = ["toggle", "show", "hide", "close_all", "quit", "list", "density", "hdr_half", "export", "hdr_source"])]
         apply: Option<PathBuf>,
     },
 
@@ -997,6 +1031,17 @@ pub enum CaptureTarget {
     },
 }
 
+/// What a write path needs to know about formats: which one each half is, the
+/// settings each one carries, and whether the SDR half is written at all.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WriteFormats {
+    pub sdr: SdrFormat,
+    pub sdr_values: codec::ParamValues,
+    pub hdr: HdrFormat,
+    pub hdr_values: codec::ParamValues,
+    pub sdr_copy: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Request {
     pub target: CaptureTarget,
@@ -1010,6 +1055,9 @@ pub struct Request {
     /// which of that format's own settings.
     pub hdr_format: HdrFormat,
     pub hdr_params: codec::ParamValues,
+    /// Whether a capture that carries HDR content also writes the SDR half
+    /// beside it.  When it is off the HDR file is the only one written.
+    pub sdr_copy: bool,
     /// How the SDR half is mapped down from that HDR content: which behaviour,
     /// and where SDR white lands for the two that take a level.
     pub tone_map: ToneMapOptions,
@@ -1027,6 +1075,18 @@ pub enum Action {
     Pin(crate::pin::PinInvocation),
     /// Internal: render one pin-edit session and write the result back.
     PinApply(std::path::PathBuf),
+    /// Internal: write one pinned image out in the format the flags name, the
+    /// way a capture writes its own halves.
+    PinExport {
+        sdr: std::path::PathBuf,
+        hdr: Option<std::path::PathBuf>,
+        destination: std::path::PathBuf,
+        formats: WriteFormats,
+        /// The scale the file should declare, as the pin it came from had it.
+        /// `None` writes no declaration, which is what the daemon's own save
+        /// did before any of this existed.
+        density: Option<u32>,
+    },
     /// Control the resident annotation overlay: toggle, show, hide, clear, quit,
     /// or ask what it holds.
     Annotate(crate::annotate::AnnotateAction),
@@ -1900,6 +1960,9 @@ impl Cli {
             quit,
             list,
             density,
+            hdr_half,
+            export,
+            hdr_source,
             apply,
         } = &self.command
         {
@@ -1913,6 +1976,16 @@ impl Cli {
             if let Some(session) = apply {
                 return Ok(Action::PinApply(session.clone()));
             }
+            if let Some(paths) = export {
+                // Two values, checked by clap; the destination is the second.
+                return Ok(Action::PinExport {
+                    sdr: paths[0].clone(),
+                    hdr: hdr_source.clone(),
+                    destination: paths[1].clone(),
+                    formats: self.write_formats()?,
+                    density: *density,
+                });
+            }
             return Ok(Action::Pin(crate::pin::PinInvocation::build(
                 files.clone(),
                 self.clipboard,
@@ -1924,18 +1997,24 @@ impl Cli {
                 *list,
                 *density,
                 self.hdr_reference_white,
+                *hdr_half,
             )?));
         }
         Ok(Action::Capture(self.parse_request()?))
     }
 
-    pub fn parse_request(self) -> Result<Request> {
-        // The flag wins, then the config file, then the built-in default.
-        let sdr_format = match self.sdr_format.as_deref() {
+    /// The formats a write path uses, and the settings each one carries.
+    ///
+    /// One resolution for both a capture and a pin being saved: the flag, then
+    /// the config file, then the format's own declared default.  Two copies of
+    /// this would eventually disagree, and the value that disagreed would be a
+    /// file written in a format nobody asked for.
+    pub fn write_formats(&self) -> Result<WriteFormats> {
+        let sdr = match self.sdr_format.as_deref() {
             Some(name) => SdrFormat::parse(name)?,
             None => crate::config::sdr_format_default().unwrap_or_default(),
         };
-        let hdr_format = match self.hdr_format.as_deref() {
+        let hdr = match self.hdr_format.as_deref() {
             Some(name) => HdrFormat::parse(name)?,
             None => crate::config::hdr_format_default().unwrap_or_default(),
         };
@@ -1944,19 +2023,41 @@ impl Cli {
         // command line's: the codec is what knows which names exist and what
         // range each one lives in, so a key no format declares is dropped here
         // rather than reaching the encoder.
+        let sdr_values = resolve_params(
+            sdr.name(),
+            sdr.specs(),
+            crate::config::format_params(sdr.name()),
+            &self.format_params,
+        )?;
+        let hdr_values = resolve_params(
+            hdr.name(),
+            hdr.specs(),
+            crate::config::format_params(hdr.name()),
+            &self.format_params,
+        )?;
+        // Writing the SDR copy is what a capture has always done, so an absent
+        // key anywhere reads as on rather than as "off".
+        Ok(WriteFormats {
+            sdr,
+            sdr_values,
+            hdr,
+            hdr_values,
+            sdr_copy: self
+                .sdr_copy
+                .or_else(crate::config::sdr_copy_default)
+                .unwrap_or(true),
+        })
+    }
+
+    pub fn parse_request(self) -> Result<Request> {
+        let WriteFormats {
+            sdr: sdr_format,
+            sdr_values: sdr_params,
+            hdr: hdr_format,
+            hdr_values: hdr_params,
+            sdr_copy,
+        } = self.write_formats()?;
         let config = crate::config::load();
-        let sdr_params = resolve_params(
-            sdr_format.name(),
-            sdr_format.specs(),
-            crate::config::format_params(sdr_format.name()),
-            &self.format_params,
-        )?;
-        let hdr_params = resolve_params(
-            hdr_format.name(),
-            hdr_format.specs(),
-            crate::config::format_params(hdr_format.name()),
-            &self.format_params,
-        )?;
         // The flag wins, then the config file, then the built-in default.  A
         // white level outside the range the map accepts is clamped rather than
         // refused: it is a number the user meant, and the map has a defined
@@ -2123,6 +2224,7 @@ impl Cli {
             sdr_params,
             hdr_format,
             hdr_params,
+            sdr_copy,
             tone_map: ToneMapOptions {
                 mode: tone_map,
                 white: tone_map_white,
@@ -2514,11 +2616,9 @@ mod tests {
             r#"{"cli":{"record":{"encoder":"hevc","fps":30,"portal":true,"mic":"alsa_input.x","follow":["game","chat"]},"replay":{"follow":["game"],"save-dir":"/tmp/vshot-clips"}}}"#,
         )
         .unwrap();
-        // SAFETY: the variable is put back below.  A test in another thread
-        // that parses a record command while this one runs reads whatever
-        // config the variable points at, and none of them asserts a
-        // remembered default, so the worst a stray read can do is parse a
-        // different encoder than the file this test wrote.
+        // SAFETY: the lock keeps this the only test setting the variable, and
+        // the value is put back before returning.
+        let _guard = crate::config::config_env_guard();
         let saved = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", &dir);
 
@@ -2657,11 +2757,9 @@ mod tests {
                  "avif":{"quality":40,"speed":4,"sharpness":9}}}}"#,
         )
         .unwrap();
-        // SAFETY: the variable is put back below.  A test in another thread
-        // that parses a capture while this one runs reads whatever config the
-        // variable points at; none of them asserts a remembered format
-        // parameter, so the worst a stray read can do is parse a different
-        // quality than the file this test wrote.
+        // SAFETY: the lock keeps this the only test setting the variable, and
+        // the value is put back before returning.
+        let _guard = crate::config::config_env_guard();
         let saved = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", &dir);
 
@@ -2670,8 +2768,20 @@ mod tests {
             other => panic!("{argv:?} is a capture: {other:?}"),
         };
 
+        // Which format the HDR half is written in is the *machine's* answer now
+        // -- JPEG XL where this ffmpeg has it, AVIF where it does not -- so the
+        // format this file configures is asked for by name.  Without the `avif`
+        // feature the section is simply unused, and the assertions below are
+        // gated with it.
+        #[cfg(feature = "avif")]
+        let hdr = ["--hdr-format", "avif"];
+        #[cfg(not(feature = "avif"))]
+        let hdr: [&str; 0] = [];
+
         // Nothing on the command line: the file decides, per format.
-        let request = capture(&["vshot", "region", "--clipboard"]);
+        let mut argv = vec!["vshot", "region", "--clipboard"];
+        argv.extend(hdr);
+        let request = capture(&argv);
         assert_eq!(request.sdr_format.name(), "png");
         assert_eq!(request.sdr_params.text("compression", "?"), "high");
         #[cfg(feature = "avif")]
@@ -2684,13 +2794,15 @@ mod tests {
         }
 
         // A flag wins over the file, for its own format only.
-        let request = capture(&[
+        let mut argv = vec![
             "vshot",
             "region",
             "--clipboard",
             "--format-param",
             "png.compression=fastest",
-        ]);
+        ];
+        argv.extend(hdr);
+        let request = capture(&argv);
         assert_eq!(request.sdr_params.text("compression", "?"), "fastest");
         #[cfg(feature = "avif")]
         assert_eq!(
@@ -2834,6 +2946,7 @@ mod tests {
                 sdr_params: codec::ParamValues::defaults(SdrFormat::default().specs()),
                 hdr_format: HdrFormat::default(),
                 hdr_params: codec::ParamValues::defaults(HdrFormat::default().specs()),
+                sdr_copy: true,
                 tone_map: ToneMapOptions::default(),
             })
         );
@@ -2857,16 +2970,31 @@ mod tests {
     /// line that configures both halves of a capture is the ordinary case.
     #[test]
     fn a_format_parameter_reaches_only_the_format_it_names() {
-        let Action::Capture(request) = Cli::try_parse_action_from([
+        // The HDR format is named, for the reason the test above gives: which
+        // one a capture writes is the machine's answer now.
+        #[cfg(feature = "avif")]
+        let mut argv = vec![
+            "vshot",
+            "region",
+            "--clipboard",
+            "--hdr-format",
+            "avif",
+            "--format-param",
+            "png.compression=high",
+            "--format-param",
+            "avif.quality=40",
+        ];
+        #[cfg(not(feature = "avif"))]
+        let mut argv = vec![
             "vshot",
             "region",
             "--clipboard",
             "--format-param",
             "png.compression=high",
-            "--format-param",
-            "avif.quality=40",
-        ])
-        .unwrap() else {
+        ];
+        let Action::Capture(request) =
+            Cli::try_parse_action_from(std::mem::take(&mut argv)).unwrap()
+        else {
             panic!("`region` is a capture");
         };
         assert_eq!(request.sdr_params.text("compression", "?"), "high");
@@ -2936,7 +3064,7 @@ mod tests {
         assert_eq!(request.sdr_format.name(), "png");
 
         let error =
-            Cli::try_parse_action_from(["vshot", "region", "--clipboard", "--sdr-format", "jpeg"])
+            Cli::try_parse_action_from(["vshot", "region", "--clipboard", "--sdr-format", "tiff"])
                 .unwrap_err()
                 .to_string();
         assert!(error.contains("--sdr-format"), "{error}");
@@ -3036,6 +3164,8 @@ mod tests {
                 command: Some(crate::pin::PinCommand::Toggle),
                 density: None,
                 reference_nits: crate::model::hdr::REFERENCE_WHITE_NITS,
+                // The config file says nothing in this test, which reads as on.
+                hdr_half: true,
             })
         );
         let action = Cli::try_parse_action_from(["vshot", "pin", "a.png", "b.png"]).unwrap();
@@ -3062,6 +3192,8 @@ mod tests {
                 command: None,
                 density: None,
                 reference_nits: crate::model::hdr::REFERENCE_WHITE_NITS,
+                // The config file says nothing in this test, which reads as on.
+                hdr_half: true,
             })
         );
         let action = Cli::try_parse_action_from(["vshot", "pin", "--clipboard", "a.png"]).unwrap();

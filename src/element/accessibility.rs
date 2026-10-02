@@ -265,13 +265,7 @@ impl Accessibility {
         interface: &'static str,
     ) -> Option<Proxy<'a>> {
         let path = ObjectPath::try_from(accessible.path.as_str()).ok()?;
-        Proxy::new(
-            &self.connection,
-            accessible.bus.as_str(),
-            path,
-            interface,
-        )
-        .ok()
+        Proxy::new(&self.connection, accessible.bus.as_str(), path, interface).ok()
     }
 
     /// Reads one property through an explicit `Properties.Get`.
@@ -426,10 +420,9 @@ fn match_frame<'a>(
     };
 
     if window.pid > 0 {
-        if let Some(frame) = frames
-            .iter()
-            .find(|frame| frame.pid == window.pid && frame.title == window.title && same_size(frame))
-        {
+        if let Some(frame) = frames.iter().find(|frame| {
+            frame.pid == window.pid && frame.title == window.title && same_size(frame)
+        }) {
             return Some(frame);
         }
         // One process can own several toplevels — a browser's windows and its
@@ -482,7 +475,6 @@ type Unused = Result<()>;
 mod tests {
     use super::*;
 
-
     /// The bug this matching exists for: Chromium names a pinned tab's toplevel
     /// `… - 已固定 - Chromium` to AT-SPI while the compositor reports
     /// `… - Chromium`.  Requiring equal titles dropped the window's whole
@@ -491,7 +483,12 @@ mod tests {
     fn a_browser_that_renames_its_toplevel_is_still_matched() {
         let window = candidate("WorkBuddy 用量看板 - Chromium", 4117827, 2550, 1397);
         let frames = vec![
-            frame("WorkBuddy 用量看板 - 已固定 - Chromium", 4117827, 2550, 1397),
+            frame(
+                "WorkBuddy 用量看板 - 已固定 - Chromium",
+                4117827,
+                2550,
+                1397,
+            ),
             frame("", 4117827, 1790, 88),
         ];
         let matched = match_frame(&frames, &window).expect("the pinned tab's window");
@@ -596,16 +593,20 @@ mod tests {
             ),
         };
         let frames = accessibility.frames().expect("frames");
-        assert!(!frames.is_empty(), "no frame at all: is any GTK/Qt app open?");
+        assert!(
+            !frames.is_empty(),
+            "no frame at all: is any GTK/Qt app open?"
+        );
 
-        let named: Vec<_> = frames.iter().filter(|frame| !frame.title.is_empty()).collect();
+        let named: Vec<_> = frames
+            .iter()
+            .filter(|frame| !frame.title.is_empty())
+            .collect();
         assert!(!named.is_empty(), "every frame is unnamed");
         for frame in &named {
             let rect = frame
                 .rect
-                .map(|rect| {
-                    format!("{}x{}", rect.size.width, rect.size.height)
-                })
+                .map(|rect| format!("{}x{}", rect.size.width, rect.size.height))
                 .unwrap_or_else(|| "none".into());
             println!("frame {:?} size={rect}", frame.title);
         }
@@ -663,8 +664,7 @@ mod tests {
                     geometry
                 );
                 assert!(
-                    element.rect.left() >= geometry.left()
-                        && element.rect.top() >= geometry.top(),
+                    element.rect.left() >= geometry.left() && element.rect.top() >= geometry.top(),
                     "element {:?} at {:?} was not shifted into global \
                      coordinates (window starts at {:?})",
                     element.label,
@@ -721,7 +721,10 @@ mod tests {
     }
 
     fn compositor_window_titles() -> Vec<String> {
-        compositor_windows().into_iter().map(|(title, _)| title).collect()
+        compositor_windows()
+            .into_iter()
+            .map(|(title, _)| title)
+            .collect()
     }
 }
 
@@ -748,5 +751,3 @@ impl<'a> Flatten<'a> for Vec<RegionNode> {
         all
     }
 }
-
-

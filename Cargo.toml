@@ -81,8 +81,8 @@ cc = "1.2"
 
 [features]
 # Every HDR file format is on by default; a build that wants fewer turns them
-# off.  The one that costs anything is `avif`, which is most of the build time
-# an HDR capture path adds.
+# off.  FFmpeg still-image formats are registered at runtime only when this
+# binary can find the matching system encoder and decoder.
 default = ["avif", "radiance", "png"]
 
 # The AVIF codec: `rav1e` and `avif-serialize` to write a ten-bit PQ file, and

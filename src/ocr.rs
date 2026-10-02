@@ -180,7 +180,7 @@ impl Builtin {
 
     /// Recognizes the text in `frame`.
     pub fn recognize(&self, frame: &crate::model::Frame) -> Result<Vec<OcrLine>> {
-        let png = frame.encode_png(None, crate::model::PngCompression::Fastest)?;
+        let png = frame.encode_png(crate::model::PngCompression::Fastest)?;
         let image = oar_ocr::utils::image::load_image_from_memory(&png)
             .map_err(|error| VshotError::Ocr(format!("cannot read the image to OCR: {error}")))?;
         let results = self
@@ -266,7 +266,7 @@ pub fn recognize_external(
     engine: &ExternalEngine,
     frame: &crate::model::Frame,
 ) -> Result<Vec<OcrLine>> {
-    let png = frame.encode_png(None, crate::model::PngCompression::Fastest)?;
+    let png = frame.encode_png(crate::model::PngCompression::Fastest)?;
     let mut file = tempfile::Builder::new()
         .prefix("vshot-ocr-")
         .suffix(".png")

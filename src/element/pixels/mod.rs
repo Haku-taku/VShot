@@ -160,12 +160,13 @@ impl Analysis {
         let to_device = |value: i32, base: i32| -> i64 {
             (i64::from(value) - i64::from(base)) * i64::from(scale)
         };
-        let left = to_device(bounds.left(), output.geometry.left()).clamp(0, i64::from(source.width));
+        let left =
+            to_device(bounds.left(), output.geometry.left()).clamp(0, i64::from(source.width));
         let top = to_device(bounds.top(), output.geometry.top()).clamp(0, i64::from(source.height));
-        let right =
-            to_device(bounds.right().ok()?, output.geometry.left()).clamp(0, i64::from(source.width));
-        let bottom =
-            to_device(bounds.bottom().ok()?, output.geometry.top()).clamp(0, i64::from(source.height));
+        let right = to_device(bounds.right().ok()?, output.geometry.left())
+            .clamp(0, i64::from(source.width));
+        let bottom = to_device(bounds.bottom().ok()?, output.geometry.top())
+            .clamp(0, i64::from(source.height));
         let device_width = u32::try_from(right - left).ok()?;
         let device_height = u32::try_from(bottom - top).ok()?;
         // A window the compositor lists but the screen does not show — one
@@ -293,8 +294,8 @@ mod tests {
             }
         }
         let frame = Frame::new(size, pixels).expect("frame");
-        let output =
-            OutputSnapshot::new(1, "TEST", Rect::new(0, 0, width, height), 1, frame).expect("output");
+        let output = OutputSnapshot::new(1, "TEST", Rect::new(0, 0, width, height), 1, frame)
+            .expect("output");
         let scene = SceneSnapshot::from_outputs(vec![output]).expect("scene");
         let window = WindowCandidate {
             geometry: Rect::new(0, 0, width, height),
@@ -362,11 +363,13 @@ mod tests {
     #[test]
     fn a_flat_window_yields_nothing() {
         let (scene, window) = scene_of(1200, 800, [30, 30, 30, 255], &[]);
-        assert!(Pixels.elements(&ElementRequest {
+        assert!(Pixels
+            .elements(&ElementRequest {
                 window: &window,
                 scene: &scene,
                 fallback: Fallback::default(),
-            }).is_none());
+            })
+            .is_none());
     }
 
     /// The tree nests: a divider inside a pane makes a child, not a sibling.
@@ -410,11 +413,14 @@ mod tests {
         // No divider was drawn, so nothing may be found: a glyph is 12 wide and
         // 14 tall, and a line has to be long one way and thin the other.
         let found = Pixels.elements(&ElementRequest {
-                window: &window,
-                scene: &scene,
-                fallback: Fallback::default(),
-            });
-        let count = found.as_ref().map(|roots| flatten(roots).len()).unwrap_or(0);
+            window: &window,
+            scene: &scene,
+            fallback: Fallback::default(),
+        });
+        let count = found
+            .as_ref()
+            .map(|roots| flatten(roots).len())
+            .unwrap_or(0);
         assert!(count == 0, "text was read as structure: {count} region(s)");
     }
 
@@ -495,15 +501,19 @@ mod tests {
     #[test]
     fn a_tiny_window_yields_nothing() {
         let (scene, window) = scene_of(4, 4, [30, 30, 30, 255], &[]);
-        assert!(Pixels.elements(&ElementRequest {
+        assert!(Pixels
+            .elements(&ElementRequest {
                 window: &window,
                 scene: &scene,
                 fallback: Fallback::default(),
-            }).is_none());
-        assert!(Components.elements(&ElementRequest {
+            })
+            .is_none());
+        assert!(Components
+            .elements(&ElementRequest {
                 window: &window,
                 scene: &scene,
                 fallback: Fallback::default(),
-            }).is_none());
+            })
+            .is_none());
     }
 }

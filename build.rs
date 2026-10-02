@@ -10,6 +10,7 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=src/record/shim.c");
+    println!("cargo:rerun-if-changed=src/model/codec/ffmpeg_still.c");
     println!("cargo:rerun-if-changed=src/record/pipewire_client.c");
     println!("cargo:rerun-if-changed=src/record/pipewire_audio.c");
     println!("cargo:rerun-if-changed=src/pin_hdr_fp16.c");
@@ -17,6 +18,17 @@ fn main() {
     // `cfg` names a build script chooses have to be declared, or rustc reports
     // every use of them as a typo.
     println!("cargo:rustc-check-cfg=cfg(vshot_pipewire)");
+    // Still images need only the codec library: an encoded packet from these
+    // encoders *is* the file, so there is no muxer step and no libavformat.
+    // See the comment at the top of `ffmpeg_still.c` for the measurement.
+    let mut still = cc::Build::new();
+    still.file("src/model/codec/ffmpeg_still.c");
+    for flag in pkg_config_cflags(&["libavcodec", "libavutil"]) {
+        still.flag(flag);
+    }
+    still.warnings(true);
+    still.compile("vshot_still");
+
     let mut build = cc::Build::new();
     build.file("src/record/shim.c");
     // The headers come from the system ffmpeg; a build machine without them

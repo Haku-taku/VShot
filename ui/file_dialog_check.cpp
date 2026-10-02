@@ -27,8 +27,10 @@
 
 #include <QAbstractItemView>
 #include <QApplication>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDeadlineTimer>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
@@ -37,6 +39,7 @@
 #include <QFileInfo>
 #include <QFileSystemModel>
 #include <QImage>
+#include <QGridLayout>
 #include <QImageReader>
 #include <QListView>
 #include <QMenu>
@@ -289,6 +292,126 @@ void checkSaveDialogShape(const QString &pictures)
     expect(dialog->testOption(QFileDialog::DontUseNativeDialog),
            "the save dialog does not hand itself to the desktop portal");
     delete dialog;
+}
+
+// A save dialog that was handed a registry, which is the one the pin daemon
+// opens.
+//
+// The formats are the caller's answer rather than this file's, so what is
+// checked here is that they arrive intact and decide the two things they are
+// supposed to: which filters the dialog offers, and whether the SDR copy
+// switch is on it.  The names used are the registry's own, read off the real
+// `vshot formats --json` where that is reachable, so a rename on either side
+// of the wire shows up here.
+void checkSaveFormats(const QString &pictures)
+{
+    const QList<vshot::SaveFormat> sdr =
+        vshot::saveFormatsFromArgument(QStringLiteral("png/png,jpeg/jpg/jpeg,webp/webp"));
+    expect(sdr.size() == 3, "the argument carries every format", QString::number(sdr.size()));
+    expect(sdr.size() == 3 && sdr.at(1).name == QStringLiteral("jpeg") &&
+               sdr.at(1).suffixes == QStringList({QStringLiteral("jpg"), QStringLiteral("jpeg")}),
+           "a format keeps both of its suffixes");
+    // A malformed entry is dropped rather than offered as a format with no
+    // suffix, which the dialog could neither label nor rename a file for.
+    expect(vshot::saveFormatsFromArgument(QStringLiteral("jxl,,avif/avif,bare"))
+                   .size() == 1,
+           "an entry with no suffix is left out");
+    expect(vshot::saveFormatsFromArgument(QString()).isEmpty(),
+           "an empty argument is no formats at all");
+
+    QFileDialog *plain = vshot::createFileDialog(true, pictures + QStringLiteral("/out.png"), sdr);
+    if (plain == nullptr) {
+        expect(false, "the save dialog builds with a registry");
+        return;
+    }
+    const QStringList offered = plain->nameFilters();
+    expect(offered.size() == 3, "one filter per format", QString::number(offered.size()));
+    expect(offered.size() == 3 && offered.at(1).contains(QStringLiteral("*.jpg"))
+               && offered.at(1).contains(QStringLiteral("*.jpeg")),
+           "JPEG's filter offers both spellings", offered.value(1));
+    expect(offered.size() == 3 && offered.at(2).contains(QStringLiteral("*.webp")),
+           "and the last one is the last format it was handed", offered.value(2));
+    expect(plain->defaultSuffix() == QStringLiteral("png"),
+           "a name typed with no suffix gets the format the dialog opens on",
+           plain->defaultSuffix());
+    expect(plain->findChild<QCheckBox *>(QStringLiteral("sdrCopyBox")) == nullptr,
+           "content with no HDR half is not asked about an SDR copy");
+    delete plain;
+
+    const QList<vshot::SaveFormat> hdr =
+        vshot::saveFormatsFromArgument(QStringLiteral("jxl/jxl,avif/avif,hdr/hdr"));
+    QFileDialog *withHalf = vshot::createFileDialog(true, pictures + QStringLiteral("/out.png"),
+                                                    hdr, true);
+    if (withHalf == nullptr) {
+        expect(false, "the HDR save dialog builds");
+        return;
+    }
+    const QString hdrFilters = withHalf->nameFilters().join(QLatin1Char(' '));
+    expect(withHalf->nameFilters().size() == 3 &&
+               withHalf->nameFilters().first().contains(QStringLiteral("*.jxl")),
+           "the HDR dialog offers the HDR formats");
+    // The half it was not handed is not offered: an SDR format here would be a
+    // file the caller has nothing to write -- the pin's HDR half could not be
+    // saved as a PNG, and quietly writing the tone-mapped picture under a PNG
+    // name is exactly what the split is for.
+    expect(!hdrFilters.contains(QStringLiteral("*.png")) &&
+               !hdrFilters.contains(QStringLiteral("*.webp")) &&
+               !hdrFilters.contains(QStringLiteral("*.jpg")),
+           "and nothing from the other half", hdrFilters);
+    expect(withHalf->defaultSuffix() == QStringLiteral("jxl"),
+           "and its first format is the one a bare name gets", withHalf->defaultSuffix());
+    auto *box = withHalf->findChild<QCheckBox *>(QStringLiteral("sdrCopyBox"));
+    expect(box != nullptr, "an HDR save is asked about the SDR copy");
+    if (box != nullptr) {
+        expect(box->isChecked() == vshot::loadConfig().cli.sdrCopy,
+               "the switch starts where the setting left it");
+        // It has to be on the row above the buttons.  A widget added to the
+        // grid without moving them would sit under the buttons instead, which
+        // reads as a footnote to them rather than as part of the form.
+        auto *buttons = withHalf->findChild<QDialogButtonBox *>();
+        auto *grid = withHalf->findChild<QGridLayout *>();
+        int boxRow = -1;
+        int buttonRow = -1;
+        if (buttons != nullptr && grid != nullptr) {
+            int column = 0;
+            int rowSpan = 1;
+            int columnSpan = 1;
+            const int buttonIndex = grid->indexOf(buttons);
+            const int boxIndex = grid->indexOf(box);
+            if (buttonIndex >= 0) {
+                grid->getItemPosition(buttonIndex, &buttonRow, &column, &rowSpan, &columnSpan);
+            }
+            if (boxIndex >= 0) {
+                grid->getItemPosition(boxIndex, &boxRow, &column, &rowSpan, &columnSpan);
+            }
+        }
+        expect(boxRow >= 0 && buttonRow > boxRow,
+               "the switch sits above the buttons, not below them",
+               QStringLiteral("box row %1, buttons row %2").arg(boxRow).arg(buttonRow));
+    }
+    delete withHalf;
+
+    // And the name rule the dialog applies at the accept, which is what keeps
+    // the file's suffix and its bytes from disagreeing.
+    const vshot::SaveFormat webp = sdr.at(2);
+    const vshot::SaveFormat jpeg = sdr.at(1);
+    const vshot::SaveFormat jxl = hdr.first();
+    expect(vshot::withFormatSuffix(QStringLiteral("/a/shot.png"), webp)
+               == QStringLiteral("/a/shot.webp"),
+           "a suffix of another format is replaced, not appended to",
+           vshot::withFormatSuffix(QStringLiteral("/a/shot.png"), webp));
+    expect(vshot::withFormatSuffix(QStringLiteral("/a/shot"), jpeg) == QStringLiteral("/a/shot.jpg"),
+           "a name with no suffix gets one");
+    expect(vshot::withFormatSuffix(QStringLiteral("/a/shot.jpeg"), jpeg)
+               == QStringLiteral("/a/shot.jpeg"),
+           "JPEG's other spelling is left alone");
+    expect(vshot::withFormatSuffix(QStringLiteral("/a/shot.JPG"), jpeg)
+               == QStringLiteral("/a/shot.JPG"),
+           "and it is left alone whatever case it was typed in");
+    expect(vshot::withFormatSuffix(QStringLiteral("/a/shot.final"), jxl)
+               == QStringLiteral("/a/shot.jxl"),
+           "a suffix this program never writes is replaced by the one it did write",
+           vshot::withFormatSuffix(QStringLiteral("/a/shot.final"), jxl));
 }
 
 // The stylesheet: present, palette-driven, and actually painting.
@@ -991,6 +1114,7 @@ int main(int argc, char **argv)
     checkThumbnailGrid(pictures);
     checkOpenIsNotBlockedByDecoding();
     checkSaveDialogShape(pictures);
+    checkSaveFormats(pictures);
     checkStyleSheet(pictures);
     checkOuterStroke(pictures);
     checkShadowGeometry();

@@ -62,17 +62,19 @@ impl Frame {
 
     /// Encodes the frame as a PNG at the default compression level.
     pub fn to_png(&self) -> Result<Vec<u8>> {
-        self.encode_png(None, PngCompression::default())
+        self.encode_png(PngCompression::default())
     }
 
-    /// Encodes the frame as a PNG. `density` — the frame's device pixels per
-    /// logical pixel, i.e. the scale of the output it was captured on — is
-    /// declared as the PNG's physical resolution when given. The image then
-    /// says which output it came from on its own, so pinning the file
-    /// elsewhere needs no side record; a 2x capture declares 192 DPI.
-    /// `compression` picks how hard the encoder works: the levels are all
-    /// lossless and differ only in the time they cost and the size they buy.
-    pub fn encode_png(&self, density: Option<u32>, compression: PngCompression) -> Result<Vec<u8>> {
+    /// Encodes the frame as a PNG.  `compression` picks how hard the encoder
+    /// works: the levels are all lossless and differ only in the time they
+    /// cost and the size they buy.
+    ///
+    /// The scale the capture was taken at is **not** written here.  Every
+    /// format records it through `codec::scale`, and PNG is no exception: a
+    /// `pHYs` chunk added to these bytes by `Png::with_scale`.  Writing it in
+    /// the encoder instead would give this one format a second way to say the
+    /// same thing, and a format added later no way to tell which to follow.
+    pub fn encode_png(&self, compression: PngCompression) -> Result<Vec<u8>> {
         let width = self.size.width;
         let height = self.size.height;
         let mut bytes = Vec::new();
@@ -86,14 +88,6 @@ impl Frame {
             // to read them as that display's own gamut -- which is exactly what
             // a P3 or BT.2020 panel is, so an untagged capture came out tinted.
             encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
-            if let Some(density) = density {
-                let pixels_per_meter = density_to_pixels_per_meter(density);
-                encoder.set_pixel_dims(Some(png::PixelDimensions {
-                    xppu: pixels_per_meter,
-                    yppu: pixels_per_meter,
-                    unit: png::Unit::Meter,
-                }));
-            }
             let mut writer = encoder
                 .write_header()
                 .map_err(|error| VshotError::PngEncode(error.to_string()))?;
@@ -1183,14 +1177,6 @@ impl From<PngCompression> for png::Compression {
     }
 }
 
-/// A device density as PNG physical resolution: 96 DPI per density step, which
-/// is the convention Qt reports back as dots per metre, so a 2x capture reads
-/// as 192 DPI on the other side. Clamped to the densities the renderer knows.
-fn density_to_pixels_per_meter(density: u32) -> u32 {
-    let dpi = 96.0 * f64::from(density.clamp(1, 4));
-    (dpi / 0.0254).round() as u32
-}
-
 fn checked_rect_bounds(rect: Rect) -> Result<(i64, i64, i64, i64)> {
     if rect.is_empty() {
         return Err(VshotError::InvalidGeometry(
@@ -2175,44 +2161,6 @@ mod tests {
     }
 
     #[test]
-    fn png_with_density_declares_its_physical_resolution() {
-        let frame = Frame::solid(Size::new(2, 1), [10, 20, 30, 255]).unwrap();
-        let encoded = frame
-            .encode_png(Some(2), PngCompression::default())
-            .unwrap();
-        // A declared density doubles as the DPI the pin side reads back, and
-        // the file still has to be an ordinary PNG.
-        assert_eq!(Frame::from_png(&encoded).unwrap(), frame);
-        let phys = encoded
-            .windows(4)
-            .position(|chunk| chunk == &b"pHYs"[..])
-            .expect("a density-declaring PNG carries a pHYs chunk");
-        assert_eq!(
-            u32::from_be_bytes(encoded[phys + 4..phys + 8].try_into().unwrap()),
-            7559 // 192 DPI in pixels per metre
-        );
-        assert_eq!(
-            u32::from_be_bytes(encoded[phys + 8..phys + 12].try_into().unwrap()),
-            7559
-        );
-        assert_eq!(encoded[phys + 12], 1); // metre, not the unspecified unit
-
-        // 96 DPI (a density of 1) is deliberately not what an undeclared PNG
-        // gets: Qt reports that default itself, and the pin side filters it out.
-        let single = frame
-            .encode_png(Some(1), PngCompression::default())
-            .unwrap();
-        let phys = single
-            .windows(4)
-            .position(|chunk| chunk == &b"pHYs"[..])
-            .expect("a density of 1 is still a declaration");
-        assert_eq!(
-            u32::from_be_bytes(single[phys + 4..phys + 8].try_into().unwrap()),
-            3780
-        );
-    }
-
-    #[test]
     fn png_declares_its_colour_space() {
         // The pixels are sRGB, and without the chunk a viewer on a wide-gamut
         // display is free to read them as that display's own gamut — a P3 or
@@ -2252,7 +2200,7 @@ mod tests {
         ]
         .into_iter()
         .map(|compression| {
-            let encoded = frame.encode_png(None, compression).unwrap();
+            let encoded = frame.encode_png(compression).unwrap();
             // Every level still has to be an ordinary PNG of the same pixels.
             assert_eq!(Frame::from_png(&encoded).unwrap(), frame);
             encoded.len()

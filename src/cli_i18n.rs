@@ -92,8 +92,8 @@ const COMMANDS: &[(&str, &str, &str)] = &[
 
 共用修饰
   -c, --cursor        把合成器光标画进捕获
-  --sdr-format        png（默认），写到 --output 的文件用哪种格式
-  --hdr-format        avif（默认）|hdr，捕获带 HDR 内容时写在 PNG 旁边的那个文件
+  --sdr-format        png（默认）|jpeg|webp，SDR 那一半写成哪种格式
+  --hdr-format        jxl|avif（回退）|hdr，捕获带 HDR 内容时写在 SDR 旁边的那份
   --format-param      格式.参数名=值，编码参数，可重复；`vshot formats` 列出可用的
 
 合成器：wlroots 会话（Hyprland、Sway、labwc、niri）走 wlr-screencopy；KWin/Plasma 走
@@ -437,13 +437,17 @@ const ARGS: &[(&str, &str)] = &[
     ("cursor", "每次原生 screencopy 捕获时把合成器光标画进去。"),
     (
         "output",
-        "把结果写到 PATH，展开 strftime（`-` 写到 stdout）：截图是 PNG 字节，写完后把文件 URI 复制进剪贴板。对 `record` 则是视频文件：`-` 被拒，没有 `.mp4` 后缀时补上。",
+        "把结果写到 PATH，展开 strftime（`-` 写到 stdout）：截图写的是 `--sdr-format` 选定的那一份，写完后把文件 URI 复制进剪贴板。后缀会按实际写出的格式改写，`--sdr-format webp -o shot.png` 写出的是 `shot.webp`；后缀是别的写法时名字原样保留。对 `record` 则是视频文件：`-` 被拒，没有 `.mp4` 后缀时补上。",
     ),
     ("clipboard", "把结果复制进剪贴板：截图是 PNG 字节，`vshot ocr` 是识别出的文字，`vshot translate` 是合成好的图片或译文。"),
     ("pin", "把截到的图像 pin 到屏幕上，而不是写到任何地方。"),
     (
         "sdr_format",
-        "SDR 那一半写成哪种格式：`png`（默认），或这个 build 还编译进了哪些。`vshot formats` 会列出来。`--pin` 不写 SDR 文件，剪贴板与 stdout 无论这里怎么写都还是 PNG。",
+        "SDR 那一半写成哪种格式：`png`（默认），或本机 ffmpeg 还能写哪些（`jpeg`、`webp`）。`vshot formats` 会列出来。剪贴板与 stdout 也用这里的格式；`--pin` 不写 SDR 文件。",
+    ),
+    (
+        "sdr_copy",
+        "带 HDR 内容的截图是否也写出 SDR 那一份。这种截图本来写两个文件——SDR 视图和 HDR 内容本身——关掉之后只写 HDR 那一份，落在目标路径上、用它自己的后缀；不带 HDR 内容的截图不受影响，它的 SDR 文件是唯一的一份。",
     ),
     (
         "format_params",
@@ -492,6 +496,10 @@ const ARGS: &[(&str, &str)] = &[
     (
         "density",
         "pin 出的图每逻辑像素对应多少设备像素（1-4），例如在 2 倍屏上截的图就填 2。vshot 会自己从捕获、图片自带的 PNG 密度（96 DPI 声明即 1 倍）、截图工具的记录或图片尺寸里推断；推断错了或推不出来时，用这个覆盖。",
+    ),
+    (
+        "hdr_half",
+        "pin 一个文件时，是否连它旁边的 HDR 副本一起用。带 HDR 内容的截图会在 SDR 那一份旁边再写一个文件，不开这个，pin 上的是色调映射后的那一份。不给这个参数时由 `cli.pin.hdr-half` 决定，默认开。",
     ),
     (
         "apply",

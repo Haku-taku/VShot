@@ -15,6 +15,7 @@
 
 use crate::error::Result;
 use crate::model::codec::params::{ParamKind, ParamSpec, ParamValues};
+use crate::model::codec::scale::{self, ScaleMetadata, ScalePlace};
 use crate::model::codec::SdrCodec;
 use crate::model::frame::{Frame, PngCompression};
 
@@ -57,8 +58,97 @@ impl SdrCodec for Png {
 
     fn encode(&self, frame: &Frame, density: Option<u32>, values: &ParamValues) -> Result<Vec<u8>> {
         let compression = PngCompression::parse(values.text("compression", DEFAULT_COMPRESSION))?;
-        frame.encode_png(density, compression)
+        let bytes = frame.encode_png(compression)?;
+        match density {
+            Some(density) => self.with_scale(bytes, density, frame.size()),
+            None => Ok(bytes),
+        }
     }
+}
+
+/// The width of a PNG's signature and its `IHDR`, which is always the first
+/// chunk and always the same size: where a `pHYs` is inserted, so it sits with
+/// the other header chunks and before the pixels.
+const AFTER_IHDR: usize = 8 + 25;
+
+impl ScaleMetadata for Png {
+    /// `pHYs` is the format's own field for a physical resolution, in pixels
+    /// per metre, and it is the one the pin daemon already reads.
+    fn scale_place(&self) -> ScalePlace {
+        ScalePlace::Standard
+    }
+
+    fn with_scale(
+        &self,
+        bytes: Vec<u8>,
+        density: u32,
+        _size: crate::geometry::Size,
+    ) -> Result<Vec<u8>> {
+        if bytes.len() < AFTER_IHDR || &bytes[12..16] != b"IHDR" {
+            return Ok(bytes); // not a PNG this can place a chunk in
+        }
+        let metres = scale::pixels_per_meter(density);
+        let mut payload = Vec::with_capacity(9);
+        payload.extend_from_slice(&metres.to_be_bytes());
+        payload.extend_from_slice(&metres.to_be_bytes());
+        // Metres: the only unit that says anything about scale.  PNG's other
+        // unit is "the ratio is all that is meaningful", which is not a density.
+        payload.push(1);
+        let mut out = bytes;
+        let rest = out.split_off(AFTER_IHDR);
+        out.extend_from_slice(&png_chunk(b"pHYs", &payload));
+        out.extend_from_slice(&rest);
+        Ok(out)
+    }
+
+    fn declared_scale(&self, bytes: &[u8]) -> Option<u32> {
+        if bytes.len() < AFTER_IHDR || &bytes[..8] != b"\x89PNG\r\n\x1a\n" {
+            return None;
+        }
+        let mut at = 8;
+        while at + 8 <= bytes.len() {
+            let length = u32::from_be_bytes(bytes[at..at + 4].try_into().ok()?) as usize;
+            let kind = bytes.get(at + 4..at + 8)?;
+            // The pixels are where a declaration would have had to be, so the
+            // walk stops rather than reading through a whole capture.
+            if kind == b"IDAT" || kind == b"IEND" {
+                return None;
+            }
+            let body = bytes.get(at + 8..at + 8 + length)?;
+            if kind == b"pHYs" && length >= 9 {
+                let x = u32::from_be_bytes(body[0..4].try_into().ok()?);
+                let y = u32::from_be_bytes(body[4..8].try_into().ok()?);
+                return scale::density_from_pixels_per_meter(x, y, body[8]);
+            }
+            // Length, type, payload and CRC; a chunk that runs past the end is
+            // a malformed file rather than a reason to read out of bounds.
+            at = at.checked_add(length + 12)?;
+        }
+        None
+    }
+}
+
+/// One PNG chunk: its length, its type, its payload and the CRC over the last
+/// two.  The CRC is the format's own (IEEE, reflected), written out rather
+/// than taken as a dependency for the seventeen bytes of one `pHYs`.
+fn png_chunk(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 12);
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(payload);
+    let mut crc = 0xffff_ffffu32;
+    for &byte in out[4..].iter() {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    out.extend_from_slice(&(!crc).to_be_bytes());
+    out
 }
 
 /// What `compression` is when nothing says otherwise.  Named here rather than
@@ -144,5 +234,24 @@ mod tests {
         // from being written as a level nobody chose.
         assert!(PngCompression::parse("slowest").is_err());
         assert!(codec.encode(&frame(), None, &values).is_ok());
+    }
+
+    /// The scale a capture was taken at survives into the file and back out,
+    /// which is what lets a pin keep its size on another monitor.
+    #[test]
+    fn the_scale_survives_the_round_trip() {
+        let frame = Frame::new(Size::new(4, 4), vec![128; 4 * 4 * 4]).unwrap();
+        let bytes = Png
+            .encode(&frame, Some(2), &ParamValues::defaults(SPECS))
+            .unwrap();
+        assert_eq!(Png.declared_scale(&bytes), Some(2));
+        assert_eq!(Png.scale_place(), ScalePlace::Standard);
+        // And it is still a PNG.
+        assert_eq!(Frame::from_png(&bytes).unwrap(), frame);
+        // A file written without one declares nothing rather than 1.
+        let plain = Png
+            .encode(&frame, None, &ParamValues::defaults(SPECS))
+            .unwrap();
+        assert_eq!(Png.declared_scale(&plain), None);
     }
 }

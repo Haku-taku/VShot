@@ -70,6 +70,10 @@ struct CliPreferences {
     /// How the HDR half of a capture is written: `avif` or `hdr`.  Empty means
     /// the file says nothing and the built-in default (AVIF) stands.
     QString hdrFormat;
+    /// Whether a capture that carries HDR content also writes the SDR half
+    /// beside it (`cli.sdr-copy`).  On when the file says nothing, which is what
+    /// a capture has always done.
+    bool sdrCopy = true;
     /// The encoding parameters of each format, keyed by format and then by the
     /// parameter's own name: `cli.format.png.compression`,
     /// `cli.format.avif.quality`.
@@ -122,6 +126,10 @@ struct CliPreferences {
     std::uint32_t longIgnoreTop = 0;
     QString longInject;     ///< `auto` | `wlr` | `portal` | `uinput`
     std::uint32_t pinDensity = 0;
+    /// Whether pinning a file also pins the HDR half a capture wrote beside it
+    /// (`cli.pin.hdr-half`).  On when the file says nothing, which is what a pin
+    /// has always done.
+    bool pinHdrHalf = true;
     /// Which codec `record --encoder` falls back to: `h264` (the built-in
     /// default), `hevc` or `av1`.  Empty means the file says nothing.
     QString recordEncoder;
@@ -380,11 +388,12 @@ const QStringList &selectModeNames();
 const QStringList &dashNames();
 const QStringList &arrowStyleNames();
 const QStringList &mosaicShapeNames();
-/// The SDR half's format: `png`.  What the *loader* accepts; the settings
-/// window offers the codec registry's list instead, which is a build-time
-/// question.
+/// The SDR half's format: `png`, `jpeg`, `webp`.  What the *loader* accepts --
+/// every name this program knows, so a config carried between machines
+/// round-trips.  The list the settings window offers is the codec registry's
+/// instead, because which formats exist is a question about the machine.
 const QStringList &sdrFormatNames();
-/// The HDR half's format: `avif`, `hdr`.
+/// The HDR half's format: `avif`, `hdr`, `jxl`, on the same terms.
 const QStringList &hdrFormatNames();
 /// How the SDR half is mapped down from the HDR one: `auto`, `fixed`,
 /// `normalize`.  The names are the ones `--tone-map` accepts.

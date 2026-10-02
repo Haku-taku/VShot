@@ -650,14 +650,12 @@ bool densityValue(const QString &token, int *out)
 }
 
 // Density a decoded image declares about itself. This is the fallback for the
-// callers that have no PNG bytes left to look at, and for the formats whose
-// declaration the PNG chunks cannot show in the first place (a JPEG carries its
-// density in the JFIF header). Here only the decoded value is left, so a 96 DPI
-// reading is indistinguishable from the 3780 dots per metre Qt reports for a
-// PNG that declares nothing at all, and it has to be left to the other
-// sources: only `pngDeclaredDensity` can recognise a 1x declaration. A print
-// resolution is not a device density either, so the value has to be a
-// near-exact multiple of 96 DPI.
+// callers that have no bytes left to look at. Here only the decoded value is
+// left, so a 96 DPI reading is indistinguishable from the 3780 dots per metre
+// Qt reports for a PNG that declares nothing at all, and it has to be left to
+// the other sources: only `imageDeclaredDensity` can recognise a 1x
+// declaration. A print resolution is not a device density either, so the value
+// has to be a near-exact multiple of 96 DPI.
 int declaredDensity(const QImage &image)
 {
     const int dotsPerMeter = image.dotsPerMeterX();
@@ -804,16 +802,17 @@ PinDensity resolveDensity(const QJsonObject &request, QScreen *target, const QIm
     if (ok && stated > 0) {
         return {std::clamp(stated, 1, 4), "the request (--density or VSHOT_PIN_DENSITY)"};
     }
-    // The PNG's own chunks first: this is the one source that can say "1x",
-    // which is what a capture on a scale-1 output declares.
-    if (const int declared = pngDeclaredDensity(sourceBytes); declared > 0) {
-        return {declared, "the PNG's own chunks (clipboard payload)"};
+    // The image's own metadata first: this is the one source that can say
+    // "1x", which is what a capture on a scale-1 output declares, and it is
+    // read from whichever of the formats the file is in.
+    if (const int declared = imageDeclaredDensity(sourceBytes); declared > 0) {
+        return {declared, "the image's own metadata (clipboard payload)"};
     }
-    if (const int declared = pngDeclaredDensityOfFile(sourcePath); declared > 0) {
-        return {declared, "the PNG's own chunks (the file)"};
+    if (const int declared = imageDeclaredDensityOfFile(sourcePath); declared > 0) {
+        return {declared, "the image's own metadata (the file)"};
     }
     if (const int declared = declaredDensity(image); declared > 0) {
-        return {declared, "the decoded PNG density"};
+        return {declared, "the decoded image density"};
     }
     if (const int recorded = recordedDensity(sourcePath); recorded > 0) {
         return {recorded, "the producer's record"};
@@ -2348,31 +2347,8 @@ wl-clipboard package"));
         // Nothing has to be told -- the editor's connection is not up yet, and
         // the answer is written to it the moment it is.
 
-        QString cliPath = QString::fromLocal8Bit(qgetenv("VSHOT_BIN"));
-        if (cliPath.isEmpty()) {
-            char buffer[4096];
-            const ssize_t length = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
-            if (length > 0) {
-                buffer[length] = '\0';
-                const QDir helperDir = QFileInfo(QString::fromLocal8Bit(buffer)).dir();
-                // The helper lives next to vshot (installed layout), in
-                // build-qt/ next to the repo root, or in a cargo target/
-                // layout; cover all of them plus the same two levels up.
-                for (const QString &candidate :
-                     {helperDir.filePath(QStringLiteral("vshot")),
-                      helperDir.filePath(QStringLiteral("../vshot")),
-                      helperDir.filePath(QStringLiteral("../../vshot")),
-                      helperDir.filePath(QStringLiteral("../target/release/vshot")),
-                      helperDir.filePath(QStringLiteral("../../target/release/vshot")),
-                      helperDir.filePath(QStringLiteral("../../../target/release/vshot"))}) {
-                    if (QFileInfo::exists(candidate)) {
-                        cliPath = QFileInfo(candidate).absoluteFilePath();
-                        break;
-                    }
-                }
-            }
-        }
-        if (cliPath.isEmpty()) {
+        const QString cli = cliPath();
+        if (cli.isEmpty()) {
             // Detached daemons have stderr discarded, but log anyway for
             // attached runs; a silent return here looks like "Space does
             // nothing" to the user.
@@ -2408,7 +2384,7 @@ wl-clipboard package"));
             delete directory;
             watcher->deleteLater();
         });
-        watcher->setProgram(cliPath);
+        watcher->setProgram(cli);
         watcher->setArguments({QStringLiteral("pin"), QStringLiteral("--apply"), sessionPath});
         watcher->setStandardInputFile(QProcess::nullDevice());
         watcher->start();
@@ -2454,6 +2430,41 @@ wl-clipboard package"));
         return QString::fromLocal8Bit(buffer);
     }
 
+    // The `vshot` executable, which is where the codecs are: this process can
+    // encode nothing but PNG through Qt, so everything that has to be written
+    // in another format -- an edit's HDR half, a save in one of the formats a
+    // capture knows -- is handed to it.  Empty when it cannot be found, which
+    // is a build tree whose CLI was moved or never built.
+    QString cliPath() const
+    {
+        const QString override = QString::fromLocal8Bit(qgetenv("VSHOT_BIN"));
+        if (!override.isEmpty()) {
+            return override;
+        }
+        char buffer[4096];
+        const ssize_t length = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+        if (length <= 0) {
+            return QString();
+        }
+        buffer[length] = '\0';
+        const QDir helperDir = QFileInfo(QString::fromLocal8Bit(buffer)).dir();
+        // The CLI lives next to the helper (installed layout), in build-qt/ next
+        // to the repo root, or in a cargo target/ layout; cover all of them plus
+        // the same two levels up.
+        for (const QString &candidate :
+             {helperDir.filePath(QStringLiteral("vshot")),
+              helperDir.filePath(QStringLiteral("../vshot")),
+              helperDir.filePath(QStringLiteral("../../vshot")),
+              helperDir.filePath(QStringLiteral("../target/release/vshot")),
+              helperDir.filePath(QStringLiteral("../../target/release/vshot")),
+              helperDir.filePath(QStringLiteral("../../../target/release/vshot"))}) {
+            if (QFileInfo::exists(candidate)) {
+                return QFileInfo(candidate).absoluteFilePath();
+            }
+        }
+        return QString();
+    }
+
     // Saves one pin's pixels to a file the user picks. The dialog runs in a
     // process of its own -- this daemon has an event loop of its own to keep,
     // and the answer comes back over the pipe -- but it is a layer surface just
@@ -2472,6 +2483,11 @@ wl-clipboard package"));
             return error(QStringLiteral("cannot locate vshot-qt-ui for the save dialog; set "
                                         "VSHOT_QT_HELPER"));
         }
+        const QString cli = cliPath();
+        if (cli.isEmpty()) {
+            return error(QStringLiteral("cannot locate the vshot CLI for the save; set "
+                                        "VSHOT_BIN"));
+        }
         // The dialog opens on the output the pin is on, so it lands in front of
         // the user rather than on whichever screen the compositor favours.
         QScreen *pinScreen = QGuiApplication::screenAt(pin->globalRect().center());
@@ -2481,40 +2497,127 @@ wl-clipboard package"));
         // id is carried in the closure: the user may have closed the pin by the
         // time the dialog closes, and a save then has nowhere to report to.
         const quint64 id = pin->id;
+        // A pin with an HDR half is written as an HDR format, and the SDR copy
+        // beside it is then the user's to ask for; every other pin is its own
+        // pixels, and the SDR formats are what it can be written as.  Which of
+        // the two lists the dialog offers is decided from what the pin holds.
+        const bool hdr = !pin->hdrPath.isEmpty();
+        // And the formats themselves come from the CLI rather than from a list
+        // kept here: the codecs are compiled into that binary, and it is the
+        // only process that can say what this build can write.
+        auto *probe = new QProcess(this);
+        probe->setProgram(cli);
+        probe->setArguments({QStringLiteral("formats"), QStringLiteral("--json")});
+        probe->setStandardInputFile(QProcess::nullDevice());
+        connect(probe, &QProcess::finished, this,
+                [this, probe, helper, cli, suggested, outputName, id, hdr](int code,
+                                                                          QProcess::ExitStatus) {
+                    const QByteArray out = probe->readAllStandardOutput();
+                    probe->deleteLater();
+                    if (code != 0) {
+                        qWarning("pin %llu: `vshot formats` exited %d",
+                                 static_cast<unsigned long long>(id), code);
+                    }
+                    // An answer that cannot be read leaves the argument empty,
+                    // and the dialog then offers PNG alone: a save that works
+                    // rather than a Save as… that does nothing.
+                    beginSaveDialog(id, helper, cli, suggested, outputName,
+                                    formatArgument(out, hdr), hdr);
+                });
+        // A probe that never starts still has to lead to a dialog, or Save as…
+        // looks like it did nothing at all.  Only `FailedToStart` is handled:
+        // it is the one error that comes without a `finished` afterwards, so
+        // the two cannot both open a dialog.
+        connect(probe, &QProcess::errorOccurred, this,
+                [this, probe, helper, cli, suggested, outputName, id, hdr](
+                    QProcess::ProcessError error) {
+                    if (error != QProcess::FailedToStart) {
+                        return;
+                    }
+                    probe->deleteLater();
+                    beginSaveDialog(id, helper, cli, suggested, outputName, QString(), hdr);
+                });
+        probe->start();
+        return okReply();
+    }
+
+    // One half of the registry as the `name/suffix,...` argument the save
+    // dialog parses: the list is the CLI's answer, and this is it in the one
+    // form that crosses a process boundary.
+    static QString formatArgument(const QByteArray &json, bool hdr)
+    {
+        const QJsonDocument document = QJsonDocument::fromJson(json);
+        if (!document.isObject()) {
+            return QString();
+        }
+        const QJsonArray formats = document.object()
+                                       .value(hdr ? QStringLiteral("hdr") : QStringLiteral("sdr"))
+                                       .toArray();
+        QStringList entries;
+        for (const QJsonValue &value : formats) {
+            const QJsonObject format = value.toObject();
+            const QString name = format.value(QStringLiteral("name")).toString();
+            QStringList parts;
+            parts << name;
+            for (const QJsonValue &suffix : format.value(QStringLiteral("suffixes")).toArray()) {
+                const QString text = suffix.toString();
+                if (!text.isEmpty()) {
+                    parts << text;
+                }
+            }
+            // A name with no suffix beside it is a format the dialog could not
+            // label or rename a file for, so it is left out rather than offered.
+            if (parts.size() >= 2) {
+                entries.append(parts.join(QLatin1Char('/')));
+            }
+        }
+        return entries.join(QLatin1Char(','));
+    }
+
+    // Opens the save dialog, once the formats it may offer are known.
+    //
+    // Detached, and its answer comes back through a signal: the daemon must
+    // keep drawing while the dialog is open, and the user may close the pin
+    // before they are done with it.  The id is carried in both closures for
+    // that reason -- a save on a pin that is gone has nowhere to report to.
+    void beginSaveDialog(quint64 id, const QString &helper, const QString &cli,
+                         const QString &suggested, const QString &outputName,
+                         const QString &formats, bool hdr)
+    {
         auto *dialog = new QProcess(this);
         dialog->setProgram(helper);
-        dialog->setArguments({QStringLiteral("--save-dialog"), suggested, outputName});
+        // The output and the format list keep their places even when empty: the
+        // dialog reads them by position, and an empty one is what its fallbacks
+        // are for.
+        dialog->setArguments({QStringLiteral("--save-dialog"), suggested, outputName, formats,
+                              hdr ? QStringLiteral("hdr") : QStringLiteral("sdr")});
         dialog->setStandardInputFile(QProcess::nullDevice());
-        connect(dialog, &QProcess::finished, this, [this, dialog, id](int code, QProcess::ExitStatus) {
-            const QByteArray out = dialog->readAllStandardOutput();
-            dialog->deleteLater();
-            QJsonParseError parseError;
-            const QJsonDocument document = QJsonDocument::fromJson(out.trimmed(), &parseError);
-            if (code != 0 || parseError.error != QJsonParseError::NoError || !document.isObject()
-                || !document.object().value(QStringLiteral("ok")).toBool()) {
-                return; // cancelled, or the dialog could not run at all
-            }
-            const QString path = document.object().value(QStringLiteral("path")).toString();
-            Pin *target = byId_.value(id, nullptr);
-            if (target == nullptr || path.isEmpty()) {
-                return;
-            }
-            const bool written = target->image.save(path, "PNG");
-            if (!written || debug_) {
-                qWarning("pin %llu: %s `%s`", static_cast<unsigned long long>(id),
-                         written ? "saved" : "could not save", qPrintable(path));
-            }
-            // The badge is a corner label on the image, so it names the file
-            // rather than spelling out where it went: a full path would be
-            // wider than most pins and get clipped to something unreadable.
-            announce(id, written ? uiTr("Saved %1").arg(QFileInfo(path).fileName())
-                                 : uiTr("Could not save the image"));
-        });
+        connect(dialog, &QProcess::finished, this,
+                [this, dialog, cli, id, hdr](int code, QProcess::ExitStatus) {
+                    const QByteArray out = dialog->readAllStandardOutput();
+                    dialog->deleteLater();
+                    QJsonParseError parseError;
+                    const QJsonDocument document =
+                        QJsonDocument::fromJson(out.trimmed(), &parseError);
+                    if (code != 0 || parseError.error != QJsonParseError::NoError
+                        || !document.isObject()
+                        || !document.object().value(QStringLiteral("ok")).toBool()) {
+                        return; // cancelled, or the dialog could not run at all
+                    }
+                    const QJsonObject answer = document.object();
+                    const QString path = answer.value(QStringLiteral("path")).toString();
+                    Pin *target = byId_.value(id, nullptr);
+                    if (target == nullptr || path.isEmpty()) {
+                        return;
+                    }
+                    writeSave(cli, id, target->image, target->hdrPath, target->density, path,
+                              answer.value(QStringLiteral("format")).toString(),
+                              answer.value(QStringLiteral("sdrCopy")).toBool());
+                });
         // A dialog that never starts (the helper went missing between the two
         // halves of the round trip) still has to say so, or `Save as…` looks
-        // like it did nothing at all. Only `FailedToStart` is handled: it is
-        // the one error that comes without a `finished` afterwards, so the
-        // two cannot both report the same failure.
+        // like it did nothing at all. Only `FailedToStart` is handled, for the
+        // same reason as above.
         connect(dialog, &QProcess::errorOccurred, this,
                 [this, dialog, id](QProcess::ProcessError error) {
                     if (error != QProcess::FailedToStart) {
@@ -2526,7 +2629,84 @@ wl-clipboard package"));
                     dialog->deleteLater();
                 });
         dialog->start();
-        return okReply();
+    }
+
+    // Writes the pin out in the format the dialog named, through the CLI.
+    //
+    // This process can encode PNG and nothing else -- Qt is the whole of its
+    // image support -- so the pin's picture is handed over as one and the CLI
+    // writes the file: in the chosen format, and for a pin with an HDR half
+    // with the SDR copy beside it or without it, as the user asked.  `--export`
+    // is the internal command that is exactly this.
+    void writeSave(const QString &cli, quint64 id, const QImage &image, const QString &hdrPath,
+                   int density, const QString &destination, const QString &format, bool sdrCopy)
+    {
+        // The picture goes through a file rather than a pipe: `--export` reads
+        // it by path, and a temporary directory is the one place the daemon is
+        // free to write that the user did not name.
+        auto *directory =
+            new QTemporaryDir(QDir::tempPath() + QStringLiteral("/vshot-save-XXXXXX"));
+        const QString picture =
+            directory->isValid() ? directory->filePath(QStringLiteral("pin.png")) : QString();
+        if (picture.isEmpty() || !image.save(picture, "PNG")) {
+            delete directory;
+            announce(id, uiTr("Could not save the image"));
+            return;
+        }
+        // The pin's own density, so the file declares the scale it is shown at:
+        // without it the next person to pin this file gets it sized from
+        // whatever output it lands on, which is the one thing the declaration
+        // is for.
+        QStringList arguments{QStringLiteral("pin"), QStringLiteral("--export"), picture,
+                              destination, QStringLiteral("--density"),
+                              QString::number(std::clamp(density, 1, 4))};
+        if (hdrPath.isEmpty()) {
+            arguments << QStringLiteral("--sdr-format") << format;
+        } else {
+            // The SDR copy's own format is not named here: it is the one the
+            // config already chose for captures, which is what the CLI resolves
+            // a `--sdr-format` it was not given to.
+            arguments << QStringLiteral("--hdr-source") << hdrPath << QStringLiteral("--hdr-format")
+                      << format << QStringLiteral("--sdr-copy")
+                      << (sdrCopy ? QStringLiteral("true") : QStringLiteral("false"));
+        }
+        auto *writer = new QProcess(this);
+        writer->setProgram(cli);
+        writer->setArguments(arguments);
+        writer->setStandardInputFile(QProcess::nullDevice());
+        connect(writer, &QProcess::finished, this,
+                [this, writer, directory, id, destination](int code, QProcess::ExitStatus) {
+                    const QByteArray errors = writer->readAllStandardError();
+                    writer->deleteLater();
+                    delete directory;
+                    const bool written = code == 0;
+                    if (!written) {
+                        qWarning("pin %llu: could not save `%s`: %s",
+                                 static_cast<unsigned long long>(id), qPrintable(destination),
+                                 qPrintable(QString::fromLocal8Bit(errors).trimmed()));
+                    } else if (debug_) {
+                        qWarning("pin %llu: saved `%s`", static_cast<unsigned long long>(id),
+                                 qPrintable(destination));
+                    }
+                    // The badge is a corner label on the image, so it names the
+                    // file rather than spelling out where it went: a full path
+                    // would be wider than most pins and get clipped to
+                    // something unreadable.
+                    announce(id, written ? uiTr("Saved %1").arg(QFileInfo(destination).fileName())
+                                         : uiTr("Could not save the image"));
+                });
+        connect(writer, &QProcess::errorOccurred, this,
+                [this, writer, directory, id](QProcess::ProcessError error) {
+                    if (error != QProcess::FailedToStart) {
+                        return;
+                    }
+                    delete directory;
+                    qWarning("pin %llu: the CLI could not be started for the save",
+                             static_cast<unsigned long long>(id));
+                    announce(id, uiTr("Could not save the image"));
+                    writer->deleteLater();
+                });
+        writer->start();
     }
 
     // Puts `text` on `id`'s corner in every surface that shows that pin. A save

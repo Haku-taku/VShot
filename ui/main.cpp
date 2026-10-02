@@ -137,11 +137,25 @@ int main(int argc, char **argv)
     }
     if (saveMode || openMode) {
         const QString suggested = QString::fromLocal8Bit(argv[2]);
+        // The output is a slot of its own even when the caller has none to name,
+        // so the two arguments after it keep their places; an empty one falls
+        // back to the primary screen.
         const QString screenName = argc > 3 ? QString::fromLocal8Bit(argv[3]) : QString();
         QApplication app(argc, argv);
         QApplication::setQuitOnLastWindowClosed(true);
-        return saveMode ? vshot::runSaveDialog(suggested, screenName)
-                        : vshot::runOpenDialog(suggested, screenName);
+        if (!saveMode) {
+            return vshot::runOpenDialog(suggested, screenName);
+        }
+        // What the dialog may offer, and which half of the content this is.
+        // Both come from the caller rather than from the registry: which
+        // formats a build can write is the CLI's answer -- it is the process
+        // that has the codecs -- and the dialog is only the window that asks.
+        const QList<vshot::SaveFormat> formats =
+            argc > 4 ? vshot::saveFormatsFromArgument(QString::fromLocal8Bit(argv[4]))
+                     : QList<vshot::SaveFormat>();
+        const QString half = argc > 5 ? QString::fromLocal8Bit(argv[5]) : QString();
+        const bool hdr = half.compare(QLatin1String("hdr"), Qt::CaseInsensitive) == 0;
+        return vshot::runSaveDialog(suggested, formats, hdr, screenName);
     }
     // The annotation daemon: one transparent layer surface per output, driven
     // over a socket by `vshot annotate` and living until that socket says quit.
@@ -163,7 +177,8 @@ int main(int argc, char **argv)
         reportError(QStringLiteral("usage: vshot-qt-ui --session <absolute-json-path>\n"
                                    "       vshot-qt-ui --settings\n"
                                    "       vshot-qt-ui --pin-edit <absolute-json-path>\n"
-                                   "       vshot-qt-ui --save-dialog <suggested-path> [output]\n"
+                                   "       vshot-qt-ui --save-dialog <suggested-path> [output] "
+                                   "[formats] [hdr|sdr]\n"
                                    "       vshot-qt-ui --open-dialog <suggested-path> [output]\n"
                                    "       vshot-qt-ui --pin-server <absolute-socket-path>\n"
                                    "       vshot-qt-ui --annotate-server <absolute-socket-path>"));

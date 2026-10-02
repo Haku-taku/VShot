@@ -321,6 +321,54 @@ void checkEveryFieldReachesTheFile()
     if (avifSpeed != nullptr) {
         avifSpeed->setValue(4);
     }
+    // The formats that come from this machine's ffmpeg, driven only where the
+    // registry offered them: whether `libjxl` exists is the machine's answer,
+    // and this check has to pass either way.
+    QSpinBox *jpegQuality = find<QSpinBox>(dialog.get(), "format_jpeg_quality");
+    if (jpegQuality != nullptr) {
+        jpegQuality->setValue(61);
+    }
+    QSpinBox *jxlEffort = find<QSpinBox>(dialog.get(), "format_jxl_effort");
+    if (jxlEffort != nullptr) {
+        jxlEffort->setValue(3);
+    }
+
+    // The registry feeds two places -- the Output page's selectors and the
+    // Format settings page's cards -- and they have to agree: a format with
+    // cards is one the selector offers, and one with no cards is not offered.
+    // This is what catches the selectors still being a hand-written list while
+    // the cards come from the registry.
+    QComboBox *sdr = find<QComboBox>(dialog.get(), "sdrFormat");
+    QComboBox *hdr = find<QComboBox>(dialog.get(), "hdrFormat");
+    const auto has_cards = [&](const QString &format) {
+        // The card, not its parameter controls: a format that declares no
+        // parameters -- Radiance -- still has a card saying so.
+        const QString name = QStringLiteral("formatCard_%1").arg(format);
+        for (QWidget *widget : dialog->findChildren<QWidget *>()) {
+            if (widget->objectName() == name) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const auto offers = [](QComboBox *box, const QString &format) {
+        return box != nullptr && box->findData(format) >= 0;
+    };
+    struct SelectorPair {
+        QComboBox *box;
+        const char *format;
+    };
+    for (const SelectorPair &pair : {SelectorPair{sdr, "png"}, SelectorPair{sdr, "jpeg"},
+                                     SelectorPair{sdr, "webp"}, SelectorPair{hdr, "jxl"},
+                                     SelectorPair{hdr, "avif"}, SelectorPair{hdr, "hdr"}}) {
+        const QString format = QString::fromLatin1(pair.format);
+        expect(has_cards(format) == offers(pair.box, format),
+               "the selector and the Format settings cards agree",
+               QStringLiteral("%1: cards=%2 offered=%3")
+                   .arg(format)
+                   .arg(has_cards(format))
+                   .arg(offers(pair.box, format)));
+    }
 
     QPushButton *save = find<QPushButton>(dialog.get(), "saveButton");
     if (save != nullptr) {
@@ -354,6 +402,24 @@ void checkEveryFieldReachesTheFile()
                                .toInt()));
     expect(saved.cli.format.value(QStringLiteral("avif")).value(QStringLiteral("speed")).toInt() == 4,
            "the AVIF speed reached the file");
+    // The same, for the formats this machine's ffmpeg provides: asserted only
+    // where the row existed, so the check says nothing about a format that is
+    // not there.
+    if (jpegQuality != nullptr) {
+        expect(saved.cli.format.value(QStringLiteral("jpeg")).value(QStringLiteral("quality")).toInt() ==
+                   61,
+               "the JPEG quality reached the file",
+               QString::number(saved.cli.format.value(QStringLiteral("jpeg"))
+                                   .value(QStringLiteral("quality"))
+                                   .toInt()));
+    }
+    if (jxlEffort != nullptr) {
+        expect(saved.cli.format.value(QStringLiteral("jxl")).value(QStringLiteral("effort")).toInt() == 3,
+               "the JPEG XL effort reached the file",
+               QString::number(saved.cli.format.value(QStringLiteral("jxl"))
+                                   .value(QStringLiteral("effort"))
+                                   .toInt()));
+    }
     expect(saved.cli.hdrFormat == QStringLiteral("hdr"),
            "the HDR format default reached the file", saved.cli.hdrFormat);
     expect(saved.cli.toneMap == QStringLiteral("fixed"),

@@ -25,10 +25,52 @@ namespace vshot {
 // above it.  The pixels never travel: the caller picks a path here and does the
 // writing or reading itself.
 
-// `{"ok":true,"path":"..."}`, or `{"ok":false}` when the user cancelled.
+// One format the save dialog offers, as the codec registry describes it: the
+// name the command line and the config use, and the suffixes its files carry.
+//
+// The list is the *caller's*, not this file's: which formats a build can write
+// is the codec registry's answer, and a dialog that knew names of its own would
+// eventually offer one the binary cannot write.
+struct SaveFormat {
+    QString name;          //< `png`, `jpeg`, `jxl`: what the registry calls it
+    QStringList suffixes;  //< `jpg` and `jpeg` for JPEG; the first is the plain one
+};
+
+// `path` with the suffix of `format`.
+//
+// The two have to agree.  The bytes written are the format's, and a name that
+// says otherwise is what makes another program opening it by extension, a later
+// `vshot pin shot.png`, and the file URI a capture puts on the clipboard all
+// talk about a PNG that is not there.
+//
+// A suffix the format itself uses is left alone, so `.jpeg` survives for a user
+// who typed it -- it is not a second format.  A suffix of some other format is
+// replaced rather than appended to: `shot.png` saved as WebP is `shot.webp`,
+// not `shot.png.webp`.
+QString withFormatSuffix(const QString &path, const SaveFormat &format);
+
+// The save formats out of one command-line argument, `name/suffix/suffix,...`.
+// Empty when the argument is empty, which is a caller that has no registry to
+// offer and gets the format the dialog has always offered.
+//
+// A single argument rather than a run of them: an argv slot per format would
+// make the two lists below indistinguishable from the screen name beside them.
+QList<SaveFormat> saveFormatsFromArgument(const QString &argument);
+
+// `{"ok":true,"path":"...","format":"...","sdrCopy":true}`, or `{"ok":false}`
+// when the user cancelled.
+//
+// `formats` is what the content at hand can be saved as -- the SDR formats for
+// a pin that is a plain picture, the HDR ones for a pin that came from an HDR
+// capture.  `hdr` is which of those two it is, and it is what puts the "also
+// save the SDR copy" switch on the dialog: an HDR file written alone leaves
+// nothing for a reader that cannot show HDR, so the choice is the user's every
+// time.
+//
 // `screenName` is the output the dialog should open on, as Qt names it; empty
 // falls back to the primary one.
-int runSaveDialog(const QString &suggestedPath, const QString &screenName = QString());
+int runSaveDialog(const QString &suggestedPath, const QList<SaveFormat> &formats, bool hdr,
+                  const QString &screenName = QString());
 
 // The same shape, for picking an existing image to open.
 int runOpenDialog(const QString &suggestedPath, const QString &screenName = QString());
@@ -38,7 +80,8 @@ int runOpenDialog(const QString &suggestedPath, const QString &screenName = QStr
 // (stylesheet applied, thumbnail grid set) from one that was not, and the only
 // honest way to do that is on the widget tree this function returns rather than
 // on a second dialog built to look like it.  The caller owns the dialog.
-QFileDialog *createFileDialog(bool saving, const QString &suggestedPath);
+QFileDialog *createFileDialog(bool saving, const QString &suggestedPath,
+                              const QList<SaveFormat> &formats = {}, bool hdr = false);
 
 // One place in the file dialogs' sidebar.
 struct Place {

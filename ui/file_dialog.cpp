@@ -12,6 +12,8 @@
 #include <QAbstractFileIconProvider>
 #include <QAbstractItemView>
 #include <QApplication>
+#include <QCheckBox>
+#include <QDialogButtonBox>
 #include <QCache>
 #include <QComboBox>
 #include <QCryptographicHash>
@@ -21,6 +23,7 @@
 #include <QFileInfo>
 #include <QFileSystemModel>
 #include <QGuiApplication>
+#include <QGridLayout>
 #include <QHash>
 #include <QHeaderView>
 #include <QImageReader>
@@ -103,6 +106,15 @@ QString initialPathFor(const QString &suggestedPath)
     return QDir(directory).filePath(suggested.fileName());
 }
 
+// Writes one reply as the single line on stdout the caller reads.
+void emitReply(const QJsonObject &reply)
+{
+    const QByteArray encoded = QJsonDocument(reply).toJson(QJsonDocument::Compact);
+    std::fwrite(encoded.constData(), 1, static_cast<std::size_t>(encoded.size()), stdout);
+    std::fputc('\n', stdout);
+    std::fflush(stdout);
+}
+
 // Reports the chosen path, or that nothing was chosen.
 void report(const QString &path)
 {
@@ -113,10 +125,92 @@ void report(const QString &path)
         reply.insert(QStringLiteral("ok"), true);
         reply.insert(QStringLiteral("path"), path);
     }
-    const QByteArray encoded = QJsonDocument(reply).toJson(QJsonDocument::Compact);
-    std::fwrite(encoded.constData(), 1, static_cast<std::size_t>(encoded.size()), stdout);
-    std::fputc('\n', stdout);
-    std::fflush(stdout);
+    emitReply(reply);
+}
+
+// The same for a save, which answers two more questions than a path: which of
+// the formats it offered was chosen, and whether the SDR copy was asked for
+// beside it.
+//
+// Separate keys rather than a format the caller infers from the suffix.  The
+// dialog knows what the user picked and the caller only what it offered, and a
+// suffix is a third opinion that can disagree with both -- `shot.jpeg` and
+// `shot.jpg` are one format, and a name the user typed with no suffix at all
+// carries none.
+void reportSave(const QString &path, const QString &format, bool sdrCopy)
+{
+    if (path.isEmpty()) {
+        report(QString());
+        return;
+    }
+    QJsonObject reply;
+    reply.insert(QStringLiteral("ok"), true);
+    reply.insert(QStringLiteral("path"), path);
+    reply.insert(QStringLiteral("format"), format);
+    reply.insert(QStringLiteral("sdrCopy"), sdrCopy);
+    emitReply(reply);
+}
+
+// The object name of the save dialog's "also save the SDR copy" switch, so the
+// report can find it and the offline check can drive it.
+constexpr auto kSdrCopyBoxName = "sdrCopyBox";
+
+// Whether that switch is on.  False for a dialog that has none, which is every
+// open and every save of content with no HDR half.
+bool sdrCopyRequested(QFileDialog *dialog)
+{
+    const auto *box = dialog->findChild<QCheckBox *>(QLatin1String(kSdrCopyBoxName));
+    return box != nullptr && box->isChecked();
+}
+
+// Puts that switch on the save dialog, on the row above its buttons.
+//
+// The box goes into the dialog's own grid rather than into a layout of ours: a
+// widget parented to the dialog with no layout is painted in the corner over
+// whatever is there.  The buttons are moved down one row to make the room --
+// QGridLayout has no way to insert a row, so the button box is taken out and
+// put back a row lower, which is the same thing from the outside and keeps the
+// buttons the last thing on the dialog.
+//
+// It starts where `cli.sdr-copy` left it, so a user who has decided once is not
+// asked again by every save.  The switch is still here rather than being obeyed
+// silently because a save is a one-off: an HDR file written on its own leaves
+// nothing behind for a reader that cannot show HDR, and that is a decision to
+// make per file, not once for the program.
+void addSdrCopyBox(QFileDialog *dialog)
+{
+    auto *grid = dialog->findChild<QGridLayout *>();
+    if (grid == nullptr) {
+        return;
+    }
+    int row = grid->rowCount();
+    if (auto *buttons = dialog->findChild<QDialogButtonBox *>()) {
+        int column = 0;
+        int rowSpan = 1;
+        int columnSpan = 1;
+        const int index = grid->indexOf(buttons);
+        if (index >= 0) {
+            grid->getItemPosition(index, &row, &column, &rowSpan, &columnSpan);
+            grid->removeWidget(buttons);
+            grid->addWidget(buttons, row + 1, column, rowSpan, columnSpan);
+        }
+    }
+    auto *box = new QCheckBox(uiTr("Also save the SDR copy"), dialog);
+    box->setObjectName(QLatin1String(kSdrCopyBoxName));
+    box->setChecked(loadConfig().cli.sdrCopy);
+    box->setToolTip(uiTr("Write the tone-mapped picture beside the HDR file, "
+                         "so a reader that cannot show HDR has something to open."));
+    grid->addWidget(box, row, 0, 1, std::max(1, grid->columnCount()));
+}
+
+// One format's line in the dialog's filter list.
+QString formatFilter(const SaveFormat &format)
+{
+    QStringList globs;
+    for (const QString &suffix : format.suffixes) {
+        globs.append(QStringLiteral("*.") + suffix);
+    }
+    return uiTr("%1 image (%2)").arg(format.name.toUpper(), globs.join(QLatin1Char(' ')));
 }
 
 // What an image to open may be. The readers Qt ships with cover these; the
@@ -1188,13 +1282,13 @@ bool placeOnLayer(QFileDialog *dialog, QScreen *screen)
 // Shows one dialog on the given output and reports the path it produced.  Both
 // entry points differ only in which mode they ask QFileDialog for.
 int showDialog(QFileDialog::AcceptMode accept, const QString &suggestedPath,
-               const QString &screenName)
+               const QList<SaveFormat> &formats, bool hdr, const QString &screenName)
 {
     initUiLanguage();
     const bool saving = accept == QFileDialog::AcceptSave;
     // Heap-allocated rather than on the stack: the dialog deletes itself on
     // close (WA_DeleteOnClose), and a stack object would be destroyed twice.
-    QFileDialog *dialog = createFileDialog(saving, suggestedPath);
+    QFileDialog *dialog = createFileDialog(saving, suggestedPath, formats, hdr);
     if (!placeOnLayer(dialog, dialogScreen(screenName))) {
         std::fprintf(stderr, "vshot-qt-ui: cannot place the file dialog on a layer surface\n");
         std::fflush(stderr);
@@ -1208,9 +1302,28 @@ int showDialog(QFileDialog::AcceptMode accept, const QString &suggestedPath,
     // widget dereferences a dangling selection model -- which is exactly the
     // crash this shape is here to avoid.
     QString chosen;
-    QObject::connect(dialog, &QFileDialog::fileSelected, dialog, [&chosen](const QString &path) {
-        chosen = path;
-    });
+    QString format;
+    bool copy = false;
+    // The format is read here rather than after `exec()` for the same reason
+    // the path is: the delete-on-close has run by then, and the filter list
+    // lives on the freed widget.
+    QObject::connect(dialog, &QFileDialog::fileSelected, dialog,
+                     [dialog, formats, &chosen, &format, &copy](const QString &path) {
+                         const int index =
+                             dialog->nameFilters().indexOf(dialog->selectedNameFilter());
+                         if (index >= 0 && index < formats.size()) {
+                             format = formats.at(index).name;
+                             chosen = withFormatSuffix(path, formats.at(index));
+                         } else {
+                             // No registry behind this dialog: the format the
+                             // save has always been, and a name to match.
+                             format = QStringLiteral("png");
+                             chosen = QFileInfo(path).suffix().isEmpty()
+                                          ? path + QStringLiteral(".png")
+                                          : path;
+                         }
+                         copy = sdrCopyRequested(dialog);
+                     });
     dialog->show();
     dialog->raise();
     dialog->activateWindow();
@@ -1219,12 +1332,11 @@ int showDialog(QFileDialog::AcceptMode accept, const QString &suggestedPath,
         report(QString());
         return 0;
     }
-    // A name typed without an extension gets one, so the caller never has to
-    // guess a format from a path.
-    if (saving && QFileInfo(chosen).suffix().isEmpty()) {
-        chosen += QStringLiteral(".png");
+    if (saving) {
+        reportSave(chosen, format, copy);
+    } else {
+        report(chosen);
     }
-    report(chosen);
     return 0;
 }
 
@@ -1258,7 +1370,8 @@ QList<Place> readPlaces(const QStringList &files)
     return dedupePlaces(places);
 }
 
-QFileDialog *createFileDialog(bool saving, const QString &suggestedPath)
+QFileDialog *createFileDialog(bool saving, const QString &suggestedPath,
+                              const QList<SaveFormat> &formats, bool hdr)
 {
     auto *dialog = new FramedFileDialog(
         loadDialogPreferences(), nullptr,
@@ -1270,12 +1383,33 @@ QFileDialog *createFileDialog(bool saving, const QString &suggestedPath)
     dialog->setOption(QFileDialog::DontUseNativeDialog, true);
     dialog->setAcceptMode(saving ? QFileDialog::AcceptSave : QFileDialog::AcceptOpen);
     dialog->setFileMode(saving ? QFileDialog::AnyFile : QFileDialog::ExistingFile);
-    if (saving) {
-        // PNG and nothing else: what gets saved is a screenshot, a color card
-        // or a rendered text card, none of which wants a lossy format, and PNG
-        // is the one image format Qt always has.
+    if (saving && formats.isEmpty()) {
+        // No registry reached this dialog -- a caller that could not read one,
+        // or a build with nothing but PNG.  It offers what a save has always
+        // been: PNG, the one image format Qt always has.
         dialog->setNameFilter(uiTr("PNG image (*.png)"));
         dialog->setDefaultSuffix(QStringLiteral("png"));
+    } else if (saving) {
+        // What this content can be written as, and nothing else: the SDR
+        // formats for a pin that is a plain picture, the HDR ones for a pin
+        // that came from an HDR capture.  Offering the other half would be
+        // offering a file the caller has nothing to write it from -- and for
+        // the HDR side, a file that would quietly be the tone-mapped picture
+        // under an HDR name.
+        QStringList filters;
+        for (const SaveFormat &format : formats) {
+            filters.append(formatFilter(format));
+        }
+        dialog->setNameFilters(filters);
+        dialog->selectNameFilter(filters.first());
+        // A name typed with no suffix gets the first format's, which is the one
+        // the dialog opens on.  Picking another filter does not re-point it --
+        // Qt's default suffix is not per filter -- so what the chosen format
+        // really decides is the name is `withFormatSuffix`, at the accept.
+        dialog->setDefaultSuffix(formats.first().suffixes.value(0));
+        if (hdr) {
+            addSdrCopyBox(dialog);
+        }
     } else {
         dialog->setNameFilter(imageFilter());
     }
@@ -1310,14 +1444,53 @@ QFileDialog *createFileDialog(bool saving, const QString &suggestedPath)
     return dialog;
 }
 
-int runSaveDialog(const QString &suggestedPath, const QString &screenName)
+int runSaveDialog(const QString &suggestedPath, const QList<SaveFormat> &formats, bool hdr,
+                  const QString &screenName)
 {
-    return showDialog(QFileDialog::AcceptSave, suggestedPath, screenName);
+    return showDialog(QFileDialog::AcceptSave, suggestedPath, formats, hdr, screenName);
 }
 
 int runOpenDialog(const QString &suggestedPath, const QString &screenName)
 {
-    return showDialog(QFileDialog::AcceptOpen, suggestedPath, screenName);
+    return showDialog(QFileDialog::AcceptOpen, suggestedPath, QList<SaveFormat>(), false,
+                      screenName);
+}
+
+// The rule is documented on the declaration.
+QString withFormatSuffix(const QString &path, const SaveFormat &format)
+{
+    if (format.suffixes.isEmpty()) {
+        return path;
+    }
+    const QString suffix = QFileInfo(path).suffix();
+    for (const QString &known : format.suffixes) {
+        if (suffix.compare(known, Qt::CaseInsensitive) == 0) {
+            return path;
+        }
+    }
+    const QString stem =
+        suffix.isEmpty() ? path : path.left(path.size() - suffix.size() - 1);
+    return stem + QLatin1Char('.') + format.suffixes.first();
+}
+
+QList<SaveFormat> saveFormatsFromArgument(const QString &argument)
+{
+    QList<SaveFormat> formats;
+    const QStringList entries = argument.split(QLatin1Char(','), Qt::SkipEmptyParts);
+    for (const QString &entry : entries) {
+        // `name/suffix/suffix`: `/` rather than `:` because a name and a suffix
+        // are both things a shell and a config file spell plainly, and neither
+        // ever holds a slash.
+        const QStringList parts = entry.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+        if (parts.size() < 2) {
+            continue;
+        }
+        SaveFormat format;
+        format.name = parts.first();
+        format.suffixes = parts.mid(1);
+        formats.append(format);
+    }
+    return formats;
 }
 
 } // namespace vshot

@@ -336,7 +336,6 @@ fn run_helper_dialogue(
                 })?
             }
             HelperRequest::Elements { index } => {
-
                 // Asked once per hovered window, not once per pointer move: a
                 // tree walk is a D-Bus round trip per node.  `None` means this
                 // window has no accessibility tree, which leaves the picker
@@ -1682,8 +1681,8 @@ mod tests {
             serde_json::from_str::<HelperRequest>(r#"{"request":"candidates"}"#).unwrap(),
             HelperRequest::Candidates
         ));
-        let elements: HelperRequest =
-            serde_json::from_str(r#"{"request":"elements","index":3}"#).expect("an element request");
+        let elements: HelperRequest = serde_json::from_str(r#"{"request":"elements","index":3}"#)
+            .expect("an element request");
         match elements {
             HelperRequest::Elements { index } => assert_eq!(index, 3),
             other => panic!("read as {other:?}"),

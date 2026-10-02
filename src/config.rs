@@ -19,6 +19,26 @@ use serde::Deserialize;
 use crate::model::{codec, HdrDecision, ToneMap, ToneMapOptions};
 use crate::output::{HdrFormat, SdrFormat};
 
+/// Serialises the tests that point `XDG_CONFIG_HOME` at a scratch file.
+///
+/// The variable is process-global, so two tests that set it at the same time
+/// read each other's config -- and the symptom is a value the *other* test
+/// wrote, which reads exactly like a bug in the code under test.  Every test
+/// that sets it holds this for its whole body, including the restore.
+#[cfg(test)]
+pub(crate) static CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Takes [`CONFIG_ENV_LOCK`], ignoring a previous test's panic.
+///
+/// A test that fails while holding it poisons the mutex, and every test after
+/// it would then fail on the poison rather than on its own subject.
+#[cfg(test)]
+pub(crate) fn config_env_guard() -> std::sync::MutexGuard<'static, ()> {
+    CONFIG_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
 /// Reads an optional number, treating a value of any other type as absent.
 ///
 /// The file is one a user may edit by hand, and `serde`'s default answer to a
@@ -82,6 +102,10 @@ pub struct CliDefaults {
     /// `--hdr-area-test`: whether HDR content is judged by the share of the
     /// capture brighter than SDR white rather than by any single pixel.
     pub hdr_area_test: Option<bool>,
+    /// `--sdr-copy`: whether a capture that carries HDR content also writes the
+    /// SDR half beside the HDR one.  `None` is "the file says nothing", which
+    /// reads as on -- the behaviour a capture has always had.
+    pub sdr_copy: Option<bool>,
     /// `--hdr-area-ratio`, the share that share has to reach.  Read through
     /// [`de_optional_number`] for the same reason as `tone_map_white`.
     #[serde(default, deserialize_with = "de_optional_number")]
@@ -368,6 +392,10 @@ pub struct LongDefaults {
 pub struct PinDefaults {
     /// `--density` for every pinned image.
     pub density: Option<u32>,
+    /// `--hdr-half`: whether pinning a file also pins the HDR half a capture
+    /// wrote beside it.  `None` is "the file says nothing", which reads as on --
+    /// the behaviour a pin has always had.
+    pub hdr_half: Option<bool>,
 }
 
 /// The whole file, as far as this side is concerned.  The helper's `editor`
@@ -468,6 +496,12 @@ pub fn tone_map_white_default() -> Option<f32> {
 /// nothing usable.  The caller keeps its own built-in default (on).
 pub fn hdr_area_test_default() -> Option<bool> {
     load().hdr_area_test
+}
+
+/// Whether the config file remembers writing the SDR half beside a capture's
+/// HDR one.  `None` when it says nothing, which the caller reads as on.
+pub fn sdr_copy_default() -> Option<bool> {
+    load().sdr_copy
 }
 
 /// The element fallback the config file remembers, or `None` when it says
@@ -766,8 +800,9 @@ mod path_tests {
 
     #[test]
     fn the_config_path_honours_xdg_config_home() {
-        // SAFETY: single-threaded test body, and the variable is restored
-        // before returning.
+        // SAFETY: the lock keeps this the only test setting the variable, and
+        // the value is restored before returning.
+        let _guard = config_env_guard();
         let saved = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", "/tmp/vshot-cfg-probe");
         assert_eq!(

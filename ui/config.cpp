@@ -41,15 +41,17 @@ const QStringList kArrowStyleNames = {QStringLiteral("open"), QStringLiteral("fi
 const QStringList kMosaicShapeNames = {QStringLiteral("rect"), QStringLiteral("ellipse"),
                                        QStringLiteral("brush")};
 // The SDR half's format.  The names are the file suffixes, which is also what
-// `--sdr-format` accepts -- and the list the settings window offers comes from
-// the codec registry instead, since which formats exist is a build-time
-// question.  This is what the *loader* accepts, so a name written by a build
-// with a codec this one lacks is dropped rather than kept as a value nothing
-// can write.
-const QStringList kSdrFormatNames = {QStringLiteral("png")};
-// The HDR half's format.  The names are the file suffixes, which is also what
-// `--hdr-format` accepts.
-const QStringList kHdrFormatNames = {QStringLiteral("avif"), QStringLiteral("hdr")};
+// `--sdr-format` accepts -- and the list the settings window *offers* comes
+// from the codec registry instead, since which formats exist is a question
+// about the machine.  This is what the *loader* accepts, so it holds every name
+// this program knows rather than only the ones this machine can write: a config
+// carried between machines must round-trip, and a name dropped here would be
+// erased from the user's file the next time the window saved.
+const QStringList kSdrFormatNames = {QStringLiteral("png"), QStringLiteral("jpeg"),
+                                     QStringLiteral("webp")};
+// The HDR half's format, on the same terms.
+const QStringList kHdrFormatNames = {QStringLiteral("avif"), QStringLiteral("hdr"),
+                                     QStringLiteral("jxl")};
 // How the SDR half is mapped down from the HDR one.  The names are what
 // `--tone-map` accepts, in the order the settings window offers them: the
 // default first, then the two that read a level.
@@ -375,13 +377,22 @@ const std::pair<const char *, const char *> kOwnedCliKeys[] = {
     {"", "sdr-format"},      {"", "hdr-format"},   {"", "monitor"},
     {"", "tone-map"},        {"", "tone-map-white"},
     {"", "hdr-area-test"},   {"", "hdr-area-ratio"},
+    {"", "sdr-copy"},
     {"", "hdr-reference-white"},
+    // One leaf per parameter every codec declares.  A parameter missing here is
+    // one the window can set but never clear: the merge below would put the old
+    // value back.  The list is the same set `vshot formats` prints, so a codec
+    // that grows a parameter needs a line here too.
     {"format.png", "compression"},
-    {"format.avif", "quality"}, {"format.avif", "speed"},
+    {"format.jpeg", "quality"},
+    {"format.webp", "lossless"}, {"format.webp", "quality"},
+    {"format.jxl", "distance"},  {"format.jxl", "effort"},
+    {"format.avif", "quality"},  {"format.avif", "speed"},
     {"long", "notches"},     {"long", "max-height"},
     {"long", "max-frames"},  {"long", "timeout"},
     {"long", "ignore-top"},  {"long", "inject"},
-    {"pin", "density"},      {"ocr", "notify"},
+    {"pin", "density"},      {"pin", "hdr-half"},
+    {"ocr", "notify"},
     {"record", "encoder"},   {"record", "encoder-backend"},
     {"record", "fps"},       {"record", "portal"},
     {"record", "mic"},       {"record", "follow"},
@@ -523,6 +534,9 @@ CliPreferences readCli(const QJsonObject &cli)
                                             kMinToneMapWhite, kMaxToneMapWhite);
     preferences.hdrAreaTest =
         readFlag(cli, QStringLiteral("hdr-area-test"), preferences.hdrAreaTest);
+    // Writing the SDR half beside the HDR one is what a capture has always
+    // done, so the fallback is `true` and only an explicit `false` reads as off.
+    preferences.sdrCopy = readFlag(cli, QStringLiteral("sdr-copy"), true);
     preferences.elementFallback = readChoice(cli, QStringLiteral("element-fallback"),
                                              preferences.elementFallback, kElementFallbackNames);
     // Zero is a ratio here, not an absent key, so the reader has to be able to
@@ -546,6 +560,10 @@ CliPreferences readCli(const QJsonObject &cli)
 
     const QJsonObject pinSection = cli.value(QStringLiteral("pin")).toObject();
     preferences.pinDensity = readOptional(pinSection, QStringLiteral("density"), kMaxDensity);
+    // Looking for the half is what a pin does when the file says nothing, so the
+    // fallback is `true` and only an explicit `false` reads as off -- the rule
+    // `ocr.notify` and `record.notify` follow.
+    preferences.pinHdrHalf = readFlag(pinSection, QStringLiteral("hdr-half"), true);
 
     // The `ocr` section holds the engine as well, which the settings window
     // does not offer: only the notification is written back, and the merge in
@@ -646,10 +664,12 @@ QJsonObject cliJson(const CliPreferences &preferences)
     if (!preferences.sdrFormat.isEmpty()) {
         cli.insert(QStringLiteral("sdr-format"), preferences.sdrFormat);
     }
-    // The encoding parameters, one object per format.  What is written is
-    // whatever the window put in the map: the window builds those rows from the
-    // registry, so a value present here is one the format itself declared, and
-    // a parameter left at its declared default was never put in the map at all.
+    // The encoding parameters, one object per format.  What is written is what
+    // the window put in the map: the rows it drew come from the registry, so a
+    // value from one of those is one the format itself declared, and a
+    // parameter left at its declared default was never put in the map at all.
+    // A format the window drew no rows for -- one this machine's ffmpeg cannot
+    // write -- keeps whatever the file already had.
     if (!preferences.format.isEmpty()) {
         QJsonObject formatSection;
         for (auto entry = preferences.format.constBegin(); entry != preferences.format.constEnd();
@@ -677,6 +697,10 @@ QJsonObject cliJson(const CliPreferences &preferences)
     // the same rule `record.notify` follows below.
     if (!preferences.hdrAreaTest) {
         cli.insert(QStringLiteral("hdr-area-test"), false);
+    }
+    // The same rule for the SDR copy: it is written only when turned off.
+    if (!preferences.sdrCopy) {
+        cli.insert(QStringLiteral("sdr-copy"), false);
     }
     // `lines` is the default, so only the other choice is written -- the same
     // rule the area test above follows.
@@ -722,9 +746,17 @@ QJsonObject cliJson(const CliPreferences &preferences)
     if (!longSection.isEmpty()) {
         cli.insert(QStringLiteral("long"), longSection);
     }
-    if (preferences.pinDensity > 0) {
+    if (preferences.pinDensity > 0 || !preferences.pinHdrHalf) {
         QJsonObject pinSection;
-        pinSection.insert(QStringLiteral("density"), static_cast<double>(preferences.pinDensity));
+        if (preferences.pinDensity > 0) {
+            pinSection.insert(QStringLiteral("density"),
+                              static_cast<double>(preferences.pinDensity));
+        }
+        // Only the *off* state is written, for the reason the notify switches
+        // give below: a key that says "on" says nothing the absent key did not.
+        if (!preferences.pinHdrHalf) {
+            pinSection.insert(QStringLiteral("hdr-half"), false);
+        }
         cli.insert(QStringLiteral("pin"), pinSection);
     }
     // Only the notification's *off* state is written.  Notifications are on

@@ -46,8 +46,13 @@ use crate::error::{Result, VshotError};
 use crate::geometry::Size;
 use crate::model::hdr::{HdrFrame, Primaries, Transfer, REFERENCE_WHITE_NITS};
 
+pub mod ffmpeg_still;
+pub mod jpeg;
+pub mod jxl;
 pub mod params;
 pub mod radiance;
+pub mod scale;
+pub mod webp;
 
 #[cfg(feature = "avif")]
 pub mod avif;
@@ -117,6 +122,17 @@ pub trait HdrCodec: Sync {
     /// The suffix this format's files carry.
     fn extension(&self) -> &'static str;
 
+    /// The other suffixes this format's files are written with, when it has
+    /// more than one.  `extension` alone means the format is spelled one way,
+    /// which is every format here but JPEG: `.jpeg` and `.jpg` are the same
+    /// file, and a dialog that offered only one of them would make the other
+    /// look like a different format.
+    ///
+    /// The first entry is always what [`Self::extension`] returns.
+    fn suffixes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// The name `--hdr-format` and the config file use for it.
     fn name(&self) -> &'static str;
 
@@ -129,14 +145,20 @@ pub trait HdrCodec: Sync {
     /// Encodes `image` in this format.
     fn encode(&self, image: &HdrImage) -> Result<Vec<u8>>;
 
-    /// The same, at the settings the caller asked for.
+    /// The same, at the settings the caller asked for and at the scale the
+    /// file should declare.
     ///
-    /// The default ignores them and encodes at the format's own defaults, which
+    /// The default ignores both and encodes at the format's own defaults, which
     /// is what a codec with no parameters wants and what a codec that has them
     /// overrides.  Having both means a caller that has no settings to pass —
     /// a test, or a path that never grew any — still has a way in.
-    fn encode_with(&self, image: &HdrImage, values: &ParamValues) -> Result<Vec<u8>> {
-        let _ = values;
+    fn encode_with(
+        &self,
+        image: &HdrImage,
+        values: &ParamValues,
+        density: Option<u32>,
+    ) -> Result<Vec<u8>> {
+        let _ = (values, density);
         self.encode(image)
     }
 
@@ -182,6 +204,12 @@ pub fn detect(bytes: &[u8]) -> Option<&'static dyn HdrCodec> {
         #[cfg(feature = "avif")]
         return Some(&avif::Avif);
     }
+    // JPEG XL: a twelve-byte container signature, or a bare codestream, which
+    // is the same two bytes a JPEG XL file's payload starts with.
+    let jxl = bytes.starts_with(b"\0\0\0\x0cJXL \r\n\x87\n") || bytes.starts_with(&[0xff, 0x0a]);
+    if jxl && ffmpeg_still::jxl_available() {
+        return Some(&jxl::Jxl);
+    }
     None
 }
 
@@ -193,6 +221,7 @@ pub fn from_extension(path: &Path) -> Option<&'static dyn HdrCodec> {
         "avif" => Some(&avif::Avif),
         #[cfg(feature = "radiance")]
         "hdr" => Some(&radiance::Radiance),
+        "jxl" if ffmpeg_still::jxl_available() => Some(&jxl::Jxl),
         _ => None,
     }
 }
@@ -204,12 +233,23 @@ fn is_avif_brand(brand: &[u8]) -> bool {
 }
 
 /// The formats this build can read and write, in the order the help lists them.
-// The pushes are feature-gated, which a `vec![]` literal cannot express: an
+// The pushes are conditional, which a `vec![]` literal cannot express: an
 // attribute on an element is not stable.  The clippy lint that wants the macro
 // has no way to see that.
+//
+// The compiled-in codecs are gated on cargo features; the three that run on
+// ffmpeg are gated on the *machine* instead, because a rolling release can ship
+// a libavcodec with `libjxl` left out.  A format that cannot encode and decode
+// is not offered, and its absence costs the user nothing -- the built-in
+// default for each half is one of the formats that is always there.
 #[allow(clippy::vec_init_then_push)]
 pub fn codecs() -> Vec<&'static dyn HdrCodec> {
     let mut found: Vec<&'static dyn HdrCodec> = Vec::new();
+    // JPEG XL first: it is the exact one, and it is what the HDR half defaults
+    // to when this machine can write it.
+    if ffmpeg_still::jxl_available() {
+        found.push(&jxl::Jxl);
+    }
     #[cfg(feature = "avif")]
     found.push(&avif::Avif);
     #[cfg(feature = "radiance")]
@@ -239,6 +279,17 @@ pub trait SdrCodec: Sync {
     /// The suffix this format's files carry.
     fn extension(&self) -> &'static str;
 
+    /// The other suffixes this format's files are written with, when it has
+    /// more than one.  `extension` alone means the format is spelled one way,
+    /// which is every format here but JPEG: `.jpeg` and `.jpg` are the same
+    /// file, and a dialog that offered only one of them would make the other
+    /// look like a different format.
+    ///
+    /// The first entry is always what [`Self::extension`] returns.
+    fn suffixes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// The name `--sdr-format` and the config file use for it.
     fn name(&self) -> &'static str;
 
@@ -263,11 +314,21 @@ pub trait SdrCodec: Sync {
 
 /// The SDR formats this build can read and write, in the order the help lists
 /// them.
-#[allow(clippy::vec_init_then_push)] // the push is feature-gated; see `codecs`
+///
+/// PNG first and always: it is the one a capture is never without, and the
+/// default.  The two ffmpeg ones follow, and appear only when this machine's
+/// libavcodec can do them.
+#[allow(clippy::vec_init_then_push)] // the push is conditional; see `codecs`
 pub fn sdr_codecs() -> Vec<&'static dyn SdrCodec> {
     let mut found: Vec<&'static dyn SdrCodec> = Vec::new();
     #[cfg(feature = "png")]
     found.push(&png::Png);
+    if ffmpeg_still::jpeg_available() {
+        found.push(&jpeg::Jpeg);
+    }
+    if ffmpeg_still::webp_available() {
+        found.push(&webp::Webp);
+    }
     found
 }
 
@@ -300,9 +361,10 @@ pub fn describe_json() -> String {
             out.push(',');
         }
         out.push_str(&format!(
-            "{{\"name\":{},\"extension\":{},\"params\":[",
+            "{{\"name\":{},\"extension\":{},\"suffixes\":{},\"params\":[",
             quote(codec.name()),
-            quote(codec.extension())
+            quote(codec.extension()),
+            suffixes_json(codec.extension(), codec.suffixes())
         ));
         out.push_str(&params_json(codec.specs()));
         out.push_str("]}");
@@ -313,14 +375,34 @@ pub fn describe_json() -> String {
             out.push(',');
         }
         out.push_str(&format!(
-            "{{\"name\":{},\"extension\":{},\"params\":[",
+            "{{\"name\":{},\"extension\":{},\"suffixes\":{},\"params\":[",
             quote(codec.name()),
-            quote(codec.extension())
+            quote(codec.extension()),
+            suffixes_json(codec.extension(), codec.suffixes())
         ));
         out.push_str(&params_json(codec.specs()));
         out.push_str("]}");
     }
     out.push_str("]}");
+    out
+}
+
+/// A codec's suffixes as a JSON array, with `extension` standing in for the
+/// formats that have only the one.
+fn suffixes_json(extension: &str, suffixes: &[&str]) -> String {
+    let list: &[&str] = if suffixes.is_empty() {
+        std::slice::from_ref(&extension)
+    } else {
+        suffixes
+    };
+    let mut out = String::from("[");
+    for (index, suffix) in list.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&quote(suffix));
+    }
+    out.push(']');
     out
 }
 
@@ -459,6 +541,51 @@ mod tests {
                 .map(|codec| codec["name"].as_str().expect("a name"))
                 .collect();
             assert_eq!(listed, built, "the {half} half lists what was compiled in");
+        }
+    }
+
+    /// Every format's suffixes are listed, the plain one first.
+    ///
+    /// The save dialog builds its filter list and renames a file from these, so
+    /// a format that reached it with none -- or with the wrong first entry --
+    /// would offer a name for a file it does not write.
+    #[test]
+    fn every_format_lists_its_suffixes() {
+        let described: serde_json::Value = serde_json::from_str(&describe_json()).unwrap();
+        for half in ["sdr", "hdr"] {
+            for codec in described[half].as_array().unwrap() {
+                let name = codec["name"].as_str().unwrap();
+                let suffixes: Vec<&str> = codec["suffixes"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{name} lists its suffixes"))
+                    .iter()
+                    .map(|suffix| suffix.as_str().expect("a suffix"))
+                    .collect();
+                assert!(!suffixes.is_empty(), "{name} lists at least one suffix");
+                assert_eq!(
+                    suffixes[0],
+                    codec["extension"].as_str().unwrap(),
+                    "{name}'s plain suffix is its extension"
+                );
+            }
+        }
+        // JPEG is the one format spelled two ways, and both of them are there:
+        // a dialog offering `.jpg` alone would read as though `.jpeg` were a
+        // different format.
+        let described: serde_json::Value = serde_json::from_str(&describe_json()).unwrap();
+        let jpeg = described["sdr"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|codec| codec["name"] == "jpeg");
+        if let Some(jpeg) = jpeg {
+            let suffixes: Vec<&str> = jpeg["suffixes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|suffix| suffix.as_str().unwrap())
+                .collect();
+            assert_eq!(suffixes, ["jpg", "jpeg"]);
         }
     }
 

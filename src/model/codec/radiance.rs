@@ -17,6 +17,7 @@
 
 use crate::error::{Result, VshotError};
 use crate::geometry::Size;
+use crate::model::codec::scale::{ScaleMetadata, ScalePlace};
 use crate::model::codec::{HdrCodec, HdrImage};
 use crate::model::hdr::{HdrFrame, Primaries, D65};
 use crate::parallel::collect_rows;
@@ -37,10 +38,75 @@ impl HdrCodec for Radiance {
         Ok(encode(&image.frame, image.white()))
     }
 
+    /// Overridden for the scale: Radiance declares no parameters, so the
+    /// default would drop it, and a `.hdr` written from a 2x capture that says
+    /// nothing about its scale is a file that comes back the wrong size.
+    fn encode_with(
+        &self,
+        image: &HdrImage,
+        _values: &crate::model::codec::ParamValues,
+        density: Option<u32>,
+    ) -> Result<Vec<u8>> {
+        let bytes = encode(&image.frame, image.white());
+        match density {
+            Some(density) => self.with_scale(bytes, density, image.frame.size()),
+            None => Ok(bytes),
+        }
+    }
+
     fn decode(&self, bytes: &[u8], fallback_nits: f32) -> Result<HdrImage> {
         decode(bytes, fallback_nits, "<memory>")
     }
 }
+
+impl ScaleMetadata for Radiance {
+    /// A header line of this program's own, beside the primaries and the
+    /// reference white.  RGBE has no field for a physical resolution, and it
+    /// has no EXIF either, so there is nowhere standard for this to go -- but
+    /// the header is a comment field the format was built to carry, and this
+    /// program already puts two numbers of its own in it.
+    fn scale_place(&self) -> ScalePlace {
+        ScalePlace::Private
+    }
+
+    fn with_scale(&self, mut bytes: Vec<u8>, density: u32, _size: Size) -> Result<Vec<u8>> {
+        // The header ends at the blank line before the resolution line, and
+        // the number goes at the end of it.  A file without that blank line is
+        // not one this encoder wrote, and is left as it is.
+        let Some(at) = bytes.windows(2).position(|window| window == b"\n\n") else {
+            return Ok(bytes);
+        };
+        let line = format!("{SCALE_HEADER}={}\n", density.clamp(1, 4));
+        bytes.splice(at + 1..at + 1, line.into_bytes());
+        Ok(bytes)
+    }
+
+    fn declared_scale(&self, bytes: &[u8]) -> Option<u32> {
+        // The header only: it ends at the first blank line, and the pixels
+        // after it are not text, so the walk stops there rather than trying to
+        // read them.
+        for line in bytes.split(|byte| *byte == b'\n') {
+            let line = std::str::from_utf8(line).ok()?;
+            let line = line.trim_end_matches('\r');
+            if line.is_empty() {
+                return None;
+            }
+            if let Some(value) = line.strip_prefix(&format!("{SCALE_HEADER}=")) {
+                let density: u32 = value.trim().parse().ok()?;
+                return (1..=4).contains(&density).then_some(density);
+            }
+        }
+        None
+    }
+}
+
+/// The header line this program records the scale in.
+///
+/// Prefixed rather than left bare, unlike `PRIMARIES=`: that one is a Radiance
+/// keyword of long standing, while `SCALE=` is a name a picture's own tooling
+/// could plausibly be using for something else.  A name no one else has is the
+/// only kind this can safely be.
+const SCALE_HEADER: &str = "VSHOT_SCALE";
 
 /// Writes `frame` as a Radiance RGBE file whose `1.0` is `reference_nits`.
 ///
@@ -440,6 +506,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The scale is a header line of this program's own, written beside the
+    /// gamut and the white, and the file still decodes around it.
+    #[test]
+    fn the_scale_survives_the_round_trip() {
+        let image = HdrImage::new(
+            frame(
+                Size::new(4, 4),
+                vec![[1.0, 1.0, 1.0, 1.0]; 16],
+                Primaries::Bt709,
+            ),
+            203.0,
+        );
+        let bytes = Radiance
+            .encode_with(&image, &Default::default(), Some(3))
+            .expect("encode");
+        assert_eq!(Radiance.declared_scale(&bytes), Some(3));
+        assert_eq!(Radiance.scale_place(), ScalePlace::Private);
+        // The line is in the header, above the blank line that ends it, and
+        // beside the two numbers already there.
+        let header =
+            std::str::from_utf8(&bytes[..bytes.windows(2).position(|w| w == b"\n\n").unwrap()])
+                .expect("the header is text");
+        assert!(header.contains("REFERENCE_NITS=203.00"), "{header}");
+        assert_eq!(
+            header.lines().next_back(),
+            Some("VSHOT_SCALE=3"),
+            "{header}"
+        );
+        // And it cost the file none of what it already said.
+        let back = Radiance
+            .decode(&bytes, REFERENCE_WHITE_NITS)
+            .expect("decode");
+        assert_eq!(back.frame.size(), image.frame.size());
+        assert!((back.reference_nits - 203.0).abs() < 0.01);
+    }
+
+    /// A file another program wrote declares no scale, and one that says
+    /// something this program would not write is not believed.
+    #[test]
+    fn a_foreign_radiance_file_declares_no_scale() {
+        let image = HdrImage::new(
+            frame(
+                Size::new(2, 2),
+                vec![[1.0, 1.0, 1.0, 1.0]; 4],
+                Primaries::Bt709,
+            ),
+            203.0,
+        );
+        let plain = Radiance.encode(&image).expect("encode");
+        assert_eq!(Radiance.declared_scale(&plain), None);
+        let mut odd = plain.clone();
+        let at = odd.windows(2).position(|w| w == b"\n\n").unwrap();
+        odd.splice(at + 1..at + 1, b"VSHOT_SCALE=9\n".to_vec());
+        assert_eq!(Radiance.declared_scale(&odd), None);
+        let mut spelled = plain.clone();
+        spelled.splice(at + 1..at + 1, b"VSHOT_SCALE=two\n".to_vec());
+        assert_eq!(Radiance.declared_scale(&spelled), None);
     }
 
     #[test]
