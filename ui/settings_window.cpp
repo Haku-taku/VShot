@@ -2302,7 +2302,10 @@ private:
                     "rounds ordinary SDR white a few thousandths over, so with this off a "
                     "handful of rounding pixels can pass a whole desktop off as HDR and dim "
                     "it. Only outputs the compositor describes as HDR are asked at all"),
-               hdrAreaSwitch_, false);
+               // The first row of its card, so no divider above it: `first` is
+               // what says so, and passing false here drew a line along the
+               // card's top edge.
+               hdrAreaSwitch_, true);
 
         hdrAreaRatioSpin_ = new ModernDoubleSpinBox(card);
         hdrAreaRatioSpin_->setObjectName(QStringLiteral("hdrAreaRatio"));

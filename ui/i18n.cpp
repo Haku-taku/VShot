@@ -478,6 +478,23 @@ const QHash<QString, QString> &chineseTable()
          QString::fromUtf8("SDR 白落在整个范围的百分之多少处。剩下的留给比白更亮的光，"
                            "所以档位越低，高光之间分得越开，画面也越暗。"
                            "自动（仅对带高光的截图）和固定会读它")},
+        {QStringLiteral("What a capture of HDR content is written as. Used only where "
+                        "the command line gives nothing: an argument, or an "
+                        "environment variable, always wins over these."),
+         QString::fromUtf8("HDR 内容截图的写法。只在命令行什么都没给时生效："
+                           "参数或环境变量总是盖过这里的设置")},
+        {QStringLiteral("The second file"), QString::fromUtf8("第二个文件")},
+        {QStringLiteral("Reference white"), QString::fromUtf8("参考白")},
+        {QStringLiteral("The light an HDR file's 1.0 stands for, in cd/m², for a file that "
+                        "does not say itself -- one written by another program. A capture "
+                        "always reads the white off the output it came from, and an AVIF "
+                        "this program wrote carries it in the file, so this is only the "
+                        "answer for the files that have no answer of their own. BT.2408's "
+                        "reference white is 203"),
+         QString::fromUtf8("HDR 文件里 1.0 代表的光，单位 cd/m²，用于自己没说明的文件"
+                           "——别的程序写的那些。本程序截的图总是从它所在的输出读出白点，"
+                           "本程序写的 AVIF 也把白点写在文件里，所以这个值只对"
+                           "自己没有答案的文件生效。BT.2408 的参考白是 203")},
         {QStringLiteral("Judge HDR by area"), QString::fromUtf8("按面积判定 HDR")},
         {QStringLiteral("Whether a capture counts as HDR content by how much of it is brighter "
                         "than SDR white rather than by any single pixel. A ten-bit PQ screen "
