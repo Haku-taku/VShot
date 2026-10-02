@@ -185,9 +185,33 @@ pub(crate) fn is_hdr(transfer: Option<Transfer>) -> bool {
     }
 }
 
+/// One pointer event on a pin surface, in global logical pixels.
+///
+/// Queued rather than handed to a callback: the caller that consumes these also
+/// owns the session that produces them, and a callback would have to reach back
+/// into what is already borrowed.  The daemon drains the queue after each wait,
+/// which is also where it decides what the gesture meant.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PinEvent {
+    /// A button went down at `at`, at `time` — the compositor's own timestamp,
+    /// which is what tells a double-click from two clicks.
+    Press { at: Point, time: u32 },
+    /// The pointer moved to `at` with a button down.
+    Motion { at: Point },
+    /// The button came up.
+    Release,
+    /// The wheel turned `notches`, positive away from the user, at `at`.
+    Scroll { notches: i32, at: Point },
+}
+
 #[derive(Debug, Default)]
 struct WaylandState {
     topology: TopologyState,
+    /// Whether the pin surfaces take the pointer, and what it has done so far.
+    /// Empty and false for every other kind of session: an overlay draws, and
+    /// nothing here is its business.
+    pin_input: bool,
+    pin_events: Vec<PinEvent>,
     scene: Option<SceneSnapshot>,
     overlays: HashMap<u32, OverlaySurface>,
     /// Set while the overlays are an HDR backdrop rather than the SDR freeze
@@ -265,6 +289,26 @@ impl WaylandState {
         } else {
             RedrawTarget::ParentSelection
         }
+    }
+
+    /// Where a pointer event on `output_id` landed, in global logical pixels.
+    ///
+    /// A pin surface covers a whole output, so the compositor's surface-local
+    /// coordinates are the output's own; a pin's place in the stack is stated
+    /// globally, and this is where the two meet.
+    fn pin_point(&self, output_id: u32, x: f64, y: f64) -> Option<Point> {
+        let position = self.topology.outputs.get(&output_id)?.logical_position?;
+        Some(Point::new(
+            position.x + x.round() as i32,
+            position.y + y.round() as i32,
+        ))
+    }
+
+    /// The same for the output the pointer is on, which is where the events
+    /// without coordinates of their own -- a button, the wheel -- happen.
+    fn pin_point_of_pointer(&self) -> Option<Point> {
+        let (output_id, x, y) = self.pointer_position?;
+        self.pin_point(output_id, x, y)
     }
 
     fn pointer_motion_output(&self) -> Option<u32> {
@@ -1283,6 +1327,73 @@ impl WaylandSession {
             .collect())
     }
 
+    /// Lets the pin surfaces take the pointer, or stops them.
+    ///
+    /// Off is the right state for every session that is not a pin daemon: an
+    /// overlay draws pictures and answers the pointer through its own path, and
+    /// a pin surface that took events as well would be two answers to one
+    /// click.
+    pub fn set_pin_input(&mut self, on: bool) {
+        self.state.pin_input = on;
+    }
+
+    /// Takes whatever the pointer has done on the pin surfaces since the last
+    /// call, in the order it happened.
+    pub fn take_pin_events(&mut self) -> Vec<PinEvent> {
+        std::mem::take(&mut self.state.pin_events)
+    }
+
+    /// Gives the pin surfaces an input region covering `rects`, in global
+    /// logical pixels.
+    ///
+    /// Not the whole output: a click that lands on no pin has to reach whatever
+    /// is under it, and a surface that took everything would swallow it.  A pin
+    /// straddling two outputs contributes its part to each.
+    pub fn set_pin_input_rects(&mut self, rects: &[Rect]) -> Result<()> {
+        let Some(compositor) = self.state.topology.compositor.clone() else {
+            return Err(VshotError::MissingCapability("wl_compositor".into()));
+        };
+        let qh = self.event_queue.handle();
+        let ids = self
+            .state
+            .pin_surfaces
+            .iter()
+            .copied()
+            .collect::<Vec<u32>>();
+        for id in ids {
+            let Some(position) = self
+                .state
+                .topology
+                .outputs
+                .get(&id)
+                .and_then(|output| output.logical_position)
+            else {
+                continue;
+            };
+            let region = compositor.create_region(&qh, ());
+            for rect in rects {
+                // The surface's own coordinates: it covers the output, and the
+                // pins are stated in the desktop's.
+                let width = i32::try_from(rect.size.width).unwrap_or(i32::MAX);
+                let height = i32::try_from(rect.size.height).unwrap_or(i32::MAX);
+                region.add(
+                    rect.origin.x - position.x,
+                    rect.origin.y - position.y,
+                    width,
+                    height,
+                );
+            }
+            if let Some(overlay) = self.state.overlays.get(&id) {
+                overlay.surface.set_input_region(Some(&region));
+                overlay.surface.commit();
+            }
+            region.destroy();
+        }
+        self.event_queue
+            .flush()
+            .map_err(|error| VshotError::WaylandProtocol(error.to_string()))
+    }
+
     /// Commits one picture buffer of `name`'s pin surface having changed only
     /// `damage` of it, in device pixels.  `false` means that slot was still with
     /// the compositor; the caller keeps what it wanted to show and offers it
@@ -2144,6 +2255,14 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                     return;
                 };
                 state.pointer_position = Some((output_id, surface_x, surface_y));
+                if state.pin_input {
+                    // Recorded above first: the button and the wheel carry no
+                    // coordinates of their own and are placed by this one.
+                    if let Some(at) = state.pin_point(output_id, surface_x, surface_y) {
+                        state.pin_events.push(PinEvent::Motion { at });
+                    }
+                    return;
+                }
                 let event = SelectionEvent::PointerMoved {
                     output_id,
                     local_x: surface_x,
@@ -2170,6 +2289,21 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 if button == BTN_LEFT && pressed {
                     state.pointer_grab_output = state.pointer_output;
                 }
+                if state.pin_input {
+                    // Only the left button and the wheel are a pin's business:
+                    // anything else belongs to whatever the pin is covering.
+                    if button == BTN_LEFT {
+                        let at = state.pin_point_of_pointer();
+                        match (pressed, at) {
+                            (true, Some(at)) => {
+                                state.pin_events.push(PinEvent::Press { at, time });
+                            }
+                            (false, _) => state.pin_events.push(PinEvent::Release),
+                            (true, None) => {}
+                        }
+                    }
+                    return;
+                }
                 let event = SelectionEvent::ButtonWithTimestamp {
                     button,
                     pressed,
@@ -2195,6 +2329,27 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
             } => state.fail(VshotError::WaylandProtocol(format!(
                 "unknown wl_pointer button state value {value}"
             ))),
+            wl_pointer::Event::Axis {
+                axis: WEnum::Value(axis),
+                value,
+                ..
+            } if state.pin_input => {
+                if axis == wl_pointer::Axis::VerticalScroll {
+                    let notches = (value / 10.0).round() as i32;
+                    let notches = if notches == 0 && value != 0.0 {
+                        if value > 0.0 {
+                            1
+                        } else {
+                            -1
+                        }
+                    } else {
+                        notches
+                    };
+                    if let Some(at) = state.pin_point_of_pointer() {
+                        state.pin_events.push(PinEvent::Scroll { notches, at });
+                    }
+                }
+            }
             _ => {}
         }
     }

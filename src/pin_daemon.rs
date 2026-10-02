@@ -29,12 +29,12 @@ use std::io::{BufRead, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
 use crate::error::{Result, VshotError};
-use crate::geometry::{Point, Size};
+use crate::geometry::{Point, Rect, Size};
 use crate::model::picture::{self, Picture};
 use crate::pin::PinCommand;
 use crate::pin_hdr::{Pin, Surfaces};
@@ -74,11 +74,203 @@ impl Pinned {
     }
 }
 
-/// The daemon: the pins, and what is showing them.
-struct Daemon {
+/// How long two presses on one pin have to be apart to be one gesture rather
+/// than two.  Qt's own double-click interval, so the two daemons feel alike.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
+/// How much one wheel notch scales a pin by.  Multiplicative rather than
+/// additive, so a notch feels the same at any size.
+const ZOOM_PER_NOTCH: f64 = 1.1;
+
+/// The range a pin may be zoomed to, on the same reasoning as the Qt daemon's:
+/// below a tenth a pin is a speck, and above eight times a screenshot is a
+/// handful of pixels filling a screen.
+const MIN_SCALE: f64 = 0.1;
+const MAX_SCALE: f64 = 8.0;
+
+/// What the pointer is doing with the stack.
+///
+/// Which pin a point lands on, what a press starts, and when a second press is
+/// a double-click: all of it is decisions, so all of it is here rather than in
+/// the Wayland plumbing that feeds it.
+#[derive(Debug, Default)]
+struct Pointer {
+    /// The pin being dragged, where the pointer was when it started and where
+    /// the pin was then.
+    drag: Option<(u64, Point, Point)>,
+    /// The pin the pointer last pressed, and when, for telling a double-click
+    /// from two clicks on the same pin.
+    pressed: Option<(u64, Instant)>,
+}
+
+/// What a gesture changed, so the daemon knows what to do about it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Change {
+    /// The stack is not what is on screen any more.
+    redraw: bool,
+    /// A pin went away.
+    closed: bool,
+}
+
+/// The pins, back to front, with the pointer's business with them.
+///
+/// Separated from the daemon because everything about what a gesture *means*
+/// lives here and nothing about Wayland does, which is what lets it be tested
+/// without a compositor.  The order is the paint order: the last entry is
+/// drawn last, so it is the frontmost, and it is the one a point lands on when
+/// two pins overlap.
+struct Stack {
     pins: Vec<Pinned>,
     next_id: u64,
     all_visible: bool,
+    pointer: Pointer,
+}
+
+impl Stack {
+    fn new() -> Self {
+        Self {
+            pins: Vec::new(),
+            next_id: 1,
+            all_visible: true,
+            pointer: Pointer::default(),
+        }
+    }
+
+    /// A pin's rectangle in global logical pixels.
+    fn rect_of(pin: &Pinned) -> Rect {
+        let size = pin.picture.size();
+        Rect::new(
+            pin.origin.x,
+            pin.origin.y,
+            (f64::from(size.width) * pin.scale).round().max(1.0) as u32,
+            (f64::from(size.height) * pin.scale).round().max(1.0) as u32,
+        )
+    }
+
+    /// The index of the frontmost pin containing `point`.
+    fn index_at(&self, point: Point) -> Option<usize> {
+        self.pins
+            .iter()
+            .rposition(|pin| Self::rect_of(pin).contains(point))
+    }
+
+    /// A press at `point`.  Brings the pin under it to the front and starts
+    /// dragging it; a second press on the same pin within the double-click
+    /// interval closes it instead.
+    fn press(&mut self, point: Point, now: Instant) -> Change {
+        let Some(index) = self.index_at(point) else {
+            // A press on the desktop is not this stack's business.
+            self.pointer.pressed = None;
+            return Change::default();
+        };
+        let id = self.pins[index].id;
+        // Raised before any test on it: a click that closes a pin still brings
+        // it to the front on the way, which is what the user sees happen.
+        let index = self.raise(index);
+        let double = self
+            .pointer
+            .pressed
+            .is_some_and(|(last, at)| last == id && now.duration_since(at) <= DOUBLE_CLICK);
+        if double {
+            self.pointer.pressed = None;
+            self.pointer.drag = None;
+            self.pins.remove(index);
+            return Change {
+                redraw: true,
+                closed: true,
+            };
+        }
+        self.pointer.pressed = Some((id, now));
+        self.pointer.drag = Some((id, point, self.pins[index].origin));
+        Change {
+            redraw: true,
+            closed: false,
+        }
+    }
+
+    /// The pointer moved to `point` with a button down.
+    fn motion(&mut self, point: Point) -> Change {
+        let Some((id, from, origin)) = self.pointer.drag else {
+            return Change::default();
+        };
+        let Some(pin) = self.pins.iter_mut().find(|pin| pin.id == id) else {
+            self.pointer.drag = None;
+            return Change::default();
+        };
+        let moved = Point::new(origin.x + (point.x - from.x), origin.y + (point.y - from.y));
+        if pin.origin == moved {
+            return Change::default();
+        }
+        pin.origin = moved;
+        Change {
+            redraw: true,
+            closed: false,
+        }
+    }
+
+    /// The button came up.  A drag ends here; a press that never moved leaves
+    /// the pin where it was and keeps its place in the stack.
+    fn release(&mut self) -> Change {
+        self.pointer.drag = None;
+        Change::default()
+    }
+
+    /// The wheel turned `notches` at `at`, positive away from the user.  The
+    /// pin under it is scaled about its own centre, so it grows where the user
+    /// is looking rather than towards a corner.
+    fn scroll(&mut self, notches: i32, at: Point) -> Change {
+        if notches == 0 {
+            return Change::default();
+        }
+        let Some(index) = self.index_at(at) else {
+            return Change::default();
+        };
+        let factor = ZOOM_PER_NOTCH.powi(notches);
+        let pin = &mut self.pins[index];
+        let next = (pin.scale * factor).clamp(MIN_SCALE, MAX_SCALE);
+        if next == pin.scale {
+            return Change::default();
+        }
+        // The centre is what stays put: the pin is resized about it, so the
+        // point under the cursor is the point the user aimed at.
+        let before = Self::rect_of(pin);
+        let centre = Point::new(
+            before.origin.x + before.size.width as i32 / 2,
+            before.origin.y + before.size.height as i32 / 2,
+        );
+        pin.scale = next;
+        let after = Self::rect_of(pin);
+        pin.origin = Point::new(
+            centre.x - after.size.width as i32 / 2,
+            centre.y - after.size.height as i32 / 2,
+        );
+        Change {
+            redraw: true,
+            closed: false,
+        }
+    }
+
+    /// Moves the pin at `index` to the front, answering where it ended up.
+    fn raise(&mut self, index: usize) -> usize {
+        if index + 1 == self.pins.len() {
+            return index;
+        }
+        let pin = self.pins.remove(index);
+        self.pins.push(pin);
+        self.pins.len() - 1
+    }
+
+    fn set_visible(&mut self, visible: bool) {
+        self.all_visible = visible;
+        for pin in &mut self.pins {
+            pin.visible = visible;
+        }
+    }
+}
+
+/// The daemon: the pins, and what is showing them.
+struct Daemon {
+    stack: Stack,
     surfaces: Surfaces,
 }
 
@@ -87,9 +279,7 @@ impl Daemon {
         let mut surfaces = Surfaces::new()?;
         surfaces.start()?;
         Ok(Self {
-            pins: Vec::new(),
-            next_id: 1,
-            all_visible: true,
+            stack: Stack::new(),
             surfaces,
         })
     }
@@ -100,6 +290,7 @@ impl Daemon {
     /// frontmost, which is what a pin just made should be.
     fn refresh(&mut self) -> Result<()> {
         let stack = self
+            .stack
             .pins
             .iter()
             .map(|pin| (pin.id, pin.render_pin()))
@@ -107,6 +298,7 @@ impl Daemon {
         let debug = std::env::var_os("VSHOT_PIN_DEBUG").is_some();
         if debug {
             let names = self
+                .stack
                 .pins
                 .iter()
                 .map(|pin| {
@@ -119,12 +311,61 @@ impl Daemon {
                 })
                 .collect::<Vec<String>>()
                 .join(" ");
-            eprintln!("vshot-pin: {} pin(s): {names}", self.pins.len());
+            eprintln!("vshot-pin: {} pin(s): {names}", self.stack.pins.len());
         }
         // No style: the one this side read from the config when it came up is
         // the one to draw with, and re-reading the file on every move would
         // make the look change under a drag.
-        self.surfaces.set_pins(stack, None, debug)
+        self.surfaces.set_pins(stack, None, debug)?;
+        // And the pointer reaches exactly the pins, so a click on the desktop
+        // goes to what the pin is covering rather than being swallowed here.
+        let rects = self
+            .stack
+            .pins
+            .iter()
+            .filter(|pin| pin.visible)
+            .map(|pin| Stack::rect_of(pin))
+            .collect::<Vec<Rect>>();
+        self.surfaces.set_input_rects(&rects)
+    }
+
+    /// Applies whatever the pointer did, drawing once at the end.
+    ///
+    /// The compositor's own timestamps are not carried through: `Press` keeps
+    /// only the order, and "when" is taken here, which is microseconds after
+    /// the event was read.  Nothing else in the stack is timed.
+    fn gestures(&mut self) -> Result<()> {
+        let events = self.surfaces.take_events();
+        if events.is_empty() {
+            return Ok(());
+        }
+        let count = events.len();
+        let now = Instant::now();
+        let mut changed = Change::default();
+        for event in events {
+            let change = match event {
+                crate::wayland::PinEvent::Press { at, .. } => self.stack.press(at, now),
+                crate::wayland::PinEvent::Motion { at } => self.stack.motion(at),
+                crate::wayland::PinEvent::Release => self.stack.release(),
+                crate::wayland::PinEvent::Scroll { notches, at } => self.stack.scroll(notches, at),
+            };
+            changed.redraw |= change.redraw;
+            changed.closed |= change.closed;
+        }
+        if std::env::var_os("VSHOT_PIN_DEBUG").is_some() {
+            eprintln!(
+                "vshot-pin: {count} gesture(s), {}",
+                if changed.redraw {
+                    "redrawn"
+                } else {
+                    "nothing moved"
+                }
+            );
+        }
+        if changed.redraw {
+            self.refresh()?;
+        }
+        Ok(())
     }
 
     /// Answers one request, or says why not.
@@ -145,7 +386,7 @@ impl Daemon {
                 ack: _,
             } => self.add(&path, density, output_name.as_deref(), at),
             PinCommand::Move { id, x, y, .. } => {
-                let Some(pin) = self.pins.iter_mut().find(|pin| pin.id == id) else {
+                let Some(pin) = self.stack.pins.iter_mut().find(|pin| pin.id == id) else {
                     return Err(VshotError::Pin(format!(
                         "move names a pin that is not pinned"
                     )));
@@ -155,29 +396,30 @@ impl Daemon {
                 Ok(json!({"ok": true}))
             }
             PinCommand::Toggle => {
-                self.all_visible = !self.all_visible;
-                self.apply_visibility();
+                let visible = !self.stack.all_visible;
+                self.stack.set_visible(visible);
+                self.refresh()?;
                 Ok(json!({"ok": true}))
             }
             PinCommand::Show => {
-                self.all_visible = true;
-                self.apply_visibility();
+                self.stack.set_visible(true);
+                self.refresh()?;
                 Ok(json!({"ok": true}))
             }
             PinCommand::Hide => {
-                self.all_visible = false;
-                self.apply_visibility();
+                self.stack.set_visible(false);
+                self.refresh()?;
                 Ok(json!({"ok": true}))
             }
             PinCommand::Close => {
-                self.pins.clear();
+                self.stack.pins.clear();
                 self.refresh()?;
                 Ok(json!({"ok": true}))
             }
             PinCommand::List => Ok(json!({
                 "ok": true,
-                "count": self.pins.len(),
-                "visible": self.all_visible,
+                "count": self.stack.pins.len(),
+                "visible": self.stack.all_visible,
             })),
             // Answered by the caller, which is the loop that has to stop.
             PinCommand::Quit => Ok(json!({"ok": true})),
@@ -216,15 +458,16 @@ impl Daemon {
             Some(point) => Point::new(point.x, point.y),
             None => self.centred(size, scale, output_name),
         };
-        let id = self.next_id;
-        self.next_id += 1;
-        self.pins.push(Pinned {
+        let id = self.stack.next_id;
+        self.stack.next_id += 1;
+        let visible = self.stack.all_visible;
+        self.stack.pins.push(Pinned {
             id,
             picture,
             path: path.to_path_buf(),
             origin,
             scale,
-            visible: self.all_visible,
+            visible,
         });
         self.refresh()?;
         Ok(json!({"ok": true, "id": id}))
@@ -243,12 +486,6 @@ impl Daemon {
             rect.origin.y + (rect.size.height as i32 - height) / 2,
         )
     }
-
-    fn apply_visibility(&mut self) {
-        for pin in &mut self.pins {
-            pin.visible = self.all_visible;
-        }
-    }
 }
 
 /// Runs the daemon until it is told to stop.
@@ -261,6 +498,7 @@ pub fn run(socket: &Path) -> Result<()> {
     })?;
     let debug = std::env::var_os("VSHOT_PIN_DEBUG").is_some();
     let mut daemon = Daemon::new()?;
+    daemon.surfaces.set_pin_input(true);
     if debug {
         eprintln!(
             "vshot-pin: listening on `{}` with {} picture surface(s)",
@@ -278,6 +516,9 @@ pub fn run(socket: &Path) -> Result<()> {
             .try_clone_to_owned()
             .map_err(|source| VshotError::Pin(format!("cannot watch the pin socket: {source}")))?;
         daemon.surfaces.wait_on(Some(wake.as_fd()))?;
+        // Whatever the compositor had queued, before anything else looks at the
+        // stack: a drag is a stream of these, and each one is a repaint.
+        daemon.gestures()?;
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
@@ -370,6 +611,180 @@ mod tests {
         };
         assert_eq!(path, PathBuf::from("/tmp/shot.png"));
         assert_eq!(density, Some(2));
+    }
+
+    // --- what a gesture means ---------------------------------------------
+
+    /// A stack of `count` pins, each 100x50 at 1:1, laid out in a row so that
+    /// they do not overlap unless a test makes them.
+    fn stack_of(count: usize) -> Stack {
+        let mut stack = Stack::new();
+        for index in 0..count {
+            let id = stack.next_id;
+            stack.next_id += 1;
+            stack.pins.push(Pinned {
+                id,
+                picture: Picture::Sdr(
+                    crate::model::Frame::solid(Size::new(100, 50), [10, 20, 30, 255])
+                        .expect("frame"),
+                ),
+                path: PathBuf::from("(none)"),
+                origin: Point::new(index as i32 * 200, 0),
+                scale: 1.0,
+                visible: true,
+            });
+        }
+        stack
+    }
+
+    fn ids(stack: &Stack) -> Vec<u64> {
+        stack.pins.iter().map(|pin| pin.id).collect()
+    }
+
+    /// A press brings the pin under it to the front, because that is the pin
+    /// the user is now working with.
+    #[test]
+    fn a_press_raises_the_pin_under_it() {
+        let mut stack = stack_of(3);
+        let start = Instant::now();
+        let change = stack.press(Point::new(10, 10), start);
+        assert!(change.redraw);
+        assert_eq!(ids(&stack), vec![2, 3, 1]);
+    }
+
+    /// A press on the desktop is not the stack's business, and must not
+    /// disturb the order.
+    #[test]
+    fn a_press_on_nothing_changes_nothing() {
+        let mut stack = stack_of(2);
+        let change = stack.press(Point::new(5000, 5000), Instant::now());
+        assert_eq!(change, Change::default());
+        assert_eq!(ids(&stack), vec![1, 2]);
+    }
+
+    /// Dragging moves the pin by the pointer's own delta, so the part of the
+    /// picture the user grabbed stays under the cursor.
+    #[test]
+    fn a_drag_moves_the_pin_by_the_pointer_delta() {
+        let mut stack = stack_of(1);
+        let start = Instant::now();
+        stack.press(Point::new(10, 10), start);
+        let change = stack.motion(Point::new(40, 25));
+        assert!(change.redraw);
+        assert_eq!(stack.pins[0].origin, Point::new(30, 15));
+        // And a motion that lands where it already was is not a repaint.
+        assert_eq!(stack.motion(Point::new(40, 25)), Change::default());
+        stack.release();
+        // A motion with the button up does nothing at all.
+        assert_eq!(stack.motion(Point::new(90, 90)), Change::default());
+        assert_eq!(stack.pins[0].origin, Point::new(30, 15));
+    }
+
+    /// Two presses on one pin inside the double-click interval are one gesture
+    /// and close it; two presses further apart are two clicks and close
+    /// nothing.
+    #[test]
+    fn a_second_press_in_time_closes_the_pin() {
+        let mut stack = stack_of(2);
+        let start = Instant::now();
+        stack.press(Point::new(10, 10), start);
+        stack.release();
+        let change = stack.press(Point::new(10, 10), start + Duration::from_millis(100));
+        assert_eq!(
+            change,
+            Change {
+                redraw: true,
+                closed: true
+            }
+        );
+        assert_eq!(ids(&stack), vec![2]);
+
+        // Slow enough to be two clicks, and the pin stays.
+        let mut stack = stack_of(1);
+        stack.press(Point::new(10, 10), start);
+        stack.release();
+        let change = stack.press(Point::new(10, 10), start + DOUBLE_CLICK * 2);
+        assert!(!change.closed);
+        assert_eq!(ids(&stack), vec![1]);
+    }
+
+    /// A press on one pin followed by a press on another is not a double-click,
+    /// however fast it was.
+    #[test]
+    fn a_double_click_is_two_presses_on_the_same_pin() {
+        let mut stack = stack_of(2);
+        let start = Instant::now();
+        stack.press(Point::new(10, 10), start);
+        stack.release();
+        let change = stack.press(Point::new(210, 10), start + Duration::from_millis(50));
+        assert!(!change.closed);
+        assert_eq!(ids(&stack).len(), 2);
+    }
+
+    /// A point where two pins overlap belongs to the front one, which is the
+    /// last drawn.
+    #[test]
+    fn the_frontmost_pin_is_the_one_a_point_lands_on() {
+        let mut stack = stack_of(2);
+        stack.pins[1].origin = Point::new(50, 0);
+        // (60, 10) is inside both; the front one is pin 2.
+        assert_eq!(stack.index_at(Point::new(60, 10)), Some(1));
+        let end = stack.press(Point::new(60, 10), Instant::now());
+        assert!(end.redraw);
+        // It was already in front, so the order is unchanged and it is the one
+        // that would drag.
+        assert_eq!(ids(&stack), vec![1, 2]);
+    }
+
+    /// The wheel scales the pin under it by a tenth a notch, about the pin's
+    /// own centre, and stops at the ends of the range.
+    #[test]
+    fn the_wheel_scales_about_the_pins_centre() {
+        let mut stack = stack_of(1);
+        stack.pins[0].origin = Point::new(0, 0);
+        let change = stack.scroll(1, Point::new(50, 25));
+        assert!(change.redraw);
+        assert!((stack.pins[0].scale - ZOOM_PER_NOTCH).abs() < 1e-9);
+        // 100x50 about its centre (50, 25) at 1.1 is 110x55, so the top-left
+        // moves back by five and two and a half.
+        assert_eq!(stack.pins[0].origin, Point::new(-5, -2));
+
+        // One notch back and it is where it started.
+        stack.scroll(-1, Point::new(50, 25));
+        assert!((stack.pins[0].scale - 1.0).abs() < 1e-9);
+
+        // The ends of the range hold.
+        for _ in 0..200 {
+            stack.scroll(1, Point::new(50, 25));
+        }
+        assert_eq!(stack.pins[0].scale, MAX_SCALE);
+        for _ in 0..300 {
+            stack.scroll(-1, Point::new(50, 25));
+        }
+        assert_eq!(stack.pins[0].scale, MIN_SCALE);
+    }
+
+    /// The wheel over nothing, and a wheel that lands on a pin already at the
+    /// end of its range, are both nothing to repaint.
+    #[test]
+    fn a_wheel_that_changes_nothing_is_not_a_repaint() {
+        let mut stack = stack_of(1);
+        assert_eq!(stack.scroll(1, Point::new(5000, 5000)), Change::default());
+        assert_eq!(stack.scroll(0, Point::new(10, 10)), Change::default());
+        stack.pins[0].scale = MAX_SCALE;
+        assert_eq!(stack.scroll(1, Point::new(10, 10)), Change::default());
+    }
+
+    /// Hiding and showing is the whole stack at once, which is what the CLI's
+    /// three commands mean.
+    #[test]
+    fn the_stack_is_hidden_and_shown_together() {
+        let mut stack = stack_of(3);
+        stack.set_visible(false);
+        assert!(!stack.all_visible);
+        assert!(stack.pins.iter().all(|pin| !pin.visible));
+        stack.set_visible(true);
+        assert!(stack.pins.iter().all(|pin| pin.visible));
     }
 
     /// A request this daemon cannot serve is refused with a reason rather than

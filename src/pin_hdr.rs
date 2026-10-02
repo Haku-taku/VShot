@@ -954,6 +954,22 @@ impl Surfaces {
         self.session.pump_watching(fd, None)
     }
 
+    /// Lets the pin surfaces take the pointer, or stops them.
+    pub(crate) fn set_pin_input(&mut self, on: bool) {
+        self.session.set_pin_input(on);
+    }
+
+    /// What the pointer has done on the pin surfaces since the last call.
+    pub(crate) fn take_events(&mut self) -> Vec<crate::wayland::PinEvent> {
+        self.session.take_pin_events()
+    }
+
+    /// Says which parts of which outputs are pins, so a click anywhere else
+    /// goes to whatever the pin is covering.
+    pub(crate) fn set_input_rects(&mut self, rects: &[Rect]) -> Result<()> {
+        self.session.set_pin_input_rects(rects)
+    }
+
     /// The geometry of the output a new pin should land on: the one the caller
     /// named, or the first output there is.  `None` when this side has no
     /// output at all, which is a session with nothing to pin onto.
