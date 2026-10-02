@@ -7,7 +7,13 @@
 
 #include <LayerShellQt/Window>
 
+#include <QFontDatabase>
 #include <QGuiApplication>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QKeyEvent>
+#include <QLocalSocket>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
 #include <QRegion>
@@ -16,6 +22,13 @@
 
 namespace vshot {
 namespace {
+
+// The right-click menu, in logical pixels.  The same numbers the pin surface's
+// own menu uses, so a menu drawn here and one drawn there are the same menu.
+constexpr int kMenuRowPaddingY = 5;
+constexpr int kMenuPaddingX = 10;
+constexpr qreal kMenuRadius = 6.0;
+constexpr int kMenuCursorGap = 4;
 
 /// How long a badge stays up.  The same as the surface's own, so a zoom step
 /// reported here and a copy reported there read alike.
@@ -50,6 +63,21 @@ void paintLabel(QPainter &painter, const QRect &box, const QString &text, const 
     painter.drawRoundedRect(QRectF(box).adjusted(0.5, 0.5, -0.5, -0.5), kLabelRadius, kLabelRadius);
     painter.setPen(ink);
     painter.drawText(box, Qt::AlignCenter, text);
+    painter.restore();
+}
+
+/// One menu row drawn: its text, left-aligned, in the font the labels use.
+void paintMenuRow(QPainter &painter, const QRect &box, const QString &text, bool hovered)
+{
+    painter.save();
+    if (hovered) {
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(255, 255, 255, 40));
+        painter.drawRoundedRect(box, kMenuRadius, kMenuRadius);
+    }
+    painter.setPen(Qt::white);
+    painter.drawText(box.adjusted(kMenuPaddingX, 0, -kMenuPaddingX, 0),
+                     Qt::AlignLeft | Qt::AlignVCenter, text);
     painter.restore();
 }
 
@@ -146,6 +174,179 @@ void PinChrome::showBadge(quint64 id, const QString &text)
     update();
 }
 
+void PinChrome::setMenu(quint64 id, const QPoint &anchor, const QStringList &rows)
+{
+    menuId_ = id;
+    menuRows_ = rows;
+    menuHover_ = -1;
+    const QPoint origin = screen_ != nullptr ? screen_->geometry().topLeft() : QPoint(0, 0);
+    menuRect_ = menuRectFor(anchor - origin, rows);
+    if (menuRect_.isEmpty()) {
+        // Nothing fits on this output: leaving menuId_ set would put this
+        // surface into a state no click could leave.
+        dismissMenu();
+        return;
+    }
+    // The keyboard, so Esc reaches the menu -- and so the pointer leaving the
+    // surface does not take the menu with it.
+    applyKeyboard();
+    update();
+}
+
+QRect PinChrome::menuRectFor(const QPoint &anchor, const QStringList &rows) const
+{
+    const QFontMetrics metrics(tagFont());
+    int width = 0;
+    for (const QString &row : rows) {
+        width = std::max(width, metrics.horizontalAdvance(row));
+    }
+    const int rowHeight = metrics.height() + 2 * kMenuRowPaddingY;
+    const QSize box(width + 2 * kMenuPaddingX, rowHeight * static_cast<int>(rows.size()));
+    // Down and right of the pointer, the way a menu opens; flipped when that
+    // would run off the output, and clamped so a menu at the very edge is still
+    // usable.
+    QRect rect(anchor + QPoint(kMenuCursorGap, kMenuCursorGap), box);
+    if (rect.right() > this->rect().right()) {
+        rect.moveLeft(anchor.x() - kMenuCursorGap - box.width());
+    }
+    if (rect.bottom() > this->rect().bottom()) {
+        rect.moveTop(anchor.y() - kMenuCursorGap - box.height());
+    }
+    rect = rect.intersected(this->rect());
+    return rect.width() > 0 && rect.height() > 0 ? rect : QRect();
+}
+
+int PinChrome::menuRowAt(const QPoint &local) const
+{
+    if (menuId_ == 0 || !menuRect_.contains(local) || menuRows_.isEmpty()) {
+        return -1;
+    }
+    const QFontMetrics metrics(tagFont());
+    const int rowHeight = metrics.height() + 2 * kMenuRowPaddingY;
+    const int row = (local.y() - menuRect_.top()) / rowHeight;
+    return row >= 0 && row < menuRows_.size() ? row : -1;
+}
+
+void PinChrome::chooseRow(int row)
+{
+    if (menuId_ == 0 || row < 0) {
+        return;
+    }
+    if (socket_ != nullptr && socket_->state() == QLocalSocket::ConnectedState) {
+        QJsonObject message;
+        message.insert(QStringLiteral("cmd"), QStringLiteral("chosen"));
+        message.insert(QStringLiteral("row"), row);
+        QByteArray line = QJsonDocument(message).toJson(QJsonDocument::Compact);
+        line.append('\n');
+        socket_->write(line);
+        socket_->flush();
+    }
+    menuId_ = 0;
+    menuRows_.clear();
+    menuRect_ = QRect();
+    applyKeyboard();
+    update();
+}
+
+void PinChrome::dismissMenu()
+{
+    if (menuId_ == 0) {
+        return;
+    }
+    if (socket_ != nullptr && socket_->state() == QLocalSocket::ConnectedState) {
+        QJsonObject message;
+        message.insert(QStringLiteral("cmd"), QStringLiteral("dismissed"));
+        QByteArray line = QJsonDocument(message).toJson(QJsonDocument::Compact);
+        line.append('\n');
+        socket_->write(line);
+        socket_->flush();
+    }
+    menuId_ = 0;
+    menuRows_.clear();
+    menuRect_ = QRect();
+    applyKeyboard();
+    update();
+}
+
+void PinChrome::mousePressEvent(QMouseEvent *event)
+{
+    if (menuId_ == 0) {
+        event->ignore();
+        return;
+    }
+    const int row = menuRowAt(event->position().toPoint());
+    if (row < 0) {
+        // A click outside the menu closes it, the way it does everywhere.
+        dismissMenu();
+    } else {
+        chooseRow(row);
+    }
+    event->accept();
+}
+
+void PinChrome::mouseMoveEvent(QMouseEvent *event)
+{
+    if (menuId_ == 0) {
+        event->ignore();
+        return;
+    }
+    const int row = menuRowAt(event->position().toPoint());
+    if (row != menuHover_) {
+        menuHover_ = row;
+        update();
+    }
+    event->accept();
+}
+
+void PinChrome::keyPressEvent(QKeyEvent *event)
+{
+    if (menuId_ == 0) {
+        event->ignore();
+        return;
+    }
+    switch (event->key()) {
+    case Qt::Key_Escape:
+        dismissMenu();
+        event->accept();
+        return;
+    case Qt::Key_Down:
+    case Qt::Key_Up: {
+        const int step = event->key() == Qt::Key_Down ? 1 : -1;
+        const int count = menuRows_.size();
+        const int from = menuHover_ < 0 ? (step > 0 ? -1 : 0) : menuHover_;
+        menuHover_ = (from + step + count) % count;
+        update();
+        event->accept();
+        return;
+    }
+    case Qt::Key_Return:
+    case Qt::Key_Enter:
+        if (menuHover_ >= 0) {
+            chooseRow(menuHover_);
+        }
+        event->accept();
+        return;
+    default:
+        break;
+    }
+    event->ignore();
+}
+
+void PinChrome::applyKeyboard()
+{
+    if (layer_ == nullptr) {
+        return;
+    }
+    // On demand while a menu is up and none otherwise: the surface below holds
+    // the pointer, and taking the keyboard at all costs it its focus.
+    layer_->setKeyboardInteractivity(menuId_ != 0
+                                         ? LayerShellQt::Window::KeyboardInteractivityOnDemand
+                                         : LayerShellQt::Window::KeyboardInteractivityNone);
+    if (menuId_ != 0) {
+        setFocus(Qt::MouseFocusReason);
+    }
+}
+
 void PinChrome::setPinnedVisible(bool visible)
 {
     visible_ = visible;
@@ -170,6 +371,26 @@ void PinChrome::paintEvent(QPaintEvent *event)
         return;
     }
     painter.setFont(tagFont());
+    if (menuId_ != 0 && !menuRect_.isEmpty()) {
+        // The menu, above every label: it is the thing the user is looking at.
+        painter.save();
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(kLabelBox);
+        painter.drawRoundedRect(menuRect_, kMenuRadius, kMenuRadius);
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(QPen(QColor(255, 255, 255, 90), 1));
+        painter.drawRoundedRect(QRectF(menuRect_).adjusted(0.5, 0.5, -0.5, -0.5), kMenuRadius,
+                                kMenuRadius);
+        const QFontMetrics metrics(tagFont());
+        const int rowHeight = metrics.height() + 2 * kMenuRowPaddingY;
+        for (int row = 0; row < menuRows_.size(); ++row) {
+            const QRect box(menuRect_.left(), menuRect_.top() + row * rowHeight,
+                            menuRect_.width(), rowHeight);
+            paintMenuRow(painter, box, menuRows_.at(row), row == menuHover_);
+        }
+        painter.restore();
+    }
     const QPoint origin = screen_ != nullptr ? screen_->geometry().topLeft() : QPoint(0, 0);
     for (Entry &entry : entries_) {
         const QRect target(entry.label.origin - origin, entry.label.size);

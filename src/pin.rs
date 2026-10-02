@@ -839,20 +839,19 @@ fn keep_daemon_stderr() -> bool {
 
 /// Starts the resident daemon detached: no pipes are inherited, so the CLI
 /// returns immediately while the surfaces live on.
-/// Whether the daemon being rewritten is the one to run.
+/// Whether the daemon that draws the pins itself is the one to run.
 ///
-/// Opt-in while both exist: a session that sets nothing keeps the daemon it has
-/// always had, and the differences between them -- which file a pin is given,
-/// and whether it is told about an HDR half at all -- hang off this one answer
-/// rather than off a guess.
+/// It is the one that runs.  `VSHOT_PIN_DAEMON=qt` asks for the Qt daemon
+/// instead, which exists only while the two do: it cannot read the formats a
+/// capture writes an HDR half in, so on it a pin is a pair of files rather than
+/// one picture, and the escape hatch is there for a session where the new
+/// daemon will not come up.
 fn rust_daemon() -> bool {
-    std::env::var_os("VSHOT_PIN_DAEMON").as_deref() == Some(std::ffi::OsStr::new("rust"))
+    std::env::var_os("VSHOT_PIN_DAEMON").as_deref() != Some(std::ffi::OsStr::new("qt"))
 }
 
 fn spawn_daemon() -> Result<()> {
-    // The daemon that is being rewritten: this same binary, holding the pins
-    // and drawing them itself.  Opt-in while the two exist side by side, so a
-    // session that sets nothing keeps the daemon it has always had.
+    // The daemon: this same binary, holding the pins and drawing them itself.
     if rust_daemon() {
         let program = std::env::current_exe().map_err(|source| VshotError::CommandIo {
             program: "vshot".into(),

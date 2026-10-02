@@ -39,7 +39,8 @@ int runPinChrome(const QString &socketPath)
     // One surface per output, mapped as they come up: a label belongs on the
     // output the pin it names is on, and a pin can straddle two.
     QHash<QScreen *, PinChrome *> surfaces;
-    const auto ensureSurfaces = [&surfaces] {
+    QLocalSocket socket;
+    const auto ensureSurfaces = [&surfaces, &socket] {
         for (QScreen *screen : QGuiApplication::screens()) {
             if (screen == nullptr || surfaces.contains(screen)) {
                 continue;
@@ -49,11 +50,20 @@ int runPinChrome(const QString &socketPath)
                 delete chrome;
                 continue;
             }
+            // A surface made after the connection came up needs the socket
+            // too, or its menu would have no way to answer.
+            if (socket.state() == QLocalSocket::ConnectedState) {
+                chrome->setSocket(&socket);
+            }
             surfaces.insert(screen, chrome);
         }
     };
 
-    QLocalSocket socket;
+    QObject::connect(&socket, &QLocalSocket::connected, &socket, [&surfaces, &socket] {
+        for (PinChrome *chrome : surfaces) {
+            chrome->setSocket(&socket);
+        }
+    });
     QObject::connect(&socket, &QLocalSocket::readyRead, &socket, [&] {
         while (socket.canReadLine()) {
             const QByteArray line = socket.readLine().trimmed();
@@ -95,6 +105,27 @@ int runPinChrome(const QString &socketPath)
                     }
                     chrome->setPinnedVisible(visible);
                     chrome->setLabels(labels);
+                }
+            } else if (command == QStringLiteral("menu")) {
+                ensureSurfaces();
+                // No `id` is "take the menu down", which is what every one of
+                // the daemon's own paths sends when the menu stops being about
+                // anything.
+                const bool open = message.contains(QStringLiteral("id"));
+                const quint64 id = static_cast<quint64>(
+                    message.value(QStringLiteral("id")).toDouble());
+                const QPoint anchor(message.value(QStringLiteral("x")).toInt(),
+                                    message.value(QStringLiteral("y")).toInt());
+                QStringList rows;
+                for (const QJsonValue &row : message.value(QStringLiteral("rows")).toArray()) {
+                    rows.append(row.toString());
+                }
+                for (PinChrome *chrome : surfaces) {
+                    if (open) {
+                        chrome->setMenu(id, anchor, rows);
+                    } else {
+                        chrome->setMenu(0, QPoint(), QStringList());
+                    }
                 }
             } else if (command == QStringLiteral("badge")) {
                 ensureSurfaces();

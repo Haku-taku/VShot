@@ -194,8 +194,9 @@ pub(crate) fn is_hdr(transfer: Option<Transfer>) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PinEvent {
     /// A button went down at `at`, at `time` — the compositor's own timestamp,
-    /// which is what tells a double-click from two clicks.
-    Press { at: Point, time: u32 },
+    /// which is what tells a double-click from two clicks — with `button`, so
+    /// that the right one can open a menu where the left one starts a drag.
+    Press { at: Point, time: u32, button: u32 },
     /// The pointer moved to `at` with a button down.
     Motion { at: Point },
     /// The pointer left the pins.  Queued because it is the only thing that
@@ -2303,15 +2304,18 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 if state.pin_input {
                     // Only the left button and the wheel are a pin's business:
                     // anything else belongs to whatever the pin is covering.
-                    if button == BTN_LEFT {
-                        let at = state.pin_point_of_pointer();
-                        match (pressed, at) {
-                            (true, Some(at)) => {
-                                state.pin_events.push(PinEvent::Press { at, time });
-                            }
-                            (false, _) => state.pin_events.push(PinEvent::Release),
-                            (true, None) => {}
+                    let at = state.pin_point_of_pointer();
+                    match (pressed, at) {
+                        (true, Some(at)) => {
+                            state.pin_events.push(PinEvent::Press { at, time, button });
                         }
+                        // Only the left button drags, so only its release ends
+                        // a drag; a right button coming up is the menu's
+                        // business and not the stack's.
+                        (false, _) if button == BTN_LEFT => {
+                            state.pin_events.push(PinEvent::Release)
+                        }
+                        _ => {}
                     }
                     return;
                 }

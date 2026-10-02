@@ -25,7 +25,7 @@
 //! not wired.  A pin made through this daemon can be listed, toggled and closed
 //! by the CLI, and that is all.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -259,6 +259,36 @@ pub(crate) struct ChromeLabel {
     pub(crate) visible: bool,
 }
 
+/// A pin's right-click menu, as the chrome draws it.
+///
+/// The rows are the daemon's -- it is the side that knows what a pin is and
+/// what can be done to it -- and the drawing, the pointer and the keyboard are
+/// the chrome's.  What comes back is one row number, or nothing.
+#[derive(Clone, Debug, PartialEq)]
+struct Menu {
+    id: u64,
+    /// Where the menu is anchored, in global logical pixels: the pointer that
+    /// opened it.
+    anchor: Point,
+    rows: Vec<String>,
+    /// The row the pointer is over, or `None` while it is over none.
+    highlighted: Option<usize>,
+}
+
+/// The rows every pin's menu ends with, in order.
+///
+/// The names are the same ones the Qt surface draws, because they are the same
+/// actions; a menu that called them something else would be a second vocabulary
+/// for one set of commands.
+const MENU_ROWS: [&str; 6] = [
+    "Copy image",
+    "Save as…",
+    "Edit",
+    "Reset zoom",
+    "Recognize text…",
+    "Close",
+];
+
 /// One open editing session: the pin it is about, and the files it was handed.
 ///
 /// Kept so the daemon knows an edit is running -- two editors on one stack
@@ -414,6 +444,11 @@ impl Stack {
     /// A press at `point`.  Brings the pin under it to the front and starts
     /// dragging it; a second press on the same pin within the double-click
     /// interval closes it instead.
+    /// A right-click on `point`: the pin under it, whose menu should open.
+    fn menu_target(&self, point: Point) -> Option<u64> {
+        self.index_at(point).map(|index| self.pins[index].id)
+    }
+
     fn press(&mut self, point: Point, now: Instant) -> Change {
         let Some(index) = self.index_at(point) else {
             // A press on the desktop is not this stack's business.
@@ -736,6 +771,36 @@ fn run_save_dialog(
     Ok(Some((PathBuf::from(path), copy)))
 }
 
+/// Puts `bytes` on the clipboard as a PNG, answering whether it got there.
+///
+/// `wl-copy` forks and the child stays alive as the selection owner, so only
+/// the short-lived process started here is waited for: the copy outlives it,
+/// which is what a clipboard is.
+fn copy_to_clipboard(png: &[u8]) -> bool {
+    use std::io::Write as _;
+    let Ok(mut child) = std::process::Command::new("wl-copy")
+        .arg("--type")
+        .arg("image/png")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let written = child
+        .stdin
+        .as_mut()
+        .is_some_and(|stdin| stdin.write_all(png).is_ok());
+    // A `wl-copy` that could not take the bytes must not be left holding a
+    // half-written selection.
+    if !written {
+        let _ = child.kill();
+        return false;
+    }
+    child.wait().is_ok_and(|status| status.success())
+}
+
 /// Where the chrome process listens: beside the daemon's own socket, with a
 /// name of its own, so both can live in the runtime directory a session owns
 /// without either having to be told about the other.
@@ -758,6 +823,22 @@ struct Chrome {
     /// A drag sends one update per motion event, and every one of them would
     /// otherwise be a line and a repaint on the other side.
     sent: Option<Vec<ChromeLabel>>,
+    /// What the chrome has said back: which menu row the user picked, or that
+    /// the menu was dismissed.  The menu is the one thing that side decides --
+    /// it is the side with the pointer and the keyboard there.
+    replies: Vec<ChromeReply>,
+    /// What is left of a line that has not arrived whole yet.
+    pending: Vec<u8>,
+}
+
+/// What the chrome reports back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChromeReply {
+    /// The user picked a row of the open menu.
+    Chosen(usize),
+    /// The menu was dismissed without a pick: Esc, a click outside it, or the
+    /// pin it belonged to going away.
+    Dismissed,
 }
 
 impl Chrome {
@@ -771,6 +852,8 @@ impl Chrome {
         let mut chrome = Self {
             stream: None,
             sent: None,
+            replies: Vec::new(),
+            pending: Vec::new(),
         };
         let Some(program) = program else {
             return chrome;
@@ -791,6 +874,9 @@ impl Chrome {
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
             if let Ok(stream) = UnixStream::connect(socket) {
+                // Non-blocking so the daemon's own loop can read whatever the
+                // chrome has said without ever waiting on it.
+                let _ = stream.set_nonblocking(true);
                 chrome.stream = Some(stream);
                 break;
             }
@@ -837,6 +923,77 @@ impl Chrome {
         self.sent = Some(labels.to_vec());
     }
 
+    /// Reads whatever the chrome has said since the last look.
+    ///
+    /// Non-blocking and never an error: a chrome that has gone away is not a
+    /// failure, it is a stack without labels, and every pin is still there.
+    fn poll(&mut self) -> Vec<ChromeReply> {
+        let Some(stream) = self.stream.as_mut() else {
+            return Vec::new();
+        };
+        let mut buffer = [0u8; 4096];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => {
+                    // The chrome closed the connection: it is gone, and nothing
+                    // it says from here is worth waiting for.
+                    self.stream = None;
+                    break;
+                }
+                Ok(count) => self.pending.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    self.stream = None;
+                    break;
+                }
+            }
+        }
+        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line = self.pending.drain(..=newline).collect::<Vec<u8>>();
+            let Ok(text) = std::str::from_utf8(&line) else {
+                continue;
+            };
+            let Ok(message) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+                continue;
+            };
+            match message.get("cmd").and_then(serde_json::Value::as_str) {
+                Some("chosen") => {
+                    if let Some(row) = message.get("row").and_then(serde_json::Value::as_u64) {
+                        self.replies.push(ChromeReply::Chosen(row as usize));
+                    }
+                }
+                Some("dismissed") => self.replies.push(ChromeReply::Dismissed),
+                _ => {}
+            }
+        }
+        std::mem::take(&mut self.replies)
+    }
+
+    /// Tells the chrome to draw a pin's menu, or to take it down.
+    fn menu(&mut self, menu: Option<&Menu>) {
+        let Some(stream) = self.stream.as_mut() else {
+            return;
+        };
+        let message = match menu {
+            Some(menu) => json!({
+                "cmd": "menu",
+                "id": menu.id,
+                "x": menu.anchor.x,
+                "y": menu.anchor.y,
+                "rows": menu.rows,
+                "highlighted": menu.highlighted,
+            }),
+            None => json!({"cmd": "menu"}),
+        }
+        .to_string();
+        if stream.write_all(message.as_bytes()).is_err()
+            || stream.write_all(b"\n").is_err()
+            || stream.flush().is_err()
+        {
+            self.stream = None;
+        }
+    }
+
     /// Puts `text` on one pin's corner for a moment.
     fn badge(&mut self, id: u64, text: &str) {
         let Some(stream) = self.stream.as_mut() else {
@@ -859,6 +1016,9 @@ struct Daemon {
     chrome: Chrome,
     /// The open editing session, if any.
     editing: Option<EditSession>,
+    /// The open menu, if any.  One at a time: a second right-click replaces it,
+    /// which is what a menu that follows the pointer should do.
+    menu: Option<Menu>,
     /// The socket clients reach this daemon on.  The editor is told about it
     /// because it drives the real pin over it rather than drawing a copy.
     socket: PathBuf,
@@ -876,6 +1036,7 @@ impl Daemon {
             surfaces,
             chrome,
             editing: None,
+            menu: None,
             socket: socket.to_path_buf(),
             idle: None,
         })
@@ -943,6 +1104,128 @@ impl Daemon {
         Some(*self.idle.get_or_insert_with(|| Instant::now() + IDLE_QUIT))
     }
 
+    /// Opens the menu for the pin under `at`, or closes whatever menu is open
+    /// when there is no pin there.
+    ///
+    /// The rows are this side's: it is the side that knows what a pin is and
+    /// what can be done to it.  Drawing them, tracking the pointer over them
+    /// and reading the keyboard are the chrome's, which is why the rows travel
+    /// as text and the answer comes back as a row number.
+    fn open_menu(&mut self, at: Point) {
+        let Some(id) = self.stack.menu_target(at) else {
+            // A right-click on the desktop is not this stack's business, and it
+            // takes any open menu with it -- which is what a click outside a
+            // menu does everywhere else.
+            if self.menu.take().is_some() {
+                self.chrome.menu(None);
+            }
+            return;
+        };
+        let menu = Menu {
+            id,
+            anchor: at,
+            rows: MENU_ROWS.iter().map(|row| (*row).to_string()).collect(),
+            highlighted: None,
+        };
+        self.chrome.menu(Some(&menu));
+        self.menu = Some(menu);
+    }
+
+    /// Does what the user picked out of an open menu.
+    ///
+    /// The row is a number because that is what the chrome can answer with: it
+    /// draws the text it was given and knows nothing about what the rows mean.
+    /// A number out of range is not an error -- the menu may have been drawn by
+    /// an older daemon -- it is simply nothing to do.
+    fn choose(&mut self, row: usize) -> Result<()> {
+        let Some(menu) = self.menu.take() else {
+            return Ok(());
+        };
+        self.chrome.menu(None);
+        let id = menu.id;
+        // The first rows are the pin's own formats, when it has any: a colour
+        // card offers its values there, and picking one copies it.  They are
+        // not in this side's gift -- a card is Qt's to render and its text is
+        // what a copy hands over -- so they are left to the chrome's own list.
+        let Some(action) = MENU_ROWS.get(row) else {
+            return Ok(());
+        };
+        match *action {
+            "Copy image" => self.copy_image(id),
+            "Save as…" => {
+                self.save(id)?;
+            }
+            "Edit" => {
+                self.start_edit(id, false)?;
+            }
+            "Reset zoom" => {
+                if let Some(index) = self.stack.pins.iter().position(|pin| pin.id == id) {
+                    let pin = &mut self.stack.pins[index];
+                    pin.scale = 1.0 / f64::from(pin.density);
+                    self.refresh()?;
+                }
+            }
+            "Recognize text…" => {
+                self.start_edit(id, true)?;
+            }
+            "Close" => {
+                self.stack.pins.retain(|pin| pin.id != id);
+                self.refresh()?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Puts one pin's picture on the clipboard.
+    ///
+    /// Through `wl-copy`, the same tool the capture side writes the clipboard
+    /// with, and as a PNG: a clipboard is read by every kind of program, and
+    /// PNG is the one image format all of them have.
+    fn copy_image(&mut self, id: u64) {
+        let Some(pin) = self.stack.pins.iter().find(|pin| pin.id == id) else {
+            return;
+        };
+        let encoded = match &pin.picture {
+            Picture::Sdr(frame) => frame.to_png(),
+            Picture::Hdr(image) => image
+                .frame
+                .tone_map_to_srgb_with(crate::config::tone_map_options())
+                .and_then(|frame| frame.to_png()),
+        };
+        let text = match encoded {
+            Ok(bytes) => copy_to_clipboard(&bytes),
+            Err(error) => {
+                eprintln!("vshot-pin: could not encode the pin to copy it: {error}");
+                false
+            }
+        };
+        // Reported on the pin's own corner, the way a save is: the menu that
+        // started it has closed by now, and a silent failure looks like the
+        // row doing nothing at all.
+        self.chrome
+            .badge(id, if text { "Copied image" } else { "Copy failed" });
+    }
+
+    /// Does whatever the chrome has reported since the last look.
+    ///
+    /// Separate from `gestures` because the two come from different places and
+    /// mean different things: a gesture is the pointer on a pin, and this is
+    /// the chrome's answer about a menu it drew.
+    fn chrome_replies(&mut self) -> Result<()> {
+        for reply in self.chrome.poll() {
+            match reply {
+                ChromeReply::Chosen(row) => self.choose(row)?,
+                ChromeReply::Dismissed => {
+                    // The chrome took the menu down itself -- Esc, or a click
+                    // outside it -- and all this side has to do is forget it.
+                    self.menu = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Applies whatever the pointer did, drawing once at the end.
     ///
     /// The compositor's own timestamps are not carried through: `Press` keeps
@@ -958,6 +1241,14 @@ impl Daemon {
         let mut changed = Change::default();
         for event in events {
             let change = match event {
+                crate::wayland::PinEvent::Press { at, button, .. }
+                    if button == crate::wayland::input::BTN_RIGHT =>
+                {
+                    // The menu is the chrome's to draw and the user's to pick
+                    // from; all this side does is say which pin it is about.
+                    self.open_menu(at);
+                    Change::default()
+                }
                 crate::wayland::PinEvent::Press { at, .. } => self.stack.press(at, now),
                 crate::wayland::PinEvent::Motion { at } => {
                     // The hover first: it is what the tag follows, and a motion
@@ -1587,6 +1878,9 @@ pub fn run(socket: &Path) -> Result<()> {
             },
             None => daemon.surfaces.wait_on(Some(wake.as_fd()))?,
         }
+        // Whatever the chrome said back -- a menu row picked, a menu dismissed
+        // -- before anything else looks at the stack.
+        daemon.chrome_replies()?;
         // Whatever the compositor had queued, before anything else looks at the
         // stack: a drag is a stream of these, and each one is a repaint.
         daemon.gestures()?;
@@ -1964,6 +2258,35 @@ mod tests {
         // The marks described the old pixels, and a picture that arrives
         // without any of its own has none to keep.
         assert!(stack.pins[0].annotations.is_none());
+    }
+
+    /// A menu row is a number, and a number out of range is nothing to do --
+    /// not an error: the menu may have been drawn by an older daemon, and a
+    /// pick the daemon does not understand must not take it down.
+    #[test]
+    fn every_menu_row_names_an_action() {
+        // The six rows the daemon offers, and the ones the Qt surface draws,
+        // are one list: a menu that called them something else would be a
+        // second vocabulary for one set of commands.
+        assert_eq!(MENU_ROWS.len(), 6);
+        assert_eq!(MENU_ROWS[0], "Copy image");
+        assert_eq!(MENU_ROWS[5], "Close");
+        // `Close` last: the row that throws the pin away sits at the bottom of
+        // a list where every other row is reversible.
+        assert!(MENU_ROWS.contains(&"Save as…"));
+        assert!(MENU_ROWS.contains(&"Edit"));
+        assert!(MENU_ROWS.contains(&"Reset zoom"));
+        assert!(MENU_ROWS.contains(&"Recognize text…"));
+    }
+
+    /// A right-click on a pin opens its menu; on the desktop it closes whatever
+    /// menu is up, which is what a click outside a menu does everywhere else.
+    #[test]
+    fn the_menu_opens_on_the_pin_under_the_pointer() {
+        let stack = stack_of(2);
+        assert_eq!(stack.menu_target(Point::new(10, 10)), Some(1));
+        assert_eq!(stack.menu_target(Point::new(210, 10)), Some(2));
+        assert_eq!(stack.menu_target(Point::new(5000, 5000)), None);
     }
 
     /// The save dialog is offered what this build can write, built from the

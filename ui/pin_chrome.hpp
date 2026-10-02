@@ -9,14 +9,16 @@
 #include <QRect>
 #include <QSize>
 #include <QString>
+#include <QStringList>
 #include <QVector>
 #include <QWidget>
 
 #include <cstdint>
 
-class QScreen;
-class QTcpSocket;
 class QLocalSocket;
+class QMouseEvent;
+class QKeyEvent;
+class QScreen;
 class QTimer;
 
 namespace LayerShellQt {
@@ -75,6 +77,18 @@ public:
     /// that two labels on one pin overlap in the order the pins do.
     void setLabels(const QVector<Label> &labels);
 
+    /// Draws a pin's right-click menu, or takes down whatever menu is up.
+    ///
+    /// The rows are the daemon's -- it is the side that knows what a pin is and
+    /// what can be done to it -- and the drawing, the pointer and the keyboard
+    /// are this side's, because this is the surface with all three.  The answer
+    /// goes back as a row number.
+    void setMenu(quint64 id, const QPoint &anchor, const QStringList &rows);
+
+    /// The socket answers are written to.  Set once, when the connection comes
+    /// up; a chrome with none simply never answers.
+    void setSocket(QLocalSocket *socket) { socket_ = socket; }
+
     /// Puts `text` on `id`'s corner for a moment: the zoom factor after a wheel
     /// step, or the outcome of a copy or a save.  A badge names a pin that is
     /// still in the stack, so one for a pin that is gone is dropped.
@@ -95,7 +109,24 @@ private:
     };
 
     void paintEvent(QPaintEvent *event) override;
+    void mousePressEvent(QMouseEvent *event) override;
+    void mouseMoveEvent(QMouseEvent *event) override;
+    void keyPressEvent(QKeyEvent *event) override;
     void applyMask();
+    /// The keyboard is taken only while a menu is up: Esc has to reach this
+    /// surface for the menu to be dismissible, and nothing else here wants a
+    /// key.  Taking it at all costs the surface below its pointer focus, so it
+    /// is asked for and given back.
+    void applyKeyboard();
+    /// The rectangle a menu of `rows` occupies when anchored at `anchor`, or an
+    /// empty rect when it cannot fit on this output at all.
+    QRect menuRectFor(const QPoint &anchor, const QStringList &rows) const;
+    /// The row the pointer is over, or -1.
+    int menuRowAt(const QPoint &local) const;
+    /// Tells the daemon which row was picked, and takes the menu down.
+    void chooseRow(int row);
+    /// Tells the daemon the menu is gone without a pick.
+    void dismissMenu();
 
     QScreen *screen_ = nullptr;
     LayerShellQt::Window *layer_ = nullptr;
@@ -107,6 +138,15 @@ private:
     // The pin a badge belongs to, and its text, for as long as it lasts.
     quint64 badgeId_ = 0;
     QTimer *badgeTimer_ = nullptr;
+    /// The open menu: the pin it is about, the rows the daemon sent, where it
+    /// sits and which row the pointer is over.
+    quint64 menuId_ = 0;
+    QStringList menuRows_;
+    QRect menuRect_;
+    int menuHover_ = -1;
+    /// The socket the daemon is on, so an answer can be sent back.  Not owned:
+    /// it belongs to the server that made it.
+    QLocalSocket *socket_ = nullptr;
 };
 
 } // namespace vshot
