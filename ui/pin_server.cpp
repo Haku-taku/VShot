@@ -1016,7 +1016,15 @@ public:
 
     // Whether the helper's surface on `name` carries that output's own colour
     // description.  Only there can a ten-bit buffer be read as HDR.
-    bool isHdrOutput(const QString &name) const { return outputs_.contains(name); }
+    // Whether this side draws the pins on that output: the helper has a
+    // picture surface there, so the whole stack — picture, shadow and rim — is
+    // the helper's and this Qt surface keeps only the chrome.
+    bool helperDraws(const QString &name) const { return outputs_.contains(name); }
+
+    // Whether what is shown on that output is HDR.  A different question from
+    // the one above: the helper covers SDR outputs too, and a pin drawn there
+    // is not being shown in HDR just because the helper drew it.
+    bool isHdrOutput(const QString &name) const { return hdrOutputs_.contains(name); }
 
     // Copies one PQ image into the helper's directory and answers the copy's
     // path: the CLI's file is gone the moment it is answered, and the helper
@@ -1233,6 +1241,10 @@ private:
                 for (const QJsonValue &value : outputs) {
                     outputs_.append(value.toString());
                 }
+                const QJsonArray hdr = object.value(QStringLiteral("hdr")).toArray();
+                for (const QJsonValue &value : hdr) {
+                    hdrOutputs_.append(value.toString());
+                }
                 mapped_ = true;
                 return;
             }
@@ -1265,6 +1277,7 @@ private:
     QProcess process_;
     QLocalSocket socket_;
     QStringList outputs_;
+    QStringList hdrOutputs_;
     // The pin stack the helper was last handed, so an unchanged one is not
     // handed over again, and the look and the live pin that went with it.
     std::optional<QJsonArray> sent_;
@@ -3102,8 +3115,9 @@ wl-clipboard package"));
                 // Only an output the helper described can show a helper-drawn
                 // pin; on any other this surface paints the image itself.
                 const QScreen *screen = surface->screen();
-                surface->setHdrPixels(screen != nullptr
-                                      && hdr_.isHdrOutput(screen->name()));
+                surface->setHelperPictures(screen != nullptr
+                                           && hdr_.helperDraws(screen->name()));
+                surface->setHdrOutput(screen != nullptr && hdr_.isHdrOutput(screen->name()));
                 surface->setPins(items);
             }
         }

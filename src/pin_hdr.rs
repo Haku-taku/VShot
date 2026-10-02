@@ -158,18 +158,26 @@ impl Pin {
     /// against the output every time, which is the same conversion done from the
     /// other end.
     fn words_in(&self, output: &OutputRect, tone_map: ToneMapOptions) -> Result<Vec<u32>> {
-        let written = self.pixels.picture.words_for(output.color(), tone_map)?;
-        // This side's surface carries the output's *own* description, and it is
-        // only ever installed on an output that is showing HDR -- so the codes
-        // are PQ.  A surface written with the other curve is the failure this
-        // whole split exists to avoid: every pin dark, its highlights clipped.
-        match written.encoding {
-            Encoding::Pq => Ok(written.words),
-            Encoding::Srgb => Err(VshotError::PinSurface(format!(
-                "{} was encoded for an SDR surface, and this side only has HDR ones",
-                output.name
-            ))),
+        let color = output.color();
+        let written = self.pixels.picture.words_for(color, tone_map)?;
+        // The codes come back on the curve the output's description names, and
+        // that is the curve the surface is described in -- the two are the same
+        // field read once.  The check is here because the failure it catches is
+        // invisible until it is on screen: codes on the wrong curve make every
+        // pin dark with its highlights clipped, and nothing else on this path
+        // would say so.
+        let expected = if color.is_hdr() {
+            Encoding::Pq
+        } else {
+            Encoding::Srgb
+        };
+        if written.encoding != expected {
+            return Err(VshotError::PinSurface(format!(
+                "{}: the picture was encoded for a {:?} surface and this one is {:?}",
+                output.name, written.encoding, expected
+            )));
         }
+        Ok(written.words)
     }
 
     /// The light one unit of content stands for on this output, which is what
@@ -475,6 +483,24 @@ fn pin_damage_rect(pin: &Pin, output: &OutputRect, style: &Style) -> Option<Rect
 /// in, so this is that colour said in the terms the surface is described in.
 /// The same colour on an SDR surface and on this one then puts the same light on
 /// the panel.
+/// The value one channel of a colour from the config is written into a surface
+/// with.
+///
+/// The rim is a colour the Qt dialog draws in 8-bit sRGB, and what a surface
+/// wants is that colour said in the surface's own terms: an sRGB code on one
+/// described in sRGB, and the PQ code for the same light on one described in
+/// PQ.  The white only enters the second, because an sRGB code already means
+/// "this output's white" and needs nothing to be measured against.
+fn rim_value(channel: u8, color: OutputColor, white_nits: f32) -> f32 {
+    if color.is_hdr() {
+        pq_code(channel, white_nits)
+    } else {
+        f32::from(channel) / 255.0
+    }
+}
+
+/// The PQ code one sRGB channel stands for, when a code of `1.0` is that
+/// channel's own light at this output's white.
 fn pq_code(channel: u8, white_nits: f32) -> f32 {
     let value = f32::from(channel) / 255.0;
     let linear = if value <= 0.04045 {
@@ -530,9 +556,12 @@ struct Stage {
 /// description, and the picture each of those is showing.
 struct Surfaces {
     session: WaylandSession,
-    /// Outputs whose surface carries its own description.  A pin on any other
-    /// output cannot be shown as HDR, and is left to the Qt daemon's SDR copy.
-    hdr_outputs: Vec<String>,
+    /// Outputs this side has a picture surface on, each described in that
+    /// output's own curve.  Every output that could be given a buffer is here,
+    /// SDR ones included: one surface per output is what keeps the stack in one
+    /// order, and a pin's picture is encoded for whichever of them it is being
+    /// drawn on.
+    picture_outputs: Vec<String>,
     targets: HashMap<String, PinTarget>,
     stages: HashMap<String, Stage>,
     outputs: Vec<OutputRect>,
@@ -554,6 +583,10 @@ struct OutputRect {
     geometry: Rect,
     scale: u32,
     pixel_size: Size,
+    /// The curve this output's own description names, which is the curve its
+    /// surface is described in and the one the codes written into it must be
+    /// on.  PQ for an output whose description never named one.
+    transfer: Transfer,
     /// The gamut this output's own description names, once
     /// [`Surfaces::start`] has read it back.  The default is only a guess for
     /// an output whose description never said; a pin captured on the same
@@ -576,7 +609,7 @@ impl OutputRect {
     /// is where the curve comes from.
     fn color(&self) -> OutputColor {
         OutputColor {
-            transfer: Transfer::Pq,
+            transfer: self.transfer,
             primaries: self.primaries,
             reference_nits: self.white,
         }
@@ -589,7 +622,7 @@ impl Surfaces {
         Ok(Self {
             session,
             tone_map: ToneMapOptions::default(),
-            hdr_outputs: Vec::new(),
+            picture_outputs: Vec::new(),
             targets: HashMap::new(),
             stages: HashMap::new(),
             outputs: Vec::new(),
@@ -627,6 +660,7 @@ impl Surfaces {
                 pixel_size: info.pixel_size,
                 // Replaced by whatever the output's own description says, just
                 // below.
+                transfer: Transfer::Pq,
                 primaries: Primaries::Bt2020,
                 white: crate::model::hdr::REFERENCE_WHITE_NITS,
             })
@@ -674,10 +708,10 @@ impl Surfaces {
         // converted into, and what an SDR pin's codes have to be written
         // against.
         let colored = self.session.apply_pin_color()?;
-        self.hdr_outputs = colored
+        self.picture_outputs = colored
             .into_iter()
             .filter(|(name, _, _, _)| self.targets.contains_key(name))
-            .filter_map(|(name, gamut, white, hdr)| {
+            .filter_map(|(name, gamut, white, transfer)| {
                 match gamut {
                     Some(gamut) => {
                         if let Some(output) = self.outputs.iter_mut().find(|out| out.name == name) {
@@ -703,37 +737,59 @@ impl Surfaces {
                     ),
                     None => {}
                 }
-                // An output whose own curve is not an HDR one is left to the Qt
-                // daemon's SDR copy.  Its surface carries the output's own
-                // description, which for an SDR output is the sRGB curve — so a
-                // PQ buffer written into it would be decoded as sRGB, and every
-                // pin would come out dark with its highlights clipped.  The
-                // output is still reported to the caller above, so an SDR pin
-                // there is drawn against the right white; it is only the HDR
-                // path that has nothing to do on this output.
-                if !hdr {
-                    if debug {
-                        eprintln!(
-                            "vshot: pin-hdr: {name}: the output's own curve is not PQ or HLG; \
-                             it is an SDR output and pins stay on the daemon's SDR surface"
-                        );
-                    }
-                    return None;
+                // The curve the surface is described in, which is also the
+                // curve the codes written into it have to be on.  An output
+                // whose description never named one counts as HDR, which is
+                // what this side assumed before it could ask -- a compositor
+                // that does not answer keeps the behaviour it had rather than
+                // losing its pins.
+                let transfer = transfer.unwrap_or(Transfer::Pq);
+                if let Some(output) = self.outputs.iter_mut().find(|out| out.name == name) {
+                    output.transfer = transfer;
+                }
+                if debug {
+                    eprintln!(
+                        "vshot: pin-hdr: {name}: {} output, primaries {:?}, white {} cd/m²",
+                        if crate::wayland::is_hdr(Some(transfer)) {
+                            "an HDR"
+                        } else {
+                            "an SDR"
+                        },
+                        self.outputs
+                            .iter()
+                            .find(|out| out.name == name)
+                            .map(|out| out.primaries)
+                            .unwrap_or(Primaries::Bt2020),
+                        self.outputs
+                            .iter()
+                            .find(|out| out.name == name)
+                            .map(|out| out.white)
+                            .unwrap_or(crate::model::hdr::REFERENCE_WHITE_NITS),
+                    );
                 }
                 Some(name)
             })
             .collect();
-        if debug {
-            for output in &self.outputs {
-                if self.hdr_outputs.contains(&output.name) {
-                    eprintln!(
-                        "vshot: pin-hdr: {}: primaries {:?}, white {} cd/m²",
-                        output.name, output.primaries, output.white
-                    );
-                }
-            }
-        }
         Ok(())
+    }
+
+    /// The covered outputs whose own curve is an HDR one.
+    ///
+    /// Reported beside the full list rather than instead of it: "this side
+    /// draws here" and "what is shown here is HDR" are different questions, and
+    /// the daemon needs both — the first to know which pins to leave alone, the
+    /// second to mark one as being shown in HDR.
+    fn hdr_outputs(&self) -> Vec<String> {
+        self.picture_outputs
+            .iter()
+            .filter(|name| {
+                self.outputs
+                    .iter()
+                    .find(|output| output.name == **name)
+                    .is_some_and(|output| crate::wayland::is_hdr(Some(output.transfer)))
+            })
+            .cloned()
+            .collect()
     }
 
     /// Brings every output's picture up to date and asks the session to show it.
@@ -743,7 +799,7 @@ impl Surfaces {
     /// drawn into it, so drawing all of it on every motion event is what would
     /// make a drag trail the pointer.
     fn show(&mut self) {
-        if self.hdr_outputs.is_empty() {
+        if self.picture_outputs.is_empty() {
             return;
         }
         let pins = self.last_pins.clone();
@@ -756,7 +812,7 @@ impl Surfaces {
             .map(|output| output.name.clone())
             .collect::<Vec<_>>();
         for name in names {
-            if !self.hdr_outputs.contains(&name) {
+            if !self.picture_outputs.contains(&name) {
                 continue;
             }
             let Some(output) = self
@@ -1116,6 +1172,7 @@ impl PinTarget {
                 // The rim's own alpha is its opacity, so the compositor blends
                 // it over the pin exactly as the SDR surface's pen does.
                 let alpha = f32::from(rgba[3]) / 255.0;
+                let color = output.color();
                 let white = pin.white_on(output);
                 self.surface.draw_rim(
                     left,
@@ -1125,9 +1182,9 @@ impl PinTarget {
                     radius,
                     thickness,
                     [
-                        pq_code(rgba[0], white),
-                        pq_code(rgba[1], white),
-                        pq_code(rgba[2], white),
+                        rim_value(rgba[0], color, white),
+                        rim_value(rgba[1], color, white),
+                        rim_value(rgba[2], color, white),
                     ],
                     alpha,
                 );
@@ -1204,18 +1261,19 @@ pub fn run(socket: &Path) -> Result<()> {
     let debug = std::env::var_os("VSHOT_PIN_DEBUG").is_some();
     if debug {
         eprintln!(
-            "vshot: pin-hdr: {} picture surface(s); HDR outputs: {}",
+            "vshot: pin-hdr: {} picture surface(s); outputs: {}",
             surfaces.targets.len(),
-            if surfaces.hdr_outputs.is_empty() {
+            if surfaces.picture_outputs.is_empty() {
                 "none".into()
             } else {
-                surfaces.hdr_outputs.join(", ")
+                surfaces.picture_outputs.join(", ")
             }
         );
     }
     let mut reply = json!({
         "event": "mapped",
-        "outputs": surfaces.hdr_outputs.clone(),
+        "outputs": surfaces.picture_outputs.clone(),
+        "hdr": surfaces.hdr_outputs(),
     })
     .to_string();
     reply.push('\n');
@@ -1915,6 +1973,7 @@ mod tests {
             geometry: Rect::new(10, 20, 4, 4),
             scale: 2,
             pixel_size: Size::new(8, 8),
+            transfer: Transfer::Pq,
             primaries: Primaries::Bt2020,
             white: 203.0,
         }

@@ -295,17 +295,32 @@ QRect PinSurface::localRect(const Item &item) const
     return QRect(item.origin - origin, paintedSize(item.image, item.scale));
 }
 
-void PinSurface::setHdrPixels(bool on)
+void PinSurface::setHelperPictures(bool on)
 {
-    if (hdrPixels_ == on) {
+    if (helperPictures_ == on) {
         return;
     }
-    hdrPixels_ = on;
+    helperPictures_ = on;
     // Every item marked `hdr` is painted by the other side when this turns on,
     // and by this surface when it turns off, so the whole output has to be
     // repainted either way.
     if (surfaceReady_) {
         update();
+    }
+}
+
+void PinSurface::setHdrOutput(bool on)
+{
+    if (hdrOutput_ == on) {
+        return;
+    }
+    hdrOutput_ = on;
+    // The tag's ink is the only thing this changes, and it belongs to the pin
+    // under the pointer alone.
+    if (surfaceReady_ && hoverId_ != 0) {
+        if (const Entry *entry = entryFor(hoverId_)) {
+            update(tagBoxes(hoverId_, localRect(entry->item)));
+        }
     }
 }
 
@@ -871,7 +886,7 @@ void PinSurface::paintEvent(QPaintEvent *event)
         // three travel together -- one surface, one commit -- or the picture
         // would trail its own edge the moment the pin was dragged.  What is
         // left here is the chrome: the badges, the menus and the `HDR` tag.
-        const bool hdr = entry.item.hdr && hdrPixels_;
+        const bool hdr = entry.item.hdr && helperPictures_;
         if (hdr) {
             continue;
         }
@@ -937,7 +952,10 @@ void PinSurface::paintEvent(QPaintEvent *event)
     hoverMarker_ = QRect();
     if (hoverId_ != 0) {
         if (const Entry *entry = entryFor(hoverId_)) {
-            paintHdrMarker(painter, localRect(entry->item), entry->item.hdr && hdrPixels_);
+            // White while the pixels on screen are the helper's HDR ones, and
+            // muted while they are this pin mapped down for an SDR output --
+            // which the helper draws just as it draws the other kind.
+            paintHdrMarker(painter, localRect(entry->item), helperPictures_ && hdrOutput_);
         }
     }
     if (menuId_ != 0) {

@@ -258,10 +258,12 @@ int main(int argc, char **argv)
     second.image = grey;
     second.origin = otherRect.topLeft();
     second.capturedHdr = true;
-    // The helper has the output: every pin's picture, shadow and rim are drawn
-    // on its own surface below this one, so this surface paints no image at all
-    // -- only the chrome, which is what these checks are about.
-    surface.setHdrPixels(true);
+    // The helper has the output, and it is an HDR one: every pin's picture,
+    // shadow and rim are drawn on its own surface below this one, so this
+    // surface paints no image at all -- only the chrome, which is what these
+    // checks are about.
+    surface.setHelperPictures(true);
+    surface.setHdrOutput(true);
     for (vshot::PinSurface::Item *item : {&first, &plain, &second}) {
         item->hdr = true;
     }
@@ -331,21 +333,37 @@ int main(int argc, char **argv)
     expectNothing("pointer gone: the tag is gone with it", away, localFirst);
     expectNothing("pointer gone: nothing is left anywhere", away, localSecond);
 
-    // The other half of the answer: an output the helper could not describe has
-    // no copy of the stack at all, so this surface paints every pin -- and the
-    // tag on an HDR capture says so by its muted ink.
-    surface.setHdrPixels(false);
+    // The other half of the answer: an output the helper could not take has no
+    // copy of the stack at all, so this surface paints every pin -- and the tag
+    // on an HDR capture says so by its muted ink.
+    surface.setHelperPictures(false);
     hover(surface, onFirst, globalOnFirst);
     const QImage fallback = paint(surface);
     leave(QStringLiteral("06-fallback.png"), fallback);
-    expectTag("SDR output: the tag is up but muted", fallback, localFirst, kFallbackInk);
+    expectTag("an output the helper could not take: the tag is up but muted", fallback, localFirst,
+              kFallbackInk);
     // Every pin's own image is back, the SDR one included: on an output the
-    // helper never described, `hdr` on the item means nothing and this surface is
+    // helper never took, `hdr` on the item means nothing and this surface is
     // the only copy of the picture there is.
-    expectPixel("SDR output: the SDR pin's own copy is painted", fallback, localPlain.topLeft(),
+    expectPixel("that output: the SDR pin's own copy is painted", fallback, localPlain.topLeft(),
                 kPinLevel, kPinLevel, kPinLevel, 255);
-    expectPixel("SDR output: the HDR pin's own copy is painted", fallback, localSecond.topLeft(),
+    expectPixel("that output: the HDR pin's own copy is painted", fallback, localSecond.topLeft(),
                 kPinLevel, kPinLevel, kPinLevel, 255);
+
+    // And the case the split between the two flags is for: the helper takes an
+    // *SDR* output too, so this surface still paints nothing of any pin -- but
+    // an HDR capture on it is being shown mapped down, and the tag has to say
+    // so.  Reading "the helper drew it" as "it is being shown in HDR" would put
+    // the white ink on every HDR pin on every output there is.
+    surface.setHelperPictures(true);
+    surface.setHdrOutput(false);
+    hover(surface, onFirst, globalOnFirst);
+    const QImage toneMapped = paint(surface);
+    leave(QStringLiteral("07-mapped.png"), toneMapped);
+    expectTag("an SDR output the helper took: the tag is up but muted", toneMapped, localFirst,
+              kFallbackInk);
+    expectNothing("an SDR output the helper took: this surface paints no picture",
+                  toneMapped, localPlain);
 
     if (failures == 0) {
         std::printf("\nall %s checks passed\n", "HDR marker");

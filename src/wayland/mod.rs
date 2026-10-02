@@ -54,14 +54,17 @@ pub struct WaylandSession {
     state: WaylandState,
 }
 
-/// One output that was given a colour description, as the HDR pin helper needs
-/// it: the gamut the output's own description names, the light one unit of
-/// content stands for there, and whether the output is an HDR one at all.  A
-/// surface shows codes written in that gamut and against that white, so a pin
-/// from elsewhere — or a plain sRGB one — has to be written in both before it
-/// goes on; and a PQ surface only means what it says on an output whose own
-/// curve is PQ, so the third says whether to draw one at all.
-pub type PinOutputColor = (String, Option<Primaries>, Option<f32>, bool);
+/// One output that was given a colour description, as the pin picture surfaces
+/// need it: the gamut the output's own description names, the light one unit of
+/// content stands for there, and the curve it is described in.
+///
+/// A surface shows codes written in that gamut and against that white, and the
+/// curve is what says which codes those are: PQ on a panel showing HDR, the
+/// sRGB curve on one that is not.  Everything the picture side has to decide
+/// about an output is in these three, which is why they travel together rather
+/// than as a single "is this HDR" flag that the caller would have to turn back
+/// into a curve.
+pub type PinOutputColor = (String, Option<Primaries>, Option<f32>, Option<Transfer>);
 
 /// One output's HDR half, as a backdrop surface needs it: the frozen frame and
 /// the light level its `1.0` stands for — the output's own SDR white — which is
@@ -175,7 +178,7 @@ fn transfer_of_named(named: TransferFunction) -> Option<Transfer> {
 /// pin helper assumed before it could read the curve — a compositor that does
 /// not answer the question keeps the behaviour it had rather than losing its
 /// pins.
-fn is_hdr(transfer: Option<Transfer>) -> bool {
+pub(crate) fn is_hdr(transfer: Option<Transfer>) -> bool {
     match transfer {
         Some(transfer) => matches!(transfer, Transfer::Pq | Transfer::Hlg),
         None => true,
@@ -1270,12 +1273,11 @@ impl WaylandSession {
             .filter(|id| colored.contains(id))
             .filter_map(|id| {
                 let name = self.state.topology.outputs.get(id)?.name.clone()?;
-                let hdr = is_hdr(self.state.cm_transfer.get(id).copied());
                 Some((
                     name,
                     self.state.cm_gamut.get(id).copied(),
                     self.state.cm_white.get(id).copied(),
-                    hdr,
+                    self.state.cm_transfer.get(id).copied(),
                 ))
             })
             .collect())

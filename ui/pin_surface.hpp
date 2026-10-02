@@ -115,11 +115,16 @@ public:
     // LayerShellQt is unavailable.
     bool showLayerSurface();
 
-    // Whether the surface helper draws this output's pins: true when it has the
-    // output's own colour description on its copy of it.  An item marked `hdr`
-    // is only left unpainted when this is on -- on any other output this
-    // surface's own image is the only copy there is.
-    void setHdrPixels(bool on);
+    // Whether the surface helper draws this output's pins.  True for every
+    // output it could take a picture surface on, SDR ones included: an item
+    // marked `hdr` is left unpainted only when this is on, and on any other
+    // output this surface's own image is the only copy there is.
+    void setHelperPictures(bool on);
+
+    // Whether this output's own curve is an HDR one, which is a different
+    // question from the one above.  A pin drawn by the helper on an SDR output
+    // is an HDR capture shown in SDR, and the tag over it has to say so.
+    void setHdrOutput(bool on);
 
     // Replaces the whole stack, back to front: the last entry is painted last,
     // i.e. it is the frontmost. Entries keep their scaled copy across calls
@@ -444,8 +449,10 @@ private:
     bool visible_ = true;
     bool surfaceReady_ = false;
     // Whether the surface helper draws this output's pins; see
-    // `setHdrPixels`.
-    bool hdrPixels_ = false;
+    // `setHelperPictures`.
+    bool helperPictures_ = false;
+    // Whether this output's own curve is an HDR one; see `setHdrOutput`.
+    bool hdrOutput_ = false;
     // This surface's layer-shell window, kept for the keyboard hand-back; null
     // until showLayerSurface() succeeded.
     LayerShellQt::Window *layer_ = nullptr;
