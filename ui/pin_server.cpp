@@ -1026,6 +1026,13 @@ public:
     // is not being shown in HDR just because the helper drew it.
     bool isHdrOutput(const QString &name) const { return hdrOutputs_.contains(name); }
 
+    // Every output the helper has a picture surface on, and the HDR ones among
+    // them.  The count is what tells a client "none of mine is HDR" apart from
+    // "I have no outputs to speak of" -- the second cannot show a pinned
+    // picture at all, so it is not an answer about HDR.
+    QStringList hdrOutputs() const { return hdrOutputs_; }
+    int outputCount() const { return outputs_.size(); }
+
     // Copies one PQ image into the helper's directory and answers the copy's
     // path: the CLI's file is gone the moment it is answered, and the helper
     // reads the pixels by path, so the copy is what lives as long as the pin.
@@ -1742,6 +1749,21 @@ private:
             QJsonObject reply = okReply();
             reply.insert(QStringLiteral("count"), static_cast<qint64>(pins_.size()));
             reply.insert(QStringLiteral("visible"), allVisible_);
+            return reply;
+        }
+        // Which of this side's outputs are showing HDR, for a client deciding
+        // whether a capture's HDR half is worth pinning.  The answer is the
+        // helper's -- it is the side that reads the colour layer -- and the
+        // count of outputs it could take is what tells "none of mine is HDR"
+        // apart from "I have none to speak of".
+        if (command == QStringLiteral("outputs")) {
+            QJsonObject reply = okReply();
+            QJsonArray hdr;
+            for (const QString &name : hdr_.hdrOutputs()) {
+                hdr.append(name);
+            }
+            reply.insert(QStringLiteral("hdr"), hdr);
+            reply.insert(QStringLiteral("outputs"), static_cast<qint64>(hdr_.outputCount()));
             return reply;
         }
         return error(QStringLiteral("unknown pin command `%1`").arg(command));
