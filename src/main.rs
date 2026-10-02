@@ -581,7 +581,11 @@ fn run() -> Result<()> {
                     // Both take the frozen frame, which the pixel source reads
                     // and the accessibility source ignores.
                     Some(&|window: &WindowCandidate| -> Option<Vec<crate::selection_region::RegionNode>> {
-                        let request = element::ElementRequest { window, scene: &scene };
+                        let request = element::ElementRequest {
+                            window,
+                            scene: &scene,
+                            fallback: request.element_fallback,
+                        };
                         element::elements_of(&request)
                     }),
                 )?;
@@ -2265,6 +2269,7 @@ mod tests {
             destination: cli::Destination::File(PathBuf::from("/dev/null")),
             cursor: false,
             compression: crate::model::PngCompression::default(),
+            element_fallback: crate::element::Fallback::Lines,
             hdr_format: crate::output::HdrFormat::default(),
             tone_map: crate::model::hdr::ToneMapOptions::default(),
         };
@@ -2381,6 +2386,7 @@ mod pixel_probe {
             let request = element::ElementRequest {
                 window,
                 scene: &scene,
+                fallback: crate::element::Fallback::Lines,
             };
             let elements = element::elements_of(&request);
             match elements {
