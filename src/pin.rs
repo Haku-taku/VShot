@@ -23,7 +23,13 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One request to the resident pin daemon; a single JSON object per
 /// connection, matching the `--pin-server` protocol in `ui/pin_server.cpp`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+///
+/// Both ends of that connection are this program, so the shape is derived in
+/// both directions from this one definition: a field added here reaches the
+/// daemon without a second edit, and one renamed here cannot leave the two
+/// halves disagreeing about a name that only shows up as a pin that will not
+/// appear.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "lowercase")]
 pub(crate) enum PinCommand {
     Add {
@@ -83,7 +89,11 @@ pub(crate) enum PinCommand {
         /// picture the compositor has not drawn yet, which the user sees as the
         /// marks vanishing for a moment.  Absent means "answer as soon as the
         /// change is applied", which is what every other caller wants.
-        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        ///
+        /// `default` because absent is the common case and the field is written
+        /// only when it is true: without it the parser demands a key the writer
+        /// deliberately leaves out.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         ack: bool,
     },
     #[serde(rename = "add-clipboard")]
@@ -119,7 +129,7 @@ pub(crate) enum PinCommand {
         annotations: Option<serde_json::Value>,
         /// Ask for the reply to wait until the new pixels are on the screen;
         /// see `Add::ack`.  The pin editor's own handoff uses it.
-        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         ack: bool,
     },
     Toggle,
@@ -131,7 +141,7 @@ pub(crate) enum PinCommand {
 }
 
 /// An output's global logical rect on the wire.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WireOutputRect {
     pub x: i32,
     pub y: i32,
@@ -140,7 +150,7 @@ pub(crate) struct WireOutputRect {
 }
 
 /// A point on the desktop's global logical grid.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WirePoint {
     pub x: i32,
     pub y: i32,
@@ -1814,6 +1824,51 @@ mod tests {
         assert!((white[0] - 1.0).abs() < 0.01, "{white:?}");
         let bright = decoded.frame.pixel(1, 0).unwrap();
         assert!((bright[0] - 4.0).abs() < 0.05, "{bright:?}");
+    }
+
+    /// The daemon parses what the client writes, from the one definition both
+    /// ends share.  A field named on one side and not the other is the kind of
+    /// mistake that only shows up as a pin that quietly does not appear.
+    #[test]
+    fn a_request_survives_the_wire() {
+        for command in [
+            PinCommand::Add {
+                path: PathBuf::from("/tmp/shot.png"),
+                hdr: Some(PathBuf::from("/tmp/shot.pq")),
+                density: Some(2),
+                output_name: Some("DP-1".into()),
+                output: Some(WireOutputRect {
+                    x: -1920,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                }),
+                at: Some(WirePoint { x: 10, y: 20 }),
+                annotations: Some(serde_json::json!([{"kind": "rect"}])),
+                base: Some(PathBuf::from("/tmp/base.png")),
+                ack: true,
+            },
+            PinCommand::Move {
+                id: 7,
+                x: 3,
+                y: 4,
+                path: None,
+                hdr: None,
+                annotations: None,
+                ack: false,
+            },
+            PinCommand::AddClipboard {
+                density: None,
+                output_name: None,
+                output: None,
+            },
+            PinCommand::List,
+            PinCommand::Quit,
+        ] {
+            let encoded = serde_json::to_string(&command).expect("encode");
+            let decoded: PinCommand = serde_json::from_str(&encoded).expect("decode");
+            assert_eq!(decoded, command, "{encoded}");
+        }
     }
 
     #[test]
