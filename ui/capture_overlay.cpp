@@ -12851,6 +12851,16 @@ void OverlayController::drawLoupe(CaptureOverlay *overlay, QPainter *painter)
         std::clamp(static_cast<int>(std::floor((pointer_.x - image.x) * scale)), minX, maxX);
     const int centerY =
         std::clamp(static_cast<int>(std::floor((pointer_.y - image.y) * scale)), minY, maxY);
+    // The readout is where the cursor *is*, not where the sample was taken.
+    // `centerX` above is clamped into the picture so a cursor past its edge
+    // still reads a pixel that exists; showing the clamped number made the
+    // coordinates stick at the selection's edge while the cursor moved on past
+    // it, which reads as the magnifier being stuck.  Clamp only to the frame,
+    // so the number tracks the cursor and is still a pixel that exists.
+    const int readoutX = std::clamp(
+        static_cast<int>(std::floor((pointer_.x - image.x) * scale)), 0, sourceWidth - 1);
+    const int readoutY = std::clamp(
+        static_cast<int>(std::floor((pointer_.y - image.y) * scale)), 0, sourceHeight - 1);
     const qreal radius = kLoupeDiameter / 2.0;
 
     QPointF center = local + QPointF(radius * 1.1, radius * 1.1);
@@ -12892,7 +12902,7 @@ void OverlayController::drawLoupe(CaptureOverlay *overlay, QPainter *painter)
     painter->drawLine(center - QPointF(radius / 2.5, 0), center + QPointF(radius / 2.5, 0));
     painter->drawLine(center, center - QPointF(0, radius / 2.5));
     painter->drawLine(center, center + QPointF(0, radius / 2.5));
-    const QString coordinates = QStringLiteral("%1, %2").arg(centerX).arg(centerY);
+    const QString coordinates = QStringLiteral("%1, %2").arg(readoutX).arg(readoutY);
     // The pixel's own colour, as the picker's own reading of it.  The circle
     // and the pill sample the same pixel, so what the pill says is what the
     // magnifier shows.
@@ -12908,9 +12918,10 @@ void OverlayController::drawLoupe(CaptureOverlay *overlay, QPainter *painter)
         pillAnchor.setY(center.y() - radius - 12.0);
     }
     // Under the eyedropper the readout is the pixel itself, chip and hex: that
-    // is the value the click is about to take, and a pair of numbers says
-    // nothing about it.  Everywhere else the loupe is there to place a corner,
-    // and the numbers are what is wanted.
+    // is the value the click is about to take.  It does not replace the
+    // coordinates -- a picker is aimed at one pixel, and knowing *which* pixel
+    // the readout is describing is what lets the user aim it.  So both are
+    // shown, on opposite sides of the loupe, so neither covers the circle.
     const bool picking = colorPickerVisible() && pixelColor.isValid();
     if (picking) {
         // The colour readout goes on the other side of the loupe from the
@@ -12925,6 +12936,8 @@ void OverlayController::drawLoupe(CaptureOverlay *overlay, QPainter *painter)
             colourAnchor.setY(center.y() - radius - 12.0);
         }
         drawColorPill(overlay, painter, colourAnchor, pixelColor);
+        drawInfoPill(painter, pillAnchor, coordinates,
+                     QRectF(0, 0, overlay->width(), overlay->height()));
     } else {
         drawInfoPill(painter, pillAnchor, coordinates,
                      QRectF(0, 0, overlay->width(), overlay->height()));
