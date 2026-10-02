@@ -23,6 +23,7 @@
 use std::path::Path;
 
 use crate::error::{Result, VshotError};
+use crate::geometry::Size;
 use crate::model::codec::{self, HdrImage};
 use crate::model::frame::Frame;
 use crate::model::hdr::{pq_encode, srgb_eotf, OutputColor, Primaries, ToneMapOptions};
@@ -68,6 +69,14 @@ pub struct SurfacePixels {
 }
 
 impl Picture {
+    /// The picture's geometry, which is the same question of either half.
+    pub fn size(&self) -> Size {
+        match self {
+            Self::Sdr(frame) => frame.size(),
+            Self::Hdr(image) => image.frame.size(),
+        }
+    }
+
     /// The codes this picture is written with on an output described by
     /// `color`.
     ///

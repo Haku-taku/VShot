@@ -74,7 +74,8 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1;
 
 use crate::error::{Result, VshotError};
 use crate::geometry::{Point, Rect, Size};
-use crate::model::hdr::{HdrFrame, Primaries, Transfer};
+use crate::model::hdr::{OutputColor, Primaries, ToneMapOptions, Transfer};
+use crate::model::picture::{Encoding, Picture};
 use crate::pin_hdr_fp16::{self as fp16, Buffer, Surface};
 use crate::wayland::{PinBufferSpec, WaylandSession};
 
@@ -90,58 +91,33 @@ const PIN_SLOTS: usize = 2;
 /// any pin id, so dropping a pin's picture never drops its shadow by mistake.
 const MASK_NAMESPACE: u64 = 1 << 63;
 
-/// A pin's pixels, as they travel from the daemon and as they are held here.
+/// One pin's picture, and the file the daemon named as where it came from.
 ///
-/// The same file is read once and kept, because every update rebuilds the stack
-/// and a drag sends one per motion event.
+/// The file is what the cache is keyed on, so a stack that names the same one
+/// again is not decoded twice.  What is held is the *picture* rather than the
+/// codes the file happened to carry, because the codes a surface wants depend
+/// on the output they are going onto: one pin on two outputs is two encodings
+/// of one picture, and re-deriving them needs the picture rather than one of
+/// its spellings.
 #[derive(Clone)]
-enum Pixels {
-    /// A pinned HDR capture: the ten-bit PQ words `pin::PqPin::encode` wrote,
-    /// already in a gamut of their own that the header names.
-    Pq {
-        path: PathBuf,
-        words: Arc<Vec<u32>>,
-        width: u32,
-        height: u32,
-        /// The light the capture's `1.0` stood for.
-        white: f32,
-        primaries: Primaries,
-    },
-    /// A pin whose picture is not HDR: the daemon's PNG, which is sRGB.  It
-    /// travels as a file for the same reason the HDR half does — a pinned
-    /// picture is output-sized and the socket carries one line per motion event
-    /// — and the daemon drops the file when the pin goes.  The bytes are kept
-    /// and encoded per output, because the level they stand for is the *output's*
-    /// own reference white and not the pin's: the same SDR picture pinned on two
-    /// outputs of different white is two different sets of codes.
-    Sdr {
-        path: PathBuf,
-        frame: Arc<crate::model::Frame>,
-    },
+struct Pixels {
+    picture: Arc<Picture>,
+    path: PathBuf,
 }
 
 impl Pixels {
     fn width(&self) -> u32 {
-        match self {
-            Pixels::Pq { width, .. } => *width,
-            Pixels::Sdr { frame, .. } => frame.size().width,
-        }
+        self.picture.size().width
     }
 
     fn height(&self) -> u32 {
-        match self {
-            Pixels::Pq { height, .. } => *height,
-            Pixels::Sdr { frame, .. } => frame.size().height,
-        }
+        self.picture.size().height
     }
 
-    /// What this pin's pixels are as the daemon identified them, so a stack that
+    /// What this pin's picture is as the daemon identified it, so a stack that
     /// names the same file again is not read a second time.
-    fn source(&self) -> (bool, PathBuf) {
-        match self {
-            Pixels::Pq { path, .. } => (true, path.clone()),
-            Pixels::Sdr { path, .. } => (false, path.clone()),
-        }
+    fn source(&self) -> PathBuf {
+        self.path.clone()
     }
 }
 
@@ -181,59 +157,64 @@ impl Pin {
     /// An SDR pin has no codes of its own to re-encode; its PNG is written
     /// against the output every time, which is the same conversion done from the
     /// other end.
-    fn words_in(&self, output: &OutputRect) -> Result<Vec<u32>> {
-        match &self.pixels {
-            Pixels::Sdr { frame, .. } => Ok(crate::model::picture::srgb_frame_words(
-                frame,
-                output.white,
-                output.primaries,
-            )),
-            Pixels::Pq {
-                words,
-                width,
-                height,
-                white,
-                primaries,
-                ..
-            } => {
-                if *primaries == output.primaries {
-                    return Ok(words.as_ref().clone());
-                }
-                let white = if white.is_finite() && *white > 0.0 {
-                    *white
-                } else {
-                    crate::model::hdr::REFERENCE_WHITE_NITS
-                };
-                Ok(HdrFrame::from_rgb10(
-                    words,
-                    Size::new(*width, *height),
-                    Transfer::Pq,
-                    *primaries,
-                    // The words carry real alpha bits, the way a surface buffer
-                    // does.
-                    true,
-                    white,
-                )?
-                .to_rgb10_pq_in(output.primaries, white))
-            }
+    fn words_in(&self, output: &OutputRect, tone_map: ToneMapOptions) -> Result<Vec<u32>> {
+        let written = self.pixels.picture.words_for(output.color(), tone_map)?;
+        // This side's surface carries the output's *own* description, and it is
+        // only ever installed on an output that is showing HDR -- so the codes
+        // are PQ.  A surface written with the other curve is the failure this
+        // whole split exists to avoid: every pin dark, its highlights clipped.
+        match written.encoding {
+            Encoding::Pq => Ok(written.words),
+            Encoding::Srgb => Err(VshotError::PinSurface(format!(
+                "{} was encoded for an SDR surface, and this side only has HDR ones",
+                output.name
+            ))),
         }
     }
 
     /// The light one unit of content stands for on this output, which is what
-    /// the rim is encoded against: the pin's own white for an HDR pin, and the
-    /// output's for an SDR one, because that is what its codes mean there.
+    /// the rim is encoded against: the pin's own white for an HDR picture, and
+    /// the output's for an SDR one, because that is what its codes mean there.
     fn white_on(&self, output: &OutputRect) -> f32 {
-        match &self.pixels {
-            Pixels::Sdr { .. } => output.white,
-            Pixels::Pq { white, .. } => {
-                if white.is_finite() && *white > 0.0 {
-                    *white
-                } else {
-                    crate::model::hdr::REFERENCE_WHITE_NITS
-                }
-            }
+        match self.pixels.picture.as_hdr() {
+            Some(image) => image.white(),
+            None => output.white,
         }
     }
+}
+
+/// Reads one pin's picture, whichever way the daemon handed it over.
+///
+/// Two spellings reach this: the PQ file the daemon copies for a pin that has
+/// an HDR half — a container of this program's own, which no general reader
+/// knows — and any image file, which is what a pin without one names.  The
+/// magic is what tells them apart, and it is the file's own bytes rather than
+/// its name.
+fn read_picture(path: &Path, fallback_nits: f32) -> Result<Picture> {
+    let bytes = std::fs::read(path).map_err(|source| VshotError::HdrPin {
+        path: path.to_path_buf(),
+        reason: format!("cannot read the pinned image: {source}"),
+    })?;
+    if bytes.starts_with(PQ_MAGIC) {
+        let image = read_pq_bytes(&bytes, path)?;
+        let size = Size::new(image.width, image.height);
+        return Ok(Picture::Hdr(crate::model::codec::HdrImage::from_rgb10(
+            &image.words,
+            size,
+            Transfer::Pq,
+            image.primaries,
+            // The words carry real alpha bits, the way a surface buffer does.
+            true,
+            image.reference_nits,
+        )?));
+    }
+    crate::model::picture::decode_bytes(&bytes, fallback_nits).map_err(|error| match error {
+        VshotError::HdrDecode { reason, .. } => VshotError::HdrPin {
+            path: path.to_path_buf(),
+            reason,
+        },
+        other => other,
+    })
 }
 
 /// The magic a PQ file starts with, so a file that is not one is refused
@@ -277,6 +258,12 @@ pub(crate) fn read_pq_file(path: &Path) -> Result<PqImage> {
         path: path.to_path_buf(),
         reason: format!("cannot read the pinned HDR image: {source}"),
     })?;
+    read_pq_bytes(&bytes, path)
+}
+
+/// The same for bytes already in hand: the reader above and the one a pin's
+/// picture comes in by share this parser rather than each having their own.
+fn read_pq_bytes(bytes: &[u8], path: &Path) -> Result<PqImage> {
     if bytes.len() < PQ_HEADER || &bytes[..8] != PQ_MAGIC {
         // The magic names the layout, so a file carrying another one is a pin
         // written by a VShot whose format this build does not know -- an older
@@ -334,23 +321,6 @@ pub(crate) fn read_pq_file(path: &Path) -> Result<PqImage> {
         reference_nits,
         primaries,
         words,
-    })
-}
-
-/// Reads one SDR pin's PNG, which is sRGB by construction.
-///
-/// The frame is kept rather than encoded: the level its codes stand for is the
-/// *output's* reference white, so the same picture pinned on two outputs of
-/// different white is two different sets of words, and the conversion belongs
-/// where the output is known.
-pub(crate) fn read_sdr_png(png: &Path) -> Result<crate::model::Frame> {
-    let bytes = std::fs::read(png).map_err(|source| VshotError::HdrPin {
-        path: png.to_path_buf(),
-        reason: format!("cannot read the pinned image: {source}"),
-    })?;
-    crate::model::Frame::from_png(&bytes).map_err(|error| VshotError::HdrPin {
-        path: png.to_path_buf(),
-        reason: format!("not a readable PNG: {error}"),
     })
 }
 
@@ -528,7 +498,7 @@ struct PinTarget {
     /// reference white they were re-encoded into for this output.  A pin whose
     /// file, destination gamut or destination white changed is uploaded again;
     /// one that changed none of them is left alone.
-    images: HashMap<u64, ((bool, PathBuf), Primaries, f32)>,
+    images: HashMap<u64, (PathBuf, Primaries, f32)>,
     /// The shape each pin's shadow mask was built for.  A pin whose shape
     /// changed has its mask built again.
     masks: HashMap<u64, MaskKey>,
@@ -567,6 +537,11 @@ struct Surfaces {
     stages: HashMap<String, Stage>,
     outputs: Vec<OutputRect>,
     style: Style,
+    /// How an HDR picture is mapped down for an output that cannot show it,
+    /// read from the config once when the surfaces come up.  A capture resolves
+    /// the same keys for its own SDR half, so a pinned capture and the file it
+    /// was written from are mapped the same way.
+    tone_map: ToneMapOptions,
     /// The stack the daemon last handed over, so a compose that found no buffer
     /// can be offered again without the daemon saying anything.
     last_pins: Vec<(u64, Pin)>,
@@ -591,11 +566,29 @@ struct OutputRect {
     white: f32,
 }
 
+impl OutputRect {
+    /// This output as the colour layer describes it.
+    ///
+    /// The transfer is PQ because this side only ever installs a surface on an
+    /// output that is showing HDR: a surface described in an SDR curve would
+    /// have a PQ buffer read as sRGB, and every pin would come out dark with
+    /// its highlights clipped.  When the surfaces cover SDR outputs too, this
+    /// is where the curve comes from.
+    fn color(&self) -> OutputColor {
+        OutputColor {
+            transfer: Transfer::Pq,
+            primaries: self.primaries,
+            reference_nits: self.white,
+        }
+    }
+}
+
 impl Surfaces {
     fn new() -> Result<Self> {
         let session = WaylandSession::connect()?;
         Ok(Self {
             session,
+            tone_map: ToneMapOptions::default(),
             hdr_outputs: Vec::new(),
             targets: HashMap::new(),
             stages: HashMap::new(),
@@ -611,6 +604,7 @@ impl Surfaces {
     /// are drawn into.
     fn start(&mut self) -> Result<()> {
         let debug = std::env::var_os("VSHOT_PIN_DEBUG").is_some();
+        self.tone_map = crate::config::tone_map_options();
         let candidates = self
             .session
             .show_pin_surfaces(zwlr_layer_shell_v1::Layer::Overlay, "vshot-pin-hdr")?;
@@ -753,6 +747,9 @@ impl Surfaces {
             return;
         }
         let pins = self.last_pins.clone();
+        // Copied out before the loop: the targets are borrowed mutably in it,
+        // and the map is a handful of numbers.
+        let tone_map = self.tone_map;
         let names = self
             .outputs
             .iter()
@@ -800,7 +797,7 @@ impl Surfaces {
                 continue;
             };
             let rendered = match self.targets.get_mut(&name) {
-                Some(target) => target.render(&pins, &output, &self.style, damage, slot),
+                Some(target) => target.render(&pins, &output, &self.style, tone_map, damage, slot),
                 None => continue,
             };
             if let Err(error) = rendered {
@@ -987,6 +984,7 @@ impl PinTarget {
         pins: &[(u64, Pin)],
         output: &OutputRect,
         style: &Style,
+        tone_map: ToneMapOptions,
         damage: Rect,
         slot: usize,
     ) -> Result<()> {
@@ -1015,7 +1013,7 @@ impl PinTarget {
             damage.size.height as i32,
         );
         for (id, pin) in pins {
-            self.upload(id, pin, output)?;
+            self.upload(id, pin, output, tone_map)?;
             self.draw_pin(id, pin, output, style)?;
         }
         if !self
@@ -1041,7 +1039,13 @@ impl PinTarget {
     /// shifts.  The cache is keyed on the file *and* the gamut, so the same pin
     /// moving between two outputs is converted once per output rather than per
     /// motion event.
-    fn upload(&mut self, id: &u64, pin: &Pin, output: &OutputRect) -> Result<()> {
+    fn upload(
+        &mut self,
+        id: &u64,
+        pin: &Pin,
+        output: &OutputRect,
+        tone_map: ToneMapOptions,
+    ) -> Result<()> {
         // Keyed on the file, the destination gamut *and* the destination white:
         // an SDR pin's words are written against the output's own white, so two
         // outputs that differ in either are two different sets of words for the
@@ -1051,7 +1055,7 @@ impl PinTarget {
             return Ok(());
         }
         self.surface.drop(*id);
-        let words = pin.words_in(output)?;
+        let words = pin.words_in(output, tone_map)?;
         self.surface.image(*id, &words, pin.width(), pin.height())?;
         self.images.insert(*id, key);
         Ok(())
@@ -1387,7 +1391,12 @@ fn apply_pins(command: &serde_json::Value, surfaces: &mut Surfaces, debug: bool)
         None => surfaces.style.clone(),
     };
     let previous = std::mem::take(&mut surfaces.last_pins);
-    let wanted = stack_of(command, incoming, &previous)?;
+    // The white a file that names none of its own is read at: the same setting
+    // a capture reads an HDR half at, so a pin and the capture it came from
+    // agree about how bright it is.
+    let reference_nits = crate::config::hdr_reference_white_default()
+        .unwrap_or(crate::model::hdr::REFERENCE_WHITE_NITS);
+    let wanted = stack_of(command, incoming, &previous, reference_nits)?;
     if debug {
         let names = wanted
             .iter()
@@ -1449,6 +1458,7 @@ fn stack_of(
     command: &serde_json::Value,
     incoming: &[serde_json::Value],
     previous: &[(u64, Pin)],
+    reference_nits: f32,
 ) -> Result<Vec<(u64, Pin)>> {
     // Which pin shows the live rim.  It travels once for the stack rather than on
     // every entry, because it is a fact about the pointer rather than about the
@@ -1465,32 +1475,22 @@ fn stack_of(
             continue;
         };
         // A pin with neither key is one this side cannot draw, and is skipped:
-        // it simply does not appear in the helper's stack.
+        // it simply does not appear in the helper's stack.  Which key it came
+        // under only says which corner of the program wrote the file; what the
+        // file *is* comes from its own bytes, in `read_picture`.
         let hdr = entry.get("hdr").and_then(|value| value.as_str());
         let png = entry.get("png").and_then(|value| value.as_str());
-        let (is_hdr, path) = match (hdr, png) {
-            (Some(path), _) => (true, PathBuf::from(path)),
-            (None, Some(path)) => (false, PathBuf::from(path)),
+        let path = match (hdr, png) {
+            (Some(path), _) | (None, Some(path)) => PathBuf::from(path),
             (None, None) => continue,
         };
         let existing = previous
             .iter()
-            .find(|(pin_id, pin)| *pin_id == id && pin.pixels.source() == (is_hdr, path.clone()));
+            .find(|(pin_id, pin)| *pin_id == id && pin.pixels.source() == path);
         let pixels = match existing {
             Some((_, pin)) => pin.pixels.clone(),
-            None if is_hdr => {
-                let image = read_pq_file(&path)?;
-                Pixels::Pq {
-                    path,
-                    words: Arc::new(image.words),
-                    width: image.width,
-                    height: image.height,
-                    white: image.reference_nits,
-                    primaries: image.primaries,
-                }
-            }
-            None => Pixels::Sdr {
-                frame: Arc::new(read_sdr_png(&path)?),
+            None => Pixels {
+                picture: Arc::new(read_picture(&path, reference_nits)?),
                 path,
             },
         };
@@ -1585,16 +1585,18 @@ fn visible_of(entry: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::hdr::HdrFrame;
 
-    fn pin(width: u32, height: u32, origin: Point, scale: f64) -> Pin {
+    /// The light the test pins stand for: half of SDR white, which is a code
+    /// that moves when it is written against anything but its own gamut.
+    const HALF: f32 = 0.5;
+
+    /// A pin holding one picture, and the file it would have come from.
+    fn pin_of(picture: Picture, origin: Point, scale: f64) -> Pin {
         Pin {
-            pixels: Pixels::Pq {
+            pixels: Pixels {
+                picture: Arc::new(picture),
                 path: PathBuf::from("(none)"),
-                words: Arc::new(vec![0; (width * height) as usize]),
-                width,
-                height,
-                white: 203.0,
-                primaries: Primaries::Bt2020,
             },
             origin,
             scale,
@@ -1603,14 +1605,43 @@ mod tests {
         }
     }
 
+    /// A flat HDR picture, as a codec would have decoded one.
+    fn flat(light: [f32; 3], width: u32, height: u32, primaries: Primaries, white: f32) -> Picture {
+        let pixels = vec![[light[0], light[1], light[2], 1.0]; (width * height) as usize];
+        Picture::Hdr(crate::model::codec::HdrImage::new(
+            HdrFrame::in_primaries(Size::new(width, height), pixels, primaries).expect("frame"),
+            white,
+        ))
+    }
+
+    fn pin(width: u32, height: u32, origin: Point, scale: f64) -> Pin {
+        pin_of(
+            flat([HALF; 3], width, height, Primaries::Bt2020, 203.0),
+            origin,
+            scale,
+        )
+    }
+
     #[test]
-    fn a_pin_is_uploaded_untouched_on_the_gamut_it_was_captured_in() {
+    fn a_pin_on_the_gamut_it_was_captured_in_keeps_its_light() {
+        // The picture is held as light and re-encoded for whichever output it
+        // is going onto, so a pin on its own gamut is no longer byte-identical
+        // to the file it came from: the round trip through the PQ curve costs
+        // at most a code per channel.  What has to survive is the light.
         let pin = pin(1, 1, Point::new(0, 0), 1.0);
-        let words = pin.words_in(&output()).unwrap();
-        let Pixels::Pq { words: held, .. } = &pin.pixels else {
-            panic!("the helper pin is an HDR one");
-        };
-        assert_eq!(words, **held);
+        let words = pin.words_in(&output(), ToneMapOptions::default()).unwrap();
+        let back = HdrFrame::from_rgb10(
+            &words,
+            Size::new(1, 1),
+            Transfer::Pq,
+            Primaries::Bt2020,
+            true,
+            203.0,
+        )
+        .expect("decode")
+        .pixel(0, 0)
+        .expect("pixel");
+        assert!((back[0] - HALF).abs() < 0.01, "{back:?}");
     }
 
     #[test]
@@ -1625,29 +1656,27 @@ mod tests {
         )
         .unwrap();
         let words = source.to_rgb10_pq_in(Primaries::Bt709, 203.0);
-        let pin = Pin {
-            pixels: Pixels::Pq {
-                path: PathBuf::from("(none)"),
-                words: Arc::new(words.clone()),
-                width: 1,
-                height: 1,
-                white: 203.0,
-                primaries: Primaries::Bt709,
-            },
-            ..pin(1, 1, Point::new(0, 0), 1.0)
-        };
+        let pin = pin_of(
+            flat(LIGHT, 1, 1, Primaries::Bt709, 203.0),
+            Point::new(0, 0),
+            1.0,
+        );
 
         // On its own gamut the codes go up as they are.
         let mut bt709_output = output();
         bt709_output.primaries = Primaries::Bt709;
-        assert_eq!(pin.words_in(&bt709_output).unwrap(), words);
+        assert_eq!(
+            pin.words_in(&bt709_output, ToneMapOptions::default())
+                .unwrap(),
+            words
+        );
 
         // On a BT.2020 surface they are rewritten, and reading them back in
         // *that* gamut and writing them out again as BT.709 gives the codes we
         // started from: the light survived the move.  Without the rewrite the
         // compositor would read BT.709 codes as BT.2020 and the colour would
         // come out wrong.
-        let moved = pin.words_in(&output()).unwrap();
+        let moved = pin.words_in(&output(), ToneMapOptions::default()).unwrap();
         assert_ne!(moved, words, "the codes were not re-encoded");
         let back = HdrFrame::from_rgb10(
             &moved,
@@ -1672,18 +1701,21 @@ mod tests {
     }
 
     #[test]
-    fn an_sdr_png_round_trips_through_the_reader() {
+    fn an_sdr_pin_comes_in_as_the_codes_it_holds() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("pin.png");
         let frame = crate::model::Frame::solid(Size::new(2, 3), [1, 2, 3, 255]).unwrap();
         std::fs::write(&path, frame.to_png().unwrap()).unwrap();
-        let read = read_sdr_png(&path).unwrap();
-        assert_eq!(read.size(), Size::new(2, 3));
+        let picture = read_picture(&path, 203.0).unwrap();
+        assert_eq!(picture.size(), Size::new(2, 3));
+        let Picture::Sdr(read) = &picture else {
+            panic!("a PNG is an SDR picture");
+        };
         assert_eq!(&read.pixels()[..4], &[1, 2, 3, 255]);
-        // A file that is not a PNG is refused rather than drawn as noise.
+        // A file that is not an image is refused rather than drawn as noise.
         let bad = directory.path().join("bad.png");
         std::fs::write(&bad, b"not a png").unwrap();
-        assert!(read_sdr_png(&bad).is_err());
+        assert!(read_picture(&bad, 203.0).is_err());
     }
 
     #[test]
@@ -1712,15 +1744,22 @@ mod tests {
                 {"id": 3, "hdr": pq.to_str().unwrap(), "x": 5, "y": 6, "scale": 1.0},
             ],
         });
-        let stack = stack_of(&command, command["pins"].as_array().unwrap(), &[]).unwrap();
+        let stack = stack_of(&command, command["pins"].as_array().unwrap(), &[], 203.0).unwrap();
         assert_eq!(
             stack.iter().map(|(id, _)| *id).collect::<Vec<u64>>(),
             vec![1, 2, 3]
         );
-        // The key decides how the pixels are read: the PQ file is its own words
-        // and the PNG is a frame to encode against the output's white.
-        assert!(matches!(stack[0].1.pixels, Pixels::Pq { .. }));
-        assert!(matches!(stack[1].1.pixels, Pixels::Sdr { .. }));
+        // The file decides what the picture is: the PQ file is light of this
+        // program's own, and the PNG is codes to be encoded against whatever
+        // output the pin lands on.
+        assert!(matches!(
+            stack[0].1.pixels.picture.as_ref(),
+            Picture::Hdr(_)
+        ));
+        assert!(matches!(
+            stack[1].1.pixels.picture.as_ref(),
+            Picture::Sdr(_)
+        ));
         assert_eq!(stack[1].1.width(), 2);
         // Which pin the pointer is on travels once, and lands on that pin alone.
         assert_eq!(
@@ -1740,7 +1779,7 @@ mod tests {
                 {"id": 2, "x": 3, "y": 4},
             ],
         });
-        let stack = stack_of(&partial, partial["pins"].as_array().unwrap(), &[]).unwrap();
+        let stack = stack_of(&partial, partial["pins"].as_array().unwrap(), &[], 203.0).unwrap();
         assert_eq!(stack.len(), 1);
         assert_eq!(stack[0].0, 1);
     }
@@ -1762,7 +1801,7 @@ mod tests {
             "cmd": "pins",
             "pins": [{"id": 7, "png": path, "x": 0, "y": 0, "scale": 1.0}],
         });
-        let first = stack_of(&command, command["pins"].as_array().unwrap(), &[]).unwrap();
+        let first = stack_of(&command, command["pins"].as_array().unwrap(), &[], 203.0).unwrap();
         // The file is gone, so a second read would fail: the pixels a drag sends
         // again have to come from the stack already held.
         std::fs::remove_file(&png).unwrap();
@@ -1770,16 +1809,14 @@ mod tests {
             "cmd": "pins",
             "pins": [{"id": 7, "png": path, "x": 40, "y": 0, "scale": 1.0}],
         });
-        let second = stack_of(&moved, moved["pins"].as_array().unwrap(), &first).unwrap();
+        let second = stack_of(&moved, moved["pins"].as_array().unwrap(), &first, 203.0).unwrap();
         assert_eq!(second[0].1.origin, Point::new(40, 0));
-        // The frame is shared, not copied: reading it again is what the cache is
-        // there to avoid.
-        let (Pixels::Sdr { frame: before, .. }, Pixels::Sdr { frame: after, .. }) =
-            (&first[0].1.pixels, &second[0].1.pixels)
-        else {
-            panic!("both are the SDR pin");
-        };
-        assert!(Arc::ptr_eq(before, after));
+        // The picture is shared, not copied: reading the file again is what the
+        // cache is there to avoid.
+        assert!(Arc::ptr_eq(
+            &first[0].1.pixels.picture,
+            &second[0].1.pixels.picture
+        ));
     }
 
     /// A minimal PQ file the reader accepts: `width`×`height` black words.

@@ -492,6 +492,28 @@ pub fn tone_map_white_default() -> Option<f32> {
     load().tone_map_white.map(ToneMapOptions::clamp_white)
 }
 
+/// The tone map the capture path would use, resolved from the file alone.
+///
+/// The flags win over these for a capture, so this is the same chain with its
+/// first link missing — for the callers that have no command line at all.  The
+/// pin daemon is one: it maps an HDR pin down for an SDR output, and that is
+/// the same decision a capture makes about its own SDR half, at the same
+/// setting, or a pinned capture and the file it was written from would not
+/// match.
+pub fn tone_map_options() -> ToneMapOptions {
+    ToneMapOptions {
+        mode: tone_map_default().unwrap_or_default(),
+        white: tone_map_white_default().map_or_else(
+            || ToneMapOptions::default().white,
+            ToneMapOptions::clamp_white,
+        ),
+        hdr: HdrDecision::from_config(
+            hdr_area_test_default().unwrap_or_else(|| HdrDecision::default().ratio > 0.0),
+            hdr_area_ratio_default().unwrap_or_else(|| HdrDecision::default().ratio),
+        ),
+    }
+}
+
 /// Whether the config file asks for the HDR area test, or `None` when it says
 /// nothing usable.  The caller keeps its own built-in default (on).
 pub fn hdr_area_test_default() -> Option<bool> {
