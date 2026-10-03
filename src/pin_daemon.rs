@@ -1197,6 +1197,23 @@ impl Daemon {
         Some(*self.idle.get_or_insert_with(|| Instant::now() + IDLE_QUIT))
     }
 
+    /// The edit is over: the editor's connection has gone.
+    ///
+    /// The session's directory goes with it, and the pin takes its input back
+    /// -- while an edit is open the editor covers the whole output and every
+    /// press has to reach it, which is why the pin gives its rect up at all.
+    fn end_edit(&mut self) {
+        if self.editing.take().is_none() {
+            return;
+        }
+        // The editor draws its own frame, and it is gone; the pin is drawn by
+        // this side again.
+        self.announced_active = 0;
+        if let Err(error) = self.refresh() {
+            eprintln!("vshot-pin: {error}");
+        }
+    }
+
     /// The pin the editor should draw its frame around: the one the open edit
     /// is on, while that pin is still the live one.
     ///
@@ -1364,11 +1381,19 @@ impl Daemon {
                     self.refresh()?;
                     // A click that was aimed past the menu is handed on, so it
                     // lands where the user pointed rather than being spent on
-                    // closing a menu.
+                    // closing a menu.  It is a *click*: the button was already
+                    // let go by the time this arrives -- the chrome took the
+                    // press and the release -- so the gesture is started and
+                    // ended here rather than left open, which would have the
+                    // pin follow the pointer until the user pressed and
+                    // released again to finish a drag they never began.
                     if passthrough {
                         if let Some(at) = self.last_pointer {
-                            self.stack.press(at, Instant::now());
-                            self.refresh()?;
+                            let raised = self.stack.press(at, Instant::now());
+                            self.stack.release();
+                            if raised.redraw {
+                                self.refresh()?;
+                            }
                         }
                     }
                 }
@@ -1536,9 +1561,30 @@ impl Daemon {
                 if let Some(marks) = annotations {
                     self.stack.pins[index].annotations = Some(marks);
                 }
-                self.stack.pins[index].origin = Point::new(x, y);
+                // The clamp is what the pin really landed on, which is not
+                // always where it was asked to go: a drag past the edge of
+                // every output is pulled back.  The editor is told where it
+                // ended up rather than where it asked -- it draws its frame and
+                // its toolbar against that rect, and a frame tracking a
+                // position the pin never took is a frame beside the picture.
+                let clamped = self.stack.clamp_origin(
+                    Point::new(x, y),
+                    Stack::drawn(
+                        self.stack.pins[index].picture.size(),
+                        self.stack.pins[index].scale,
+                    ),
+                );
+                self.stack.pins[index].origin = clamped;
                 self.refresh()?;
-                Ok(json!({"ok": true}))
+                let pin = &self.stack.pins[index];
+                let size = Stack::drawn(pin.picture.size(), pin.scale);
+                Ok(json!({
+                    "ok": true,
+                    "x": pin.origin.x,
+                    "y": pin.origin.y,
+                    "width": size.width,
+                    "height": size.height,
+                }))
             }
             PinCommand::Toggle => {
                 let visible = !self.stack.all_visible;
@@ -2093,10 +2139,16 @@ pub fn run(socket: &Path) -> Result<()> {
         // Everything every client has said, answered on the spot.  A client
         // that has gone away is dropped, and a `quit` stops the daemon.
         let mut live: Vec<Client> = Vec::with_capacity(clients.len());
+        let mut dropped_watcher = false;
         for mut client in clients {
             match serve_client(&mut daemon, &mut client, debug) {
                 Ok(true) => live.push(client),
-                Ok(false) => {}
+                Ok(false) => {
+                    // The editor holds the connection it asked to watch on for
+                    // as long as its session lasts, so a watcher that has gone
+                    // is an edit that has finished.
+                    dropped_watcher |= client.watcher;
+                }
                 Err(error) => {
                     if debug {
                         eprintln!("vshot-pin: {error}");
@@ -2105,6 +2157,9 @@ pub fn run(socket: &Path) -> Result<()> {
             }
         }
         clients = live;
+        if dropped_watcher {
+            daemon.end_edit();
+        }
         // Whatever the chrome said back -- a menu row picked, a menu dismissed
         // -- before anything else looks at the stack.
         daemon.chrome_replies()?;
@@ -2138,6 +2193,10 @@ pub fn run(socket: &Path) -> Result<()> {
 struct Client {
     stream: UnixStream,
     pending: Vec<u8>,
+    /// Whether this client asked to be told which pin is live.  Only the pin
+    /// editor does, and it keeps the connection open for as long as its session
+    /// lasts -- so a watcher that has gone is an edit that has finished.
+    watcher: bool,
 }
 
 impl Client {
@@ -2148,6 +2207,7 @@ impl Client {
         Ok(Self {
             stream,
             pending: Vec::new(),
+            watcher: false,
         })
     }
 }
@@ -2196,6 +2256,9 @@ fn serve_client(daemon: &mut Daemon, client: &mut Client, debug: bool) -> Result
         if matches!(command, PinCommand::Quit) {
             write_reply(&client.stream, &json!({"ok": true}))?;
             return Ok(false);
+        }
+        if matches!(command, PinCommand::WatchActive) {
+            client.watcher = true;
         }
         let reply = match daemon.handle(command, Some(&client.stream)) {
             Ok(reply) => reply,
