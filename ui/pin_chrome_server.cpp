@@ -84,14 +84,12 @@ int runPinChrome(const QString &socketPath)
                     const QJsonArray pins = message.value(QStringLiteral("pins")).toArray();
                     for (const QJsonValue &value : pins) {
                         const QJsonObject pin = value.toObject();
-                        // Only the labels that have something to say: a pin
-                        // with no tag and no badge is a rect this surface would
-                        // repaint for nothing.
-                        const bool hovered = pin.value(QStringLiteral("hovered")).toBool();
-                        const bool hdr = pin.value(QStringLiteral("hdr")).toBool();
-                        if (!hovered || !hdr) {
-                            continue;
-                        }
+                        // Every pin, not only the ones with something to say
+                        // this instant: the badge is about a pin the pointer is
+                        // nowhere near -- a save reports from a menu that has
+                        // closed -- and a label dropped here has nowhere to
+                        // appear.  What each one draws is decided at paint time,
+                        // from the hover and from whether it is an HDR capture.
                         PinChrome::Label label;
                         label.id = static_cast<quint64>(
                             pin.value(QStringLiteral("id")).toDouble());
@@ -99,8 +97,9 @@ int runPinChrome(const QString &socketPath)
                                               pin.value(QStringLiteral("y")).toInt());
                         label.size = QSize(pin.value(QStringLiteral("width")).toInt(),
                                            pin.value(QStringLiteral("height")).toInt());
-                        label.capturedHdr = hdr;
+                        label.capturedHdr = pin.value(QStringLiteral("hdr")).toBool();
                         label.shownAsHdr = pin.value(QStringLiteral("shown")).toBool();
+                        label.hovered = pin.value(QStringLiteral("hovered")).toBool();
                         labels.append(label);
                     }
                     chrome->setPinnedVisible(visible);

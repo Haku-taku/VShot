@@ -62,6 +62,9 @@ public:
         /// opposed to the same capture mapped down for an SDR output.  The tag
         /// is drawn in a different ink for each.
         bool shownAsHdr = false;
+        /// Whether the pointer is over this pin, which is the only one whose
+        /// tag is up.
+        bool hovered = false;
     };
 
     explicit PinChrome(QScreen *screen);

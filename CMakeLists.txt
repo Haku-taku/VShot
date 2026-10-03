@@ -158,6 +158,27 @@ if(VSHOT_BUILD_CHECKS)
     # out of its chunks, which is what makes a 1080p capture stay its own size
     # when it is pinned on a 4K screen. Pure byte work, so it needs no
     # platform plugin at all.
+    add_executable(vshot-pin-chrome-check
+        ui/pin_chrome_check.cpp
+        ui/pin_chrome.cpp
+        ui/pin_chrome.hpp
+        ui/pin_label.cpp
+        ui/pin_label.hpp
+        ui/i18n.cpp
+        ui/i18n.hpp
+    )
+    target_link_libraries(vshot-pin-chrome-check PRIVATE
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+        Qt6::Network
+        LayerShellQt::Interface
+    )
+    target_compile_features(vshot-pin-chrome-check PRIVATE cxx_std_17)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(vshot-pin-chrome-check PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
     add_executable(vshot-pin-density-check
         ui/pin_density_check.cpp
         ui/pin_density.cpp

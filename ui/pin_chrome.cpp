@@ -397,7 +397,10 @@ void PinChrome::paintEvent(QPaintEvent *event)
         if (!target.intersects(rect())) {
             continue;
         }
-        if (entry.label.capturedHdr) {
+        // The tag only while the pointer is over the pin: it says what the
+        // thing under the cursor is, and one on every pin at once would be a
+        // wall of text over the desktop.
+        if (entry.label.capturedHdr && entry.label.hovered) {
             const QRect box = tagBox(kHdrTag, target.topLeft(), false, rect());
             if (!box.isEmpty()) {
                 paintLabel(painter, box, kHdrTag,
