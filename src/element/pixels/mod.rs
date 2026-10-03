@@ -307,6 +307,46 @@ mod tests {
         (scene, window)
     }
 
+    /// Like [`scene_of`], but the output, its scale and the window are all
+    /// given rather than making the window the whole frame.
+    ///
+    /// `painted` is in *frame* (device) pixels, which is the space the reader
+    /// works in before it converts to global logical ones.
+    pub(crate) fn scene_in_output(
+        frame_size: Size,
+        scale: u32,
+        output: Rect,
+        window: Rect,
+        background: [u8; 4],
+        painted: &[(Rect, [u8; 4])],
+    ) -> (SceneSnapshot, WindowCandidate) {
+        let mut pixels = Vec::with_capacity((frame_size.width * frame_size.height * 4) as usize);
+        for y in 0..frame_size.height {
+            for x in 0..frame_size.width {
+                let point = Point::new(x as i32, y as i32);
+                let color = painted
+                    .iter()
+                    .rev()
+                    .find(|(rect, _)| rect.contains(point))
+                    .map(|(_, paint)| *paint)
+                    .unwrap_or(background);
+                pixels.extend_from_slice(&color);
+            }
+        }
+        let frame = Frame::new(frame_size, pixels).expect("frame");
+        let output = OutputSnapshot::new(1, "TEST", output, scale, frame).expect("output");
+        let scene = SceneSnapshot::from_outputs(vec![output]).expect("scene");
+        let window = WindowCandidate {
+            geometry: window,
+            label: String::new(),
+            app_id: String::new(),
+            title: "test".into(),
+            pid: 0,
+            handle: None,
+        };
+        (scene, window)
+    }
+
     pub(crate) fn flatten(nodes: &[RegionNode]) -> Vec<&RegionNode> {
         fn walk<'a>(node: &'a RegionNode, out: &mut Vec<&'a RegionNode>) {
             out.push(node);
@@ -449,6 +489,103 @@ mod tests {
                 "a pixel-found region is labelled by its size"
             );
         }
+    }
+
+    /// The reader works in window-local pixels and converts to global ones once
+    /// at the end.
+    ///
+    /// Every real window sits somewhere other than the screen's origin.  If the
+    /// conversion is applied once per level of the tree instead of once per
+    /// tree, every level below the root gets the window's origin added again,
+    /// and the panes land nowhere near the divider they were cut from.  The
+    /// other tests put the window at `(0, 0)`, where that mistake is invisible
+    /// because the conversion is the identity.
+    #[test]
+    fn a_window_away_from_the_origin_is_converted_once() {
+        let window = Rect::new(137, 91, 1200, 800);
+        let (scene, candidate) = scene_in_output(
+            Size::new(1400, 1000),
+            1,
+            Rect::new(0, 0, 1400, 1000),
+            window,
+            [30, 30, 30, 255],
+            &[
+                // Frame pixels: a left pane, then the divider beside it.
+                (Rect::new(137, 91, 598, 800), [40, 40, 40, 255]),
+                (Rect::new(137 + 598, 91, 2, 800), [200, 200, 200, 255]),
+            ],
+        );
+        let roots = Pixels
+            .elements(&ElementRequest {
+                window: &candidate,
+                scene: &scene,
+                fallback: Fallback::default(),
+            })
+            .expect("a divider was drawn");
+        assert_eq!(roots.len(), 1, "one root");
+        let root = &roots[0];
+        assert_eq!(
+            (root.rect.left(), root.rect.top(), root.rect.size.width, root.rect.size.height),
+            (137, 91, 1200, 800),
+            "the root is the window itself"
+        );
+        let left = root
+            .children
+            .iter()
+            .min_by_key(|node| node.rect.left())
+            .expect("the divider cut the window in two");
+        assert_eq!(
+            (left.rect.left(), left.rect.top(), left.rect.size.width, left.rect.size.height),
+            (137, 91, 600, 800),
+            "the left pane is the window's own top-left corner, converted once: {:?}",
+            root.children.iter().map(|n| n.rect).collect::<Vec<_>>()
+        );
+    }
+
+    /// The same conversion once, with the output scaled.
+    ///
+    /// A device pixel is half a logical one at scale 2, so a conversion applied
+    /// twice halves the region twice — a 598-pixel pane comes back 299 wide.
+    #[test]
+    fn a_scaled_output_is_converted_once() {
+        let window = Rect::new(0, 0, 1200, 800);
+        let (scene, candidate) = scene_in_output(
+            Size::new(2400, 1600),
+            2,
+            window,
+            window,
+            [30, 30, 30, 255],
+            &[
+                // Device pixels: the left pane, then the divider, which is two
+                // logical pixels at this scale.
+                (Rect::new(0, 0, 1196, 1600), [40, 40, 40, 255]),
+                (Rect::new(1196, 0, 4, 1600), [200, 200, 200, 255]),
+            ],
+        );
+        let roots = Pixels
+            .elements(&ElementRequest {
+                window: &candidate,
+                scene: &scene,
+                fallback: Fallback::default(),
+            })
+            .expect("a divider was drawn");
+        let root = &roots[0];
+        assert_eq!(
+            (root.rect.size.width, root.rect.size.height),
+            (1200, 800),
+            "the root is the window in logical pixels"
+        );
+        let left = root
+            .children
+            .iter()
+            .min_by_key(|node| node.rect.left())
+            .expect("the divider cut the window in two");
+        assert_eq!(
+            (left.rect.left(), left.rect.size.width, left.rect.size.height),
+            (0, 600, 800),
+            "the pane is a device-space cut halved once: {:?}",
+            root.children.iter().map(|n| n.rect).collect::<Vec<_>>()
+        );
     }
 
     /// The two readers disagree about a window with no lines in it.

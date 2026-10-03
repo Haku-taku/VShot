@@ -366,6 +366,11 @@ const std::pair<const char *, const char *> kOwnedCliKeys[] = {
     {"", "png-compression"}, {"", "hdr-format"}, {"", "monitor"},
     {"", "tone-map"},        {"", "tone-map-white"},
     {"", "hdr-area-test"},   {"", "hdr-area-ratio"},
+    // The pixel reader is written only when it is not the default `lines`, so a
+    // remembered `components` has to be cleared out on the way back: without
+    // this line the merge below puts the old value back, and `lines` can never
+    // be selected again.
+    {"", "element-fallback"},
     {"long", "notches"},     {"long", "max-height"},
     {"long", "max-frames"},  {"long", "timeout"},
     {"long", "ignore-top"},  {"long", "inject"},

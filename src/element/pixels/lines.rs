@@ -127,10 +127,20 @@ pub(super) fn regions(analysis: &Analysis) -> Vec<RegionNode> {
         return Vec::new();
     }
     let root = cut(&segments, analysis.width, analysis.height);
-    let root = prune(root, analysis);
-    (root.children.is_empty() && root.rect.size == analysis.window.size)
-        .then(Vec::new)
-        .unwrap_or_else(|| vec![root])
+    let root = prune(root);
+    // Nothing was cut: the window is the only region there is, which is "no
+    // elements", not "one element".  Judged here, in the reader's own pixels —
+    // the space every constant above is measured in — and before the one
+    // conversion to global coordinates below.
+    if root.children.is_empty()
+        && root.rect.origin.x == 0
+        && root.rect.origin.y == 0
+        && root.rect.size.width == analysis.width
+        && root.rect.size.height == analysis.height
+    {
+        return Vec::new();
+    }
+    vec![root.into_global(analysis)]
 }
 
 /// The luminance of every pixel, which is what all the passes read.
@@ -229,8 +239,8 @@ fn segments(analysis: &Analysis) -> Vec<Segment> {
     // short — filtering by length here would drop the fragments a rounded
     // corner leaves, and they are needed to bridge the corner.
     let mut out = Vec::new();
-    out.extend(group(collect(&vertical, width, height, true), true));
-    out.extend(group(collect(&horizontal, width, height, false), false));
+    out.extend(group(collect(&vertical, width, height, true)));
+    out.extend(group(collect(&horizontal, width, height, false)));
     merge_gaps(analysis, out)
 }
 
@@ -278,7 +288,7 @@ fn collect(points: &[(u32, u32)], width: u32, height: u32, vertical: bool) -> Ve
 
 /// Join runs that are the same line's two ends around a rounded corner, then
 /// keep the ones long enough to be a line.
-fn group(mut items: Vec<Segment>, vertical: bool) -> Vec<Segment> {
+fn group(mut items: Vec<Segment>) -> Vec<Segment> {
     items.sort_by_key(|segment| (segment.at, segment.start));
     let mut merged: Vec<Segment> = Vec::new();
     for item in items {
@@ -300,7 +310,6 @@ fn group(mut items: Vec<Segment>, vertical: bool) -> Vec<Segment> {
             merged.push(item);
         }
     }
-    let _ = vertical;
     merged.retain(|segment| segment.length() >= MIN_LENGTH);
     merged
 }
@@ -313,13 +322,11 @@ fn group(mut items: Vec<Segment>, vertical: bool) -> Vec<Segment> {
 /// pixels long whose colour matched both sides exactly, while two different
 /// lines 161 pixels apart had a gap colour 12 levels off.
 fn merge_gaps(analysis: &Analysis, segments: Vec<Segment>) -> Vec<Segment> {
-    let (mut verticals, mut horizontals): (Vec<Segment>, Vec<Segment>) =
+    let (verticals, horizontals): (Vec<Segment>, Vec<Segment>) =
         segments.into_iter().partition(|segment| segment.vertical);
-    let _ = (&mut verticals, &mut horizontals);
-    let mut verticals = merge_axis(analysis, verticals, true);
-    let mut horizontals = merge_axis(analysis, horizontals, false);
-    verticals.append(&mut horizontals);
-    verticals
+    let mut merged = merge_axis(analysis, verticals, true);
+    merged.extend(merge_axis(analysis, horizontals, false));
+    merged
 }
 
 fn merge_axis(analysis: &Analysis, items: Vec<Segment>, vertical: bool) -> Vec<Segment> {
@@ -500,11 +507,17 @@ fn coverage(segments: &[Segment], vertical: bool, at: u32, from: u32, to: u32) -
 /// Cutting leaves a few pixel-sized pieces behind — antialiasing, the edge of
 /// an icon.  They are not regions.  A node with one child is dissolved because
 /// it says nothing: it and its child are the same piece of the window.
-fn prune(node: RegionNode, analysis: &Analysis) -> RegionNode {
+///
+/// Everything here stays in the reader's own pixels.  The size test is the one
+/// the prototype applied to the image it was handed, so it is measured in the
+/// same pixels the rest of this file works in — a region is small or not small
+/// on its own, not after it has been rescaled to logical ones.  Converting to
+/// global coordinates is [`regions`]'s single, final step.
+fn prune(node: RegionNode) -> RegionNode {
     let rect = node.rect;
     let mut kept = Vec::new();
     for child in node.children {
-        let child = prune(child, analysis);
+        let child = prune(child);
         if child.rect.size.width < MIN_REGION_EDGE || child.rect.size.height < MIN_REGION_EDGE {
             continue;
         }
@@ -512,18 +525,20 @@ fn prune(node: RegionNode, analysis: &Analysis) -> RegionNode {
     }
     // A node with one child says nothing — it and its child are the same piece
     // of the window — so the child takes its place.
-    let pruned = match kept.len() {
+    match kept.len() {
         0 => leaf(rect),
         1 => kept.into_iter().next().expect("one child"),
         _ => leaf(rect).with_children(kept),
-    };
-    pruned.into_global(analysis)
+    }
 }
 
 /// Converts the tree's local rectangles to global logical ones.
 ///
-/// Done once, at the end: the whole reader works in window-local pixels, and
-/// only the picker cares where the window is on the screen.
+/// Applied exactly once, to the pruned tree, by [`regions`]: the whole reader
+/// works in window-local pixels, and only the picker cares where the window is
+/// on the screen.  It is not idempotent — a logical pixel is `scale` device
+/// ones, so converting a converted rect divides it again — which is why it may
+/// not be applied per level as the recursion unwinds.
 trait IntoGlobal {
     fn into_global(self, analysis: &Analysis) -> RegionNode;
 }
