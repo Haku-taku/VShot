@@ -911,37 +911,19 @@ impl Surfaces {
         }
     }
 
-    /// The same, woken by anything: a socket with something to say, or the
-    /// compositor handing a buffer back.  A daemon that owns its own listener
-    /// has no stream to hand over, and waiting on the listener's own descriptor
-    /// is what keeps a connection from sitting unread until the compositor
-    /// happens to speak.
-    pub(crate) fn wait_on(&mut self, fd: Option<BorrowedFd<'_>>) -> Result<()> {
-        self.session.pump_watching(fd, None)
-    }
-
-    /// The same, giving up after `timeout` so the caller can look at its own
-    /// clock: a daemon with nothing pinned has to notice that, and nothing the
-    /// compositor or the socket says will tell it.
-    pub(crate) fn wait_on_until(
+    /// The same, with as many clients to wait on as the caller has.
+    ///
+    /// A daemon serves a listener, every client that is connected and the
+    /// chrome it drives; a socket this loop does not watch has its lines read
+    /// only when something else happens to wake it, which is a menu that
+    /// responds a fifth of a second late and an editor whose moves arrive in
+    /// bursts.
+    pub(crate) fn wait_on_many(
         &mut self,
-        fd: Option<BorrowedFd<'_>>,
+        fds: &[BorrowedFd<'_>],
         timeout: Option<Duration>,
     ) -> Result<()> {
-        self.session.pump_watching(fd, timeout)
-    }
-
-    /// The same, with two clients to wait on: the command socket and the
-    /// chrome.  A client whose socket is not watched has its answers read only
-    /// when something else wakes this loop, which is a menu that responds a
-    /// fifth of a second late.
-    pub(crate) fn wait_on_two(
-        &mut self,
-        first: Option<BorrowedFd<'_>>,
-        second: Option<BorrowedFd<'_>>,
-        timeout: Option<Duration>,
-    ) -> Result<()> {
-        self.session.pump_watching3(first, second, timeout)
+        self.session.pump_watching_many(fds, timeout)
     }
 
     /// Lets the pin surfaces take the pointer, or stops them.

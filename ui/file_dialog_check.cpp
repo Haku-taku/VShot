@@ -29,6 +29,7 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QLineEdit>
 #include <QDeadlineTimer>
 #include <QDialogButtonBox>
 #include <QDir>
@@ -55,6 +56,7 @@
 #include <QUrl>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 
@@ -368,26 +370,59 @@ void checkSaveFormats(const QString &pictures)
         // It has to be on the row above the buttons.  A widget added to the
         // grid without moving them would sit under the buttons instead, which
         // reads as a footnote to them rather than as part of the form.
+        // Where the switch lands, and what it must not cover.  QFileDialog's
+        // own grid puts the name box at [2,1], the type box at [3,1] and the
+        // buttons across [2,2]..[3,2], so "on its own row under all of that" is
+        // a claim about four positions, not one -- and asserting only that the
+        // switch is above the buttons is what let it be drawn over the name box.
         auto *buttons = withHalf->findChild<QDialogButtonBox *>();
         auto *grid = withHalf->findChild<QGridLayout *>();
-        int boxRow = -1;
-        int buttonRow = -1;
-        if (buttons != nullptr && grid != nullptr) {
-            int column = 0;
-            int rowSpan = 1;
-            int columnSpan = 1;
-            const int buttonIndex = grid->indexOf(buttons);
-            const int boxIndex = grid->indexOf(box);
-            if (buttonIndex >= 0) {
-                grid->getItemPosition(buttonIndex, &buttonRow, &column, &rowSpan, &columnSpan);
+        auto position = [&grid](QWidget *widget) {
+            int row = -1;
+            int column = -1;
+            int rowSpan = 0;
+            int columnSpan = 0;
+            if (grid == nullptr || widget == nullptr) {
+                return std::array<int, 4>{row, column, rowSpan, columnSpan};
             }
-            if (boxIndex >= 0) {
-                grid->getItemPosition(boxIndex, &boxRow, &column, &rowSpan, &columnSpan);
+            const int index = grid->indexOf(widget);
+            if (index >= 0) {
+                grid->getItemPosition(index, &row, &column, &rowSpan, &columnSpan);
+            }
+            return std::array<int, 4>{row, column, rowSpan, columnSpan};
+        };
+        const auto boxAt = position(box);
+        const auto buttonsAt = position(buttons);
+        // The first `QLineEdit` and `QComboBox` found this way are the ones in
+        // the dialog's grid; the look-in combo is a child of the dialog itself
+        // and is not part of what the switch has to sit under.
+        const auto nameAt = position(withHalf->findChild<QLineEdit *>());
+        QComboBox *typeBox = nullptr;
+        for (QComboBox *candidate : withHalf->findChildren<QComboBox *>()) {
+            if (grid != nullptr && grid->indexOf(candidate) >= 0) {
+                typeBox = candidate;
+                break;
             }
         }
-        expect(boxRow >= 0 && buttonRow > boxRow,
-               "the switch sits above the buttons, not below them",
-               QStringLiteral("box row %1, buttons row %2").arg(boxRow).arg(buttonRow));
+        const auto typeAt = position(typeBox);
+        expect(boxAt[0] >= 0, "the switch is in the dialog's own grid",
+               QStringLiteral("row %1").arg(boxAt[0]));
+        expect(nameAt[0] >= 0 && typeAt[0] >= 0,
+               "and so are the name and type rows it has to sit under",
+               QStringLiteral("name row %1, type row %2").arg(nameAt[0]).arg(typeAt[0]));
+        // Under everything the dialog already had: a row past the last one any
+        // of them occupies.
+        // The button box has been moved below the switch by the time this runs,
+        // so it is not part of what the switch has to sit under: the name and
+        // type rows are.
+        const int lowest = std::max(nameAt[0] + nameAt[2], typeAt[0] + typeAt[2]);
+        expect(boxAt[0] >= lowest,
+               "the switch is on a row of its own under the name, the type and the buttons",
+               QStringLiteral("box row %1, lowest occupied %2").arg(boxAt[0]).arg(lowest));
+        // And the buttons stay the last thing on the dialog.
+        expect(buttonsAt[0] > boxAt[0],
+               "the buttons are still below everything, including the switch",
+               QStringLiteral("box row %1, buttons row %2").arg(boxAt[0]).arg(buttonsAt[0]));
     }
     delete withHalf;
 

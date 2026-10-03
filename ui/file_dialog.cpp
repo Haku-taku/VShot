@@ -183,24 +183,41 @@ void addSdrCopyBox(QFileDialog *dialog)
     if (grid == nullptr) {
         return;
     }
-    int row = grid->rowCount();
+    // QFileDialog's own grid, read rather than guessed: the name box is at
+    // [2,1], the type box at [3,1], and the button box spans [2,2] to [3,2].
+    // The switch goes on a row of its own under all of that, and the buttons
+    // move down one so they stay the last thing on the dialog -- putting it
+    // anywhere else is what had it drawn over the name box.
+    int row = 0;
+    int column = 0;
     if (auto *buttons = dialog->findChild<QDialogButtonBox *>()) {
-        int column = 0;
         int rowSpan = 1;
         int columnSpan = 1;
         const int index = grid->indexOf(buttons);
         if (index >= 0) {
             grid->getItemPosition(index, &row, &column, &rowSpan, &columnSpan);
             grid->removeWidget(buttons);
-            grid->addWidget(buttons, row + 1, column, rowSpan, columnSpan);
         }
+    }
+    // One row past everything the dialog already had.
+    int last = 0;
+    for (int index = 0; index < grid->count(); ++index) {
+        int itemRow = 0;
+        int itemColumn = 0;
+        int itemRowSpan = 1;
+        int itemColumnSpan = 1;
+        grid->getItemPosition(index, &itemRow, &itemColumn, &itemRowSpan, &itemColumnSpan);
+        last = std::max(last, itemRow + itemRowSpan);
     }
     auto *box = new QCheckBox(uiTr("Also save the SDR copy"), dialog);
     box->setObjectName(QLatin1String(kSdrCopyBoxName));
     box->setChecked(loadConfig().cli.sdrCopy);
     box->setToolTip(uiTr("Write the tone-mapped picture beside the HDR file, "
                          "so a reader that cannot show HDR has something to open."));
-    grid->addWidget(box, row, 0, 1, std::max(1, grid->columnCount()));
+    grid->addWidget(box, last, 0, 1, std::max(1, grid->columnCount()));
+    if (auto *buttons = dialog->findChild<QDialogButtonBox *>()) {
+        grid->addWidget(buttons, last + 1, column, 1, 1);
+    }
 }
 
 // One format's line in the dialog's filter list.
@@ -722,6 +739,15 @@ QComboBox, QLineEdit { color: %2; background: %5;
 QComboBox:hover, QLineEdit:hover { border-color: %8; }
 QComboBox:focus, QLineEdit:focus { border-color: %8; }
 QComboBox::drop-down { border: 0; width: 22px; }
+/* The save dialog's SDR-copy switch, dressed like the inputs above it: it is
+   one more setting on the same form, and a bare platform checkbox beside two
+   styled boxes reads as something that does not belong. */
+QCheckBox { color: %2; spacing: 8px; font-size: 13px; min-height: 24px; }
+QCheckBox::indicator { width: 16px; height: 16px;
+              border: 1px solid %6; border-radius: 4px; background: %5; }
+QCheckBox::indicator:hover { border-color: %8; }
+QCheckBox::indicator:checked { background: %8; border-color: %8;
+              image: none; }
 QComboBox QAbstractItemView { color: %2; background: %5;
               border: 1px solid %6; border-radius: 6px; padding: 4px;
               selection-color: %7; selection-background-color: %8;

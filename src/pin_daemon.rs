@@ -26,7 +26,7 @@
 //! by the CLI, and that is all.
 
 use std::io::{Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -2040,6 +2040,12 @@ pub fn run(socket: &Path) -> Result<()> {
     let debug = std::env::var_os("VSHOT_PIN_DEBUG").is_some();
     let mut daemon = Daemon::new(socket)?;
     daemon.surfaces.set_pin_input(true);
+    // Every client that is still connected.  A connection is kept for as long
+    // as the client wants it -- the editor holds one open for the live-pin
+    // answers, and a drag pipelines its positions down another -- so they are
+    // all held here and polled together.  Serving one to completion is what
+    // let an open editor stop the daemon from looking at anything else.
+    let mut clients: Vec<Client> = Vec::new();
     if debug {
         eprintln!(
             "vshot-pin: listening on `{}` with {} picture surface(s)",
@@ -2052,18 +2058,29 @@ pub fn run(socket: &Path) -> Result<()> {
         // what keeps a connection from sitting unread until a buffer happens to
         // come back: with nothing pinned there are no buffers, and the first
         // request would wait for ever.
-        let wake = listener
-            .as_fd()
-            .try_clone_to_owned()
-            .map_err(|source| VshotError::Pin(format!("cannot watch the pin socket: {source}")))?;
+        let mut watching: Vec<OwnedFd> = Vec::new();
+        watching.push(
+            listener.as_fd().try_clone_to_owned().map_err(|source| {
+                VshotError::Pin(format!("cannot watch the pin socket: {source}"))
+            })?,
+        );
+        for client in &clients {
+            if let Ok(fd) = client.stream.as_fd().try_clone_to_owned() {
+                watching.push(fd);
+            }
+        }
+        let chrome = daemon.chrome.fd();
+        let fds: Vec<BorrowedFd<'_>> = watching
+            .iter()
+            .map(AsFd::as_fd)
+            .chain(chrome.as_ref().map(AsFd::as_fd))
+            .collect();
         match daemon.idle_at() {
             // Nothing pinned: wait out the deadline and give up when it passes.
             // Nothing the compositor or the socket says announces an empty
             // stack, so the clock is the only thing that can.
             Some(deadline) => match deadline.checked_duration_since(Instant::now()) {
-                Some(left) => daemon
-                    .surfaces
-                    .wait_on_until(Some(wake.as_fd()), Some(left))?,
+                Some(left) => daemon.surfaces.wait_on_many(&fds, Some(left))?,
                 None => {
                     if debug {
                         eprintln!("vshot-pin: nothing pinned; giving up");
@@ -2071,8 +2088,23 @@ pub fn run(socket: &Path) -> Result<()> {
                     return Ok(());
                 }
             },
-            None => daemon.surfaces.wait_on(Some(wake.as_fd()))?,
+            None => daemon.surfaces.wait_on_many(&fds, None)?,
         }
+        // Everything every client has said, answered on the spot.  A client
+        // that has gone away is dropped, and a `quit` stops the daemon.
+        let mut live: Vec<Client> = Vec::with_capacity(clients.len());
+        for mut client in clients {
+            match serve_client(&mut daemon, &mut client, debug) {
+                Ok(true) => live.push(client),
+                Ok(false) => {}
+                Err(error) => {
+                    if debug {
+                        eprintln!("vshot-pin: {error}");
+                    }
+                }
+            }
+        }
+        clients = live;
         // Whatever the chrome said back -- a menu row picked, a menu dismissed
         // -- before anything else looks at the stack.
         daemon.chrome_replies()?;
@@ -2081,13 +2113,14 @@ pub fn run(socket: &Path) -> Result<()> {
         daemon.gestures()?;
         loop {
             match listener.accept() {
-                Ok((stream, _)) => {
-                    if serve(&mut daemon, stream, debug)? {
-                        return Ok(());
+                Ok((stream, _)) => match Client::new(stream) {
+                    Ok(client) => clients.push(client),
+                    Err(error) => {
+                        if debug {
+                            eprintln!("vshot-pin: {error}");
+                        }
                     }
-                    // The stack may have changed; showing it is the loop's.
-                    daemon.refresh()?;
-                }
+                },
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(error) => {
                     return Err(VshotError::Pin(format!(
@@ -2100,99 +2133,82 @@ pub fn run(socket: &Path) -> Result<()> {
     }
 }
 
-/// Reads one request from `stream`, answers it, and says whether the daemon
-/// should stop.
-/// Serves one connection until it goes away.
-///
-/// A connection may carry more than one request: the pin editor asks to be told
-/// which pin is live and then keeps the socket for the answers, and a drag
-/// pipelines its positions.  So the loop reads whatever has arrived, answers
-/// each line, and waits for more rather than closing after the first.
-///
-/// Answers `true` when the daemon should stop, which is what `quit` means.
-fn serve(daemon: &mut Daemon, stream: UnixStream, debug: bool) -> Result<bool> {
-    stream.set_nonblocking(true).map_err(|source| {
-        VshotError::Pin(format!("cannot make the connection non-blocking: {source}"))
-    })?;
-    let mut pending: Vec<u8> = Vec::new();
-    let mut buffer = [0u8; 8192];
-    let mut watcher = false;
-    loop {
-        // Whatever the client has said so far, all of it: a drag sends a burst
-        // of positions and waiting for one at a time would pace it.
-        let mut read_more = true;
-        while read_more {
-            match (&stream).read(&mut buffer) {
-                Ok(0) => return Ok(false), // the client went away
-                Ok(count) => pending.extend_from_slice(&buffer[..count]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => read_more = false,
-                Err(_) => return Ok(false),
-            }
-        }
-        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
-            let line = pending.drain(..=newline).collect::<Vec<u8>>();
-            let Ok(text) = std::str::from_utf8(&line) else {
-                continue;
-            };
-            let command: PinCommand = match serde_json::from_str(text.trim()) {
-                Ok(command) => command,
-                Err(error) => {
-                    // A command this build does not know is answered rather
-                    // than fatal: the editor and the daemon can be different
-                    // builds, and a client that asked for something new should
-                    // hear that it was not understood.
-                    let reply =
-                        json!({"ok": false, "error": format!("cannot read the request: {error}")});
-                    write_reply(&stream, &reply)?;
-                    continue;
-                }
-            };
-            // Whether to stop is decided from the command, not from the reply:
-            // the reply has to go out first.
-            let quit = matches!(command, PinCommand::Quit);
-            if matches!(command, PinCommand::WatchActive) {
-                watcher = true;
-            }
-            let reply = match daemon.handle(command, Some(&stream)) {
-                Ok(reply) => reply,
-                Err(error) => {
-                    if debug {
-                        eprintln!("vshot-pin: {error}");
-                    }
-                    json!({"ok": false, "error": error.to_string()})
-                }
-            };
-            write_reply(&stream, &reply)?;
-            if quit {
-                return Ok(true);
-            }
-        }
-        // Nothing more to read: wait for the client or the compositor to say
-        // something.  A watcher keeps its connection for the answers, and the
-        // wait on its socket is what wakes this loop when one is written.
-        // The chrome is waited on as well, not only this client: its answers --
-        // a menu row picked, the rectangle a menu came out as -- are what this
-        // loop is here to read, and a socket that is not watched has them read
-        // only when something else happens to wake it.
-        let chrome = daemon.chrome.fd();
-        if watcher {
-            daemon.surfaces.wait_on_two(
-                Some(stream.as_fd()),
-                chrome.as_ref().map(|fd| fd.as_fd()),
-                Some(Duration::from_millis(50)),
-            )?;
-        } else {
-            // An ordinary client sends one request and reads its answer; the
-            // wait is short because it has nothing else to say.
-            daemon.surfaces.wait_on_two(
-                Some(stream.as_fd()),
-                chrome.as_ref().map(|fd| fd.as_fd()),
-                Some(Duration::from_millis(200)),
-            )?;
-        }
-        daemon.chrome_replies()?;
-        daemon.gestures()?;
+/// One connected client: the socket, what has arrived but not been read yet,
+/// and whether it asked to be told which pin is live.
+struct Client {
+    stream: UnixStream,
+    pending: Vec<u8>,
+}
+
+impl Client {
+    fn new(stream: UnixStream) -> Result<Self> {
+        stream.set_nonblocking(true).map_err(|source| {
+            VshotError::Pin(format!("cannot make the connection non-blocking: {source}"))
+        })?;
+        Ok(Self {
+            stream,
+            pending: Vec::new(),
+        })
     }
+}
+
+/// Reads whatever `client` has said and answers every complete line.
+///
+/// Answers `true` while the client is still connected, `false` when it has gone
+/// away, and `Ok(true)` is also what a `quit` command means for the daemon --
+/// the caller tells them apart by the command, not by the return.
+///
+/// Non-blocking, and it never waits: the daemon has other clients and the
+/// compositor to serve, and a connection that is kept for later -- the editor's,
+/// which stays open for the live-pin answers -- must not hold the loop.  Serving
+/// one connection to completion is what made an open editor stop the daemon
+/// from seeing anything else at all, including the moves the editor sent.
+fn serve_client(daemon: &mut Daemon, client: &mut Client, debug: bool) -> Result<bool> {
+    let mut buffer = [0u8; 8192];
+    loop {
+        match (&client.stream).read(&mut buffer) {
+            Ok(0) => return Ok(false), // the client went away
+            Ok(count) => client.pending.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => return Ok(false),
+        }
+    }
+    while let Some(newline) = client.pending.iter().position(|byte| *byte == b'\n') {
+        let line = client.pending.drain(..=newline).collect::<Vec<u8>>();
+        let Ok(text) = std::str::from_utf8(&line) else {
+            continue;
+        };
+        let command: PinCommand = match serde_json::from_str(text.trim()) {
+            Ok(command) => command,
+            Err(error) => {
+                // A command this build does not know is answered rather than
+                // fatal: the editor and the daemon can be different builds, and
+                // a client that asked for something new should hear that it was
+                // not understood.
+                let reply =
+                    json!({"ok": false, "error": format!("cannot read the request: {error}")});
+                write_reply(&client.stream, &reply)?;
+                continue;
+            }
+        };
+        // Whether to stop is decided from the command, not from the reply: the
+        // reply has to go out first.
+        if matches!(command, PinCommand::Quit) {
+            write_reply(&client.stream, &json!({"ok": true}))?;
+            return Ok(false);
+        }
+        let reply = match daemon.handle(command, Some(&client.stream)) {
+            Ok(reply) => reply,
+            Err(error) => {
+                if debug {
+                    eprintln!("vshot-pin: {error}");
+                }
+                json!({"ok": false, "error": error.to_string()})
+            }
+        };
+        write_reply(&client.stream, &reply)?;
+    }
+    Ok(true)
 }
 
 /// Writes one reply, followed by the newline that ends it.

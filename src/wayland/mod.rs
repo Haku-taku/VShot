@@ -1457,36 +1457,20 @@ impl WaylandSession {
     /// both at once costs nothing and wakes the moment either happens.
     ///
     /// `None` for `timeout` waits as long as it takes.
-    /// Waits until the connection, `extra` or `third` has something to say.
+    /// Waits until the connection or any of `extra` has something to say.
     ///
-    /// Three because a daemon may be waiting on two clients at once -- the
-    /// command socket it serves and the chrome it drives -- and a client whose
-    /// socket is not watched has its answers read only when something else
-    /// happens to wake this loop, which shows up as a menu that responds a
-    /// fifth of a second late.
-    pub fn pump_watching3(
+    /// A daemon may be waiting on a listener, several clients and another
+    /// process it drives; a socket this loop does not watch has its lines read
+    /// only when something else happens to wake it.
+    pub fn pump_watching_many(
         &mut self,
-        extra: Option<BorrowedFd<'_>>,
-        third: Option<BorrowedFd<'_>>,
+        extra: &[BorrowedFd<'_>],
         timeout: Option<Duration>,
     ) -> Result<()> {
-        self.pump_polling(extra, third, timeout)
+        self.pump_polling(extra, timeout)
     }
 
-    pub fn pump_watching(
-        &mut self,
-        extra: Option<BorrowedFd<'_>>,
-        timeout: Option<Duration>,
-    ) -> Result<()> {
-        self.pump_polling(extra, None, timeout)
-    }
-
-    fn pump_polling(
-        &mut self,
-        extra: Option<BorrowedFd<'_>>,
-        third: Option<BorrowedFd<'_>>,
-        timeout: Option<Duration>,
-    ) -> Result<()> {
+    fn pump_polling(&mut self, extra: &[BorrowedFd<'_>], timeout: Option<Duration>) -> Result<()> {
         self.event_queue
             .dispatch_pending(&mut self.state)
             .map_err(|error| VshotError::WaylandProtocol(error.to_string()))?;
@@ -1508,8 +1492,7 @@ impl WaylandSession {
             &fd,
             rustix::event::PollFlags::IN | rustix::event::PollFlags::ERR,
         ));
-        let waiting: Vec<BorrowedFd<'_>> = [extra, third].into_iter().flatten().collect();
-        for fd in &waiting {
+        for fd in extra {
             poll_fds.push(rustix::event::PollFd::new(
                 fd,
                 rustix::event::PollFlags::IN
