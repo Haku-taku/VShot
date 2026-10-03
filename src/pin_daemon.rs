@@ -886,7 +886,13 @@ pub(crate) enum ChromeReply {
     Menu(Rect),
     /// The menu was dismissed without a pick: Esc, a click outside it, or the
     /// pin it belonged to going away.
-    Dismissed,
+    Dismissed {
+        /// Whether the click that closed it was over no row and should reach
+        /// whatever is underneath.  The chrome took it only because a menu
+        /// closes on a click anywhere; swallowing it as well would make the
+        /// first click after a menu do nothing at all.
+        passthrough: bool,
+    },
 }
 
 impl Chrome {
@@ -971,6 +977,12 @@ impl Chrome {
         self.sent = Some(labels.to_vec());
     }
 
+    /// A handle on the connection, for a caller that has to wait on it.
+    fn fd(&self) -> Option<std::os::fd::OwnedFd> {
+        use std::os::fd::AsFd;
+        self.stream.as_ref()?.as_fd().try_clone_to_owned().ok()
+    }
+
     /// Reads whatever the chrome has said since the last look.
     ///
     /// Non-blocking and never an error: a chrome that has gone away is not a
@@ -1010,7 +1022,13 @@ impl Chrome {
                         self.replies.push(ChromeReply::Chosen(row as usize));
                     }
                 }
-                Some("dismissed") => self.replies.push(ChromeReply::Dismissed),
+                Some("dismissed") => {
+                    let passthrough = message
+                        .get("passthrough")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    self.replies.push(ChromeReply::Dismissed { passthrough });
+                }
                 Some("menu") => {
                     if let Some(rect) = message.get("rect").and_then(json_rect) {
                         self.replies.push(ChromeReply::Menu(rect));
@@ -1079,6 +1097,10 @@ struct Daemon {
     /// The open menu, if any.  One at a time: a second right-click replaces it,
     /// which is what a menu that follows the pointer should do.
     menu: Option<Menu>,
+    /// Where the pointer was last seen.  A click the chrome passes on arrives
+    /// without coordinates -- the chrome took it on its own surface -- and this
+    /// is what says where it was.
+    last_pointer: Option<Point>,
     /// The socket clients reach this daemon on.  The editor is told about it
     /// because it drives the real pin over it rather than drawing a copy.
     socket: PathBuf,
@@ -1099,6 +1121,7 @@ impl Daemon {
             watchers: Vec::new(),
             announced_active: 0,
             menu: None,
+            last_pointer: None,
             socket: socket.to_path_buf(),
             idle: None,
         })
@@ -1332,13 +1355,22 @@ impl Daemon {
         for reply in self.chrome.poll() {
             match reply {
                 ChromeReply::Chosen(row) => self.choose(row)?,
-                ChromeReply::Dismissed => {
+                ChromeReply::Dismissed { passthrough } => {
                     // The chrome took the menu down itself -- Esc, or a click
                     // outside it -- and all this side has to do is forget it.
                     self.menu = None;
                     // The pins take their input back, now that nothing is over
                     // them.
                     self.refresh()?;
+                    // A click that was aimed past the menu is handed on, so it
+                    // lands where the user pointed rather than being spent on
+                    // closing a menu.
+                    if passthrough {
+                        if let Some(at) = self.last_pointer {
+                            self.stack.press(at, Instant::now());
+                            self.refresh()?;
+                        }
+                    }
                 }
                 ChromeReply::Menu(rect) => {
                     if let Some(menu) = self.menu.as_mut() {
@@ -1375,8 +1407,12 @@ impl Daemon {
                     self.open_menu(at);
                     Change::default()
                 }
-                crate::wayland::PinEvent::Press { at, .. } => self.stack.press(at, now),
+                crate::wayland::PinEvent::Press { at, .. } => {
+                    self.last_pointer = Some(at);
+                    self.stack.press(at, now)
+                }
                 crate::wayland::PinEvent::Motion { at } => {
+                    self.last_pointer = Some(at);
                     // The hover first: it is what the tag follows, and a motion
                     // with no button down still changes it.
                     let hovered = self.stack.hover(at);
@@ -2134,16 +2170,25 @@ fn serve(daemon: &mut Daemon, stream: UnixStream, debug: bool) -> Result<bool> {
         // Nothing more to read: wait for the client or the compositor to say
         // something.  A watcher keeps its connection for the answers, and the
         // wait on its socket is what wakes this loop when one is written.
+        // The chrome is waited on as well, not only this client: its answers --
+        // a menu row picked, the rectangle a menu came out as -- are what this
+        // loop is here to read, and a socket that is not watched has them read
+        // only when something else happens to wake it.
+        let chrome = daemon.chrome.fd();
         if watcher {
-            daemon
-                .surfaces
-                .wait_on_until(Some(stream.as_fd()), Some(Duration::from_millis(50)))?;
+            daemon.surfaces.wait_on_two(
+                Some(stream.as_fd()),
+                chrome.as_ref().map(|fd| fd.as_fd()),
+                Some(Duration::from_millis(50)),
+            )?;
         } else {
             // An ordinary client sends one request and reads its answer; the
             // wait is short because it has nothing else to say.
-            daemon
-                .surfaces
-                .wait_on_until(Some(stream.as_fd()), Some(Duration::from_millis(200)))?;
+            daemon.surfaces.wait_on_two(
+                Some(stream.as_fd()),
+                chrome.as_ref().map(|fd| fd.as_fd()),
+                Some(Duration::from_millis(200)),
+            )?;
         }
         daemon.chrome_replies()?;
         daemon.gestures()?;

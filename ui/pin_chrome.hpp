@@ -153,7 +153,12 @@ private:
     /// Tells the daemon which row was picked, and takes the menu down.
     void chooseRow(int row);
     /// Tells the daemon the menu is gone without a pick.
-    void dismissMenu();
+    ///
+    /// `passthrough` says the click that closed it was over no row and should
+    /// reach whatever is underneath: this surface took it only because a menu
+    /// closes on a click anywhere, and swallowing the click as well would make
+    /// the first click after a menu do nothing at all.
+    void dismissMenu(bool passthrough = false);
 
     QScreen *screen_ = nullptr;
     LayerShellQt::Window *layer_ = nullptr;

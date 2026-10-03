@@ -931,6 +931,19 @@ impl Surfaces {
         self.session.pump_watching(fd, timeout)
     }
 
+    /// The same, with two clients to wait on: the command socket and the
+    /// chrome.  A client whose socket is not watched has its answers read only
+    /// when something else wakes this loop, which is a menu that responds a
+    /// fifth of a second late.
+    pub(crate) fn wait_on_two(
+        &mut self,
+        first: Option<BorrowedFd<'_>>,
+        second: Option<BorrowedFd<'_>>,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
+        self.session.pump_watching3(first, second, timeout)
+    }
+
     /// Lets the pin surfaces take the pointer, or stops them.
     pub(crate) fn set_pin_input(&mut self, on: bool) {
         self.session.set_pin_input(on);

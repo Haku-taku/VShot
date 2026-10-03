@@ -95,7 +95,10 @@ PinChrome::PinChrome(QScreen *screen)
     // Nothing here is interactive, and nothing here should be able to take the
     // keyboard from the surface below it.
     setFocusPolicy(Qt::NoFocus);
-    setMouseTracking(false);
+    // On, because the menu highlights the row under the pointer: without it a
+    // motion with no button held is never delivered, and the highlight only
+    // ever follows a click.
+    setMouseTracking(true);
     badgeTimer_ = new QTimer(this);
     badgeTimer_->setSingleShot(true);
     connect(badgeTimer_, &QTimer::timeout, this, [this] {
@@ -271,7 +274,7 @@ void PinChrome::chooseRow(int row)
     update();
 }
 
-void PinChrome::dismissMenu()
+void PinChrome::dismissMenu(bool passthrough)
 {
     if (menuId_ == 0) {
         return;
@@ -279,6 +282,7 @@ void PinChrome::dismissMenu()
     if (socket_ != nullptr && socket_->state() == QLocalSocket::ConnectedState) {
         QJsonObject message;
         message.insert(QStringLiteral("cmd"), QStringLiteral("dismissed"));
+        message.insert(QStringLiteral("passthrough"), passthrough);
         QByteArray line = QJsonDocument(message).toJson(QJsonDocument::Compact);
         line.append('\n');
         socket_->write(line);
@@ -300,8 +304,10 @@ void PinChrome::mousePressEvent(QMouseEvent *event)
     }
     const int row = menuRowAt(event->position().toPoint());
     if (row < 0) {
-        // A click outside the menu closes it, the way it does everywhere.
-        dismissMenu();
+        // A click outside the menu closes it, the way it does everywhere -- and
+        // then goes on to whatever it was aimed at, because the user meant to
+        // click *there*, not to dismiss a menu.
+        dismissMenu(true);
     } else {
         chooseRow(row);
     }
@@ -394,16 +400,14 @@ void PinChrome::applyMask()
         return;
     }
     if (menuId_ != 0 && !menuRect_.isEmpty()) {
-        const QRect menu = menuRect_.intersected(QRect(QPoint(0, 0), size()));
-        if (!menu.isEmpty()) {
-            window->setMask(QRegion(menu));
-            if (qEnvironmentVariableIsSet("VSHOT_PIN_DEBUG")) {
-                std::fprintf(stderr, "CHROME: input region = menu %d,%d %dx%d\n", menu.x(),
-                             menu.y(), menu.width(), menu.height());
-                std::fflush(stderr);
-            }
-            return;
-        }
+        // While a menu is up this surface takes the pointer *everywhere*, not
+        // only over the menu: a menu closes on a click anywhere, and a click
+        // the compositor hands to the surface underneath is one this side never
+        // hears about.  What it does with such a click is close the menu and
+        // tell the daemon to pass the click on, so the click still lands where
+        // it was aimed.
+        window->setMask(QRegion(QRect(QPoint(0, 0), size())));
+        return;
     }
     window->setMask(clickThroughInputRegion());
 }
