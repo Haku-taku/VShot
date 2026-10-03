@@ -387,8 +387,13 @@ pub struct LongDefaults {
 }
 
 /// Defaults for `vshot pin`.
+///
+/// `kebab-case`, like every other section here and like the settings window
+/// writes: the file spells its keys with hyphens, and a field named
+/// `hdr_half` without this reads as a key of that name -- which nothing writes,
+/// so the setting was silently ignored.
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "kebab-case")]
 pub struct PinDefaults {
     /// `--density` for every pinned image.
     pub density: Option<u32>,
@@ -658,6 +663,39 @@ mod tests {
         // saying "the default": the codec's own default is what stands.
         let bare: ConfigFile = serde_json::from_str(r#"{"cli":{}}"#).unwrap();
         assert!(bare.cli.format.is_empty());
+    }
+
+    /// The `pin` section's keys, as the settings window spells them.
+    ///
+    /// `hdr-half` was silently ignored for a while because `PinDefaults` was
+    /// the one struct here without `rename_all = "kebab-case"`: the file writes
+    /// hyphens, the field is named with an underscore, and nothing said so.  The
+    /// keys below are the ones `ui/config.cpp` inserts, which is the only thing
+    /// that makes this a check rather than a restatement.
+    ///
+    /// The section is read in two places and they are *not* the same shape: the
+    /// daemon's look comes from the top-level `pin`, and the pin command's
+    /// defaults from `cli.pin`.  Both are spelled the same way in the file.
+    #[test]
+    fn the_pin_section_is_read_by_the_names_the_settings_window_writes() {
+        let file: ConfigFile = serde_json::from_str(
+            r##"{"cli":{"pin":{"density":2,"hdr-half":false}},
+                "pin":{"radius":8,"shadow":true,"shadowSize":20,"shadowOffset":-4,
+                       "shadowOpacity":90,"borderWidth":3,
+                       "borderColor":"#112233","activeBorderColor":"#445566"}}"##,
+        )
+        .expect("a pin section parses");
+        assert_eq!(file.cli.pin.density, Some(2));
+        assert_eq!(file.cli.pin.hdr_half, Some(false));
+        // And the look, which is the top-level section.
+        assert_eq!(file.pin.radius, Some(8));
+        assert_eq!(file.pin.shadow, Some(true));
+        assert_eq!(file.pin.shadow_size, Some(20));
+        assert_eq!(file.pin.shadow_offset, Some(-4));
+        assert_eq!(file.pin.shadow_opacity, Some(90));
+        assert_eq!(file.pin.border_width, Some(3));
+        assert_eq!(file.pin.border_colour.as_deref(), Some("#112233"));
+        assert_eq!(file.pin.active_border_colour.as_deref(), Some("#445566"));
     }
 
     #[test]
