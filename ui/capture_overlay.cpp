@@ -13056,16 +13056,17 @@ QByteArray OverlayController::loupeCompositeKey(const OutputSession &output) con
         if (annotation.raster == nullptr) {
             annotation.raster = makeAnnotationRaster(annotation);
         }
-        stream << annotation.raster->key(annotation, output, output.image.size());
+        // The raster's own key *and* where the mark sits.  A raster's key
+        // deliberately leaves position out -- a translated mark re-uses its
+        // pixels and the blit lands them somewhere else -- but the composite is
+        // one picture with every mark already drawn into it, so a mark that
+        // moved changes it even though its own pixels did not.  Without this
+        // the magnifier showed the picture as it was when the first mark was
+        // drawn, and went on showing it through every drag.
+        stream << annotation.raster->key(annotation, output, output.image.size())
+               << static_cast<qint64>(annotation.rect.x) << static_cast<qint64>(annotation.rect.y);
     }
     return key;
-}
-
-void OverlayController::invalidateLoupeComposite()
-{
-    loupeCompositeKey_.clear();
-    loupeComposite_ = QImage();
-    loupeCompositeOutput_ = -1;
 }
 
 const QImage *OverlayController::loupeFrame(const OutputSession &output)

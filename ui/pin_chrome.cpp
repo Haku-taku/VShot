@@ -383,6 +383,21 @@ void PinChrome::setPinnedVisible(bool visible)
     setVisible(visible);
 }
 
+bool PinChrome::event(QEvent *event)
+{
+    // A mask set before the surface is mapped is not the mask it ends up with:
+    // Qt creates the platform window on the first show, and an input region
+    // that was never sent leaves the surface taking input *everywhere* -- which
+    // is a pin that blocks every click on the desktop under it.  So it is
+    // re-sent once the window is really up.
+    if (event->type() == QEvent::PlatformSurface
+        && static_cast<QPlatformSurfaceEvent *>(event)->surfaceEventType()
+               == QPlatformSurfaceEvent::SurfaceCreated) {
+        applyMask();
+    }
+    return QWidget::event(event);
+}
+
 void PinChrome::applyMask()
 {
     // Click-through except for the menu.  The labels say what a pin is and every

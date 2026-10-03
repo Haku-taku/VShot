@@ -128,6 +128,7 @@ private:
         QString badge;
     };
 
+    bool event(QEvent *event) override;
     void paintEvent(QPaintEvent *event) override;
     /// Everything this surface draws, into any painter: the widget's own
     /// paintEvent and the debug dump that saves what it put on screen, which is

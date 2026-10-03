@@ -3153,55 +3153,98 @@ mod tests {
         assert_eq!(request.destination, Destination::Pin);
     }
 
+    /// The pin command's defaults come from the config file, so a test that
+    /// asserts them has to say what the file holds: one that read the machine's
+    /// own would pass on a fresh account and fail on one where the setting was
+    /// ever changed -- which is a test that reports the user's settings as a
+    /// bug.
+    fn with_pin_hdr_half<T>(value: Option<bool>, body: impl FnOnce() -> T) -> T {
+        let _guard = crate::config::config_env_guard();
+        let directory = tempfile::tempdir().expect("a directory for the config");
+        let vshot = directory.path().join("vshot");
+        std::fs::create_dir_all(&vshot).expect("the config directory");
+        if let Some(value) = value {
+            std::fs::write(
+                vshot.join("config.json"),
+                format!(r#"{{"cli":{{"pin":{{"hdr-half":{value}}}}}}}"#),
+            )
+            .expect("the config file");
+        }
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", directory.path());
+        let result = body();
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        result
+    }
+
     #[test]
     fn pin_subcommand_maps_control_flags() {
-        let action = Cli::try_parse_action_from(["vshot", "pin", "--toggle"]).unwrap();
-        assert_eq!(
-            action,
-            Action::Pin(crate::pin::PinInvocation {
-                files: Vec::new(),
-                clipboard: false,
-                command: Some(crate::pin::PinCommand::Toggle),
-                density: None,
-                // The config file says nothing in this test, which reads as on.
-                hdr_half: true,
-            })
-        );
-        let action = Cli::try_parse_action_from(["vshot", "pin", "a.png", "b.png"]).unwrap();
-        match action {
-            Action::Pin(invocation) => {
-                assert_eq!(invocation.command, None);
-                assert_eq!(
-                    invocation.files,
-                    vec![PathBuf::from("a.png"), PathBuf::from("b.png")]
-                );
+        with_pin_hdr_half(None, || {
+            let action = Cli::try_parse_action_from(["vshot", "pin", "--toggle"]).unwrap();
+            assert_eq!(
+                action,
+                Action::Pin(crate::pin::PinInvocation {
+                    files: Vec::new(),
+                    clipboard: false,
+                    command: Some(crate::pin::PinCommand::Toggle),
+                    density: None,
+                    // The config file says nothing here, which reads as on.
+                    hdr_half: true,
+                })
+            );
+            let action = Cli::try_parse_action_from(["vshot", "pin", "a.png", "b.png"]).unwrap();
+            match action {
+                Action::Pin(invocation) => {
+                    assert_eq!(invocation.command, None);
+                    assert_eq!(
+                        invocation.files,
+                        vec![PathBuf::from("a.png"), PathBuf::from("b.png")]
+                    );
+                }
+                other => panic!("expected a pin action, got {other:?}"),
             }
-            other => panic!("expected a pin action, got {other:?}"),
-        }
+        });
+
+        // And with the file saying no, the command reads it: that is the
+        // setting the window writes, and it was ignored while this section had
+        // no `rename_all`.
+        with_pin_hdr_half(Some(false), || {
+            let action = Cli::try_parse_action_from(["vshot", "pin", "a.png"]).unwrap();
+            match action {
+                Action::Pin(invocation) => assert!(!invocation.hdr_half),
+                other => panic!("expected a pin action, got {other:?}"),
+            }
+        });
     }
 
     #[test]
     fn pin_subcommand_accepts_clipboard_source() {
-        let action = Cli::try_parse_action_from(["vshot", "pin", "--clipboard"]).unwrap();
-        assert_eq!(
-            action,
-            Action::Pin(crate::pin::PinInvocation {
-                files: Vec::new(),
-                clipboard: true,
-                command: None,
-                density: None,
-                // The config file says nothing in this test, which reads as on.
-                hdr_half: true,
-            })
-        );
-        let action = Cli::try_parse_action_from(["vshot", "pin", "--clipboard", "a.png"]).unwrap();
-        match action {
-            Action::Pin(invocation) => {
-                assert!(invocation.clipboard);
-                assert_eq!(invocation.files, vec![PathBuf::from("a.png")]);
+        with_pin_hdr_half(None, || {
+            let action = Cli::try_parse_action_from(["vshot", "pin", "--clipboard"]).unwrap();
+            assert_eq!(
+                action,
+                Action::Pin(crate::pin::PinInvocation {
+                    files: Vec::new(),
+                    clipboard: true,
+                    command: None,
+                    density: None,
+                    // The config file says nothing in this test, which reads as on.
+                    hdr_half: true,
+                })
+            );
+            let action =
+                Cli::try_parse_action_from(["vshot", "pin", "--clipboard", "a.png"]).unwrap();
+            match action {
+                Action::Pin(invocation) => {
+                    assert!(invocation.clipboard);
+                    assert_eq!(invocation.files, vec![PathBuf::from("a.png")]);
+                }
+                other => panic!("expected a pin action, got {other:?}"),
             }
-            other => panic!("expected a pin action, got {other:?}"),
-        }
+        });
     }
 
     #[test]

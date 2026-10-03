@@ -2642,6 +2642,73 @@ void checkLoupeShowsTheCursorPixelEverywhere()
     run(scaledCoordinateSession(), &ok);
 }
 
+// The magnifier shows the marks as they are *now*.
+//
+// A mark's own raster cache deliberately ignores where the mark sits -- a
+// translated mark re-uses its pixels and the blit lands them elsewhere -- but
+// the magnifier's picture is one image with every mark already drawn into it,
+// so a mark that moves changes it even though its own pixels did not.  Keying
+// the composite on the rasters alone left the magnifier showing the picture as
+// it was when the first mark was drawn, and it went on showing it through every
+// drag, which is what "the magnifier is stuck on the initial state" means.
+void checkTheMagnifierFollowsAMarkThatMoves()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+    controller.chooseTool(vshot::Tool::Rectangle);
+
+    // Draw a rectangle, so there is a mark for the magnifier to carry.
+    controller.press(overlay, QPointF(120, 120), Qt::LeftButton, Qt::NoModifier);
+    controller.move(overlay, QPointF(220, 200), Qt::LeftButton, Qt::NoModifier);
+    controller.release(overlay, QPointF(220, 200), Qt::LeftButton, Qt::NoModifier);
+    const int drawnCount = controller.annotations().size();
+    expect(drawnCount >= 1, "a rectangle was drawn", QString::number(drawnCount));
+    // The magnifier's own picture, read directly: painting the overlay would
+    // not tell the two apart, because the marks are drawn there whether the
+    // cache is fresh or not.
+    const vshot::OutputSession &output = controller.session().outputs.constFirst();
+    const QImage *drawn = controller.magnifierImage(output);
+    expect(drawn != nullptr && !drawn->isNull(), "the magnifier builds a picture of the marks");
+    if (drawn == nullptr || drawn->isNull()) {
+        return;
+    }
+    const QImage before = *drawn;
+
+    // *Move* the mark.  This is the case a mark's own raster cache cannot see:
+    // a translated mark re-uses its pixels, so its raster key is unchanged, and
+    // a composite keyed on the rasters alone is reused with the mark still
+    // drawn where it used to be.  The mark is picked up the way a user picks
+    // one up -- with the pick-up modifier held, and a drag.
+    const vshot::LogicalRect was = controller.annotations().constFirst().rect;
+    const Qt::KeyboardModifiers pick = Qt::ShiftModifier;
+    controller.press(overlay, QPointF(was.x + 50, was.y + 40), Qt::LeftButton, pick);
+    controller.move(overlay, QPointF(was.x + 90, was.y + 80), Qt::LeftButton, pick);
+    controller.release(overlay, QPointF(was.x + 90, was.y + 80), Qt::LeftButton, pick);
+    const vshot::LogicalRect now = controller.annotations().constFirst().rect;
+    expect(now.x != was.x || now.y != was.y, "the mark really moved",
+           QStringLiteral("%1,%2 -> %3,%4").arg(was.x).arg(was.y).arg(now.x).arg(now.y));
+
+    // The same picture, asked for again after the marks changed.
+    const QImage *moved = controller.magnifierImage(output);
+    expect(moved != nullptr && !moved->isNull(), "and it still has one");
+    if (moved != nullptr) {
+        expect(*moved != before,
+               "the magnifier shows the mark where it is now, not where it was drawn");
+    }
+}
+
 // The colour picker: the right button's magnifier, and only the right button's.
 //
 // The loupe is drawn the same way whichever press brought it up, so the pixels
@@ -4854,6 +4921,7 @@ int main(int argc, char *argv[])
     checkLiveStrokeMatchesTheCommittedMark();
     checkTextEditorMatchesTheCommittedLabel();
     checkLoupeShowsTheCursorPixelEverywhere();
+    checkTheMagnifierFollowsAMarkThatMoves();
     checkDraggingOffTheImageLeavesItWhereItIs();
     checkThePinsBorderMovesItButTakesNoInk();
     checkThePinFrameGoesWhenAnotherPinTakesOver();

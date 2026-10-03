@@ -1207,12 +1207,20 @@ private:
     // picture twice.  Rebuilt only when the marks, the frame or the frame's
     // place have changed; see `loupeCompositeKey`.
     const QImage *loupeFrame(const OutputSession &output);
+
+public:
+    // The magnifier's own picture, built from the marks as they are now.
+    //
+    // Public for the offline check: the composite is a cache, and a cache that
+    // goes stale is invisible in a painted overlay -- the marks are drawn there
+    // anyway, so a check that read the screen would pass with the cache broken.
+    // This reads what the magnifier itself will show.
+    const QImage *magnifierImage(const OutputSession &output) { return loupeFrame(output); }
+
+private:
     // Everything the composite depends on.  A change to any of it is what
     // makes the next magnifier paint rebuild rather than reuse the pixels.
     QByteArray loupeCompositeKey(const OutputSession &output) const;
-    // Throws the composite away: the marks are about to change, or the frame
-    // has moved, so what is cached no longer describes the screen.
-    void invalidateLoupeComposite();
     // The colour readout that hangs off the loupe: the pixel's code, on a
     // ground of that pixel's own colour.  Drawn as its own pill rather than
     // folded into the loupe's, because the two say different things -- one
