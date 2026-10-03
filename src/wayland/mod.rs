@@ -39,7 +39,7 @@ use self::freeze_overlay::{
 };
 use self::input::{
     global_point, EditorState, ResizeHandle, SelectionEvent, SelectionResult, SelectionTracker,
-    BTN_LEFT, KEY_ESC,
+    BTN_LEFT, BTN_RIGHT, KEY_ESC,
 };
 use self::topology::{OutputData, OutputInfo, OutputUserData, TopologyState};
 
@@ -2354,15 +2354,15 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                     state.pointer_grab_output = state.pointer_output;
                 }
                 if state.pin_input {
-                    // The left button is the one that drags; every *release*
-                    // is the stack's business, though, because a drag can be
-                    // started with the left button and ended with any of them
-                    // -- the middle button is what a user reaches for when the
-                    // left one is busy, and a release that never arrives leaves
-                    // the pin following the pointer for ever.
+                    // Both buttons are the stack's business and for different
+                    // reasons: the left one starts a drag, the right one opens
+                    // a menu.  Every *release* is too, whatever button it is,
+                    // because a drag can be started with the left button and
+                    // ended with any of them -- and a release that never
+                    // arrives leaves the pin following the pointer for ever.
                     let at = state.pin_point_of_pointer();
                     match (pressed, at) {
-                        (true, Some(at)) if button == BTN_LEFT => {
+                        (true, Some(at)) if button == BTN_LEFT || button == BTN_RIGHT => {
                             state.pin_events.push(PinEvent::Press { at, time, button });
                         }
                         (false, _) => state.pin_events.push(PinEvent::Release),
