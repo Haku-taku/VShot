@@ -2825,10 +2825,6 @@ struct OverlayController::Gesture {
     Point current;
     LogicalRect origin;
     int handle = 0;
-    // Alt was down when the handle was grabbed.  It is read once, at the press:
-    // a resize that changed its mind halfway through would jump, and the key is
-    // held for the whole drag in practice anyway.
-    bool preserveAspect = false;
     QVector<Point> points;
     // The in-progress freehand stroke, rasterized incrementally.  Re-stroking
     // the whole path on every paint is O(points) each time -- quadratic over a
@@ -5115,6 +5111,11 @@ LogicalRect OverlayController::moveSelection(LogicalRect origin, Point anchor, P
     return rectFromEdges(x, y, x + origin.width, y + origin.height);
 }
 
+bool OverlayController::keepingAspect(Qt::KeyboardModifiers modifiers) const
+{
+    return shortcuts_.held(ShortcutAction::PreserveAspect, static_cast<int>(modifiers));
+}
+
 LogicalRect OverlayController::resizeSelection(LogicalRect origin, int handle, Point current,
                                               bool preserveAspect) const
 {
@@ -5687,7 +5688,7 @@ void OverlayController::applyCandidates(QVector<WindowCandidate> candidates)
     updateAll();
 }
 
-void OverlayController::beginSelectionGesture(Point point, bool preserveAspect)
+void OverlayController::beginSelectionGesture(Point point)
 {
     const int handle = hitHandle(point);
     if (selection_.has_value() && handle != 0 && handle != 9) {
@@ -5695,7 +5696,6 @@ void OverlayController::beginSelectionGesture(Point point, bool preserveAspect)
         gesture_->current = point;
         gesture_->origin = *selection_;
         gesture_->handle = handle;
-        gesture_->preserveAspect = preserveAspect;
         gesture_->type = Gesture::Type::Resizing;
     } else {
         // A press that landed on no handle draws a new frame.  The body of the
@@ -6918,9 +6918,7 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
                 selectedAnnotation_ >= 0 ? annotationHandleAt(grab) : 0;
             const int hit = annotationHitAt(grab);
             if (annotationHandle != 0) {
-                beginAnnotationDrag(grab, true,
-                                    shortcuts_.held(ShortcutAction::PreserveAspect,
-                                                    static_cast<int>(modifiers)));
+                beginAnnotationDrag(grab, true);
                 updateAll();
                 return;
             }
@@ -6950,8 +6948,7 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
                 // A handle is the one thing that stretches, and a middle press
                 // on it means the same as a left one.
                 selectAnnotation(-1);
-                beginSelectionGesture(grab, shortcuts_.held(ShortcutAction::PreserveAspect,
-                                                            static_cast<int>(modifiers)));
+                beginSelectionGesture(grab);
                 updateAll();
                 return;
             }
@@ -7112,8 +7109,7 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
         if (annotationHandle != 0) {
             // A handle, which is the one thing that stretches: the whole of a
             // mark's edge moves it, and the eight small targets resize it.
-            beginAnnotationDrag(point, true, shortcuts_.held(ShortcutAction::PreserveAspect,
-                                                            static_cast<int>(modifiers)));
+            beginAnnotationDrag(point, true);
             updateAll();
             return;
         }
@@ -7133,8 +7129,7 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
         const int handle = hitHandle(point);
         if (handle != 0 && handle != 9) {
             selectAnnotation(-1);
-            beginSelectionGesture(point, shortcuts_.held(ShortcutAction::PreserveAspect,
-                                                         static_cast<int>(modifiers)));
+            beginSelectionGesture(point);
             updateAll();
             return;
         }
@@ -7326,7 +7321,7 @@ void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::
             const Point anchor = *looseDrag_;
             looseDrag_.reset();
             beginAnnotationDrag(anchor, false);
-            updateAnnotationDrag(point);
+            updateAnnotationDrag(point, modifiers);
             updateTouch(annotationTouch());
             return;
         }
@@ -7457,11 +7452,11 @@ void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::
         updateTouch(selectionTouch());
     } else if (gesture_->type == Gesture::Type::Resizing) {
         selection_ = resizeSelection(gesture_->origin, gesture_->handle, clampPoint(point),
-                                     gesture_->preserveAspect);
+                                     keepingAspect(modifiers));
         updateTouch(selectionTouch());
     } else if (gesture_->type == Gesture::Type::MovingAnnotation ||
                gesture_->type == Gesture::Type::ResizingAnnotation) {
-        updateAnnotationDrag(point);
+        updateAnnotationDrag(point, modifiers);
         updateTouch(annotationTouch());
     } else if (gesture_->type == Gesture::Type::Drawing) {
         const int pointsBefore = gesture_->points.size();
@@ -7481,7 +7476,6 @@ void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::
 void OverlayController::release(CaptureOverlay *overlay, const QPointF &local,
                                 Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
-    Q_UNUSED(modifiers);
     if (finished_ || cancelled_) {
         return;
     }
@@ -7549,14 +7543,17 @@ void OverlayController::release(CaptureOverlay *overlay, const QPointF &local,
         showToolbar();
         break;
     case Gesture::Type::Resizing:
+        // The release's own modifiers, like every step before it: the box lands
+        // on the size the last step drew, so a key held for the whole drag keeps
+        // the ratio and one let go part-way through lands free.
         selection_ = resizeSelection(gesture_->origin, gesture_->handle, clampPoint(point),
-                                     gesture_->preserveAspect);
+                                     keepingAspect(modifiers));
         gesture_->type = Gesture::Type::None;
         showToolbar();
         break;
     case Gesture::Type::MovingAnnotation:
     case Gesture::Type::ResizingAnnotation:
-        finishAnnotationDrag(overlay, point);
+        finishAnnotationDrag(overlay, point, modifiers);
         break;
     case Gesture::Type::Drawing:
         finishDrawing(end);
@@ -10113,7 +10110,7 @@ void OverlayController::deleteSelectedAnnotation()
     mutateAnnotations(std::move(next));
 }
 
-void OverlayController::beginAnnotationDrag(Point point, bool resize, bool preserveAspect)
+void OverlayController::beginAnnotationDrag(Point point, bool resize)
 {
     if (selectedAnnotation_ < 0 || selectedAnnotation_ >= annotations_.size()) {
         return;
@@ -10123,13 +10120,12 @@ void OverlayController::beginAnnotationDrag(Point point, bool resize, bool prese
     gesture_->anchor = point;
     gesture_->current = point;
     gesture_->handle = resize ? annotationHandleAt(point) : 0;
-    gesture_->preserveAspect = preserveAspect;
     dragAnnotation_ = annotations_.at(selectedAnnotation_);
     dragSnapshot_ = annotations_;
     dragMoved_ = false;
 }
 
-void OverlayController::updateAnnotationDrag(Point point)
+void OverlayController::updateAnnotationDrag(Point point, Qt::KeyboardModifiers modifiers)
 {
     if (selectedAnnotation_ < 0 || selectedAnnotation_ >= annotations_.size()) {
         gesture_->type = Gesture::Type::None;
@@ -10154,16 +10150,21 @@ void OverlayController::updateAnnotationDrag(Point point)
         if (!annotationBounds(dragAnnotation_, &originalBounds)) {
             return;
         }
-        const LogicalRect newBounds = resizeSelection(originalBounds, gesture_->handle, current,
-                                                      gesture_->preserveAspect);
+        // Read at every step rather than at the press: holding the key part-way
+        // through a drag has to constrain it from that moment, which is what
+        // the key promises.
+        const LogicalRect newBounds =
+            resizeSelection(originalBounds, gesture_->handle, current,
+                            keepingAspect(modifiers));
         annotations_[selectedAnnotation_] = scaledAnnotation(dragAnnotation_, newBounds);
     }
 }
 
-void OverlayController::finishAnnotationDrag(CaptureOverlay *overlay, Point point)
+void OverlayController::finishAnnotationDrag(CaptureOverlay *overlay, Point point,
+                                             Qt::KeyboardModifiers modifiers)
 {
     Q_UNUSED(overlay);
-    updateAnnotationDrag(point);
+    updateAnnotationDrag(point, modifiers);
     const bool moved = dragMoved_;
     gesture_->type = Gesture::Type::None;
     if (!moved) {

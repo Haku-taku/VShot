@@ -1046,13 +1046,20 @@ private:
     // follows the pointer along the box's diagonal.
     LogicalRect resizeSelection(LogicalRect origin, int handle, Point current,
                                 bool preserveAspect = false) const;
+    /// Whether the keep-the-aspect key is down in `modifiers`.  Read at every
+    /// step of a resize rather than once at the press: the key is a state of the
+    /// keyboard, so holding it part-way through a drag has to constrain that
+    /// drag from that moment on, and letting it go has to set the box free
+    /// again.  Taking it at the press made the key do nothing until the next
+    /// drag began.
+    bool keepingAspect(Qt::KeyboardModifiers modifiers) const;
     int hitHandle(Point point) const;
     // What a press on the bare canvas does: resize the selection by its handle,
     // or start a new one.  The body of the selection is not a target -- dragging
     // it is `beginSelectionMove`, which only the middle button reaches.  Shared
     // with the loose drag's click path, which has to reach the same selection
     // logic once it has let go of the mark.
-    void beginSelectionGesture(Point point, bool preserveAspect = false);
+    void beginSelectionGesture(Point point);
     // Middle-drag: the selection is dragged whole, from wherever the press
     // landed inside it.  The pin editor reaches it through the same call: a
     // pin's image is moved, not resized, so its whole area is this target.
@@ -1123,9 +1130,10 @@ private:
     // there are no handles to aim at until it is picked up, and the border is
     // the one part of it that cannot be read as "start a stroke here".
     int annotationBorderOf(int index, Point point) const;
-    void beginAnnotationDrag(Point point, bool resize, bool preserveAspect = false);
-    void updateAnnotationDrag(Point point);
-    void finishAnnotationDrag(CaptureOverlay *overlay, Point point);
+    void beginAnnotationDrag(Point point, bool resize);
+    void updateAnnotationDrag(Point point, Qt::KeyboardModifiers modifiers);
+    void finishAnnotationDrag(CaptureOverlay *overlay, Point point,
+                              Qt::KeyboardModifiers modifiers);
     Annotation translatedAnnotation(const Annotation &original, int dx, int dy) const;
     Annotation scaledAnnotation(const Annotation &original, const LogicalRect &bounds) const;
     void selectAnnotation(int index);

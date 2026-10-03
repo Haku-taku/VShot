@@ -671,17 +671,18 @@ const SDR_WHITE_LEVEL: f32 = 0.8;
 /// photograph of an HDR scene wants its highlights kept apart.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ToneMap {
-    /// Pick the white level from the frame: the last code for a frame with
-    /// nothing above white, [`ToneMapOptions::white`] for one that has
-    /// highlights.  This is what an SDR capture being exact means, and it is
-    /// the default.
+    /// Use [`ToneMapOptions::white`, defaulting to `SDR_WHITE_LEVEL`], whatever
+    /// the frame holds.  The default.
+    ///
+    /// There used to be an `Auto` mode here, which moved the white point only
+    /// when the frame carried highlights — exact for an SDR capture, at the
+    /// price of a pixel's code depending on what else shared the frame.  It is
+    /// gone because the pipeline no longer needs telling: a capture that has
+    /// light above white gets an HDR half and a tone-mapped SDR one, a frame
+    /// with nothing above white is written as it is, and the two cases are
+    /// decided by the content rather than by this setting.  What is left is the
+    /// one thing the user actually chooses: where SDR white lands.
     #[default]
-    Auto,
-    /// Always use [`ToneMapOptions::white`, defaulting to `SDR_WHITE_LEVEL`],
-    /// whatever the frame holds.  An SDR capture on an HDR output then comes out
-    /// slightly dim rather than exact, in exchange for a pixel's code not
-    /// depending on what else shares the frame — which is what makes a pinned
-    /// copy match the content it was taken from.
     Fixed,
     /// Scale the light so the frame's own brightest point lands on white, i.e.
     /// SDR white goes to `1.0 / peak`.  Highlights keep their *ordering* but not
@@ -693,12 +694,16 @@ pub enum ToneMap {
 
 impl ToneMap {
     /// The names the CLI and the settings window use.
-    pub const NAMES: [&'static str; 3] = ["auto", "fixed", "normalize"];
+    pub const NAMES: [&'static str; 2] = ["fixed", "normalize"];
 
+    /// `auto` is accepted and read as `fixed`, which is what it meant for every
+    /// frame that had no light above white — and a frame that has any is the
+    /// one case the pipeline decides for itself now.  A config file written
+    /// before this stays valid rather than being refused for a word that used
+    /// to be right.
     pub fn parse(name: &str) -> Option<Self> {
         match name {
-            "auto" => Some(Self::Auto),
-            "fixed" => Some(Self::Fixed),
+            "auto" | "fixed" => Some(Self::Fixed),
             "normalize" => Some(Self::Normalize),
             _ => None,
         }
@@ -706,7 +711,6 @@ impl ToneMap {
 
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Auto => "auto",
             Self::Fixed => "fixed",
             Self::Normalize => "normalize",
         }
@@ -719,21 +723,19 @@ impl ToneMap {
 pub struct ToneMapOptions {
     pub mode: ToneMap,
     /// Where SDR white lands in the 0..=1 output range.  Used by
-    /// [`ToneMap::Auto`] (only for a frame that carries highlights) and by
     /// [`ToneMap::Fixed`] (always).  Clamped to a sane span so a config file
     /// cannot put white on black or on the ceiling itself.
     pub white: f32,
-    /// How "this frame carries highlights" is decided, so that
-    /// [`ToneMap::Auto`] moves the white point exactly when the rest of the
-    /// pipeline agrees the capture is HDR content.  [`ToneMap::Fixed`] and
-    /// [`ToneMap::Normalize`] do not read it.
+    /// How "this frame carries highlights" is decided.  Read by
+    /// [`ToneMap::Normalize`] and by the roll-off, both of which care whether a
+    /// frame's peak is a highlight at all.
     pub hdr: HdrDecision,
 }
 
 impl Default for ToneMapOptions {
     fn default() -> Self {
         Self {
-            mode: ToneMap::Auto,
+            mode: ToneMap::Fixed,
             white: SDR_WHITE_LEVEL,
             hdr: HdrDecision::default(),
         }
@@ -774,7 +776,6 @@ impl ToneMapOptions {
         let peak = frame.peak();
         let has_highlights = frame.carries_hdr(self.hdr);
         match self.mode {
-            ToneMap::Auto => (if has_highlights { white } else { 1.0 }, ROLL_OFF_PEAK),
             ToneMap::Fixed => (white, ROLL_OFF_PEAK),
             // The reciprocal of the peak, which is exactly "the brightest point
             // becomes white": white lands on `1 / peak` and the curve is scaled
@@ -1737,12 +1738,16 @@ mod tests {
             .unwrap()
             .pixel(Point::new(0, 0))
             .unwrap();
-        // White is neutral, and a frame with nothing above white puts it on the
-        // last code: an SDR image is shown exactly as it was, with no headroom
-        // spent on highlights it does not have (see `white_level_for`).
+        // White is neutral, and it lands where the setting puts it: the same
+        // place for every frame, which is what makes a pixel's code depend on
+        // the pixel rather than on what shares the frame.
         assert_eq!(pixel[0], pixel[1]);
         assert_eq!(pixel[1], pixel[2]);
-        assert_eq!(pixel[0], 255, "SDR white did not land on white");
+        assert_eq!(
+            pixel[0],
+            to_u8(srgb_oetf(ToneMapOptions::default().white)),
+            "SDR white did not land on the configured level"
+        );
     }
 
     #[test]
@@ -2139,20 +2144,31 @@ mod tests {
         }
     }
 
+    /// The white point is the user's, and it is the same whatever the frame
+    /// holds: white lands where [`ToneMapOptions::white`] says, and light above
+    /// it rolls off into the codes that are left.
+    ///
+    /// This is what is left of a mode that used to move the white point only
+    /// for a frame with highlights.  The pipeline decides *whether* a capture
+    /// has an HDR half by what it holds, so a frame with nothing above white
+    /// never reaches this map on an SDR output at all -- it is written as it is
+    /// -- and the setting is free to mean one thing.
     #[test]
-    fn an_sdr_frame_is_shown_exactly_and_an_hdr_one_makes_room_for_its_highlights() {
-        // The white point is the frame's, and that is the trade: a frame with
-        // nothing above white is an SDR image, so it is shown as it was — white
-        // on the last code — while a frame that does hold highlights moves white
-        // down to leave them somewhere to go.  Nothing else can be exact *and*
-        // keep a highlight apart in eight bits.
+    fn the_white_point_is_the_settings_and_the_highlights_roll_off() {
         let white = one_pixel([1.0, 1.0, 1.0, 1.0]);
         let white_code = white
             .tone_map_to_srgb()
             .unwrap()
             .pixel(Point::new(0, 0))
             .unwrap()[0];
-        assert_eq!(white_code, 255, "SDR white did not land on white");
+        // The default white level, as a code: SDR white sits below the top so
+        // that the highlights have somewhere to go.  The level is a fraction of
+        // the *linear* range, so it reaches the file through the sRGB curve.
+        assert_eq!(
+            white_code,
+            to_u8(srgb_oetf(SDR_WHITE_LEVEL)),
+            "SDR white did not land on the configured level"
+        );
 
         // The same white in a frame that also holds an 8× highlight: it moves
         // down to `SDR_WHITE_LEVEL`, and the highlight lands above it.
@@ -2170,16 +2186,16 @@ mod tests {
             "the highlight ({highlight}) did not land above white ({white_code})"
         );
 
-        // SDR light keeps its own shape in either frame: below white the map is
-        // one straight scale, so the ratios inside the SDR range are what they
-        // were.  Only the level they are scaled by differs.
+        // SDR light keeps its own shape: below white the map is one straight
+        // scale, so the ratios inside the SDR range are what they were.  Only
+        // the level they are scaled by differs.
         assert_eq!(
             one_pixel([0.5, 0.5, 0.5, 1.0])
                 .tone_map_to_srgb()
                 .unwrap()
                 .pixel(Point::new(0, 0))
                 .unwrap()[0],
-            to_u8(srgb_oetf(0.5))
+            to_u8(srgb_oetf(0.5 * ToneMapOptions::default().white))
         );
 
         // And a value with no light of its own stays black.
@@ -2284,36 +2300,58 @@ mod tests {
         assert_eq!(sdr, to_u8(srgb_oetf(0.5)));
     }
 
+    /// The white point does not move for a frame that only *looks* like it has
+    /// highlights.
+    ///
+    /// A plain SDR desktop on a ten-bit PQ output holds thousands of pixels a
+    /// few thousandths over white.  An earlier mode moved the white point for
+    /// any such frame and dimmed a whole 3.7-megapixel capture about 18 %; that
+    /// mode is gone, and what keeps the harm away now is upstream: the pipeline
+    /// asks [`HdrFrame::carries_hdr`] before it writes an HDR half at all, and a
+    /// frame whose overshoot is rounding noise fails that test by area.  This
+    /// pins the half of it that lives here -- the map itself never reads the
+    /// peak to place white.
     #[test]
-    fn auto_leaves_an_sdr_frame_alone_however_many_rounding_pixels_it_has() {
-        // The regression this whole decision exists for.  A plain SDR desktop on
-        // a ten-bit PQ output holds thousands of pixels a few thousandths over
-        // white; under the old peak test a handful of them moved the white point
-        // from 1.0 to 0.8 and dimmed the whole 3.7-megapixel capture about 18 %.
-        // White has to land on the last code, not on the configured level.
+    fn the_white_point_does_not_chase_a_frames_rounding_noise() {
         let options = ToneMapOptions {
-            mode: ToneMap::Auto,
+            mode: ToneMap::Fixed,
             white: 0.8,
             ..ToneMapOptions::default()
         };
-        let frame = frame_with(1.03, 35, 100_000);
-        let white = frame
+        // Noise over white: 35 pixels a few thousandths up, in a hundred
+        // thousand.  The area test is what refuses to call that HDR content.
+        let noisy = frame_with(1.03, 35, 100_000);
+        assert!(
+            !noisy.carries_hdr(options.hdr),
+            "rounding noise was read as HDR content"
+        );
+        // And the map puts white where the setting says whatever the frame
+        // holds, rather than reading the frame's peak for it.
+        let white = noisy
             .tone_map_to_srgb_with(options)
             .unwrap()
             .pixel(Point::new(99_999, 0))
             .unwrap()[0];
-        assert_eq!(white, 255, "an SDR frame was dimmed by its own rounding");
+        assert_eq!(
+            white,
+            to_u8(srgb_oetf(0.8)),
+            "white did not land on the setting"
+        );
 
-        // A frame that really does carry light above white still moves it, which
-        // is the other half of the trade: `Auto` reads the frame, it just reads
-        // it by the share and not by the peak.
-        let frame = frame_with(2.0, 10_000, 100_000);
-        let white = frame
+        // A frame that really does carry light above white is HDR content, and
+        // its white lands in the same place -- the setting is the only thing
+        // that decides where white is.
+        let bright = frame_with(2.0, 10_000, 100_000);
+        assert!(
+            bright.carries_hdr(options.hdr),
+            "a real highlight was missed"
+        );
+        let white = bright
             .tone_map_to_srgb_with(options)
             .unwrap()
             .pixel(Point::new(99_999, 0))
             .unwrap()[0];
-        assert!(white < 255, "the highlights had nowhere to go: {white}");
+        assert_eq!(white, to_u8(srgb_oetf(0.8)), "white moved with the frame");
     }
 
     #[test]
@@ -2357,9 +2395,13 @@ mod tests {
             let mode = ToneMap::parse(name).unwrap_or_else(|| panic!("{name} did not parse"));
             assert_eq!(mode.name(), name);
         }
+        // `auto` was a mode once; it is read as `fixed` now, which is what it
+        // meant for every frame with nothing above white -- and the frames that
+        // have any are decided by the pipeline rather than by this setting.
+        assert_eq!(ToneMap::parse("auto"), Some(ToneMap::Fixed));
         assert_eq!(ToneMap::parse("AUTO"), None);
         assert_eq!(ToneMap::parse(""), None);
-        assert_eq!(ToneMap::default(), ToneMap::Auto);
+        assert_eq!(ToneMap::default(), ToneMap::Fixed);
         assert_eq!(ToneMapOptions::default().white, SDR_WHITE_LEVEL);
     }
 

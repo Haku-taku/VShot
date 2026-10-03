@@ -52,10 +52,16 @@ const QStringList kSdrFormatNames = {QStringLiteral("png"), QStringLiteral("jpeg
 // The HDR half's format, on the same terms.
 const QStringList kHdrFormatNames = {QStringLiteral("avif"), QStringLiteral("hdr"),
                                      QStringLiteral("jxl")};
-// How the SDR half is mapped down from the HDR one.  The names are what
+// How HDR content is mapped down whenever it has to be.  The names are what
 // `--tone-map` accepts, in the order the settings window offers them: the
-// default first, then the two that read a level.
-const QStringList kToneMapNames = {QStringLiteral("auto"), QStringLiteral("fixed"),
+// default first.
+//
+// `auto` used to be here and is gone: the pipeline decides whether a capture
+// has an HDR half by what it holds, so the setting is left with the one thing a
+// user chooses -- where SDR white lands.  A file that still says `auto` is read
+// as `fixed` by the Rust side, which is what it meant for every frame with
+// nothing above white.
+const QStringList kToneMapNames = {QStringLiteral("fixed"),
                                    QStringLiteral("normalize")};
 // `--element-fallback` accepts, in the order the settings window offers them:
 // the default first.  The two name the pixel readers -- see `src/element/mod.rs`.

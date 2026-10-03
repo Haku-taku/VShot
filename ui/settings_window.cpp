@@ -134,7 +134,7 @@ constexpr int kDefaultReplayFps = 30;
 // readable rather than implied by the word "default".
 constexpr const char *kDefaultSdrFormat = "png";
 constexpr const char *kDefaultHdrFormat = "avif";
-constexpr const char *kDefaultToneMap = "auto";
+constexpr const char *kDefaultToneMap = "fixed";
 // The pixel reader the picker falls back to: `lines`, which reads the dividers
 // the interface draws.  See `src/element/mod.rs` for the other.
 constexpr const char *kDefaultElementFallback = "lines";
@@ -2130,10 +2130,9 @@ private:
 
     /// Whether the white-level box does anything for the mode now selected.
     ///
-    /// `auto` and `fixed` both read a level; `normalize` works its own out from
-    /// the capture's peak, so the box is greyed rather than left live and
-    /// ignored.  The leading "built-in default" entry means `auto`, which does
-    /// read one.
+    /// `fixed` reads a level; `normalize` works its own out from the capture's
+    /// peak, so the box is greyed rather than left live and ignored.  The
+    /// leading "built-in default" entry means `fixed`, which does read one.
     void updateToneMapWhiteEnabled()
     {
         const QString mode = toneMapBox_->currentData().toString();
@@ -2278,12 +2277,13 @@ private:
         toneMapBox_->setMinimumWidth(200);
         selectChoice(toneMapBox_, config_.cli.toneMap);
         addRow(card, uiTr("HDR to SDR"),
-               uiTr("How the SDR half of an HDR capture is made from the HDR one. "
-                    "Auto reads each capture: an SDR picture comes out exactly as it "
-                    "was, and one with highlights makes room for them. Fixed always "
-                    "maps SDR white to the level below, so a pixel's value does not "
-                    "depend on what else is in the picture. Normalize scales the "
-                    "capture so its brightest point becomes white"),
+               uiTr("How HDR content is mapped down whenever it has to be: an HDR "
+                    "image shown on an SDR display, or the SDR copy saved beside an "
+                    "HDR file. Whether a conversion is needed at all is worked out "
+                    "from the content, not from this. Fixed maps SDR white to the "
+                    "level below, so a pixel's value does not depend on what else is "
+                    "in the picture. Normalize scales the capture so its brightest "
+                    "point becomes white"),
                toneMapBox_, true);
 
         toneMapWhiteSpin_ = new ModernDoubleSpinBox(card);
@@ -2300,12 +2300,10 @@ private:
         addRow(card, uiTr("SDR white level"),
                uiTr("Where SDR white lands in the range, as a percentage. The rest is "
                     "spent on light above white, so a lower level keeps highlights more "
-                    "apart and makes the picture dimmer. Used by Auto (only for a "
-                    "capture that has highlights) and by Fixed"),
+                    "apart and makes the picture dimmer. Used by Fixed"),
                toneMapWhiteSpin_, false);
-        // A level is only read by two of the three modes, and Normalize works
-        // its own out from the capture's peak: a box that did nothing would
-        // read as a setting that was ignored.
+        // Normalize works its own level out from the capture's peak: a box that
+        // did nothing would read as a setting that was ignored.
         connect(toneMapBox_, &QComboBox::currentIndexChanged, this,
                 [this] { updateToneMapWhiteEnabled(); });
         updateToneMapWhiteEnabled();
@@ -2434,10 +2432,12 @@ private:
     void addFormatCard(const FormatInfo &format, const QString &half)
     {
         QWidget *card = addCard(formatsPage_, uiTr("%1 (%2)").arg(format.name, half));
-        // Named so the offline check can tell which formats the page has cards
-        // for: a format that declares no parameters still gets a card, so the
-        // parameter controls alone cannot answer that.
-        card->setObjectName(QStringLiteral("formatCard_%1").arg(format.name));
+        // Which format this card is for, as a *property* rather than as the
+        // object name: the name is `card`, and the stylesheet keys on it for
+        // the background, the border and the radius every other card has.  A
+        // name of its own here took that away -- the one page whose cards are
+        // built in a loop was the one page whose cards were undressed.
+        card->setProperty("formatCard", format.name);
         // A format with nothing to tune still gets a card, saying so: a format
         // missing from the page entirely would read as a format this build does
         // not have, which is the one thing the registry's answer must not be

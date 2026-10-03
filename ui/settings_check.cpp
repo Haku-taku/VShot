@@ -27,6 +27,7 @@
 #include <QAbstractButton>
 #include <QColor>
 #include <QComboBox>
+#include <utility>
 #include <QDialog>
 #include <QDir>
 #include <QFile>
@@ -342,15 +343,41 @@ void checkEveryFieldReachesTheFile()
     QComboBox *hdr = find<QComboBox>(dialog.get(), "hdrFormat");
     const auto has_cards = [&](const QString &format) {
         // The card, not its parameter controls: a format that declares no
-        // parameters -- Radiance -- still has a card saying so.
-        const QString name = QStringLiteral("formatCard_%1").arg(format);
+        // parameters -- Radiance -- still has a card saying so.  Found by its
+        // property rather than by an object name of its own, because the name
+        // is `card` and the stylesheet needs it to stay that way.
         for (QWidget *widget : dialog->findChildren<QWidget *>()) {
-            if (widget->objectName() == name) {
+            if (widget->property("formatCard").toString() == format) {
                 return true;
             }
         }
         return false;
     };
+    // Every card on the page is *dressed*: the stylesheet keys the background,
+    // the border and the radius on the object name `card`, and a card that
+    // renamed itself for the check's benefit lost all three.  This is what
+    // makes "the page uses the same card design as the others" a claim rather
+    // than an intention.
+    const auto dressed = [&] {
+        int cards = 0;
+        int dressedCards = 0;
+        for (QWidget *widget : dialog->findChildren<QWidget *>()) {
+            if (widget->property("formatCard").toString().isEmpty()) {
+                continue;
+            }
+            ++cards;
+            if (widget->objectName() == QStringLiteral("card")) {
+                ++dressedCards;
+            }
+        }
+        return std::pair<int, int>{cards, dressedCards};
+    }();
+    expect(dressed.first > 0, "the formats page has cards",
+           QString::number(dressed.first));
+    expect(dressed.first == dressed.second,
+           "every format card carries the object name the card style is keyed on",
+           QStringLiteral("%1 of %2").arg(dressed.second).arg(dressed.first));
+
     const auto offers = [](QComboBox *box, const QString &format) {
         return box != nullptr && box->findData(format) >= 0;
     };

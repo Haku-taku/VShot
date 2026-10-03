@@ -148,20 +148,21 @@ pub struct Cli {
         allow_hyphen_values = true
     )]
     pub format_params: Vec<String>,
-    /// How the SDR PNG of an HDR capture is mapped down from the HDR light:
-    /// `auto` (the default) reads the white level from the frame, so an SDR
-    /// capture comes out exactly as it looked and only a frame with highlights
-    /// moves white down to make room for them; `fixed` always uses
-    /// `--tone-map-white`; `normalize` scales the light so the frame's own
-    /// brightest point lands on white, which keeps the highlights ordered but
-    /// flattens their separation. Ignored by a capture with no HDR content.
+    /// How HDR content is mapped down whenever it has to be -- an HDR image
+    /// shown on an SDR display, or the SDR copy written beside an HDR file.
+    /// Whether a conversion is needed at all is decided from the content, not
+    /// from this. `fixed` (the default) puts SDR white at `--tone-map-white`,
+    /// so a pixel's value does not depend on what else is in the picture;
+    /// `normalize` scales the light so the frame's own brightest point lands on
+    /// white, which keeps the highlights ordered but flattens their separation.
+    /// `auto` was a mode once and is read as `fixed`.
     #[arg(long = "tone-map", global = true, value_name = "MODE")]
     pub tone_map: Option<String>,
     /// Where SDR white lands in the SDR copy, as a fraction of the output
     /// range: 0.5 to 0.95, default 0.8. Everything above it is the room left
     /// for light brighter than white, so a lower value keeps more highlight
     /// separation at the cost of dimming the rest of the picture. Used by
-    /// `--tone-map fixed` and `auto`.
+    /// `--tone-map fixed`.
     #[arg(long = "tone-map-white", global = true, value_name = "LEVEL")]
     pub tone_map_white: Option<f32>,
     /// Whether a capture on an HDR output is judged to hold HDR content by how
@@ -2293,11 +2294,11 @@ mod tests {
     fn the_tone_map_flags_parse_and_are_clamped() {
         // Both defaults, with nothing given.
         let request = Cli::try_parse_from(["vshot", "monitor", "--output", "-"]).unwrap();
-        assert_eq!(request.tone_map.mode, ToneMap::Auto);
+        assert_eq!(request.tone_map.mode, ToneMap::Fixed);
         assert!((request.tone_map.white - ToneMapOptions::default().white).abs() < 1e-6);
 
         // The mode, by each of its names.
-        for mode in [ToneMap::Auto, ToneMap::Fixed, ToneMap::Normalize] {
+        for mode in [ToneMap::Fixed, ToneMap::Normalize] {
             let request = Cli::try_parse_from([
                 "vshot",
                 "monitor",

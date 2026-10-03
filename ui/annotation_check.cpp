@@ -2225,6 +2225,98 @@ void checkSelectModeDecidesWhatAPressPicksUp()
     run(QStringLiteral("precise"), false);
 }
 
+// The keep-the-aspect key is a state of the keyboard, not a property of the
+// press that started a resize.  It used to be read once, when the handle was
+// grabbed, which made it do nothing at all in the one case it is most obviously
+// wanted: the user starts a drag, sees the box go the wrong shape, and reaches
+// for the key *while still holding the button*.  The box has to snap onto its
+// diagonal from that moment on, and letting the key go has to set it free
+// again.
+//
+// Both halves are checked here, on the same drag: one step with no modifier,
+// one with the key down, and one with it released again.  The box's own ratio
+// is the assertion rather than a pixel count, because the ratio is what the key
+// promises and what the clamp at the canvas edge cannot fake.
+void checkTheAspectKeyConstrainsADragAlreadyUnderWay()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+
+    // A 4:3-ish box drawn clear of the canvas edge, so the free steps below have
+    // room to grow in both directions and the clamp never decides the shape.
+    controller.chooseTool(vshot::Tool::Rectangle);
+    drag(controller, overlay, QPointF(60, 60), QPointF(260, 210));
+    expect(controller.annotations().size() == 1, "the rectangle lands as one mark");
+    if (controller.annotations().size() != 1) {
+        return;
+    }
+    controller.chooseTool(std::nullopt);
+    const vshot::LogicalRect drawn = controller.annotations().at(0).rect;
+    const double ratio = static_cast<double>(drawn.width) / drawn.height;
+    // The bottom-right handle, which stretches the box along both axes at once.
+    const QPointF corner(drawn.x + static_cast<int>(drawn.width) - 1,
+                         drawn.y + static_cast<int>(drawn.height) - 1);
+    // Far enough right that the box would become plainly wider than it is tall
+    // if nothing constrained it, and short enough to stay off the canvas edge.
+    const QPointF pulled(corner.x() + 100, corner.y() + 12);
+    const auto rectOf = [&controller] { return controller.annotations().constFirst().rect; };
+    const auto shapeOf = [](const vshot::LogicalRect &rect) {
+        return QStringLiteral("%1x%2").arg(rect.width).arg(rect.height);
+    };
+    const auto aspectKept = [&](const vshot::LogicalRect &rect) {
+        const double got = static_cast<double>(rect.width) /
+            static_cast<double>(std::max(1u, rect.height));
+        return std::abs(got - ratio) < 0.05;
+    };
+
+    controller.press(overlay, corner, Qt::LeftButton, Qt::NoModifier);
+    controller.move(overlay, pulled, Qt::LeftButton, Qt::NoModifier);
+    const vshot::LogicalRect free = rectOf();
+    expect(!aspectKept(free),
+           "a drag with no key held changes the mark's shape",
+           QStringLiteral("%1 (wanted off %2)").arg(shapeOf(free)).arg(ratio, 0, 'f', 3));
+
+    // The key goes down mid-drag: the very next step has to land on the
+    // diagonal, which is the half that used to do nothing.
+    controller.move(overlay, pulled + QPointF(40, 0), Qt::LeftButton, Qt::AltModifier);
+    const vshot::LogicalRect held = rectOf();
+    expect(aspectKept(held),
+           "holding the key mid-drag constrains the mark from that step on",
+           QStringLiteral("%1 (wanted %2)").arg(shapeOf(held)).arg(ratio, 0, 'f', 3));
+    expect(held.width > free.width,
+           "the constrained step still follows the pointer outwards",
+           QStringLiteral("%1 -> %2").arg(shapeOf(free)).arg(shapeOf(held)));
+
+    // ... and letting it go sets the box free again, so the key is a state and
+    // not a one-way latch on the gesture.
+    controller.move(overlay, pulled + QPointF(80, 0), Qt::LeftButton, Qt::NoModifier);
+    const vshot::LogicalRect freed = rectOf();
+    expect(!aspectKept(freed),
+           "letting the key go mid-drag frees the mark again",
+           QStringLiteral("%1 (wanted off %2)").arg(shapeOf(freed)).arg(ratio, 0, 'f', 3));
+
+    // The release carries the same reading: the box must land on the shape the
+    // last step drew rather than on whatever the press-time snapshot said.
+    controller.move(overlay, pulled + QPointF(80, 0), Qt::LeftButton, Qt::AltModifier);
+    controller.release(overlay, pulled + QPointF(80, 0), Qt::LeftButton, Qt::AltModifier);
+    const vshot::LogicalRect landed = rectOf();
+    expect(aspectKept(landed),
+           "a release with the key still held lands on the constrained shape",
+           QStringLiteral("%1 (wanted %2)").arg(shapeOf(landed)).arg(ratio, 0, 'f', 3));
+}
+
 // The state the removed Select tool left behind: a modifier held *while* a press
 // is made, which lets an existing mark be picked up without the armed tool being
 // put down.
@@ -4946,6 +5038,7 @@ int main(int argc, char *argv[])
     checkBezierFillsAtHalfAlpha();
     checkBezierStepCoverage();
     checkSelectModeDecidesWhatAPressPicksUp();
+    checkTheAspectKeyConstrainsADragAlreadyUnderWay();
     checkThePinDragRaisesNoMagnifier();
     checkTheEyedropperTakesThePixelItIsPointedAt();
     checkTheEyedropperLoupeFollowsThePointer();

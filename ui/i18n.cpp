@@ -534,25 +534,25 @@ const QHash<QString, QString> &chineseTable()
          QString::fromUtf8("编码器用多大功夫，1（快）到 9（慢）。"
                            "以时间换体积，不改变画面内容")},
         {QStringLiteral("HDR to SDR"), QString::fromUtf8("HDR 转 SDR")},
-        {QStringLiteral("How the SDR half of an HDR capture is made from the HDR one. "
-                        "Auto reads each capture: an SDR picture comes out exactly as it "
-                        "was, and one with highlights makes room for them. Fixed always "
-                        "maps SDR white to the level below, so a pixel's value does not "
-                        "depend on what else is in the picture. Normalize scales the "
-                        "capture so its brightest point becomes white"),
-         QString::fromUtf8("一次 HDR 截图的 SDR 那一半怎么由 HDR 那一半得到。"
-                           "自动会逐张判断：本来就是 SDR 的画面原样输出，带高光的才腾出空间。"
-                           "固定则总是把 SDR 白映射到下面那个档位，"
+        {QStringLiteral("How HDR content is mapped down whenever it has to be: an HDR "
+                        "image shown on an SDR display, or the SDR copy saved beside an "
+                        "HDR file. Whether a conversion is needed at all is worked out "
+                        "from the content, not from this. Fixed maps SDR white to the "
+                        "level below, so a pixel's value does not depend on what else is "
+                        "in the picture. Normalize scales the capture so its brightest "
+                        "point becomes white"),
+         QString::fromUtf8("HDR 内容在必须降映射时怎么做：把 HDR 图像显示在 SDR 显示器上，"
+                           "或把 SDR 副本存在 HDR 文件旁边。"
+                           "到底需不需要转换由内容本身决定，不看这里。"
+                           "固定把 SDR 白映射到下面那个档位，"
                            "一个像素的值不取决于画面里还有什么。"
                            "归一化把整张截图缩放到最亮处即白")},
         {QStringLiteral("SDR white level"), QString::fromUtf8("SDR 白电平")},
         {QStringLiteral("Where SDR white lands in the range, as a percentage. The rest is "
                         "spent on light above white, so a lower level keeps highlights more "
-                        "apart and makes the picture dimmer. Used by Auto (only for a "
-                        "capture that has highlights) and by Fixed"),
+                        "apart and makes the picture dimmer. Used by Fixed"),
          QString::fromUtf8("SDR 白落在整个范围的百分之多少处。剩下的留给比白更亮的光，"
-                           "所以档位越低，高光之间分得越开，画面也越暗。"
-                           "自动（仅对带高光的截图）和固定会读它")},
+                           "所以档位越低，高光分得越开，画面也越暗。固定会读它")},
         {QStringLiteral("What a capture of HDR content is written as. Used only where "
                         "the command line gives nothing: an argument, or an "
                         "environment variable, always wins over these."),
