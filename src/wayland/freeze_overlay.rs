@@ -1423,7 +1423,10 @@ impl Drop for ShmSlot {
 
 pub(crate) struct OverlaySurface {
     pub(crate) output_id: u32,
-    pub(crate) _layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+    /// The layer surface itself, held rather than dropped: a pin surface's
+    /// keyboard interactivity changes while it lives -- see
+    /// `WaylandSession::set_pin_keyboard` -- and that takes this object.
+    pub(crate) layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
     pub(crate) surface: wl_surface::WlSurface,
     pub(crate) configured: bool,
     pub(crate) closed: bool,
@@ -1528,7 +1531,7 @@ impl Drop for OverlaySurface {
         // Unmap the surface before destroying its role and base surface.
         self.surface.attach(None, 0, 0);
         self.surface.commit();
-        self._layer_surface.destroy();
+        self.layer_surface.destroy();
         self.surface.destroy();
     }
 }

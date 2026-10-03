@@ -697,7 +697,7 @@ impl WaylandSession {
                 OverlaySurface {
                     output_id: info.global_id,
                     surface,
-                    _layer_surface: layer_surface,
+                    layer_surface,
                     configured: false,
                     closed: false,
                     width: info.geometry.size.width,
@@ -860,7 +860,7 @@ impl WaylandSession {
                 OverlaySurface {
                     output_id: info.global_id,
                     surface,
-                    _layer_surface: layer_surface,
+                    layer_surface,
                     configured: false,
                     closed: false,
                     width: info.geometry.size.width,
@@ -1154,8 +1154,15 @@ impl WaylandSession {
             layer_surface.set_size(0, 0);
             layer_surface.set_anchor(zwlr_layer_surface_v1::Anchor::all());
             layer_surface.set_exclusive_zone(-1);
+            // Refused until a pin is under the pointer.  `OnDemand` on a
+            // surface that covers the whole output means the compositor hands
+            // it the keyboard whenever the pointer is anywhere on that output
+            // -- and once it has it, every keystroke goes here and nowhere
+            // else, so the window underneath stops taking input entirely.
+            // `set_pin_keyboard` grants it for as long as the pointer is over a
+            // pin, which is the only time a pin wants a key at all.
             layer_surface
-                .set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand);
+                .set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
             // A picture takes no input of its own, and this one sits above
             // every window: the input region is what keeps a click outside the
             // pin going to what is under it instead of to us.  It is set by
@@ -1174,7 +1181,7 @@ impl WaylandSession {
                 OverlaySurface {
                     output_id: info.global_id,
                     surface,
-                    _layer_surface: layer_surface,
+                    layer_surface,
                     configured: false,
                     closed: false,
                     width: info.geometry.size.width,
@@ -1361,6 +1368,38 @@ impl WaylandSession {
     /// Not the whole output: a click that lands on no pin has to reach whatever
     /// is under it, and a surface that took everything would swallow it.  A pin
     /// straddling two outputs contributes its part to each.
+    /// Lets the pin surfaces take the keyboard, or stops them.
+    ///
+    /// A pin answers exactly one key -- Space, which opens the annotation
+    /// editor on the pin under the pointer -- and it wants that key only while
+    /// the pointer is over one.  At every other moment the keyboard belongs to
+    /// whatever the user is working in, so the interactivity follows the hover
+    /// rather than being left on for the life of the surface.
+    pub fn set_pin_keyboard(&mut self, over_a_pin: bool) -> Result<()> {
+        let interactivity = if over_a_pin {
+            zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand
+        } else {
+            zwlr_layer_surface_v1::KeyboardInteractivity::None
+        };
+        let ids = self
+            .state
+            .pin_surfaces
+            .iter()
+            .copied()
+            .collect::<Vec<u32>>();
+        for id in ids {
+            if let Some(overlay) = self.state.overlays.get(&id) {
+                overlay
+                    .layer_surface
+                    .set_keyboard_interactivity(interactivity);
+                overlay.surface.commit();
+            }
+        }
+        self.event_queue
+            .flush()
+            .map_err(|error| VshotError::WaylandProtocol(error.to_string()))
+    }
+
     pub fn set_pin_input_rects(&mut self, rects: &[Rect]) -> Result<()> {
         let Some(compositor) = self.state.topology.compositor.clone() else {
             return Err(VshotError::MissingCapability("wl_compositor".into()));

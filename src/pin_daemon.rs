@@ -1178,6 +1178,11 @@ impl Daemon {
             .filter(|rect| covered.is_none_or(|covered| !covered.contains(rect.origin)))
             .collect::<Vec<Rect>>();
         self.surfaces.set_input_rects(&rects)?;
+        // And the keyboard, which follows the hover: a pin wants a key only
+        // while the pointer is over one, and the rest of the time it belongs to
+        // the window the user is actually working in.
+        self.surfaces
+            .set_pin_keyboard(self.stack.pointer.hovered.is_some())?;
         self.chrome
             .sync(&self.stack.labels(), self.stack.all_visible);
         Ok(())

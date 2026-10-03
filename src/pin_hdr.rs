@@ -926,6 +926,12 @@ impl Surfaces {
         self.session.pump_watching_many(fds, timeout)
     }
 
+    /// Lets the pin surfaces take the keyboard, or stops them: on only while
+    /// the pointer is over a pin, which is the only time a pin wants a key.
+    pub(crate) fn set_pin_keyboard(&mut self, over_a_pin: bool) -> Result<()> {
+        self.session.set_pin_keyboard(over_a_pin)
+    }
+
     /// Lets the pin surfaces take the pointer, or stops them.
     pub(crate) fn set_pin_input(&mut self, on: bool) {
         self.session.set_pin_input(on);
