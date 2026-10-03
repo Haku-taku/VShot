@@ -235,6 +235,17 @@ struct WaylandState {
     /// transparent ten-bit words, and [`WaylandSession::show_pin_image`] puts an
     /// image into one of them later.
     pin_surfaces: HashSet<u32>,
+    /// What the pin surfaces' keyboard interactivity was last set to, and which
+    /// surfaces it was set on.  A drag calls `set_pin_keyboard` on every motion
+    /// event with the same answer, and re-sending it is a round of `set_` +
+    /// `commit` per output for nothing: the interactivity only changes when the
+    /// pointer enters or leaves a pin, which is a handful of times in a drag.
+    pin_keyboard: Option<(bool, HashSet<u32>)>,
+    /// The same for the input region: the rects last sent, and to which
+    /// surfaces.  These change on every motion of a drag -- that is the point of
+    /// them -- but not on the motions that do not move a pin, which is most of
+    /// the ones a slow hand makes.
+    pin_input_rects: Option<(Vec<Rect>, HashSet<u32>)>,
     /// Output ids whose image description came back `ready`, and those whose
     /// query failed, between `get_image_description` and the flood of events.
     cm_ready: HashSet<u32>,
@@ -1376,25 +1387,38 @@ impl WaylandSession {
     /// whatever the user is working in, so the interactivity follows the hover
     /// rather than being left on for the life of the surface.
     pub fn set_pin_keyboard(&mut self, over_a_pin: bool) -> Result<()> {
-        let interactivity = if over_a_pin {
-            zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand
-        } else {
-            zwlr_layer_surface_v1::KeyboardInteractivity::None
-        };
         let ids = self
             .state
             .pin_surfaces
             .iter()
             .copied()
-            .collect::<Vec<u32>>();
-        for id in ids {
-            if let Some(overlay) = self.state.overlays.get(&id) {
+            .collect::<HashSet<u32>>();
+        // The same answer for the same surfaces is not worth a round of
+        // `set_keyboard_interactivity` + `commit` on every motion event of a
+        // drag; the state only turns over when the pointer enters or leaves a
+        // pin.
+        if self
+            .state
+            .pin_keyboard
+            .as_ref()
+            .is_some_and(|(was, surfaces)| *was == over_a_pin && *surfaces == ids)
+        {
+            return Ok(());
+        }
+        let interactivity = if over_a_pin {
+            zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand
+        } else {
+            zwlr_layer_surface_v1::KeyboardInteractivity::None
+        };
+        for id in &ids {
+            if let Some(overlay) = self.state.overlays.get(id) {
                 overlay
                     .layer_surface
                     .set_keyboard_interactivity(interactivity);
                 overlay.surface.commit();
             }
         }
+        self.state.pin_keyboard = Some((over_a_pin, ids));
         self.event_queue
             .flush()
             .map_err(|error| VshotError::WaylandProtocol(error.to_string()))
@@ -1410,8 +1434,20 @@ impl WaylandSession {
             .pin_surfaces
             .iter()
             .copied()
-            .collect::<Vec<u32>>();
-        for id in ids {
+            .collect::<HashSet<u32>>();
+        // The rects move with a dragged pin, so they do change during a drag --
+        // but a motion that left the pin where it was sends the same list, and
+        // that is a `create_region` + `set_input_region` + `commit` per output
+        // for nothing.
+        if self
+            .state
+            .pin_input_rects
+            .as_ref()
+            .is_some_and(|(was, surfaces)| was.as_slice() == rects && *surfaces == ids)
+        {
+            return Ok(());
+        }
+        for id in &ids {
             let Some(position) = self
                 .state
                 .topology
@@ -1440,6 +1476,7 @@ impl WaylandSession {
             }
             region.destroy();
         }
+        self.state.pin_input_rects = Some((rects.to_vec(), ids));
         self.event_queue
             .flush()
             .map_err(|error| VshotError::WaylandProtocol(error.to_string()))
