@@ -3,6 +3,7 @@
 
 #include "pin_chrome.hpp"
 
+#include "i18n.hpp"
 #include "pin_label.hpp"
 
 
@@ -189,10 +190,29 @@ void PinChrome::setMenu(quint64 id, const QPoint &anchor, const QStringList &row
         dismissMenu();
         return;
     }
-    // The keyboard, so Esc reaches the menu -- and so the pointer leaving the
-    // surface does not take the menu with it.
+    // The keyboard, so Esc reaches the menu -- and the input region, so a click
+    // on a row lands here rather than on the pin under it.
     applyKeyboard();
+    applyMask();
     update();
+    // And the rectangle it came out as, which the daemon needs: the pins under
+    // it have to give their input up over it, or a click on a row that happens
+    // to lie over its own pin would go to the pin.
+    if (socket_ != nullptr && socket_->state() == QLocalSocket::ConnectedState) {
+        const QPoint origin = screen_ != nullptr ? screen_->geometry().topLeft() : QPoint(0, 0);
+        const QRect global = menuRect_.translated(origin);
+        QJsonObject answer;
+        answer.insert(QStringLiteral("cmd"), QStringLiteral("menu"));
+        answer.insert(QStringLiteral("id"), static_cast<qint64>(menuId_));
+        answer.insert(QStringLiteral("x"), global.x());
+        answer.insert(QStringLiteral("y"), global.y());
+        answer.insert(QStringLiteral("width"), global.width());
+        answer.insert(QStringLiteral("height"), global.height());
+        QByteArray line = QJsonDocument(answer).toJson(QJsonDocument::Compact);
+        line.append('\n');
+        socket_->write(line);
+        socket_->flush();
+    }
 }
 
 QRect PinChrome::menuRectFor(const QPoint &anchor, const QStringList &rows) const
@@ -247,6 +267,7 @@ void PinChrome::chooseRow(int row)
     menuRows_.clear();
     menuRect_ = QRect();
     applyKeyboard();
+    applyMask();
     update();
 }
 
@@ -267,6 +288,7 @@ void PinChrome::dismissMenu()
     menuRows_.clear();
     menuRect_ = QRect();
     applyKeyboard();
+    applyMask();
     update();
 }
 
@@ -357,8 +379,10 @@ void PinChrome::setPinnedVisible(bool visible)
 
 void PinChrome::applyMask()
 {
-    // Click-through, always: the labels say what a pin is, and every gesture
-    // belongs to the pin.
+    // Click-through except for the menu.  The labels say what a pin is and every
+    // gesture belongs to the pin -- but a menu is a thing to click, and without
+    // a region of its own the compositor hands its clicks to the pin surface
+    // underneath and no row can ever be picked.
     //
     // The region goes on the *window*, not the widget.  `QWidget::setMask` also
     // tells Qt to stop repainting outside the mask, so a widget whose mask is
@@ -368,6 +392,18 @@ void PinChrome::applyMask()
     QWindow *window = windowHandle();
     if (window == nullptr) {
         return;
+    }
+    if (menuId_ != 0 && !menuRect_.isEmpty()) {
+        const QRect menu = menuRect_.intersected(QRect(QPoint(0, 0), size()));
+        if (!menu.isEmpty()) {
+            window->setMask(QRegion(menu));
+            if (qEnvironmentVariableIsSet("VSHOT_PIN_DEBUG")) {
+                std::fprintf(stderr, "CHROME: input region = menu %d,%d %dx%d\n", menu.x(),
+                             menu.y(), menu.width(), menu.height());
+                std::fflush(stderr);
+            }
+            return;
+        }
     }
     window->setMask(clickThroughInputRegion());
 }
@@ -391,6 +427,68 @@ void PinChrome::paintEvent(QPaintEvent *event)
     }
 }
 
+QString menuActionLabel(int row)
+{
+    switch (row) {
+    case kCopyImageAction:
+        return uiTr("Copy image");
+    case kSaveAction:
+        return uiTr("Save as…");
+    case kEditAction:
+        return uiTr("Edit");
+    case kResetZoomAction:
+        return uiTr("Reset zoom");
+    case kRecognizeAction:
+        return uiTr("Recognize text…");
+    case kCloseAction:
+        return uiTr("Close");
+    default:
+        return QString();
+    }
+}
+
+void PinChrome::paintMenu(QPainter &painter)
+{
+    if (menuId_ == 0 || menuRect_.isEmpty()) {
+        return;
+    }
+    // The look the pin surface's own menu had, because it is the same menu: the
+    // palette's own colours, so it follows the user's theme, and the system
+    // font, so it reads like every other menu on the desktop.
+    const QPalette palette = this->palette();
+    const QFont labelFont = QFontDatabase::systemFont(QFontDatabase::GeneralFont);
+    const QFontMetrics metrics(labelFont);
+    const int rowHeight = metrics.height() + 2 * kMenuRowPaddingY;
+
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(QPen(QColor(0, 0, 0, 90), 1.0));
+    painter.setBrush(palette.color(QPalette::Base));
+    painter.drawRoundedRect(QRectF(menuRect_).adjusted(0.5, 0.5, -0.5, -0.5), kMenuRadius,
+                            kMenuRadius);
+    // A row is a full-width rectangle, so the first and last of them would
+    // square off the rounded box they sit in; clip them to its outline.
+    QPainterPath clip;
+    clip.addRoundedRect(QRectF(menuRect_).adjusted(0.5, 0.5, -0.5, -0.5), kMenuRadius, kMenuRadius);
+    painter.setClipPath(clip, Qt::IntersectClip);
+    painter.setFont(labelFont);
+    for (int row = 0; row < menuRows_.size(); ++row) {
+        const QRect box(menuRect_.left(), menuRect_.top() + row * rowHeight, menuRect_.width(),
+                        rowHeight);
+        const bool hovered = row == menuHover_;
+        if (hovered) {
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(palette.color(QPalette::Highlight));
+            painter.drawRect(box);
+        }
+        painter.setPen(hovered ? palette.color(QPalette::HighlightedText)
+                               : palette.color(QPalette::Text));
+        painter.drawText(box.adjusted(kMenuPaddingX, 0, -kMenuPaddingX, 0),
+                         Qt::AlignLeft | Qt::AlignVCenter, menuRows_.at(row));
+    }
+    painter.restore();
+}
+
 void PinChrome::paintInto(QPainter &painter)
 {
     painter.setCompositionMode(QPainter::CompositionMode_Source);
@@ -401,24 +499,7 @@ void PinChrome::paintInto(QPainter &painter)
     }
     painter.setFont(tagFont());
     if (menuId_ != 0 && !menuRect_.isEmpty()) {
-        // The menu, above every label: it is the thing the user is looking at.
-        painter.save();
-        painter.setRenderHint(QPainter::Antialiasing, true);
-        painter.setPen(Qt::NoPen);
-        painter.setBrush(kLabelBox);
-        painter.drawRoundedRect(menuRect_, kMenuRadius, kMenuRadius);
-        painter.setBrush(Qt::NoBrush);
-        painter.setPen(QPen(QColor(255, 255, 255, 90), 1));
-        painter.drawRoundedRect(QRectF(menuRect_).adjusted(0.5, 0.5, -0.5, -0.5), kMenuRadius,
-                                kMenuRadius);
-        const QFontMetrics metrics(tagFont());
-        const int rowHeight = metrics.height() + 2 * kMenuRowPaddingY;
-        for (int row = 0; row < menuRows_.size(); ++row) {
-            const QRect box(menuRect_.left(), menuRect_.top() + row * rowHeight,
-                            menuRect_.width(), rowHeight);
-            paintMenuRow(painter, box, menuRows_.at(row), row == menuHover_);
-        }
-        painter.restore();
+        paintMenu(painter);
     }
     const QPoint origin = screen_ != nullptr ? screen_->geometry().topLeft() : QPoint(0, 0);
     for (Entry &entry : entries_) {

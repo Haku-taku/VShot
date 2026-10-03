@@ -28,6 +28,22 @@ class Window;
 
 namespace vshot {
 
+// The rows every pin's menu ends with, in the order the daemon expects: a pick
+// comes back as a row number, so the two sides have to agree on the order.
+enum MenuActionRow {
+    kCopyImageAction = 0,
+    kSaveAction = 1,
+    kEditAction = 2,
+    kResetZoomAction = 3,
+    kRecognizeAction = 4,
+    kCloseAction = 5,
+    kMenuActionRowCount = 6,
+};
+
+// The label of that row, translated: the chrome is the side with the font and
+// the translation table, so it is the side that names them.
+QString menuActionLabel(int row);
+
 // The corner labels of the pin stack, drawn on a surface of their own.
 //
 // A pinned picture is painted by the daemon's half-float surfaces, which hold
@@ -117,6 +133,9 @@ private:
     /// paintEvent and the debug dump that saves what it put on screen, which is
     /// the only way to see a layer surface at all.
     void paintInto(QPainter &painter);
+    /// The right-click menu: the rows the daemon sent, in the palette's own
+    /// colours so it follows the user's theme.
+    void paintMenu(QPainter &painter);
     void mousePressEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;

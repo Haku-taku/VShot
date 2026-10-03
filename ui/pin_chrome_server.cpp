@@ -5,6 +5,7 @@
 
 #include "i18n.hpp"
 #include "pin_chrome.hpp"
+#include "pin_label.hpp"
 
 #include <QGuiApplication>
 #include <QJsonArray>
@@ -128,9 +129,13 @@ int runPinChrome(const QString &socketPath)
                         message.value(QStringLiteral("id")).toDouble());
                     const QPoint anchor(message.value(QStringLiteral("x")).toInt(),
                                         message.value(QStringLiteral("y")).toInt());
+                    // The daemon says how many rows there are; naming them is
+                    // this side's, because this is the side with the font and
+                    // the translation table.
+                    const int count = message.value(QStringLiteral("rows")).toInt();
                     QStringList rows;
-                    for (const QJsonValue &row : message.value(QStringLiteral("rows")).toArray()) {
-                        rows.append(row.toString());
+                    for (int row = 0; row < count; ++row) {
+                        rows.append(vshot::menuActionLabel(row));
                     }
                     for (PinChrome *chrome : surfaces) {
                         if (open) {

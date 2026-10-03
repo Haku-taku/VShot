@@ -258,24 +258,38 @@ pub(crate) struct ChromeLabel {
 ///
 /// The rows are the daemon's -- it is the side that knows what a pin is and
 /// what can be done to it -- and the drawing, the pointer and the keyboard are
-/// the chrome's.  What comes back is one row number, or nothing.
+/// the chrome's, which is also the side that *names* them: it has the font and
+/// the translation table, and a menu spelled here would be English in a Chinese
+/// session.  What comes back is one row number, or nothing.
 #[derive(Clone, Debug, PartialEq)]
 struct Menu {
     id: u64,
     /// Where the menu is anchored, in global logical pixels: the pointer that
     /// opened it.
     anchor: Point,
-    rows: Vec<String>,
+    /// How many rows the menu has, so a pick can be checked against it.
+    rows: usize,
+    /// The rectangle it occupies, in global logical pixels, once the chrome has
+    /// drawn it.  The chrome answers with it -- it is the side with the font, so
+    /// it is the side that knows how wide the rows are -- and the pins under it
+    /// give their input up over it, because a click goes to the topmost surface
+    /// whose region holds it.
+    rect: Option<Rect>,
     /// The row the pointer is over, or `None` while it is over none.
     highlighted: Option<usize>,
 }
 
-/// The rows every pin's menu ends with, in order.
+/// How many rows every pin's menu ends with, after any the pin itself
+/// contributes.
 ///
-/// The names are the same ones the Qt surface draws, because they are the same
-/// actions; a menu that called them something else would be a second vocabulary
-/// for one set of commands.
-const MENU_ROWS: [&str; 6] = [
+/// The *names* are the chrome's: it is the side with the font and the
+/// translation table, and a menu spelled here would be English in a Chinese
+/// session.  What travels is how many rows there are, and the row the user
+/// picked.
+const MENU_ACTION_ROWS: usize = 6;
+
+/// What each of those rows does, in the order the chrome draws them.
+const MENU_ACTIONS: [&str; MENU_ACTION_ROWS] = [
     "Copy image",
     "Save as…",
     "Edit",
@@ -293,6 +307,20 @@ struct EditSession {
     #[allow(dead_code)] // read when the editor's write-back lands
     id: u64,
     _directory: tempfile::TempDir,
+}
+
+/// The rectangle a message carries, or `None` when it carries none.
+fn json_rect(value: &serde_json::Value) -> Option<Rect> {
+    let x = value.get("x")?.as_i64()?;
+    let y = value.get("y")?.as_i64()?;
+    let width = value.get("width")?.as_u64()?;
+    let height = value.get("height")?.as_u64()?;
+    Some(Rect::new(
+        i32::try_from(x).ok()?,
+        i32::try_from(y).ok()?,
+        u32::try_from(width).ok()?,
+        u32::try_from(height).ok()?,
+    ))
 }
 
 /// One rectangle as the editor's session file spells it.
@@ -852,6 +880,10 @@ struct Chrome {
 pub(crate) enum ChromeReply {
     /// The user picked a row of the open menu.
     Chosen(usize),
+    /// The menu was drawn, and this is the rectangle it occupies in global
+    /// logical pixels.  The pins under it have to give their input up over it,
+    /// and only the chrome knows how wide the rows came out.
+    Menu(Rect),
     /// The menu was dismissed without a pick: Esc, a click outside it, or the
     /// pin it belonged to going away.
     Dismissed,
@@ -979,6 +1011,11 @@ impl Chrome {
                     }
                 }
                 Some("dismissed") => self.replies.push(ChromeReply::Dismissed),
+                Some("menu") => {
+                    if let Some(rect) = message.get("rect").and_then(json_rect) {
+                        self.replies.push(ChromeReply::Menu(rect));
+                    }
+                }
                 _ => {}
             }
         }
@@ -1102,12 +1139,20 @@ impl Daemon {
         self.surfaces.set_pins(stack, None, debug)?;
         // And the pointer reaches exactly the pins, so a click on the desktop
         // goes to what the pin is covering rather than being swallowed here.
+        //
+        // A pin under an open menu gives its rect up: the menu is drawn by a
+        // surface above this one, and the compositor hands a click to the
+        // topmost surface whose input region holds it -- so a pin that kept its
+        // own rect under the menu would take every click the menu was waiting
+        // for, and no row over the pin could ever be picked.
+        let covered = self.menu.as_ref().and_then(|menu| menu.rect);
         let rects = self
             .stack
             .pins
             .iter()
             .filter(|pin| pin.visible)
             .map(|pin| Stack::rect_of(pin))
+            .filter(|rect| covered.is_none_or(|covered| !covered.contains(rect.origin)))
             .collect::<Vec<Rect>>();
         self.surfaces.set_input_rects(&rects)?;
         self.chrome
@@ -1193,8 +1238,9 @@ impl Daemon {
         let menu = Menu {
             id,
             anchor: at,
-            rows: MENU_ROWS.iter().map(|row| (*row).to_string()).collect(),
+            rows: MENU_ACTION_ROWS,
             highlighted: None,
+            rect: None,
         };
         self.chrome.menu(Some(&menu));
         self.menu = Some(menu);
@@ -1216,7 +1262,8 @@ impl Daemon {
         // card offers its values there, and picking one copies it.  They are
         // not in this side's gift -- a card is Qt's to render and its text is
         // what a copy hands over -- so they are left to the chrome's own list.
-        let Some(action) = MENU_ROWS.get(row) else {
+        // The rows are the chrome's names for these actions, in this order.
+        let Some(action) = MENU_ACTIONS.get(row) else {
             return Ok(());
         };
         match *action {
@@ -1289,6 +1336,16 @@ impl Daemon {
                     // The chrome took the menu down itself -- Esc, or a click
                     // outside it -- and all this side has to do is forget it.
                     self.menu = None;
+                    // The pins take their input back, now that nothing is over
+                    // them.
+                    self.refresh()?;
+                }
+                ChromeReply::Menu(rect) => {
+                    if let Some(menu) = self.menu.as_mut() {
+                        menu.rect = Some(rect);
+                    }
+                    // The pins under the menu give their input up over it.
+                    self.refresh()?;
                 }
             }
         }
@@ -2432,15 +2489,17 @@ mod tests {
         // The six rows the daemon offers, and the ones the Qt surface draws,
         // are one list: a menu that called them something else would be a
         // second vocabulary for one set of commands.
-        assert_eq!(MENU_ROWS.len(), 6);
-        assert_eq!(MENU_ROWS[0], "Copy image");
-        assert_eq!(MENU_ROWS[5], "Close");
+        // The chrome's own labels are its business; what has to agree is the
+        // *order*, because a pick comes back as a row number.
+        assert_eq!(MENU_ACTION_ROWS, 6);
+        assert_eq!(MENU_ACTIONS[0], "Copy image");
+        assert_eq!(MENU_ACTIONS[5], "Close");
         // `Close` last: the row that throws the pin away sits at the bottom of
         // a list where every other row is reversible.
-        assert!(MENU_ROWS.contains(&"Save as…"));
-        assert!(MENU_ROWS.contains(&"Edit"));
-        assert!(MENU_ROWS.contains(&"Reset zoom"));
-        assert!(MENU_ROWS.contains(&"Recognize text…"));
+        assert!(MENU_ACTIONS.contains(&"Save as…"));
+        assert!(MENU_ACTIONS.contains(&"Edit"));
+        assert!(MENU_ACTIONS.contains(&"Reset zoom"));
+        assert!(MENU_ACTIONS.contains(&"Recognize text…"));
     }
 
     /// A right-click on a pin opens its menu; on the desktop it closes whatever

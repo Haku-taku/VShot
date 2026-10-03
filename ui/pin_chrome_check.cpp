@@ -125,9 +125,18 @@ QByteArray readAnswer(QLocalSocket &client, QLocalSocket &peer)
         client.flush();
         QApplication::processEvents();
         client.waitForReadyRead(20);
-        const QByteArray bytes = client.readAll();
-        if (!bytes.isEmpty()) {
-            return bytes;
+        QByteArray answer;
+        for (const QByteArray &line : client.readAll().split('\n')) {
+            // The chrome also reports where its menu came out, which the daemon
+            // needs and this check does not: those lines are dropped, so each
+            // caller reads the answer it asked for.
+            if (line.contains("\"cmd\":\"menu\"")) {
+                continue;
+            }
+            answer += line;
+        }
+        if (!answer.trimmed().isEmpty()) {
+            return answer;
         }
     }
     return QByteArray();

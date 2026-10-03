@@ -434,13 +434,13 @@ pub(crate) fn run(invocation: PinInvocation) -> Result<()> {
         pin_file(absolute, density, output, output_name.clone(), hdr_half)?;
     }
     if clipboard {
-        // A capture puts its own file on the clipboard as a URI, so a clipboard
-        // pin can be resolved to the file the program wrote and, beside it, the
-        // HDR half.  That is the one case where the clipboard carries more than
-        // the daemon can see for itself, and it is only taken when there really
-        // is a half to find: everything else -- an image, text, a colour, a file
-        // with no sibling -- is left to the daemon, which resolves the clipboard
-        // the way it always has.
+        // A clipboard that names a file is resolved here rather than by the
+        // daemon, because a file on disk is what this side can do more with:
+        // `pin_file` is the path that decides whether the capture's HDR half is
+        // worth taking, and that decision needs the output's own answer, which
+        // is a question the CLI asks.  Everything else -- image bytes, text, a
+        // colour -- is left to the daemon, which resolves the clipboard the way
+        // it always has.
         match clipboard_source() {
             Some(path) => pin_file(path, density, output, output_name, hdr_half)?,
             None => {
@@ -649,7 +649,7 @@ fn clipboard_source() -> Option<PathBuf> {
         let text = text.trim();
         if !text.is_empty() && !text.contains('\n') {
             let path = PathBuf::from(text);
-            if hdr_sibling_path(&path).is_some() {
+            if path.is_file() {
                 return Some(path);
             }
         }
@@ -668,7 +668,10 @@ fn uri_list_path(list: &str) -> Option<PathBuf> {
         let Some(path) = file_uri_path(line) else {
             continue;
         };
-        if hdr_sibling_path(&path).is_some() {
+        // Any file the clipboard names, whether or not a capture's HDR half is
+        // beside it: whether to *use* that half is `pin_file`'s decision, and it
+        // needs the output's own answer to make it.
+        if path.is_file() {
             return Some(path);
         }
     }
@@ -1444,11 +1447,14 @@ mod tests {
     }
 
     /// The two shapes a clipboard carries a path in, and the shapes it does
-    /// not: a bare `file://` URI, a percent-encoded one, a plain path, and
-    /// anything with no half beside it.
-    #[cfg(feature = "radiance")]
+    /// not: a bare `file://` URI, a percent-encoded one, and a plain path.
+    ///
+    /// A path is taken whether or not a capture's HDR half is beside it: that
+    /// decision belongs to `pin_file`, which asks the output whether the half
+    /// can be shown -- and a clipboard naming an SDR file with the setting off
+    /// must pin *that file*, not the half.
     #[test]
-    fn a_clipboard_path_resolves_only_when_a_half_is_beside_it() {
+    fn a_clipboard_path_resolves_to_the_file_it_names() {
         assert_eq!(
             file_uri_path("file:///tmp/shot.png"),
             Some(PathBuf::from("/tmp/shot.png"))
@@ -1469,15 +1475,17 @@ mod tests {
         let png = directory.path().join("shot.png");
         std::fs::write(&png, b"png").unwrap();
         let uri = format!("file://{}\n", png.display());
-        // No half beside it: the daemon is left to resolve the clipboard, which
-        // is what every clipboard without a capture behind it gets.
-        assert_eq!(uri_list_path(&uri), None);
+        // The file it names, with or without a half beside it.
+        assert_eq!(uri_list_path(&uri), Some(png.clone()));
         std::fs::write(directory.path().join("shot.hdr"), b"hdr").unwrap();
         assert_eq!(uri_list_path(&uri), Some(png.clone()));
-        // A comment and an empty line are skipped, and a list naming several
-        // files resolves to the one that has a half.
+        // A comment, an empty line and a path that is not there are skipped;
+        // a list naming several files resolves to the one that exists.
         let list = format!("# a comment\n\nfile:///nonexistent.png\n{uri}");
         assert_eq!(uri_list_path(&list), Some(png));
+        // A file the clipboard names but that is not on disk is not a path this
+        // side can pin, so the daemon is left to resolve the clipboard.
+        assert_eq!(uri_list_path("file:///nonexistent/shot.png\n"), None);
     }
 
     // A pin made from an annotated capture carries the marks and the picture
