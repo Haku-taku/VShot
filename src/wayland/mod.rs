@@ -1711,6 +1711,37 @@ fn ensure_cursor_shape_device(state: &mut WaylandState, qh: &QueueHandle<Wayland
     }
 }
 
+/// How many whole wheel detents `value120` adds, keeping the remainder.
+///
+/// The high-resolution event reports a fraction of a detent at a time -- a
+/// value of 120 is one notch, and 40 is a third of one -- so the fractions are
+/// accumulated rather than rounded away: a wheel that reports in thirds would
+/// otherwise never reach a whole step.
+fn take_notches(pending: &mut i32, value120: i32) -> i32 {
+    *pending += value120;
+    let notches = *pending / 120;
+    if notches != 0 {
+        *pending -= notches * 120;
+    }
+    notches
+}
+
+/// The same for the smoothed `axis` event, which is what a touchpad and a
+/// continuous wheel send: one notch is about ten of them, and a value too small
+/// to be a notch of its own is one, because a scroll that arrives at all is a
+/// scroll the user made.
+fn smooth_notches(value: f64) -> i32 {
+    if value.abs() < 5.0 {
+        if value > 0.0 {
+            1
+        } else {
+            -1
+        }
+    } else {
+        (value / 10.0).round() as i32
+    }
+}
+
 fn selection_cursor_shape() -> wp_cursor_shape_device_v1::Shape {
     wp_cursor_shape_device_v1::Shape::Crosshair
 }
@@ -1789,7 +1820,13 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                     );
                 }
                 "wl_seat" => {
-                    let seat = registry.bind(name, version.min(7), qh, ());
+                    // Version 8 is where `axis_value120` arrives, and it is the
+                    // one event that says how many wheel detents a scroll was:
+                    // the fractional `axis` event carries a smoothed distance
+                    // that means different things on a wheel and on a touchpad,
+                    // and `axis_discrete` -- the older spelling -- is only sent
+                    // to clients that asked for less than 8.
+                    let seat = registry.bind(name, version.min(8), qh, ());
                     state.topology.seats.push(seat);
                 }
                 _ => {}
@@ -2367,13 +2404,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
             // compositor's version and not on anything this side controls.
             wl_pointer::Event::AxisValue120 { axis, value120 } if state.pin_input => {
                 if let WEnum::Value(wl_pointer::Axis::VerticalScroll) = axis {
-                    // Accumulated rather than rounded per event: a high-
-                    // resolution wheel reports a fraction of a detent at a
-                    // time, and three events of 40 are one step between them.
-                    state.pin_scroll += value120;
-                    let notches = state.pin_scroll / 120;
+                    let notches = take_notches(&mut state.pin_scroll, value120);
                     if notches != 0 {
-                        state.pin_scroll -= notches * 120;
                         if let Some(at) = state.pin_point_of_pointer() {
                             state.pin_events.push(PinEvent::Scroll { notches, at });
                         }
@@ -2389,17 +2421,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 // continuous wheel.  One notch is about ten of these, which is
                 // the unit the rest of the desktop uses.
                 if axis == wl_pointer::Axis::VerticalScroll && value != 0.0 {
-                    let notches = if value.abs() < 5.0 {
-                        if value > 0.0 {
-                            1
-                        } else {
-                            -1
-                        }
-                    } else {
-                        (value / 10.0).round() as i32
-                    };
                     if let Some(at) = state.pin_point_of_pointer() {
-                        state.pin_events.push(PinEvent::Scroll { notches, at });
+                        state.pin_events.push(PinEvent::Scroll {
+                            notches: smooth_notches(value),
+                            at,
+                        });
                     }
                 }
             }
@@ -2685,6 +2711,57 @@ impl Dispatch<wl_buffer::WlBuffer, BufferUserData> for WaylandState {
         if matches!(event, wl_buffer::Event::Release) {
             state.handle_buffer_release(*data);
         }
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::{smooth_notches, take_notches};
+
+    /// A high-resolution wheel reports a fraction of a detent at a time, so the
+    /// fractions are accumulated: three events of a third are one step between
+    /// them, and none of them is a step on its own.
+    #[test]
+    fn a_fractional_wheel_reaches_a_whole_step() {
+        let mut pending = 0;
+        assert_eq!(take_notches(&mut pending, 40), 0);
+        assert_eq!(take_notches(&mut pending, 40), 0);
+        assert_eq!(take_notches(&mut pending, 40), 1);
+        assert_eq!(pending, 0, "the thirds are spent, not carried");
+    }
+
+    /// A whole detent is one step, and the direction is the sign.
+    #[test]
+    fn a_whole_detent_is_one_step_each_way() {
+        let mut pending = 0;
+        assert_eq!(take_notches(&mut pending, 120), 1);
+        assert_eq!(take_notches(&mut pending, -120), -1);
+        // Two detents in one event are two steps.
+        assert_eq!(take_notches(&mut pending, 240), 2);
+        assert_eq!(take_notches(&mut pending, -240), -2);
+    }
+
+    /// A remainder survives the step that spent part of it, so a wheel that
+    /// reports 150 at a time does not lose the odd 30 every notch.
+    #[test]
+    fn the_remainder_is_carried() {
+        let mut pending = 0;
+        assert_eq!(take_notches(&mut pending, 150), 1);
+        assert_eq!(pending, 30);
+        assert_eq!(take_notches(&mut pending, 90), 1);
+        assert_eq!(pending, 0);
+    }
+
+    /// The smoothed event a touchpad sends: ten to a notch, and anything too
+    /// small to be one is still one, because a scroll that arrives at all is a
+    /// scroll the user made.
+    #[test]
+    fn a_smooth_scroll_is_rounded_to_notches() {
+        assert_eq!(smooth_notches(10.0), 1);
+        assert_eq!(smooth_notches(25.0), 3);
+        assert_eq!(smooth_notches(-25.0), -3);
+        assert_eq!(smooth_notches(1.0), 1);
+        assert_eq!(smooth_notches(-1.0), -1);
     }
 }
 
