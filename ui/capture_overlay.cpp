@@ -7377,23 +7377,25 @@ void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::
             break;
         }
     } else if (pinEdit_) {
-        // Inside the image the pointer announces the drag that moves it;
-        // anywhere else with a drawing tool it is the crosshair.  A mark's own
-        // rim answers first, exactly as it does on the canvas: a press there
-        // picks the mark up rather than starting a stroke, so the pointer has to
-        // say so -- otherwise the one target that stays live with a tool armed
-        // is the one the cursor lies about.
-        const int border = insideImage ? annotationBorderAt(point) : 0;
-        if (border != 0) {
+        // The pointer answers exactly what the press would do, in the press's
+        // own order.  A mark's handles come first: they are small, deliberate
+        // targets that stretch whether or not a tool is armed, so each wears the
+        // arrow of the edge it drags.  Then a mark's rim, which is picked up and
+        // moved -- the same "drag me" the canvas shows -- and the body under the
+        // pick-up modifier.  Only then the bare image, which says "drag me" only
+        // while the middle button is down, because that button is the only way
+        // its own drag can start.
+        const int handle = insideImage && selectedAnnotation_ >= 0
+            ? annotationHandleAt(point) : 0;
+        const int border = insideImage && handle == 0 ? annotationBorderAt(point) : 0;
+        const bool overMark = insideImage && annotationHitAt(point) >= 0;
+        if (handle != 0) {
+            overlay->setCursor(cursorForHandle(handle));
+        } else if (border != 0) {
             overlay->setCursor(Qt::SizeAllCursor);
-        } else if (insideImage && pickingMarks(static_cast<int>(modifiers))
-                   && annotationHitAt(point) >= 0) {
+        } else if (insideImage && pickingMarks(static_cast<int>(modifiers)) && overMark) {
             overlay->setCursor(Qt::SizeAllCursor);
         } else {
-            // The bare image says "drag me" only while the middle button is
-            // down, exactly as the region selection's body does: that button is
-            // the only way the drag can start, so without it the pointer is
-            // promising a drag the press will not make.
             const bool drags = (buttons & Qt::MiddleButton) != 0;
             overlay->setCursor(insideImage && drags ? Qt::SizeAllCursor : Qt::ArrowCursor);
         }
@@ -7412,27 +7414,30 @@ void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::
         // that is the only way it can be dragged -- without it the press draws
         // a new frame instead, and a move cursor there would be a promise the
         // editor does not keep.
-        const int handle = selection_.has_value() && editing_ ? hitHandle(point) : 0;
-        if (handle != 0) {
+        const int selectionHandle = selection_.has_value() && editing_ ? hitHandle(point) : 0;
+        // A mark's own handles answer before the selection's: a selected mark
+        // inside the frame puts its grips on top of the frame's own, and the
+        // press reaches for the mark's first.  The eight arrows follow the edge
+        // each one drags, so the pointer says which way the box will go.
+        const int annotationHandle =
+            selectedAnnotation_ >= 0 ? annotationHandleAt(point) : 0;
+        const int border = annotationHandle == 0 ? annotationBorderAt(point) : 0;
+        if (annotationHandle != 0) {
+            overlay->setCursor(cursorForHandle(annotationHandle));
+        } else if (border != 0) {
+            // A mark's rim is picked up and moved, so it says "drag me" -- the
+            // press there starts a move, not a stretch, and not a stroke.
+            overlay->setCursor(Qt::SizeAllCursor);
+        } else if (selectionHandle != 0) {
             const bool drags = (buttons & Qt::MiddleButton) != 0;
-            overlay->setCursor(handle == 9 ? (drags ? Qt::SizeAllCursor : Qt::CrossCursor)
-                                           : cursorForHandle(handle));
+            overlay->setCursor(selectionHandle == 9
+                                   ? (drags ? Qt::SizeAllCursor : Qt::CrossCursor)
+                                   : cursorForHandle(selectionHandle));
+        } else if (pickingMarks(static_cast<int>(modifiers))
+                   && annotationHitAt(point) >= 0) {
+            overlay->setCursor(Qt::SizeAllCursor);
         } else {
-            // Not the selection: a mark's own rim answers next.  It is live on
-            // its own -- a press there picks the mark up and drags it, with
-            // nothing held and nothing armed -- so the pointer says "drag me"
-            // rather than promising the stroke the press will not make.  The
-            // handles are the mark's own and are drawn only once it is selected,
-            // so before that the rim is all there is to aim at.
-            const int border = annotationBorderAt(point);
-            if (border != 0) {
-                overlay->setCursor(Qt::SizeAllCursor);
-            } else if (pickingMarks(static_cast<int>(modifiers))
-                       && annotationHitAt(point) >= 0) {
-                overlay->setCursor(Qt::SizeAllCursor);
-            } else {
-                overlay->setCursor(Qt::CrossCursor);
-            }
+            overlay->setCursor(Qt::CrossCursor);
         }
         // The mark the pick-up modifier has put under the pointer wears a frame
         // of its own, which is the feedback that the press would take it and not
@@ -11702,23 +11707,21 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
     }
 
     // Highlight the selected annotation with handles while it is being
-    // manipulated.  The frame is up whatever tool is armed -- a mark can be
-    // picked up with a drawing tool in hand -- but not while that tool is
-    // mid-stroke, where the frame would chase the ink.
+    // manipulated.  They belong to the mark being adjusted, and that mark is
+    // the selected one whatever tool is armed: a mark lands selected the
+    // moment it is drawn, and the pick-up modifier hands the user a mark
+    // without putting the tool down.  Gating this on the unarmed state hid the
+    // handles in exactly the two states that most need them -- a stroke just
+    // drawn, and a mark held under the modifier -- and left the user with a
+    // frame and no grips.
     //
-    // While nothing is armed, or while the pick-up modifier is held.  The
-    // outline and its eight handles are the chrome of the state that adjusts
-    // marks, and that state is the unarmed one; under a drawing tool they would
-    // sit on top of the ink being laid down -- a pen stroke's own start is under
-    // the left-middle handle -- and be read as part of the picture the user is
-    // annotating.  The pick-up modifier is the other way into that state, and it
-    // deliberately leaves the tool armed: the whole point of it is that picking a
-    // mark up is not a tool change.  So it has to be read here as what it is, or
-    // the modifier that exists to hand the user a mark would be the one state in
-    // which the mark's handles never appear.
-    const bool chromeArmed = !tool_.has_value() || pickingMarks(lastModifiers_);
-    if (chromeArmed && selectedAnnotation_ >= 0 &&
-        selectedAnnotation_ < annotations_.size() &&
+    // What must not happen is chrome over ink that is still being laid down: a
+    // stroke's own start sits under the left-middle handle of its box, so a
+    // mark left selected while another is drawn would cover it.  The gesture
+    // test below is what keeps that from happening -- a drawing gesture is not
+    // one of the three states the chrome is drawn in -- so a selection that
+    // outlives the press that started the stroke still cannot paint over it.
+    if (selectedAnnotation_ >= 0 && selectedAnnotation_ < annotations_.size() &&
         (gesture_->type == Gesture::Type::None ||
          gesture_->type == Gesture::Type::MovingAnnotation ||
          gesture_->type == Gesture::Type::ResizingAnnotation)) {
@@ -13469,6 +13472,29 @@ void CaptureOverlay::keyPressEvent(QKeyEvent *event)
         controller_->key(this, event->key(), event->modifiers());
     }
     event->accept();
+}
+
+bool CaptureOverlay::event(QEvent *event)
+{
+    // Tab never reaches `keyPressEvent`: Qt treats it as focus navigation and
+    // consumes it in `QWidget::event` before the key handler is asked.  The
+    // overlay has no focusable children to navigate to -- every button on the
+    // toolbar is `Qt::NoFocus` -- so the traversal does nothing and the marks
+    // the key is bound to are unreachable.  Taken here, ahead of that branch,
+    // and handed to the controller the same way any other key is; Shift is
+    // already in the modifiers, so Shift+Tab arrives as `Key_Backtab` and the
+    // binding table tells the two apart.
+    if (event->type() == QEvent::KeyPress) {
+        auto *key = static_cast<QKeyEvent *>(event);
+        if (key->key() == Qt::Key_Tab || key->key() == Qt::Key_Backtab) {
+            if (controller_ != nullptr) {
+                controller_->key(this, key->key(), key->modifiers());
+            }
+            event->accept();
+            return true;
+        }
+    }
+    return QWidget::event(event);
 }
 
 void CaptureOverlay::closeEvent(QCloseEvent *event)

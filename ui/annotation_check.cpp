@@ -38,6 +38,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QKeyEvent>
 #include <QLineEdit>
 #include <QLocalServer>
 #include <QLocalSocket>
@@ -628,6 +629,15 @@ QVector<QPointF> serpentine()
 
 // Paints the stroke as the editor does -- one paint per move -- and keeps both
 // the in-progress image and the committed one.
+//
+// The committed frame is painted with the mark let go of first.  A mark lands
+// selected now -- that is what puts its handles on screen the moment it is
+// drawn -- so painting the release as it stands would measure the selection
+// chrome as well as the ink, and the chrome is not what this check is about:
+// the claim is that the preview and the committed stroke are the same stroke,
+// not that letting go changes nothing on screen.  `Ctrl+D` is the user's own
+// way to put a mark down, so the comparison is made in a state the user can
+// reach.
 void renderFreehand(vshot::OverlayController &controller, vshot::CaptureOverlay *overlay,
                     const QVector<QPointF> &path, QImage *live, QImage *committed)
 {
@@ -638,6 +648,7 @@ void renderFreehand(vshot::OverlayController &controller, vshot::CaptureOverlay 
         paintOnce(overlay, live);
     }
     controller.release(overlay, path.constLast(), Qt::LeftButton, Qt::NoModifier);
+    controller.key(overlay, Qt::Key_D, Qt::ControlModifier);
     *committed = QImage(overlay->size(), QImage::Format_ARGB32_Premultiplied);
     paintOnce(overlay, committed);
 }
@@ -2593,6 +2604,362 @@ void checkThePickUpModifierFramesTheMarkUnderThePointer()
            QStringLiteral("the mark at %1,%2 survived (wanted 180,190)").arg(left.x).arg(left.y));
 }
 
+// The selected mark wears its outline and its eight handles whatever tool is
+// armed.  Gating that chrome on the unarmed state left the two states that most
+// need it bare: a mark is selected the moment it is drawn -- and a tool is
+// armed then, because the user just drew with it -- and the pick-up modifier
+// hands a mark over without putting the tool down.  Both are checked here, and
+// the third part is the rule the gate was protecting: chrome must not be
+// painted over ink that is still being laid down.
+void checkASelectedMarkKeepsItsHandlesUnderATool()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+
+    // A mark and a tool armed over it: the state a user is in the instant a
+    // stroke is committed, and the one the gate hid the handles in.
+    controller.chooseTool(vshot::Tool::Rectangle);
+    drag(controller, overlay, QPointF(80, 80), QPointF(200, 170));
+    expect(controller.annotations().size() == 1, "the rectangle lands as one mark");
+    if (controller.annotations().size() != 1) {
+        return;
+    }
+    const vshot::LogicalRect bounds = controller.annotations().constFirst().rect;
+    // The mark's own bottom-right handle: a corner, so it is on the mark's rim
+    // and clear of the box's middle, where the rim's own grab band would answer.
+    const QPointF corner(bounds.x + static_cast<int>(bounds.width) - 1,
+                         bounds.y + static_cast<int>(bounds.height) - 1);
+
+    // The chrome is a difference between two renders rather than a colour: the
+    // ground is the frozen screen.  The first is taken with the tool armed and
+    // the mark selected -- the state under test -- and the second after Ctrl+D
+    // lets the mark go, which is the same render with the chrome gone.
+    QImage shown(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &shown);
+    controller.key(overlay, Qt::Key_D, Qt::ControlModifier);
+    QImage bare(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &bare);
+    const int withToolArmed = differingPixelsOutside(childAreas(overlay), shown, bare);
+    expect(withToolArmed > 0,
+           "a selected mark keeps its handles while a tool is armed",
+           QStringLiteral("%1 chrome pixel(s)").arg(withToolArmed));
+
+    // The pick-up modifier is the other way into the state, and it deliberately
+    // leaves the tool armed -- so the same chrome has to be there.  The pointer
+    // is put on the mark's rim, which the modifier frames and takes without a
+    // press.
+    controller.chooseTool(vshot::Tool::Pen);
+    controller.key(overlay, Qt::Key_D, Qt::ControlModifier);
+    controller.move(overlay, QPointF(bounds.x + 2, bounds.y + 40), Qt::NoButton,
+                    Qt::NoModifier);
+    controller.key(overlay, Qt::Key_Shift, Qt::ShiftModifier);
+    QImage held(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &held);
+    controller.key(overlay, Qt::Key_D, Qt::ControlModifier);
+    QImage notHeld(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &notHeld);
+    const int underModifier = differingPixelsOutside(childAreas(overlay), held, notHeld);
+    expect(underModifier > 0,
+           "the mark the pick-up modifier hands over wears its handles too",
+           QStringLiteral("%1 chrome pixel(s)").arg(underModifier));
+
+    // ... and the rule the gate existed for still holds: a mark left selected
+    // while another stroke is drawn must not paint over the ink.  The mark is
+    // taken first -- a press and release on its rim selects it without moving
+    // it -- and then a stroke is started on bare canvas with the pen still
+    // armed, which is the state the preview is drawn in.
+    controller.chooseTool(vshot::Tool::Pen);
+    const QPointF onRim(bounds.x + 2, bounds.y + 40);
+    controller.press(overlay, onRim, Qt::LeftButton, Qt::NoModifier);
+    controller.release(overlay, onRim, Qt::LeftButton, Qt::NoModifier);
+    controller.setWidth(5);
+    const QPointF bareCanvas(340, 330);
+    controller.press(overlay, bareCanvas, Qt::LeftButton, Qt::NoModifier);
+    controller.move(overlay, bareCanvas + QPointF(20, 20), Qt::LeftButton, Qt::NoModifier);
+    QImage during(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &during);
+    // Ctrl+D during the stroke lets the mark go.  It is handled before the
+    // gesture is consulted, so the ink is untouched by it: the two renders
+    // differ only if the chrome was over the ink to begin with.
+    controller.key(overlay, Qt::Key_D, Qt::ControlModifier);
+    QImage cleared(overlay->size(), QImage::Format_ARGB32_Premultiplied);
+    paintOnce(overlay, &cleared);
+    const int overInk = differingPixelsOutside(childAreas(overlay), during, cleared);
+    expect(overInk == 0,
+           "a stroke in progress paints no selection chrome over its own ink",
+           QStringLiteral("%1 pixel(s) differ").arg(overInk));
+    controller.release(overlay, bareCanvas + QPointF(20, 20), Qt::LeftButton, Qt::NoModifier);
+}
+
+// Tab and Shift+Tab walk the marks.  They are focus navigation to Qt, which
+// consumes them in `QWidget::event` before `keyPressEvent` is asked -- so the
+// controller's key handler never saw them and the binding did nothing.  The
+// check drives a real `QKeyEvent` through the widget, which is the only way to
+// see the difference: calling `controller.key` directly skips the branch that
+// was eating the key.
+void checkTabWalksTheMarks()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+
+    // Three marks, each selected as it is drawn; Ctrl+D is what puts the last
+    // one down so the walk starts from nothing, which is the state a user is in
+    // when they reach for the key.
+    controller.chooseTool(vshot::Tool::Rectangle);
+    drag(controller, overlay, QPointF(40, 40), QPointF(110, 100));
+    drag(controller, overlay, QPointF(140, 40), QPointF(210, 100));
+    drag(controller, overlay, QPointF(240, 40), QPointF(310, 100));
+    expect(controller.annotations().size() == 3, "three marks to walk");
+    if (controller.annotations().size() != 3) {
+        return;
+    }
+    controller.key(overlay, Qt::Key_D, Qt::ControlModifier);
+    const auto send = [&](int key, Qt::KeyboardModifiers modifiers) {
+        QKeyEvent event(QEvent::KeyPress, key, modifiers);
+        QCoreApplication::sendEvent(overlay, &event);
+        QCoreApplication::processEvents();
+    };
+    // Which mark the walk landed on is read from what the Delete binding takes,
+    // which is both the user's own way of asking and the only reader that names
+    // the mark rather than counting pixels.
+    const auto survivorsX = [&] {
+        QStringList xs;
+        for (const vshot::Annotation &annotation : controller.annotations()) {
+            xs.append(QString::number(annotation.rect.x));
+        }
+        return xs.join(QLatin1Char(','));
+    };
+
+    send(Qt::Key_Tab, Qt::NoModifier);
+    send(Qt::Key_Delete, Qt::NoModifier);
+    expect(survivorsX() == QStringLiteral("140,240"),
+           "Tab picks up the first mark and steps forward",
+           QStringLiteral("left: %1 (wanted 140,240)").arg(survivorsX()));
+
+    // Shift+Tab goes the other way: from the front of the remaining pair it
+    // wraps to the back, so the last mark is the one that goes.
+    send(Qt::Key_Backtab, Qt::ShiftModifier);
+    send(Qt::Key_Delete, Qt::NoModifier);
+    expect(survivorsX() == QStringLiteral("140"),
+           "Shift+Tab walks the other way onto the last mark",
+           QStringLiteral("left: %1 (wanted 140)").arg(survivorsX()));
+}
+
+// The pointer says what the press would do, on every target the editor has.
+// Each handle wears the arrow of the edge it drags, a mark's rim says "drag me"
+// because a press there moves it, and the handles answer before the rim -- the
+// eight grips sit on the rim, so a rim-first order would make them unreachable
+// by the pointer's own promise.
+void checkThePointerNamesTheTargetUnderIt()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+    controller.chooseTool(vshot::Tool::Rectangle);
+    drag(controller, overlay, QPointF(100, 100), QPointF(300, 220));
+    expect(controller.annotations().size() == 1, "the rectangle lands as one mark");
+    if (controller.annotations().size() != 1) {
+        return;
+    }
+    // Nothing armed from here: the chrome and the marks are the pointer's
+    // subject, and a drawing tool would put the crosshair over everything.
+    controller.chooseTool(std::nullopt);
+    const vshot::LogicalRect box = controller.annotations().constFirst().rect;
+    const int left = box.x;
+    const int top = box.y;
+    const int right = box.x + static_cast<int>(box.width) - 1;
+    const int bottom = box.y + static_cast<int>(box.height) - 1;
+    const int midX = (left + right) / 2;
+    const int midY = (top + bottom) / 2;
+    const auto cursorAt = [&](const QPointF &at) {
+        controller.move(overlay, at, Qt::NoButton, Qt::NoModifier);
+        return overlay->cursorShape();
+    };
+
+    // The eight handles, each against the arrow of the edge it drags.
+    struct HandleCase {
+        QPointF at;
+        Qt::CursorShape wanted;
+        const char *what;
+    };
+    const HandleCase handles[] = {
+        {QPointF(left, top), Qt::SizeFDiagCursor, "the top-left corner says diagonal"},
+        {QPointF(midX, top), Qt::SizeVerCursor, "the top edge says vertical"},
+        {QPointF(right, top), Qt::SizeBDiagCursor, "the top-right corner says the other diagonal"},
+        {QPointF(right, midY), Qt::SizeHorCursor, "the right edge says horizontal"},
+        {QPointF(right, bottom), Qt::SizeFDiagCursor, "the bottom-right corner says diagonal"},
+        {QPointF(midX, bottom), Qt::SizeVerCursor, "the bottom edge says vertical"},
+        {QPointF(left, bottom), Qt::SizeBDiagCursor, "the bottom-left corner says the other diagonal"},
+        {QPointF(left, midY), Qt::SizeHorCursor, "the left edge says horizontal"},
+    };
+    for (const HandleCase &one : handles) {
+        const Qt::CursorShape got = cursorAt(one.at);
+        expect(got == one.wanted, one.what,
+               QStringLiteral("at %1,%2 got %3, wanted %4")
+                   .arg(one.at.x())
+                   .arg(one.at.y())
+                   .arg(static_cast<int>(got))
+                   .arg(static_cast<int>(one.wanted)));
+    }
+
+    // A mark's rim, off every handle: a press there picks the mark up and moves
+    // it, so the pointer says so rather than promising a stretch.
+    const Qt::CursorShape onRim = cursorAt(QPointF(left + 2, top + 40));
+    expect(onRim == Qt::SizeAllCursor, "a mark's rim says the press would move it",
+           QStringLiteral("got %1").arg(static_cast<int>(onRim)));
+
+    // The handles win over the rim they sit on: the corner is inside the rim's
+    // own grab band, and it has to answer as a corner.
+    const Qt::CursorShape onCorner = cursorAt(QPointF(left, top));
+    expect(onCorner == Qt::SizeFDiagCursor,
+           "the corner handle answers before the rim under it",
+           QStringLiteral("got %1").arg(static_cast<int>(onCorner)));
+}
+
+
+// The pointer is a promise about the press, and this is the other half of it:
+// each handle has to *do* what its arrow says.  A box with eight grips whose
+// arrows all lie would pass every cursor-shape check and still be wrong -- the
+// user drags the top edge expecting the top to move, and the bottom edge moves
+// instead.  So each of the eight is dragged on its own and the box's own edges
+// are read back: the edges the arrow names move, the ones it does not stay put.
+void checkEachHandleDragsTheEdgeItsArrowNames()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+    // The session is 400x400; a box in the middle leaves room to drag every
+    // handle outwards without the canvas clamp deciding the result.
+    controller.chooseTool(vshot::Tool::Rectangle);
+    drag(controller, overlay, QPointF(120, 130), QPointF(280, 250));
+    controller.chooseTool(std::nullopt);
+    expect(controller.annotations().size() == 1, "the rectangle lands as one mark");
+    if (controller.annotations().size() != 1) {
+        return;
+    }
+
+    struct Case {
+        int handle;
+        bool movesLeft;
+        bool movesRight;
+        bool movesTop;
+        bool movesBottom;
+        const char *what;
+    };
+    const Case cases[] = {
+        {1, true, false, true, false, "the top-left handle moves the left and top edges"},
+        {2, false, false, true, false, "the top handle moves the top edge alone"},
+        {3, false, true, true, false, "the top-right handle moves the right and top edges"},
+        {4, false, true, false, false, "the right handle moves the right edge alone"},
+        {5, false, true, false, true, "the bottom-right handle moves the right and bottom edges"},
+        {6, false, false, false, true, "the bottom handle moves the bottom edge alone"},
+        {7, true, false, false, true, "the bottom-left handle moves the left and bottom edges"},
+        {8, true, false, false, false, "the left handle moves the left edge alone"},
+    };
+    for (const Case &one : cases) {
+        const vshot::LogicalRect base = controller.annotations().constFirst().rect;
+        const auto handlePoint = [&](int handle) {
+            const int left = base.x;
+            const int top = base.y;
+            const int right = base.x + static_cast<int>(base.width) - 1;
+            const int bottom = base.y + static_cast<int>(base.height) - 1;
+            switch (handle) {
+            case 1: return QPointF(left, top);
+            case 2: return QPointF((left + right) / 2, top);
+            case 3: return QPointF(right, top);
+            case 4: return QPointF(right, (top + bottom) / 2);
+            case 5: return QPointF(right, bottom);
+            case 6: return QPointF((left + right) / 2, bottom);
+            case 7: return QPointF(left, bottom);
+            default: return QPointF(left, (top + bottom) / 2);
+            }
+        };
+        // Outwards on both axes, so whichever edges the handle owns have a
+        // reason to move and the ones it does not own have no reason to.
+        const QPointF from = handlePoint(one.handle);
+        const QPointF to = from + QPointF(one.movesRight ? 24 : (one.movesLeft ? -24 : 0),
+                                          one.movesBottom ? 24 : (one.movesTop ? -24 : 0));
+        controller.press(overlay, from, Qt::LeftButton, Qt::NoModifier);
+        controller.move(overlay, to, Qt::LeftButton, Qt::NoModifier);
+        controller.release(overlay, to, Qt::LeftButton, Qt::NoModifier);
+        const vshot::LogicalRect now = controller.annotations().constFirst().rect;
+        const int nowRight = now.x + static_cast<int>(now.width) - 1;
+        const int nowBottom = now.y + static_cast<int>(now.height) - 1;
+        const int baseRight = base.x + static_cast<int>(base.width) - 1;
+        const int baseBottom = base.y + static_cast<int>(base.height) - 1;
+        const bool ok = (now.x != base.x) == one.movesLeft &&
+            (nowRight != baseRight) == one.movesRight &&
+            (now.y != base.y) == one.movesTop &&
+            (nowBottom != baseBottom) == one.movesBottom;
+        expect(ok, one.what,
+               QStringLiteral("(%1,%2 %3x%4) -> (%5,%6 %7x%8)")
+                   .arg(base.x).arg(base.y).arg(base.width).arg(base.height)
+                   .arg(now.x).arg(now.y).arg(now.width).arg(now.height));
+        // Put the box back for the next handle: one drag of the same shape.
+        controller.key(overlay, Qt::Key_Z, Qt::ControlModifier);
+        const vshot::LogicalRect restored = controller.annotations().constFirst().rect;
+        expect(restored.x == base.x && restored.y == base.y &&
+                   restored.width == base.width && restored.height == base.height,
+               "undo puts the box back for the next handle",
+               QStringLiteral("(%1,%2 %3x%4)")
+                   .arg(restored.x).arg(restored.y).arg(restored.width).arg(restored.height));
+        // Undo lets the mark go, so it has to be taken again before the next
+        // handle can be aimed at.  The press lands on the rim, off every handle
+        // -- the rim is what moves a mark, so a press and release there selects
+        // it without changing it.
+        controller.press(overlay, QPointF(base.x + 30, base.y), Qt::LeftButton,
+                         Qt::NoModifier);
+        controller.release(overlay, QPointF(base.x + 30, base.y), Qt::LeftButton,
+                           Qt::NoModifier);
+    }
+}
+
 
 // Every move invalidates a rect; Qt then repaints only that rect on top of what
 // is already on screen.  If any segment the stroke baked is not covered by a
@@ -3687,6 +4054,68 @@ void checkPinConfirmationKeepsTheRasters()
                    .arg(rebuilds.at(index))
                    .arg(controller.annotations().at(index).rasterRebuilds()));
     }
+}
+
+// The pin editor has its own branch of the pointer logic -- the image is moved
+// rather than resized, so the surface's own chrome is not in play there -- and
+// it had the same defect as the canvas: a mark's rim answered as the crosshair,
+// and its eight handles were never named at all.  A mark is drawn on the pin's
+// image and the same three questions are asked of it.
+void checkThePinEditorsPointerNamesItsTargets()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    QTemporaryDir dir;
+    StubPinDaemon daemon(&dir);
+    if (!daemon.listening()) {
+        expect(false, "the stand-in daemon listens", daemon.error());
+        return;
+    }
+    vshot::OverlayController controller(pinEditSession());
+    controller.setPinEditMode(true);
+    controller.setPinTarget(1, daemon.path());
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts the pin overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPinEdit();
+    controller.chooseTool(vshot::Tool::Rectangle);
+    // The image is 150,150..390,330, so this box is well inside it.
+    drag(controller, overlay, QPointF(200, 200), QPointF(320, 290));
+    controller.chooseTool(std::nullopt);
+    expect(controller.annotations().size() == 1, "the pin's mark lands");
+    if (controller.annotations().size() != 1) {
+        return;
+    }
+    const vshot::LogicalRect box = controller.annotations().constFirst().rect;
+    const int left = box.x;
+    const int top = box.y;
+    const int right = box.x + static_cast<int>(box.width) - 1;
+    const int bottom = box.y + static_cast<int>(box.height) - 1;
+    const auto cursorAt = [&](const QPointF &at) {
+        controller.move(overlay, at, Qt::NoButton, Qt::NoModifier);
+        return overlay->cursorShape();
+    };
+    const Qt::CursorShape corner = cursorAt(QPointF(right, bottom));
+    expect(corner == Qt::SizeFDiagCursor,
+           "a mark's corner says diagonal in the pin editor too",
+           QStringLiteral("got %1").arg(static_cast<int>(corner)));
+    const Qt::CursorShape edge = cursorAt(QPointF(left, (top + bottom) / 2));
+    expect(edge == Qt::SizeHorCursor,
+           "a mark's left edge says horizontal in the pin editor too",
+           QStringLiteral("got %1").arg(static_cast<int>(edge)));
+    // Along the top edge but clear of every grip: the corners are at the ends
+    // and the middle grip at the centre, so twenty pixels in is neither.
+    const Qt::CursorShape rim = cursorAt(QPointF(left + 20, top));
+    expect(rim == Qt::SizeAllCursor,
+           "a mark's rim says the press would move it in the pin editor too",
+           QStringLiteral("got %1").arg(static_cast<int>(rim)));
 }
 
 // The bare canvas around a pinned image is not part of the image, so a drag
@@ -5038,6 +5467,11 @@ int main(int argc, char *argv[])
     checkBezierFillsAtHalfAlpha();
     checkBezierStepCoverage();
     checkSelectModeDecidesWhatAPressPicksUp();
+    checkASelectedMarkKeepsItsHandlesUnderATool();
+    checkTabWalksTheMarks();
+    checkThePointerNamesTheTargetUnderIt();
+    checkEachHandleDragsTheEdgeItsArrowNames();
+    checkThePinEditorsPointerNamesItsTargets();
     checkTheAspectKeyConstrainsADragAlreadyUnderWay();
     checkThePinDragRaisesNoMagnifier();
     checkTheEyedropperTakesThePixelItIsPointedAt();

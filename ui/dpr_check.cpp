@@ -126,6 +126,11 @@ int main(int argc, char **argv)
     controller.move(overlay, QPointF(340, 200), Qt::LeftButton, Qt::NoModifier);
     controller.release(overlay, QPointF(340, 200), Qt::LeftButton, Qt::NoModifier);
     expect(controller.annotations().size() == 1, "the stroke lands as one annotation");
+    // The mark lands selected, and its eight handles sit on the corners of its
+    // box -- which is exactly where this check measures the ink.  Ctrl+D is the
+    // user's own way to put a mark down, so the stroke is measured in a state
+    // the user can reach rather than through its own chrome.
+    controller.key(overlay, Qt::Key_D, Qt::ControlModifier);
 
     // Render the real overlay at the screen's resolution: the target carries
     // the 2x ratio, so the painter the widget renders with does too.

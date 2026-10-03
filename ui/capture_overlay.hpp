@@ -1323,6 +1323,12 @@ public:
     bool colorPickerVisible() const;
     bool magnifierVisible() const;
 
+    // The pointer the controller last put on this surface.  Qt keeps the shape
+    // on the widget rather than reporting it, and the offline checks have no
+    // compositor to ask, so this is the one way "the pointer says what the
+    // press would do" can be asserted rather than assumed.
+    Qt::CursorShape cursorShape() const { return cursor().shape(); }
+
 protected:
     void paintEvent(QPaintEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
@@ -1334,6 +1340,9 @@ protected:
     // the overlay uses the wheel, so a step outside picking is left to Qt.
     void wheelEvent(QWheelEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
+    // Tab and Shift+Tab are focus navigation to Qt, and are consumed before the
+    // key handler sees them; the marks they are bound to are reached here.
+    bool event(QEvent *event) override;
     void closeEvent(QCloseEvent *event) override;
     void enterEvent(QEnterEvent *event) override;
     void leaveEvent(QEvent *event) override;
