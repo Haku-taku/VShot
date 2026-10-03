@@ -214,6 +214,19 @@ pub fn detect(bytes: &[u8]) -> Option<&'static dyn HdrCodec> {
     None
 }
 
+/// Encodes `image` in the format a capture writes its HDR half in by default.
+///
+/// One place decides that, so a pinned capture and the file the same capture
+/// would have written are the same format: JPEG XL where this machine's ffmpeg
+/// can write it, and Radiance under that.
+pub fn default_hdr_bytes(image: &HdrImage) -> Result<Vec<u8>> {
+    let codec = codecs()
+        .into_iter()
+        .next()
+        .ok_or_else(|| VshotError::StillEncode("this build has no HDR codec".into()))?;
+    codec.encode(image)
+}
+
 /// Which format a path's suffix names, for a caller that has a file name and
 /// wants the codec for it rather than a guess from the bytes.
 pub fn from_extension(path: &Path) -> Option<&'static dyn HdrCodec> {

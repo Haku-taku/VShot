@@ -220,6 +220,9 @@ struct WaylandState {
     /// nothing here is its business.
     pin_input: bool,
     pin_events: Vec<PinEvent>,
+    /// The high-resolution scroll not yet worth a step: a wheel that reports a
+    /// fraction of a detent at a time is accumulated here until it has one.
+    pin_scroll: i32,
     scene: Option<SceneSnapshot>,
     overlays: HashMap<u32, OverlaySurface>,
     /// Set while the overlays are an HDR backdrop rather than the SDR freeze
@@ -2192,6 +2195,12 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 state.topology.cursor_shape = None;
                 if state.selection_mode {
                     state.set_cursor_shape(selection_cursor_shape());
+                } else if state.pin_input {
+                    // A pin is something to drag, so the pointer says so: the
+                    // compositor leaves whatever shape was last set otherwise,
+                    // which is the arrow or whatever the window underneath had
+                    // asked for.
+                    state.set_cursor_shape(wp_cursor_shape_device_v1::Shape::Pointer);
                 }
                 let Some(surface_data) = surface.data::<SurfaceUserData>() else {
                     if state.selection_mode || state.editor.is_some() {
@@ -2203,6 +2212,18 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 };
                 state.pointer_output = Some(surface_data.output_id);
                 state.pointer_position = Some((surface_data.output_id, surface_x, surface_y));
+                if state.pin_input {
+                    // The pointer is on the pins now, and where it is decides
+                    // the hover -- which is the `HDR` tag.  A motion is what
+                    // normally carries that, but the pointer can arrive on a
+                    // pin without one: a pin made under a stationary pointer, or
+                    // one dragged under it.  So the arrival is a motion too.
+                    if let Some(at) = state.pin_point(surface_data.output_id, surface_x, surface_y)
+                    {
+                        state.pin_events.push(PinEvent::Motion { at });
+                    }
+                    return;
+                }
                 if state.pointer_grab_output.is_some() {
                     // During an implicit grab, motion coordinates remain relative to
                     // the surface that received the button press. Do not overwrite
@@ -2338,21 +2359,44 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
             } => state.fail(VshotError::WaylandProtocol(format!(
                 "unknown wl_pointer button state value {value}"
             ))),
+            // A wheel detent is 120 of these, and a compositor speaking
+            // protocol version 8 or later sends this *instead of* `axis`: the
+            // fractional `axis` event carries a smoothed pixel distance, while
+            // this one carries whole detents, which is what a wheel step means
+            // here.  Both are handled, because which arrives depends on the
+            // compositor's version and not on anything this side controls.
+            wl_pointer::Event::AxisValue120 { axis, value120 } if state.pin_input => {
+                if let WEnum::Value(wl_pointer::Axis::VerticalScroll) = axis {
+                    // Accumulated rather than rounded per event: a high-
+                    // resolution wheel reports a fraction of a detent at a
+                    // time, and three events of 40 are one step between them.
+                    state.pin_scroll += value120;
+                    let notches = state.pin_scroll / 120;
+                    if notches != 0 {
+                        state.pin_scroll -= notches * 120;
+                        if let Some(at) = state.pin_point_of_pointer() {
+                            state.pin_events.push(PinEvent::Scroll { notches, at });
+                        }
+                    }
+                }
+            }
             wl_pointer::Event::Axis {
                 axis: WEnum::Value(axis),
                 value,
                 ..
             } if state.pin_input => {
-                if axis == wl_pointer::Axis::VerticalScroll {
-                    let notches = (value / 10.0).round() as i32;
-                    let notches = if notches == 0 && value != 0.0 {
+                // The smoothed distance a compositor sends for a touchpad or a
+                // continuous wheel.  One notch is about ten of these, which is
+                // the unit the rest of the desktop uses.
+                if axis == wl_pointer::Axis::VerticalScroll && value != 0.0 {
+                    let notches = if value.abs() < 5.0 {
                         if value > 0.0 {
                             1
                         } else {
                             -1
                         }
                     } else {
-                        notches
+                        (value / 10.0).round() as i32
                     };
                     if let Some(at) = state.pin_point_of_pointer() {
                         state.pin_events.push(PinEvent::Scroll { notches, at });

@@ -908,31 +908,30 @@ pub(crate) fn hand_off_region_pin(
     // does.
     let at = Some(rect.origin);
     let sdr = &rendered.composite;
-    let marked = match hdr {
+    // The marks go onto the light itself: an HDR capture's annotations are
+    // composited in linear light, so the pin is one picture with the marks on
+    // it rather than a light and a picture of the marks.
+    let light = match hdr {
         Some(half) => {
-            // The marks go onto the light itself: an HDR capture's annotations
-            // are composited in linear light, so both halves describe the same
-            // light with the same marks on it.
             let mut marked = half.frame.clone();
             marked.composite_srgb_layer(&rendered.marks)?;
-            marked.carries_hdr(tone_map.hdr).then_some(marked)
+            marked
+                .carries_hdr(tone_map.hdr)
+                .then(|| {
+                    crate::model::codec::default_hdr_bytes(&crate::model::codec::HdrImage::new(
+                        marked,
+                        half.reference_nits,
+                    ))
+                })
+                .transpose()?
         }
         None => None,
     };
-    // The white the codes are written against is the frame's own: a capture
-    // carries it, and the file this becomes carries it too.
-    let pq = marked.map(|frame| PqPin {
-        words: frame.to_rgb10_pq_in(frame.primaries(), crate::model::hdr::REFERENCE_WHITE_NITS),
-        width: frame.size().width,
-        height: frame.size().height,
-        reference_nits: crate::model::hdr::REFERENCE_WHITE_NITS,
-        primaries: frame.primaries(),
-    });
     pin_png(
         &sdr.to_png()?,
         density,
         at,
-        pq.as_ref(),
+        light.as_deref(),
         marks,
         // The pin destination reads the base only when there are marks to
         // carry it for, and a session that drew nothing has none.
@@ -959,7 +958,10 @@ pub(crate) fn pin_png(
     png: &[u8],
     density: u32,
     at: Option<crate::geometry::Point>,
-    hdr: Option<&PqPin>,
+    // The capture's own light, encoded as the file the daemon reads a pin from.
+    // `None` for a capture with no light above SDR white, which is a pin of its
+    // own codes.
+    hdr: Option<&[u8]>,
     marks: Option<&serde_json::Value>,
     // The same capture before the marks were drawn on it.  Only sent when
     // `marks` is, and only a capture that came out of an editor has one.
@@ -967,29 +969,27 @@ pub(crate) fn pin_png(
     handoff: bool,
 ) -> Result<()> {
     let directory = pin_tempdir()?;
-    let path = write_private_file(directory.path(), "capture.png", png)?;
+    // A capture that carries light of its own is pinned as *that* file: the
+    // daemon decodes what it is given and encodes it for the output it lands
+    // on, so handing it the SDR view would be handing it a different picture --
+    // one with the highlights already mapped away.
+    let (name, bytes) = match hdr {
+        Some(light) => ("capture.jxl", light),
+        None => ("capture.png", png),
+    };
+    let path = write_private_file(directory.path(), name, bytes)?;
     // The pristine picture the marks were drawn on, when there are marks.  It
     // travels as its own file because the daemon loads it later, per edit.
     let base_path = match (marks, base_png) {
         (Some(_), Some(base)) => Some(write_private_file(directory.path(), "base.png", base)?),
         _ => None,
     };
-    // The helper reads this file by path, so it has to be a file and not a pipe:
-    // the daemon copies it before this directory goes.
-    let hdr_path = match hdr {
-        Some(hdr) => Some(write_private_file(
-            directory.path(),
-            "capture.pq",
-            &hdr.encode(),
-        )?),
-        None => None,
-    };
     // A capture is pinned where the user just made the selection; the
     // compositor still knows which output is focused.
     let (output, output_name) = active_output_hints();
     let result = execute(PinCommand::Add {
         path: path.clone(),
-        hdr: hdr_path.clone(),
+        hdr: None,
         density: Some(density.clamp(1, 4)),
         output,
         output_name,
@@ -1009,9 +1009,6 @@ pub(crate) fn pin_png(
     remove_pin_temp(&path);
     if let Some(base_path) = &base_path {
         remove_pin_temp(base_path);
-    }
-    if let Some(hdr_path) = &hdr_path {
-        remove_pin_temp(hdr_path);
     }
     result.map(|_| ())
 }

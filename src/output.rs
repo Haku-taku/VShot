@@ -330,23 +330,21 @@ pub fn write_frame_with_hdr(
         // surface of its own so the image reaches the panel as the light it
         // stands for rather than as the SDR view of it.
         Destination::Pin => {
-            // The codes are written in the capture's own primaries, which are
-            // the output's: the surface that shows them carries that same
-            // description, so what it declares and what the words hold agree.
-            let pq = hdr.map(|half| crate::pin::PqPin {
-                words: half
-                    .frame
-                    .to_rgb10_pq_in(half.frame.primaries(), half.reference_nits),
-                width: half.frame.size().width,
-                height: half.frame.size().height,
-                reference_nits: half.reference_nits,
-                primaries: half.frame.primaries(),
-            });
+            // The light goes over as a file of its own, in the same format a
+            // capture writes its HDR half in: the daemon decodes it and encodes
+            // it for the output the pin lands on, so the pin is the captured
+            // light rather than the SDR view of it.  Which format is the
+            // default this build has -- JPEG XL where this machine's ffmpeg can
+            // write it, and Radiance under that.
+            let light = match hdr {
+                Some(half) => Some(crate::model::codec::default_hdr_bytes(half)?),
+                None => None,
+            };
             crate::pin::pin_png(
                 &frame.to_png()?,
                 density,
                 pin_origin,
-                pq.as_ref(),
+                light.as_deref(),
                 pin_marks,
                 pin_base,
                 // The editor's own handoff, and only that: a pin carrying the
