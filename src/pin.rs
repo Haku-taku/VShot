@@ -152,6 +152,24 @@ pub(crate) enum PinCommand {
         #[serde(default)]
         text: bool,
     },
+    /// Puts one pin back on top of the stack.
+    ///
+    /// The pin editor asks for this because the pin's own surface cannot hear
+    /// the click: the editor's layer surface holds the keyboard and covers the
+    /// output, so the pointer never reaches the pin surface underneath, and
+    /// that surface is where the raise normally comes from.
+    Raise {
+        id: u64,
+    },
+    /// Asks to be told which pin is the live one, now and on every change.
+    ///
+    /// The answer is a line of its own with no `ok`, so a client reading this
+    /// socket for its move replies never mistakes it for one.  Only the pin
+    /// editor asks: its frame is Qt chrome drawn above every pin surface, and a
+    /// frame left up for a pin the user has moved on from would sit on top of
+    /// every other pin.
+    #[serde(rename = "watch-active")]
+    WatchActive,
     /// Writes one pin out to a file the user names.
     ///
     /// The dialog is the Qt helper's -- the daemon is a layer-shell client and
@@ -219,6 +237,16 @@ pub(crate) struct PinReply {
     /// other reply, and from a daemon that does not know the question.
     #[serde(default)]
     pub hdr: Option<Vec<String>>,
+    /// The pin the editor should draw its frame around, for a `watch-active`
+    /// client.  Absent from every other reply.  Read by the editor, which is
+    /// the process that asks.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub active: Option<u64>,
+    /// Which pin a `raise` put on top, or 0 when there was nothing to raise.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub raised: Option<u64>,
     /// How many outputs the daemon has a picture surface on.  Zero is a
     /// session that cannot show a pinned picture at all -- no colour
     /// management, or no half-float buffer -- and it is what tells "none of my
@@ -1736,6 +1764,8 @@ mod tests {
             visible: None,
             hdr: Some(hdr.iter().map(|name| (*name).to_string()).collect()),
             outputs: Some(outputs),
+            active: None,
+            raised: None,
         };
 
         // The ordinary HDR session, and the SDR one.
@@ -1763,6 +1793,8 @@ mod tests {
             visible: None,
             hdr: None,
             outputs: None,
+            active: None,
+            raised: None,
         };
         assert!(hdr_half_is_worth_it(Some("DP-6"), Some(&old)));
     }

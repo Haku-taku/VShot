@@ -5,10 +5,12 @@
 
 #include "pin_label.hpp"
 
+
 #include <LayerShellQt/Window>
 
 #include <QFontDatabase>
 #include <QGuiApplication>
+#include <QWindow>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QKeyEvent>
@@ -357,13 +359,40 @@ void PinChrome::applyMask()
 {
     // Click-through, always: the labels say what a pin is, and every gesture
     // belongs to the pin.
-    setMask(clickThroughInputRegion());
+    //
+    // The region goes on the *window*, not the widget.  `QWidget::setMask` also
+    // tells Qt to stop repainting outside the mask, so a widget whose mask is
+    // one pixel in the corner is a widget that never draws anything -- which is
+    // exactly what happened here, and why no label ever appeared on screen
+    // while every test that read the socket passed.
+    QWindow *window = windowHandle();
+    if (window == nullptr) {
+        return;
+    }
+    window->setMask(clickThroughInputRegion());
 }
 
 void PinChrome::paintEvent(QPaintEvent *event)
 {
     Q_UNUSED(event);
     QPainter painter(this);
+    paintInto(painter);
+    // A layer surface appears in no screenshot -- a compositor draws layers
+    // above every window and leaves them out of a capture -- so a developer
+    // asking what this actually puts on screen has only the widget itself to
+    // look at.  Written where a developer looks, and only when asked.
+    if (qEnvironmentVariableIsSet("VSHOT_PIN_DEBUG")) {
+        QImage shot(size(), QImage::Format_ARGB32);
+        shot.fill(Qt::transparent);
+        QPainter into(&shot);
+        paintInto(into);
+        into.end();
+        shot.save(QStringLiteral("/tmp/vshot-pin-chrome.png"), "PNG");
+    }
+}
+
+void PinChrome::paintInto(QPainter &painter)
+{
     painter.setCompositionMode(QPainter::CompositionMode_Source);
     painter.fillRect(rect(), Qt::transparent);
     painter.setCompositionMode(QPainter::CompositionMode_SourceOver);

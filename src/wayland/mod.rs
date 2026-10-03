@@ -2354,19 +2354,18 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                     state.pointer_grab_output = state.pointer_output;
                 }
                 if state.pin_input {
-                    // Only the left button and the wheel are a pin's business:
-                    // anything else belongs to whatever the pin is covering.
+                    // The left button is the one that drags; every *release*
+                    // is the stack's business, though, because a drag can be
+                    // started with the left button and ended with any of them
+                    // -- the middle button is what a user reaches for when the
+                    // left one is busy, and a release that never arrives leaves
+                    // the pin following the pointer for ever.
                     let at = state.pin_point_of_pointer();
                     match (pressed, at) {
-                        (true, Some(at)) => {
+                        (true, Some(at)) if button == BTN_LEFT => {
                             state.pin_events.push(PinEvent::Press { at, time, button });
                         }
-                        // Only the left button drags, so only its release ends
-                        // a drag; a right button coming up is the menu's
-                        // business and not the stack's.
-                        (false, _) if button == BTN_LEFT => {
-                            state.pin_events.push(PinEvent::Release)
-                        }
+                        (false, _) => state.pin_events.push(PinEvent::Release),
                         _ => {}
                     }
                     return;
@@ -2462,6 +2461,12 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                     return;
                 };
                 state.keyboard_focus_output = Some(surface_data.output_id);
+                if std::env::var_os("VSHOT_PIN_DEBUG").is_some() {
+                    eprintln!(
+                        "vshot: pin-input: keyboard focus on output {}",
+                        surface_data.output_id
+                    );
+                }
             }
             wl_keyboard::Event::Leave { surface, .. } => {
                 let Some(surface_data) = surface.data::<SurfaceUserData>() else {
@@ -2487,6 +2492,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                     // The pins' own keys: Space opens the editor on the pin
                     // under the pointer, and everything else is left to the
                     // compositor rather than swallowed here.
+                    if std::env::var_os("VSHOT_PIN_DEBUG").is_some() {
+                        eprintln!("vshot: pin-input: key {key} pressed={pressed}");
+                    }
                     state.pin_events.push(PinEvent::Key { key, pressed });
                     return;
                 }

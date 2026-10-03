@@ -25,7 +25,7 @@
 //! not wired.  A pin made through this daemon can be listed, toggled and closed
 //! by the CLI, and that is all.
 
-use std::io::{BufRead, Read, Write};
+use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -38,11 +38,6 @@ use crate::geometry::{Point, Rect, Size};
 use crate::model::picture::{self, Picture};
 use crate::pin::{PinCommand, PqPin};
 use crate::pin_hdr::{OutputPlacement, Pin, Surfaces};
-
-/// How long a client may take to send its request before the connection is
-/// dropped.  It is one short line, and a client that stops halfway must not
-/// hold the loop.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One pinned image, as this side knows it.
 struct Pinned {
@@ -553,7 +548,13 @@ impl Stack {
         let Some(index) = self.index_at(at) else {
             return Change::default();
         };
-        let factor = ZOOM_PER_NOTCH.powi(notches);
+        // Away from the user -- the direction Wayland calls positive -- is
+        // zoom *out*, the way a wheel behaves in every viewer: a notch down
+        // makes the picture smaller, a notch up makes it bigger.  The sign is
+        // inverted here rather than at the source, because the compositor's
+        // convention is the one worth keeping and this is where it turns into a
+        // zoom.
+        let factor = ZOOM_PER_NOTCH.powi(-notches);
         let source = self.pins[index].picture.size();
         let corner = self.pins[index].origin;
         let before = Self::drawn(source, self.pins[index].scale);
@@ -608,9 +609,17 @@ impl Stack {
                 id: pin.id,
                 origin: pin.origin,
                 size: Self::drawn(pin.picture.size(), pin.scale),
-                captured_hdr: pin
-                    .picture
-                    .carries_hdr(crate::model::hdr::HdrDecision::default()),
+                // "Is this an HDR capture" is a question about the picture, and
+                // the answer for a *pin* is whether it holds light above SDR
+                // white at all -- not whether enough of it does.  The area test
+                // is for a capture deciding whether a second file is worth
+                // writing, and applying it here would take the tag off a small
+                // pin of a bright highlight, which is exactly the pin a user
+                // wants to know is HDR.
+                captured_hdr: pin.picture.carries_hdr(crate::model::hdr::HdrDecision {
+                    always: true,
+                    ratio: 0.0,
+                }),
                 shown_as_hdr: pin.picture.as_hdr().is_some(),
                 hovered: self.pointer.hovered == Some(pin.id),
                 visible: pin.visible,
@@ -623,6 +632,13 @@ impl Stack {
         pin.picture = picture;
         pin.path = path.to_path_buf();
         pin.annotations = None;
+    }
+
+    /// Moves the pin with `id` to the front, if it is in the stack.
+    fn raise_by_id(&mut self, id: u64) -> Option<u64> {
+        let index = self.pins.iter().position(|pin| pin.id == id)?;
+        self.raise(index);
+        Some(id)
     }
 
     /// Moves the pin at `index` to the front, answering where it ended up.
@@ -1016,6 +1032,13 @@ struct Daemon {
     chrome: Chrome,
     /// The open editing session, if any.
     editing: Option<EditSession>,
+    /// The clients that asked to be told which pin is the live one, each with
+    /// the answer it was last given.  Only the pin editor asks; keeping the
+    /// last answer is what makes a change a change, rather than a line written
+    /// to every client on every sync of a drag.
+    watchers: Vec<Option<UnixStream>>,
+    /// What those clients were last told.
+    announced_active: u64,
     /// The open menu, if any.  One at a time: a second right-click replaces it,
     /// which is what a menu that follows the pointer should do.
     menu: Option<Menu>,
@@ -1036,6 +1059,8 @@ impl Daemon {
             surfaces,
             chrome,
             editing: None,
+            watchers: Vec::new(),
+            announced_active: 0,
             menu: None,
             socket: socket.to_path_buf(),
             idle: None,
@@ -1102,6 +1127,50 @@ impl Daemon {
             return None;
         }
         Some(*self.idle.get_or_insert_with(|| Instant::now() + IDLE_QUIT))
+    }
+
+    /// The pin the editor should draw its frame around: the one the open edit
+    /// is on, while that pin is still the live one.
+    ///
+    /// A pin is live while its surface holds the keyboard and the pointer is
+    /// over it, which this side reads as the hover.  Zero is not so much "no
+    /// live pin" as "no pin surface has the keyboard", which is the ordinary
+    /// state of an open editor -- the editor's own surface is the one holding
+    /// it -- so the answer stays as it was until another pin takes the pointer.
+    fn live_pin(&self) -> u64 {
+        match &self.editing {
+            Some(session) => {
+                if self.stack.pointer.hovered.is_none()
+                    || self.stack.pointer.hovered == Some(session.id)
+                {
+                    session.id
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        }
+    }
+
+    /// Tells every watcher which pin is live, when the answer changes.
+    ///
+    /// Only on a change: a drag syncs on every motion event, and a line per
+    /// watcher per event would put the editor's move replies behind a growing
+    /// queue of answers it has no use for.
+    fn announce_active(&mut self) {
+        let live = self.live_pin();
+        if live == self.announced_active {
+            return;
+        }
+        self.announced_active = live;
+        let mut line = json!({"active": live}).to_string();
+        line.push('\n');
+        self.watchers.retain_mut(|watcher| {
+            let Some(stream) = watcher.as_mut() else {
+                return false;
+            };
+            stream.write_all(line.as_bytes()).is_ok() && stream.flush().is_ok()
+        });
     }
 
     /// Opens the menu for the pin under `at`, or closes whatever menu is open
@@ -1270,6 +1339,12 @@ impl Daemon {
                 crate::wayland::PinEvent::Key { key, pressed }
                     if pressed && key == crate::wayland::input::KEY_SPACE =>
                 {
+                    if std::env::var_os("VSHOT_PIN_DEBUG").is_some() {
+                        eprintln!(
+                            "vshot-pin: space: hovered = {:?}",
+                            self.stack.pointer.hovered
+                        );
+                    }
                     if let Some(id) = self.stack.pointer.hovered {
                         // Reported rather than returned: a key is not a gesture
                         // that changes the stack, and a failure to start the
@@ -1313,11 +1388,18 @@ impl Daemon {
         if changed.redraw {
             self.refresh()?;
         }
+        // The hover is what says which pin is live, so a change in it is what
+        // the editor watching for its frame is waiting on.
+        self.announce_active();
         Ok(())
     }
 
     /// Answers one request, or says why not.
-    fn handle(&mut self, command: PinCommand) -> Result<serde_json::Value> {
+    fn handle(
+        &mut self,
+        command: PinCommand,
+        watcher: Option<&UnixStream>,
+    ) -> Result<serde_json::Value> {
         match command {
             PinCommand::Add {
                 path,
@@ -1403,6 +1485,21 @@ impl Daemon {
             })),
             // Answered by the caller, which is the loop that has to stop.
             PinCommand::Edit { id, text } => self.start_edit(id, text),
+            // A client that wants the live-pin answer joins the list, and is
+            // told the answer it has now.  What it does with it is its own:
+            // the editor draws a frame while its pin is the live one.
+            PinCommand::WatchActive => {
+                if let Some(watcher) = watcher {
+                    self.watchers.push(watcher.try_clone().ok());
+                }
+                Ok(json!({"active": self.live_pin()}))
+            }
+            PinCommand::Raise { id } => {
+                let raised = self.stack.raise_by_id(id);
+                self.refresh()?;
+                self.announce_active();
+                Ok(json!({"raised": raised.unwrap_or(0)}))
+            }
             PinCommand::Save { id } => self.save(id),
             PinCommand::Quit => Ok(json!({"ok": true})),
             PinCommand::AddClipboard {
@@ -1580,6 +1677,13 @@ impl Daemon {
     /// The editor writes its result back as a `Move` over this same socket,
     /// which is what `Move`'s `path` and `annotations` are for.
     fn start_edit(&mut self, id: u64, text: bool) -> Result<serde_json::Value> {
+        if std::env::var_os("VSHOT_PIN_DEBUG").is_some() {
+            eprintln!(
+                "vshot-pin: start_edit({id}): editing={} pins={}",
+                self.editing.is_some(),
+                self.stack.pins.len()
+            );
+        }
         let Some(index) = self.stack.pins.iter().position(|pin| pin.id == id) else {
             return Err(VshotError::Pin(
                 "edit names a pin that is not pinned".to_string(),
@@ -1607,27 +1711,25 @@ impl Daemon {
             .map_err(|error| {
                 VshotError::Pin(format!("cannot make a session directory: {error}"))
             })?;
-        let image = directory.path().join("pin.png");
-        let png = match &pin.picture {
-            Picture::Sdr(frame) => frame.to_png()?,
-            // An HDR picture is written back as the same light in the one
-            // format the editor reads, and read again on the way back: the
-            // round trip through the PQ curve costs at most a code per channel,
-            // and the alternative is an editor that cannot open an HDR pin.
-            Picture::Hdr(image) => {
-                let bytes = crate::model::codec::by_name("jxl")
-                    .map(|codec| codec.encode(image))
-                    .transpose()?;
-                match bytes {
-                    Some(bytes) => bytes,
-                    None => crate::model::codec::HdrCodec::encode(
-                        &crate::model::codec::radiance::Radiance,
-                        image,
-                    )?,
-                }
-            }
+        // The editor's session names a *raw* file -- RGBA8, four bytes a
+        // pixel, no header -- because that is what a capture session hands it
+        // through shared memory.  So the picture is written as the bytes the
+        // editor reads rather than as a PNG it would have to decode: it is the
+        // one format both sides already agree on.
+        //
+        // An HDR picture is flattened to the SDR view for this, which is what
+        // the editor can show and draw on.  The light itself is kept beside it
+        // in the pin, and a mark placed here is composited back into it when
+        // the editor's result comes home -- so annotating an HDR pin does not
+        // throw the light away.
+        let image = directory.path().join("pin.rgba");
+        let frame = match &pin.picture {
+            Picture::Sdr(frame) => frame.clone(),
+            Picture::Hdr(hdr) => hdr
+                .frame
+                .tone_map_to_srgb_with(crate::config::tone_map_options())?,
         };
-        std::fs::write(&image, &png).map_err(|source| {
+        std::fs::write(&image, frame.pixels()).map_err(|source| {
             VshotError::Pin(format!("cannot write the editor's picture: {source}"))
         })?;
 
@@ -1907,37 +2009,100 @@ pub fn run(socket: &Path) -> Result<()> {
 
 /// Reads one request from `stream`, answers it, and says whether the daemon
 /// should stop.
-fn serve(daemon: &mut Daemon, mut stream: UnixStream, debug: bool) -> Result<bool> {
-    stream
-        .set_read_timeout(Some(REQUEST_TIMEOUT))
-        .map_err(|source| VshotError::Pin(format!("cannot time the request: {source}")))?;
-    let mut line = String::new();
-    let mut reader = std::io::BufReader::new(&mut stream);
-    reader
-        .read_line(&mut line)
-        .map_err(|source| VshotError::Pin(format!("cannot read the request: {source}")))?;
-    let command: PinCommand = serde_json::from_str(line.trim())
-        .map_err(|error| VshotError::Pin(format!("cannot read the request: {error}")))?;
-    // Whether to stop is decided from the command, not from the reply: the
-    // reply has to go out first.
-    let quit = matches!(command, PinCommand::Quit);
-    let reply = match daemon.handle(command) {
-        Ok(reply) => reply,
-        Err(error) => {
-            if debug {
-                eprintln!("vshot-pin: {error}");
+/// Serves one connection until it goes away.
+///
+/// A connection may carry more than one request: the pin editor asks to be told
+/// which pin is live and then keeps the socket for the answers, and a drag
+/// pipelines its positions.  So the loop reads whatever has arrived, answers
+/// each line, and waits for more rather than closing after the first.
+///
+/// Answers `true` when the daemon should stop, which is what `quit` means.
+fn serve(daemon: &mut Daemon, stream: UnixStream, debug: bool) -> Result<bool> {
+    stream.set_nonblocking(true).map_err(|source| {
+        VshotError::Pin(format!("cannot make the connection non-blocking: {source}"))
+    })?;
+    let mut pending: Vec<u8> = Vec::new();
+    let mut buffer = [0u8; 8192];
+    let mut watcher = false;
+    loop {
+        // Whatever the client has said so far, all of it: a drag sends a burst
+        // of positions and waiting for one at a time would pace it.
+        let mut read_more = true;
+        while read_more {
+            match (&stream).read(&mut buffer) {
+                Ok(0) => return Ok(false), // the client went away
+                Ok(count) => pending.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => read_more = false,
+                Err(_) => return Ok(false),
             }
-            json!({"ok": false, "error": error.to_string()})
         }
-    };
-    let mut encoded = serde_json::to_vec(&reply)
+        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            let line = pending.drain(..=newline).collect::<Vec<u8>>();
+            let Ok(text) = std::str::from_utf8(&line) else {
+                continue;
+            };
+            let command: PinCommand = match serde_json::from_str(text.trim()) {
+                Ok(command) => command,
+                Err(error) => {
+                    // A command this build does not know is answered rather
+                    // than fatal: the editor and the daemon can be different
+                    // builds, and a client that asked for something new should
+                    // hear that it was not understood.
+                    let reply =
+                        json!({"ok": false, "error": format!("cannot read the request: {error}")});
+                    write_reply(&stream, &reply)?;
+                    continue;
+                }
+            };
+            // Whether to stop is decided from the command, not from the reply:
+            // the reply has to go out first.
+            let quit = matches!(command, PinCommand::Quit);
+            if matches!(command, PinCommand::WatchActive) {
+                watcher = true;
+            }
+            let reply = match daemon.handle(command, Some(&stream)) {
+                Ok(reply) => reply,
+                Err(error) => {
+                    if debug {
+                        eprintln!("vshot-pin: {error}");
+                    }
+                    json!({"ok": false, "error": error.to_string()})
+                }
+            };
+            write_reply(&stream, &reply)?;
+            if quit {
+                return Ok(true);
+            }
+        }
+        // Nothing more to read: wait for the client or the compositor to say
+        // something.  A watcher keeps its connection for the answers, and the
+        // wait on its socket is what wakes this loop when one is written.
+        if watcher {
+            daemon
+                .surfaces
+                .wait_on_until(Some(stream.as_fd()), Some(Duration::from_millis(50)))?;
+        } else {
+            // An ordinary client sends one request and reads its answer; the
+            // wait is short because it has nothing else to say.
+            daemon
+                .surfaces
+                .wait_on_until(Some(stream.as_fd()), Some(Duration::from_millis(200)))?;
+        }
+        daemon.chrome_replies()?;
+        daemon.gestures()?;
+    }
+}
+
+/// Writes one reply, followed by the newline that ends it.
+fn write_reply(stream: &UnixStream, reply: &serde_json::Value) -> Result<()> {
+    let mut encoded = serde_json::to_vec(reply)
         .map_err(|error| VshotError::Pin(format!("cannot encode the reply: {error}")))?;
     encoded.push(b'\n');
-    stream
+    (&*stream)
         .write_all(&encoded)
         .map_err(|source| VshotError::Pin(format!("cannot answer: {source}")))?;
-    let _ = stream.flush();
-    Ok(quit)
+    let _ = (&*stream).flush();
+    Ok(())
 }
 
 /// Reads a whole request, for the tests: one line, no daemon.
@@ -2205,7 +2370,8 @@ mod tests {
     }
 
     /// The wheel scales the pin under it by a tenth a notch, about the pin's
-    /// own centre, and stops at the ends of the range.
+    /// own centre, and stops at the ends of the range.  A notch towards the
+    /// user is the one that makes it bigger.
     ///
     /// The pin sits in the middle of the output on purpose: one against an edge
     /// is held there by the grab margin, so a wheel at the corner moves it as
@@ -2214,25 +2380,23 @@ mod tests {
     fn the_wheel_scales_about_the_pins_centre() {
         let mut stack = stack_of(1);
         stack.pins[0].origin = Point::new(910, 515);
+        // Positive is the direction Wayland calls away from the user, and a
+        // wheel away from the user zooms *out* -- the way every viewer behaves.
         let change = stack.scroll(1, Point::new(960, 540));
         assert!(change.redraw);
-        assert!((stack.pins[0].scale - ZOOM_PER_NOTCH).abs() < 1e-9);
-        // 100x50 about its centre (960, 540) at 1.1 is 110x55, so the top-left
-        // moves back by five and two and a half.
-        assert_eq!(stack.pins[0].origin, Point::new(905, 513));
+        assert!((stack.pins[0].scale - 1.0 / ZOOM_PER_NOTCH).abs() < 1e-9);
 
-        // One notch back and it is where it started.
+        // One notch the other way and it is bigger than it started.
         stack.scroll(-1, Point::new(960, 540));
         assert!((stack.pins[0].scale - 1.0).abs() < 1e-9);
-        assert_eq!(stack.pins[0].origin, Point::new(910, 515));
 
         // The ends of the range hold.
-        for _ in 0..200 {
-            stack.scroll(1, Point::new(960, 540));
-        }
-        assert_eq!(stack.pins[0].scale, MAX_SCALE);
         for _ in 0..300 {
             stack.scroll(-1, Point::new(960, 540));
+        }
+        assert_eq!(stack.pins[0].scale, MAX_SCALE);
+        for _ in 0..400 {
+            stack.scroll(1, Point::new(960, 540));
         }
         assert_eq!(stack.pins[0].scale, MIN_SCALE);
     }

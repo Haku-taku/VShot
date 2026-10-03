@@ -18,6 +18,7 @@
 class QLocalSocket;
 class QMouseEvent;
 class QKeyEvent;
+class QPainter;
 class QScreen;
 class QTimer;
 
@@ -112,6 +113,10 @@ private:
     };
 
     void paintEvent(QPaintEvent *event) override;
+    /// Everything this surface draws, into any painter: the widget's own
+    /// paintEvent and the debug dump that saves what it put on screen, which is
+    /// the only way to see a layer surface at all.
+    void paintInto(QPainter &painter);
     void mousePressEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
