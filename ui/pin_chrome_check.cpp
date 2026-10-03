@@ -354,6 +354,87 @@ void checkVisibility()
     delete chrome;
 }
 
+// A stack update has to repaint the labels it moved, and nothing else.
+//
+// This surface covers an entire output, so a step that names the whole widget
+// is a step that rasters, copies and hands the compositor an output's worth of
+// pixels for a tag the size of a word -- and that copy was the slow half of a
+// drag, the half the pin's own picture had to stay level with.  Every setter
+// used to call `update()` with no argument.
+//
+// Two claims, and the second is the one that keeps the first honest: the region
+// a step asks for must *cover* every pixel that changed, and it must be far
+// smaller than the surface.  A step that asked for nothing would pass the
+// second alone.
+void checkALabelStepRepaintsTheLabelAndNotTheOutput()
+{
+    auto *chrome = new vshot::PinChrome(screen());
+    const QSize surface(1000, 700);
+    chrome->resize(surface);
+    chrome->setLabels({label(1, QPoint(100, 100), QSize(200, 150), true, true, true)});
+    const QImage before = paint(*chrome, surface);
+
+    // The pin moves, which is what a drag does: the tag goes with it.
+    chrome->setLabels({label(1, QPoint(140, 130), QSize(200, 150), true, true, true)});
+    const QRegion asked = chrome->lastInvalidated();
+    const QImage after = paint(*chrome, surface);
+
+    expect(!asked.isEmpty(), "a label that moved asks for a repaint");
+    expect(asked.boundingRect().width() < surface.width() / 2
+               && asked.boundingRect().height() < surface.height() / 2,
+           "and asks for the label, not the output it sits on",
+           QStringLiteral("asked %1x%2 out of %3x%4")
+               .arg(asked.boundingRect().width())
+               .arg(asked.boundingRect().height())
+               .arg(surface.width())
+               .arg(surface.height()));
+
+    // Every pixel that differs has to be inside what the step asked for: the
+    // repaint region is a promise about what Qt will redraw, and a pixel left
+    // outside it keeps its old value on screen.
+    int missed = 0;
+    QRect missedAt;
+    for (int y = 0; y < surface.height(); ++y) {
+        for (int x = 0; x < surface.width(); ++x) {
+            if (before.pixel(x, y) == after.pixel(x, y)) {
+                continue;
+            }
+            if (!asked.contains(QPoint(x, y))) {
+                if (missed == 0) {
+                    missedAt = QRect(x, y, 1, 1);
+                }
+                ++missed;
+            }
+        }
+    }
+    expect(missed == 0, "and covers every pixel that changed",
+           QStringLiteral("%1 pixel(s) outside it, the first at %2,%3")
+               .arg(missed)
+               .arg(missedAt.x())
+               .arg(missedAt.y()));
+
+    // A stack update that moves nothing has nothing to repaint: the daemon
+    // sends one for every motion event, and the pin's size, not its position,
+    // is all most of them change.
+    chrome->setLabels({label(1, QPoint(140, 130), QSize(200, 150), true, true, true)});
+    expect(chrome->lastInvalidated().isEmpty(),
+           "a stack update that moved no label asks for nothing at all");
+
+    // A badge that expires takes its own corner back and nothing else.
+    chrome->setLabels({label(1, QPoint(140, 130), QSize(200, 150), false, false, false)});
+    chrome->showBadge(1, QStringLiteral("110%"));
+    const QImage badged = paint(*chrome, surface);
+    const QRegion badgeAsked = chrome->lastInvalidated();
+    expect(inkPixels(badged, QRect(140, 130, 400, 400)) > 0, "a badge is drawn");
+    expect(badgeAsked.boundingRect().width() < surface.width() / 2,
+           "and asks for its corner rather than the output",
+           QStringLiteral("asked %1x%2")
+               .arg(badgeAsked.boundingRect().width())
+               .arg(badgeAsked.boundingRect().height()));
+
+    delete chrome;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -365,6 +446,7 @@ int main(int argc, char **argv)
     checkBadge();
     checkMenu();
     checkVisibility();
+    checkALabelStepRepaintsTheLabelAndNotTheOutput();
 
     if (failures != 0) {
         std::printf("\n%d check(s) failed\n", failures);

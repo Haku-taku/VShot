@@ -7,6 +7,7 @@
 #include <QImage>
 #include <QPoint>
 #include <QRect>
+#include <QRegion>
 #include <QSize>
 #include <QString>
 #include <QStringList>
@@ -118,6 +119,15 @@ public:
     void setPinnedVisible(bool visible);
     bool isPinnedVisible() const { return visible_; }
 
+    /// The region the last change asked Qt to repaint, in widget coordinates.
+    ///
+    /// Only the check reads it, and it is the whole point of the damage
+    /// tracking below: this surface covers an entire output, so a step that
+    /// names the surface is a step that repaints an output for a label the size
+    /// of a word.  The check asks what a step asked for and compares it with
+    /// what actually changed.
+    QRegion lastInvalidated() const { return lastInvalidated_; }
+
 private:
     // One pin's labels: the `HDR` tag while the pointer is over it, and the
     // badge for as long as it lasts.
@@ -141,6 +151,15 @@ private:
     void mouseMoveEvent(QMouseEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
     void applyMask();
+    /// Every rectangle this surface draws as it stands: each pin's tag and
+    /// badge, and the menu with the row under the pointer.  The one definition
+    /// of "what is on this surface", so a change can be told what it has to
+    /// repaint by asking twice -- once before it and once after -- rather than
+    /// by each caller working it out for itself.
+    QRegion drawnRegion() const;
+    /// Repaints what `before` and the surface's new state have between them,
+    /// and remembers the region.  Every setter here goes through it.
+    void invalidateFrom(const QRegion &before);
     /// The keyboard is taken only while a menu is up: Esc has to reach this
     /// surface for the menu to be dismissible, and nothing else here wants a
     /// key.  Taking it at all costs the surface below its pointer focus, so it
@@ -180,6 +199,8 @@ private:
     /// The socket the daemon is on, so an answer can be sent back.  Not owned:
     /// it belongs to the server that made it.
     QLocalSocket *socket_ = nullptr;
+    /// What the last change repainted; see `lastInvalidated()`.
+    QRegion lastInvalidated_;
 };
 
 } // namespace vshot

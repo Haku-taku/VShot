@@ -33,6 +33,11 @@ constexpr int kMenuPaddingX = 10;
 constexpr qreal kMenuRadius = 6.0;
 constexpr int kMenuCursorGap = 4;
 
+/// How far past a label's own box its paint can reach: antialiasing and the
+/// hairline stroke the tag carries.  A repaint region that stops at the box
+/// leaves the stroke's outer pixels behind when a label moves.
+constexpr int kEdgeSlack = 2;
+
 /// How long a badge stays up.  The same as the surface's own, so a zoom step
 /// reported here and a copy reported there read alike.
 constexpr int kBadgeMs = 900;
@@ -102,11 +107,12 @@ PinChrome::PinChrome(QScreen *screen)
     badgeTimer_ = new QTimer(this);
     badgeTimer_->setSingleShot(true);
     connect(badgeTimer_, &QTimer::timeout, this, [this] {
+        const QRegion before = drawnRegion();
         badgeId_ = 0;
         for (Entry &entry : entries_) {
             entry.badge.clear();
         }
-        update();
+        invalidateFrom(before);
     });
 }
 
@@ -147,6 +153,7 @@ bool PinChrome::showLayerSurface()
 
 void PinChrome::setLabels(const QVector<Label> &labels)
 {
+    const QRegion before = drawnRegion();
     QVector<Entry> next;
     next.reserve(labels.size());
     for (const Label &label : labels) {
@@ -166,22 +173,25 @@ void PinChrome::setLabels(const QVector<Label> &labels)
     entries_ = next;
     // The tag follows the pointer, and the pointer is the daemon's to track:
     // the hovered pin is the one the daemon says it is, which arrives as the
-    // pin the stack marks active.
-    update();
+    // pin the stack marks active.  Only the labels that moved are repainted --
+    // and a stack update that moves none of them repaints nothing at all.
+    invalidateFrom(before);
 }
 
 void PinChrome::showBadge(quint64 id, const QString &text)
 {
+    const QRegion before = drawnRegion();
     badgeId_ = id;
     for (Entry &entry : entries_) {
         entry.badge = entry.label.id == id ? text : QString();
     }
     badgeTimer_->start(kBadgeMs);
-    update();
+    invalidateFrom(before);
 }
 
 void PinChrome::setMenu(quint64 id, const QPoint &anchor, const QStringList &rows)
 {
+    const QRegion before = drawnRegion();
     menuId_ = id;
     menuRows_ = rows;
     menuHover_ = -1;
@@ -197,7 +207,7 @@ void PinChrome::setMenu(quint64 id, const QPoint &anchor, const QStringList &row
     // on a row lands here rather than on the pin under it.
     applyKeyboard();
     applyMask();
-    update();
+    invalidateFrom(before);
     // And the rectangle it came out as, which the daemon needs: the pins under
     // it have to give their input up over it, or a click on a row that happens
     // to lie over its own pin would go to the pin.
@@ -257,6 +267,7 @@ void PinChrome::chooseRow(int row)
     if (menuId_ == 0 || row < 0) {
         return;
     }
+    const QRegion before = drawnRegion();
     if (socket_ != nullptr && socket_->state() == QLocalSocket::ConnectedState) {
         QJsonObject message;
         message.insert(QStringLiteral("cmd"), QStringLiteral("chosen"));
@@ -271,7 +282,7 @@ void PinChrome::chooseRow(int row)
     menuRect_ = QRect();
     applyKeyboard();
     applyMask();
-    update();
+    invalidateFrom(before);
 }
 
 void PinChrome::dismissMenu(bool passthrough)
@@ -279,6 +290,7 @@ void PinChrome::dismissMenu(bool passthrough)
     if (menuId_ == 0) {
         return;
     }
+    const QRegion before = drawnRegion();
     if (socket_ != nullptr && socket_->state() == QLocalSocket::ConnectedState) {
         QJsonObject message;
         message.insert(QStringLiteral("cmd"), QStringLiteral("dismissed"));
@@ -293,7 +305,7 @@ void PinChrome::dismissMenu(bool passthrough)
     menuRect_ = QRect();
     applyKeyboard();
     applyMask();
-    update();
+    invalidateFrom(before);
 }
 
 void PinChrome::mousePressEvent(QMouseEvent *event)
@@ -322,8 +334,11 @@ void PinChrome::mouseMoveEvent(QMouseEvent *event)
     }
     const int row = menuRowAt(event->position().toPoint());
     if (row != menuHover_) {
+        // Two rows change, not the output: the one the pointer left and the one
+        // it came to.
+        const QRegion before = drawnRegion();
         menuHover_ = row;
-        update();
+        invalidateFrom(before);
     }
     event->accept();
 }
@@ -344,8 +359,9 @@ void PinChrome::keyPressEvent(QKeyEvent *event)
         const int step = event->key() == Qt::Key_Down ? 1 : -1;
         const int count = menuRows_.size();
         const int from = menuHover_ < 0 ? (step > 0 ? -1 : 0) : menuHover_;
+        const QRegion before = drawnRegion();
         menuHover_ = (from + step + count) % count;
-        update();
+        invalidateFrom(before);
         event->accept();
         return;
     }
@@ -396,6 +412,69 @@ bool PinChrome::event(QEvent *event)
         applyMask();
     }
     return QWidget::event(event);
+}
+
+// Every rectangle this surface draws as it stands.  The mirror of `paintInto`,
+// and deliberately the only place that knows what that function reaches: a
+// change asks this twice, before and after, and repaints the union.
+//
+// What it is for: this surface covers an entire output.  Invalidating the
+// widget -- `update()` with no argument, which is what every path here used to
+// do -- makes Qt rasterise an output's worth of pixels, copy them into its
+// shared-memory buffer and hand the compositor a full-output damage rectangle,
+// for a tag the size of a word.  Measured on a 2560x1440 output while a pin was
+// dragged: a paint region of 2560x1440 and `damage_buffer(0, 0, 2560, 1440)` on
+// every motion event.  The same drag now paints 65x43 and damages the label's
+// own rectangle -- and the tag, which the pin's picture has to stay level with,
+// is no longer the slow half of the pair.
+QRegion PinChrome::drawnRegion() const
+{
+    if (!visible_) {
+        return QRegion();
+    }
+    QRegion region;
+    const QPoint origin = screen_ != nullptr ? screen_->geometry().topLeft() : QPoint(0, 0);
+    if (menuId_ != 0 && !menuRect_.isEmpty()) {
+        // The menu's own pen sits astride its edge and the rows are clipped to
+        // its outline, so the box grown by the stroke is what it reaches.
+        region += menuRect_.adjusted(-kEdgeSlack, -kEdgeSlack, kEdgeSlack, kEdgeSlack);
+    }
+    for (const Entry &entry : entries_) {
+        const QRect target(entry.label.origin - origin, entry.label.size);
+        if (!target.intersects(rect())) {
+            continue;
+        }
+        if (entry.label.capturedHdr && entry.label.hovered) {
+            const QRect box = tagBox(kHdrTag, target.topLeft(), false, rect());
+            if (!box.isEmpty()) {
+                region += box.adjusted(-kEdgeSlack, -kEdgeSlack, kEdgeSlack, kEdgeSlack);
+            }
+        }
+        if (!entry.badge.isEmpty()) {
+            const QRect box = tagBox(entry.badge, target.bottomRight(), true, rect());
+            if (!box.isEmpty()) {
+                region += box.adjusted(-kEdgeSlack, -kEdgeSlack, kEdgeSlack, kEdgeSlack);
+            }
+        }
+    }
+    return region;
+}
+
+// Repaints everything that was drawn before the caller's change and everything
+// that is drawn after it -- the label that moved needs both its old place and
+// its new one -- and remembers the region for the check.
+void PinChrome::invalidateFrom(const QRegion &before)
+{
+    const QRegion after = drawnRegion();
+    if (after == before) {
+        // The labels are where they were, and this surface draws nothing else,
+        // so there is nothing to repaint.  A stack update that only changes a
+        // pin's size, or a hover that has not moved, lands here.
+        lastInvalidated_ = QRegion();
+        return;
+    }
+    lastInvalidated_ = before + after;
+    update(lastInvalidated_);
 }
 
 void PinChrome::applyMask()
