@@ -4118,6 +4118,67 @@ void checkThePinEditorsPointerNamesItsTargets()
            QStringLiteral("got %1").arg(static_cast<int>(rim)));
 }
 
+// A drag of a pinned image must invalidate what the editor draws and nothing
+// else.  In a pin session that is the marks and the frame around the picture:
+// the picture itself is the daemon's HDR surface underneath, so naming the
+// image -- which the step's rect did -- repainted a whole 1920x1080 overlay on
+// every motion event of a drag, for the few hundred pixels a mark occupies.
+//
+// The image is the largest thing this surface could name, so "the step asked
+// for less than the image" is the claim, and it is a claim about work rather
+// than about pixels: the step still has to *cover* everything it changes, which
+// `checkPinEditStepsCoverTheirChange` measures.
+void checkAPinDragInvalidatesTheMarksAndNotThePicture()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(pinEditSession());
+    controller.setPinEditMode(true);
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPinEdit();
+    controller.chooseTool(vshot::Tool::Pen);
+    controller.setWidth(4);
+    drag(controller, overlay, QPointF(200.0, 200.0), QPointF(260.0, 240.0));
+    controller.chooseTool(std::nullopt);
+    const auto image = controller.selection();
+    if (!image.has_value()) {
+        expect(false, "the pin editor opens with the image selected");
+        return;
+    }
+    const vshot::LogicalRect imageBox = *image;
+    // The image in this session's own coordinates: the session places it at
+    // 150,150 and the overlay draws it at the scale the output carries.
+    const QPointF imageLocal =
+        overlay->localFromGlobal(vshot::Point{imageBox.x, imageBox.y});
+    const QPointF imageFar = overlay->localFromGlobal(
+        vshot::Point{imageBox.x + static_cast<std::int32_t>(imageBox.width),
+                     imageBox.y + static_cast<std::int32_t>(imageBox.height)});
+    const QSize imageSize(qRound(imageFar.x() - imageLocal.x()),
+                          qRound(imageFar.y() - imageLocal.y()));
+
+    controller.press(overlay, QPointF(220, 210), Qt::MiddleButton, Qt::NoModifier);
+    // The first step after the press is a full repaint by design (the press
+    // painted everything), so the ones after it are the ones with a rect.
+    controller.move(overlay, QPointF(224, 213), Qt::MiddleButton, Qt::NoModifier);
+    controller.move(overlay, QPointF(228, 216), Qt::MiddleButton, Qt::NoModifier);
+    const QRect claimed = controller.lastInteractiveUpdate();
+    expect(claimed.width() < imageSize.width() && claimed.height() < imageSize.height(),
+           "a pin drag asks for less than the picture",
+           QStringLiteral("claimed %1x%2, the picture is %3x%4")
+               .arg(claimed.width()).arg(claimed.height())
+               .arg(imageSize.width()).arg(imageSize.height()));
+    controller.release(overlay, QPointF(228, 216), Qt::MiddleButton, Qt::NoModifier);
+}
+
 // The bare canvas around a pinned image is not part of the image, so a drag
 // that starts there must not move it.  It did: the press and the motion were
 // both turned into global points by the *clamping* conversion, which folds a
@@ -5472,6 +5533,7 @@ int main(int argc, char *argv[])
     checkThePointerNamesTheTargetUnderIt();
     checkEachHandleDragsTheEdgeItsArrowNames();
     checkThePinEditorsPointerNamesItsTargets();
+    checkAPinDragInvalidatesTheMarksAndNotThePicture();
     checkTheAspectKeyConstrainsADragAlreadyUnderWay();
     checkThePinDragRaisesNoMagnifier();
     checkTheEyedropperTakesThePixelItIsPointedAt();

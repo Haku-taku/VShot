@@ -1161,6 +1161,12 @@ private:
     // The rects one interactive step can have changed, in session coordinates.
     LogicalRect selectionTouch() const;
     LogicalRect annotationTouch() const;
+    // Every pixel the marks reach: all a pin-edit session draws on its own
+    // surface, where the picture is the Rust surface underneath.
+    LogicalRect annotationsTouch() const;
+    // The band a thin outline around a rect can have painted: four strips, not
+    // the rectangle they enclose.
+    void invalidateFrameOutline(const LogicalRect &rect);
     LogicalRect drawingTouch(int pointsBefore) const;
     // The rects a step of the pen path can have changed, in session coordinates:
     // the path so far plus the rubber band from its last anchor to the pointer.

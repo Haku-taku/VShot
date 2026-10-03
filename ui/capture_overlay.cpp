@@ -6661,6 +6661,15 @@ LogicalRect OverlayController::selectionTouch() const
     if (!selection_.has_value()) {
         return LogicalRect{};
     }
+    // The pin editor draws the marks and the frame around the picture and
+    // nothing else -- the picture itself is the daemon's HDR surface
+    // underneath -- so a step there is measured by what the marks reach rather
+    // than by the image they sit on.  Naming the image repainted a whole
+    // 1920x1080 overlay on every motion event of a drag for a few hundred
+    // pixels of ink.
+    if (pinEdit_) {
+        return annotationsTouch();
+    }
     // The size pill hangs off the selection and reaches half its own width to
     // either side of the corner -- its whole width when it has to go beside the
     // region -- so the step's rect is measured from the very text the paint
@@ -6685,6 +6694,28 @@ LogicalRect OverlayController::annotationTouch() const
     // not been painted yet has none, so the padding comes from a temporary one.
     return uniteLogical(growBy(bounds, annotationReach(annotation) + kSelectionChrome),
                         pointerTouch());
+}
+
+// Every pixel the marks reach, and nothing else.  This is all a pin-edit
+// session draws on its own surface: the picture is the daemon's HDR surface
+// underneath, `paint` skips the selection's outline and handles there, and the
+// loupe is deliberately suppressed for the drag itself
+// (`checkThePinDragRaisesNoMagnifier`), so the pointer's furniture is not part
+// of it.  Naming the image instead -- what the pin editor's steps used to do --
+// repainted a whole 1920x1080 overlay on every motion event of a drag for the
+// handful of pixels its marks occupy.
+LogicalRect OverlayController::annotationsTouch() const
+{
+    LogicalRect region;
+    for (const Annotation &annotation : annotations_) {
+        LogicalRect bounds;
+        if (!annotationBounds(annotation, &bounds)) {
+            continue;
+        }
+        region = uniteLogical(
+            region, growBy(bounds, annotationReach(annotation) + kSelectionChrome));
+    }
+    return region;
 }
 
 LogicalRect OverlayController::drawingTouch(int pointsBefore) const
@@ -6879,6 +6910,29 @@ void OverlayController::invalidateLogicalRegion(const LogicalRect &region)
                 -1, -1, 1, 1);
         overlay->update(local);
     }
+}
+
+// The band a thin outline around `rect` can have painted: four strips, not the
+// rectangle they enclose.  The pin editor's frame is two pixels of white on the
+// picture's edge, so naming the whole image to redraw it is a picture-sized
+// repaint for a picture's worth of nothing.
+void OverlayController::invalidateFrameOutline(const LogicalRect &rect)
+{
+    constexpr std::int64_t kBand = 4; // the 2px stroke, its antialiasing, and the slack
+    const std::int64_t x = rect.x;
+    const std::int64_t y = rect.y;
+    const std::int64_t w = rect.width;
+    const std::int64_t h = rect.height;
+    const auto strip = [](std::int64_t left, std::int64_t top, std::int64_t width,
+                          std::int64_t height) {
+        return LogicalRect{static_cast<std::int32_t>(left), static_cast<std::int32_t>(top),
+                           static_cast<std::uint32_t>(std::max<std::int64_t>(0, width)),
+                           static_cast<std::uint32_t>(std::max<std::int64_t>(0, height))};
+    };
+    invalidateLogicalRegion(strip(x - kBand, y - kBand, w + 2 * kBand, 2 * kBand));
+    invalidateLogicalRegion(strip(x - kBand, y + h - kBand, w + 2 * kBand, 2 * kBand));
+    invalidateLogicalRegion(strip(x - kBand, y + kBand, 2 * kBand, h - 2 * kBand));
+    invalidateLogicalRegion(strip(x + w - kBand, y + kBand, 2 * kBand, h - 2 * kBand));
 }
 
 void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
@@ -8416,12 +8470,17 @@ void OverlayController::applyPinRect(const LogicalRect &rect)
     if (dx == 0 && dy == 0) {
         return;
     }
+    const LogicalRect marksBefore = annotationsTouch();
     translateAnnotations(dx, dy);
-    // Only the image's old and new rects can hold pixels that changed: marks are
-    // clipped to the image, so the union of the two covers every one of them.
-    // A full repaint here was a whole output's worth of work on every motion
-    // event's confirmation.
-    invalidateLogicalRegion(uniteLogical(previous, *marksOrigin_));
+    // Only the marks and the two-pixel frame around the picture can have
+    // changed on this surface.  The picture is not drawn here at all -- it is
+    // the daemon's HDR surface, already moved -- and the selection's outline
+    // and handles are skipped in a pin session (`paint`), so the union of the
+    // image's old and new rects, which is what this used to name, repainted a
+    // whole 1920x1080 overlay on every motion event of a drag.
+    invalidateLogicalRegion(uniteLogical(marksBefore, annotationsTouch()));
+    invalidateFrameOutline(previous);
+    invalidateFrameOutline(*marksOrigin_);
     // The input region follows the image, or the editor would take clicks on
     // the band it just left and pass through clicks on the band it just took.
     scheduleInputMask();
