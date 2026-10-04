@@ -28,7 +28,7 @@
 use crate::geometry::Rect;
 use crate::selection_region::RegionNode;
 
-use super::{Analysis, leaf};
+use super::{leaf, Analysis};
 
 /// Two colours are "the same" for a component when every channel is within
 /// this.  Loose enough to absorb a gradient or a subtle texture, tight enough
@@ -73,7 +73,16 @@ pub(super) fn regions(analysis: &Analysis) -> Vec<RegionNode> {
 fn candidates(analysis: &Analysis) -> Vec<Rect> {
     let edges = edges(analysis);
     let mut regions = Vec::new();
-    cut(analysis, &edges, 0, 0, analysis.width, analysis.height, 0, &mut regions);
+    cut(
+        analysis,
+        &edges,
+        0,
+        0,
+        analysis.width,
+        analysis.height,
+        0,
+        &mut regions,
+    );
 
     // Two kinds, held apart because they are worth different sizes: a region
     // is a pane and has to be big to be worth offering, while a control is a
@@ -93,7 +102,11 @@ fn candidates(analysis: &Analysis) -> Vec<Rect> {
             !(rect.size.width == analysis.width && rect.size.height == analysis.height)
         })
         .filter_map(|(rect, is_control)| {
-            let floor = if is_control { MIN_CONTROL_EDGE } else { MIN_REGION_EDGE };
+            let floor = if is_control {
+                MIN_CONTROL_EDGE
+            } else {
+                MIN_REGION_EDGE
+            };
             (rect.size.width >= floor && rect.size.height >= floor)
                 .then(|| analysis.to_global(rect))
                 .flatten()
@@ -470,5 +483,6 @@ fn contains(outer: Rect, inner: Rect) -> bool {
         && outer.left() - SLACK <= inner.left()
         && outer.top() - SLACK <= inner.top()
         && outer.right().map(|r| r + SLACK).unwrap_or(i32::MAX) >= inner.right().unwrap_or(i32::MIN)
-        && outer.bottom().map(|b| b + SLACK).unwrap_or(i32::MAX) >= inner.bottom().unwrap_or(i32::MIN)
+        && outer.bottom().map(|b| b + SLACK).unwrap_or(i32::MAX)
+            >= inner.bottom().unwrap_or(i32::MIN)
 }
