@@ -92,16 +92,40 @@ const QVector<ShortcutBinding> &bindings()
         {QStringLiteral("magnifier"), uiTr("Show the magnifier"), QStringLiteral("M"), true,
          uiTr("Shows the magnifier for two seconds, without dragging")},
         // Not rebindable: a modifier read while a drag is already under way.
-        // `QKeySequence` has no spelling for "Alt on its own", so a stored
+        // `QKeySequence` has no spelling for "Shift on its own", so a stored
         // binding could not be matched against a modifier-only press without
-        // also matching Alt+F4.
+        // also matching Shift+F4.
+        //
+        // Shift is the modifier every drawing program puts "keep it even" on:
+        // it squares a shape and keeps a resize's proportions.  It used to be
+        // the pick-up key as well, and that has moved on twice -- to Alt and
+        // then to Ctrl -- so what is left here is the one meaning Shift has
+        // always had.  The pick-up is a separate key because a press can mean
+        // both at once: a shape drawn with the aspect key down is still a shape
+        // the user is drawing.
         {QStringLiteral("preserve-aspect"), uiTr("Keep the aspect ratio"),
-         QStringLiteral("Alt"), false,
-         uiTr("Hold while resizing: the shape keeps its proportions")},
-        {QStringLiteral("coarse-step"), uiTr("Take a bigger step"), QStringLiteral("Shift"),
+         QStringLiteral("Shift"), false,
+         uiTr("Hold while resizing or drawing: the shape keeps its proportions")},
+        // Ctrl rather than the Shift this used to be, which the aspect modifier
+        // has taken: the cursor walk asks about this one only for a key that is
+        // one of its own steps, and a step's own reading is taken with this
+        // modifier dropped from both sides, so holding Ctrl through a walk is
+        // still a walk.  The pick-up binding below is the same key, and the two
+        // readers never meet: this one answers arrow keys and that one answers a
+        // mouse press, and no gesture is both.  Where they do touch they agree,
+        // which is the test of a shared key: Ctrl means "adjust what is under
+        // the pointer", so a mark held by Ctrl walks in tens as readily as a
+        // cursor does.
+        {QStringLiteral("coarse-step"), uiTr("Take a bigger step"), QStringLiteral("Ctrl"),
          false, uiTr("Hold while walking the cursor: ten pixels at a time")},
-        {QStringLiteral("select-mark"), uiTr("Pick a mark up"), QStringLiteral("Shift"),
-         false,
+        // Ctrl, the modifier every editor puts "grab this" on.  It is read as a
+        // *state* -- held while a press is made -- which is a different question
+        // from the chords Ctrl also spells (Ctrl+A, Ctrl+Z): those are asked of
+        // a key, this one of a button.  The one chord that shares its meaning is
+        // Ctrl+A, and that is the right way round: a user who has just picked
+        // every mark up and keeps the key down is holding this one, so the drag
+        // that follows moves the set, which is what they asked for.
+        {QStringLiteral("select-mark"), uiTr("Pick a mark up"), QStringLiteral("Ctrl"), false,
          uiTr("Hold to move or stretch a mark under the pointer, whatever tool is armed")},
         {QStringLiteral("cursor-left"), uiTr("Cursor left"), QStringLiteral("Left, A"), true,
          uiTr("Moves the cursor one pixel left")},
@@ -301,6 +325,11 @@ bool ShortcutPreferences::held(ShortcutAction action, int modifiers) const
     // *mask* set, which would match any key pressed with any modifier down.
     const int bits = modifierBits(shortcutBinding(action).defaultKeys);
     return bits != 0 && (modifiers & bits) == bits;
+}
+
+int ShortcutPreferences::modifierMask(ShortcutAction action) const
+{
+    return modifierBits(shortcutBinding(action).defaultKeys);
 }
 
 bool ShortcutPreferences::matches(ShortcutAction action, const QKeySequence &pressed,

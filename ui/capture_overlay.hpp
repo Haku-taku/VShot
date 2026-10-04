@@ -259,11 +259,18 @@ struct ToolStyle {
 };
 
 enum class Tool {
-    // There is no select tool.  Choosing a mark and adjusting the selection are
-    // not modes the user picks: a mark is picked by clicking it with any tool
-    // armed, and the selection is adjusted through its own border and handles,
-    // which are live whatever tool is up.  What used to be the Select tool is
-    // now the state a session is in when no drawing tool has been chosen.
+    // The tool that paints nothing: it adjusts what is already there.  A press
+    // under it takes the mark it landed on -- by its handles to stretch it, by
+    // its body to move it -- and a press on the selection's own body moves the
+    // selection, which is the one thing no drawing tool can be asked to do.
+    //
+    // It is a tool the user can arm, and it is also the state the editor is in
+    // when the user arms nothing at all: a session opens with no tool chosen, a
+    // bare drag then reframes the capture the way it always has, and this is the
+    // same adjustment under a name the toolbar can light up.  The marks answer
+    // to a press whatever is armed, so the button is not the only way in -- it
+    // is the way to say "and now I am not drawing".
+    Select,
     Rectangle,
     Ellipse,
     Arrow,
@@ -467,6 +474,18 @@ public:
 
     bool isFinished() const;
     bool isCancelled() const;
+    /// How long the right button has to stay down before it is the colour
+    /// picker rather than the cancel it has always been.
+    ///
+    /// The button carries two gestures and only one of them can be the *press*:
+    /// a tap is the session's own button -- what the README promises and what
+    /// the user's hand already does -- and a hold is the instrument, which needs
+    /// the button to stay down anyway because the reading follows the pointer
+    /// while it is held.  The line is drawn on the release, by how long the
+    /// button was down; the loupe comes up at once either way, so a picker is
+    /// never late.  Public because the checks drive both halves and have to know
+    /// where the line is.
+    static constexpr int kRightButtonCancelMs = 300;
     // Whether the user finished with the Pin button rather than OK.
     bool isPinResult() const { return pinResult_; }
     bool isPinEdit() const { return pinEdit_; }
@@ -836,9 +855,25 @@ private:
     /// down at, which is the anchor the move is measured from.
     bool looseSelect_ = false;
     std::optional<Point> looseDrag_;
+    /// A press that would throw the frame away, held back until it travels.
+    ///
+    /// The point is where the button went down, which is the corner a new frame
+    /// would be drawn from.  A press that never moves is a click, and a click is
+    /// not how a frame is drawn -- it is the first half of the double click that
+    /// accepts the capture, and the frame has to still be standing when the
+    /// second half arrives for that to mean anything.
+    std::optional<Point> pendingReframe_;
+    /// When the right button went down, so the release can tell a tap from a
+    /// hold.  Invalid while the button is up.
+    QElapsedTimer rightButtonClock_;
     Annotation dragAnnotation_;
     QVector<Annotation> dragSnapshot_;
     bool dragMoved_ = false;
+    /// Ctrl+A put every mark in the user's hand, so the drag that follows one of
+    /// them moves them together: they share one delta, which is what keeps the
+    /// picture they make up.  Cleared the moment the drag ends, and only ever
+    /// set on a move -- a stretch is one mark's edge by definition.
+    bool dragAll_ = false;
     bool styleAdjustmentActive_ = false;
     bool styleAdjustmentChanged_ = false;
     QVector<Annotation> styleAdjustmentSnapshot_;
@@ -1006,9 +1041,9 @@ private:
     void readCandidateReplies();
     LogicalRect selectionBetween(Point first, Point second) const;
     LogicalRect moveSelection(LogicalRect origin, Point anchor, Point current) const;
-    // Alt (`preserveAspect`) keeps the box's own width-to-height ratio while a
-    // handle drags it: the corner the handle is not on stays put and the other
-    // follows the pointer along the box's diagonal.
+    // The aspect key (`preserveAspect`) keeps the box's own width-to-height
+    // ratio while a handle drags it: the corner the handle is not on stays put
+    // and the other follows the pointer along the box's diagonal.
     LogicalRect resizeSelection(LogicalRect origin, int handle, Point current,
                                 bool preserveAspect = false) const;
     int hitHandle(Point point) const;
@@ -1050,7 +1085,27 @@ private:
     bool pickColorAt(CaptureOverlay *overlay, Point point);
     void startTextEditor(CaptureOverlay *overlay, int index, Point origin);
     void finishText(bool accept);
-    int annotationHitAt(Point point) const;
+    // The mark under a point, or -1.  Two questions can be asked of the same
+    // point, and the caller is the one that knows which it is asking.
+    //
+    // The default is the drawing tools' question: is there _ink_ here?  That is
+    // what makes a pen able to start a stroke on top of a mark it covers -- an
+    // unarmed press that landed on a hollow rectangle's middle has to reach the
+    // picture, and a mark that swallowed every press inside its box would be a
+    // mark that stops the user drawing anywhere near it.
+    //
+    // `byBox` is the pick-up's question -- which mark is the user pointing at --
+    // and the answer is the mark's box.  The box is what the user sees when
+    // they aim at a mark: the chrome is drawn on it, the handles resize it, and
+    // it is the only answer that works for every kind at once.  A diagonal
+    // stroke's ink is a thin line across a large box, an ellipse's rim is a
+    // curve with nothing behind it, and a mark whose whole point is to be taken
+    // hold of cannot ask the user to hit a line two pixels wide.
+    int annotationHitAt(Point point, bool byBox = false) const;
+    // Whether a point is inside a named mark's box, which is the test above,
+    // asked of one mark: the middle button uses it to tell "the mark I am
+    // holding" from "the frame behind it".
+    bool annotationBoxContains(int index, Point point) const;
     int annotationHandleAt(Point point) const;
     // The mark the pick-up modifier has put under the pointer, or -1.  This is
     // what the *hover* frame is drawn around: holding the modifier is the user
@@ -1060,6 +1115,22 @@ private:
     // Remembered rather than recomputed so the frame can be erased again: the
     // pointer's last position is not the same as the mark's rect.
     int markUnderPointer() const;
+    // Whether the press that is being held down is adjusting what is already
+    // there rather than drawing something new, so the toolbar can light Select
+    // for as long as it lasts.
+    //
+    // The pick-up modifier and the middle button both enter that state without
+    // arming anything -- that is the whole point of them -- and the panel's
+    // buttons are what says which state the editor is in.  Left alone, the
+    // panel would keep the drawing tool lit while the pointer is dragging a mark
+    // or the frame, which says the next press is about to draw, and the next
+    // press is going to do the same thing again.
+    //
+    // Derived from the gesture rather than stored, because the gesture is
+    // already the record of it: a drag of a mark or of the frame *is* the state,
+    // and it ends exactly where the press that started it ends.  A flag would be
+    // a second copy of that, to be cleared on every path out.
+    bool adjustingWhatIsThere() const;
     // Repaints the hover frame where it has just moved, and nothing where it has
     // not: the mark the pointer is over changes on a motion, and the modifier
     // that decides whether there *is* one changes on a key.  Both call this.
@@ -1088,7 +1159,30 @@ private:
     // there are no handles to aim at until it is picked up, and the border is
     // the one part of it that cannot be read as "start a stroke here".
     int annotationBorderOf(int index, Point point) const;
-    void beginAnnotationDrag(Point point, bool resize, bool preserveAspect = false);
+    // The press that draws a square or a circle: a shape tool with the
+    // aspect key down.  Read wherever a press has to decide between drawing and
+    // taking a mark, because the answer is the same in all of them -- the user
+    // has said what they are doing, and it is drawing.
+    bool drawingAConstrainedShape(int modifiers) const;
+    // The translation a whole selection of marks can make together: the delta
+    // clamped to the range *every* one of them can travel, so the set keeps its
+    // shape instead of arriving at the edge one mark at a time.  A mark that is
+    // wider than the picture cannot be confined and is left out of the range --
+    // it is free to move, and it must not be what frees the rest.
+    QPoint clampedGroupTranslation(const QVector<Annotation> &marks, int dx, int dy) const;
+    // Starts a drag of the selected mark.  `moveEveryMark` is what Ctrl+A's set
+    // needs: the drag then moves every mark of the selection by one delta
+    // instead of the one the press landed on.
+    //
+    // It is passed in rather than derived from the selection because being
+    // selected is not the same as being movable: a set picked up by Ctrl+A
+    // moves only from a press that is already *adjusting* something -- the
+    // Select tool in hand, the pick-up modifier, or the middle button -- and
+    // every other press goes on meaning what it always did (the armed tool
+    // inks, a bare drag reframes).  Anything else would make Ctrl+A a mode the
+    // user has to get out of before they can draw again.
+    void beginAnnotationDrag(Point point, bool resize, bool preserveAspect = false,
+                             bool moveEveryMark = false);
     void updateAnnotationDrag(Point point);
     void finishAnnotationDrag(CaptureOverlay *overlay, Point point);
     Annotation translatedAnnotation(const Annotation &original, int dx, int dy) const;
@@ -1220,12 +1314,24 @@ private:
     // Whether `modifiers` puts the editor in its selection state: what is on
     // the screen is the target, and the armed tool waits.
     //
-    // Shift is the modifier that answers to it: it is the state the removed
+    // Ctrl is the modifier that answers to it: it is the state the removed
     // Select tool left behind, and holding it must not change which tool is
     // armed, so letting it go puts the user back exactly where they were.
+    // Shift is the editor's other held modifier -- the aspect key, which
+    // squares a shape and keeps a resize's proportions -- and the two are
+    // separate keys because a press can mean both at once: a constrained shape
+    // is still a shape the user is drawing.  Ctrl is also the coarse step's key,
+    // which is read off an arrow key rather than off a press: no gesture is
+    // both, so the two readers never meet.
     bool pickingMarks(int modifiers) const;
-    // Ctrl+A: every mark is picked up at once, for a style change or a delete
-    // that reaches all of them.
+    // Whether the Select tool is the armed one.  It is the state in which a
+    // press adjusts what is on the screen rather than drawing: the mark under
+    // the pointer answers with its whole body, and Ctrl+A's set is what a drag
+    // moves.
+    bool selectToolArmed() const;
+    // Ctrl+A: every mark is picked up at once, for a style change, a delete, or
+    // a move that reaches all of them.  The *move* is deliberately not a press
+    // away: see `beginAnnotationDrag`'s `moveEveryMark`.
     void selectAllAnnotations();
     // Ctrl+S: the capture with its marks on it goes to the clipboard as an
     // image, through the same composite the Copy button would have made.
@@ -1279,6 +1385,13 @@ protected:
     void mouseReleaseEvent(QMouseEvent *event) override;
     void mouseDoubleClickEvent(QMouseEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
+    // Tab never reaches `keyPressEvent`: `QWidget::event` reads it as focus
+    // traversal and acts on it first, so the key the editor binds to "next mark"
+    // was spent moving the focus to the first of its own buttons that will take
+    // it.  The editor is a whole-output surface with one keyboard, and the keys
+    // it binds are its own -- so this takes the two Tab spellings ahead of that
+    // and hands them to the controller, which is where the binding lives.
+    bool event(QEvent *event) override;
     void closeEvent(QCloseEvent *event) override;
     void enterEvent(QEnterEvent *event) override;
     void leaveEvent(QEvent *event) override;

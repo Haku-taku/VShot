@@ -91,11 +91,12 @@ struct ShortcutBinding {
     QString defaultKeys;
     /// Whether the settings page offers this one for rebinding.
     ///
-    /// The modifiers a drag reads -- aspect ratio and the coarse step -- are
-    /// held *while* another key is already down, and a plain `QKeySequence`
-    /// cannot say "Alt alone": it would fire on Alt+Escape too.  They are
-    /// listed so the user can see what they are, but not edited, rather than
-    /// being edited into something that cannot be delivered.
+    /// The modifiers a press or a drag reads -- the aspect ratio, the coarse
+    /// step and the pick-up -- are held *while* another input is already under
+    /// way, and a plain `QKeySequence` cannot say "Ctrl alone": it would fire on
+    /// Ctrl+Z too.  They are listed so the user can see what they are, but not
+    /// edited, rather than being edited into something that cannot be
+    /// delivered.
     bool rebindable = true;
     /// The hint under the settings row: what the action does, in one line.
     QString hint;
@@ -186,6 +187,17 @@ struct ShortcutPreferences {
     /// here so what the settings page prints as the key for one is the key the
     /// editor actually reads, even though the binding cannot be changed.
     bool held(ShortcutAction action, int modifiers) const;
+    /// The modifier bits `action` is bound to, for a caller that has to take them
+    /// back out of another action's key.
+    ///
+    /// The editor reads the coarse step as part of the cursor step's key: Shift
+    /// -- or whatever the step is bound to -- is dropped from both sides before
+    /// the cursor binding is asked, so one binding per direction covers both
+    /// step sizes.  Taking the bits from here rather than writing the modifier
+    /// down again is what keeps that working when the step moves to another key,
+    /// which it has: the byte written down in the key handler outlived the
+    /// binding it was copied from and swallowed the wrong modifier.
+    int modifierMask(ShortcutAction action) const;
     /// Whether `pressed` is the binding of `action` with `consumed` removed
     /// from the modifiers it carries.
     ///

@@ -462,7 +462,10 @@ EditorPreferences readEditor(const QJsonObject &editor)
     // "select" is accepted as a synonym for nothing armed: it is the name the
     // tool that went away was remembered under, and every config file written
     // before then carries it.  Reading it as a typo would silently move the
-    // user onto the first tool in the list.
+    // user onto the first tool in the list.  The toolbar has a Select button
+    // again, but it is not one of the names here: arming it is the same state
+    // as opening unarmed except for what a bare drag on a framed selection
+    // does, and no session has ever needed that difference to be remembered.
     const QString remembered =
         readChoice(editor, QStringLiteral("tool"), QStringLiteral("select"),
                    QStringList(kToolNames) << QStringLiteral("select"));

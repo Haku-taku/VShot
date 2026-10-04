@@ -2675,10 +2675,13 @@ private:
                 continue;
             }
             // The held modifiers are listed but not editable: a `QKeySequence`
-            // cannot say "Alt on its own" without also saying Alt+F4, so a row
+            // cannot say "Ctrl on its own" without also saying Ctrl+Z, so a row
             // that offered to rebind one would be offering a binding the editor
             // could never deliver.  A label with no button, rather than a button
-            // the user has to discover does nothing.
+            // the user has to discover does nothing.  Two of these rows show the
+            // same key -- `coarse-step` and `select-mark` are both Ctrl -- which
+            // is the truth and not a collision: one reads it off an arrow key,
+            // the other off a press.
             if (!binding.rebindable) {
                 auto *text = new QLabel(card);
                 text->setObjectName(QStringLiteral("rowValue"));

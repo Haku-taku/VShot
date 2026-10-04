@@ -23,12 +23,14 @@ namespace vshot {
 /// nothing a capture does is written back, and the file changes only when the
 /// user means it -- a save in the settings window, or a hand edit.
 struct EditorPreferences {
-    /// Tool the toolbar opens with: select | rectangle | ellipse | arrow | pen
-    /// | text | mosaic.
-    /// The tool the editor opens with.  There is no "select" here any more:
-    /// a session with nothing armed is that state, and the empty string is
-    /// what a config written before the tool went away carries, so it lands
-    /// on the same thing.
+    /// Tool the toolbar opens with: rectangle | ellipse | arrow | pen | text |
+    /// mosaic.
+    ///
+    /// Empty is its own value here, and the one a fresh session has: nothing
+    /// armed, which is the state that adjusts the marks and the selection
+    /// without drawing anything.  The toolbar has a Select button for it, but
+    /// the file does not name it: a config written before that tool went away
+    /// carries "select", and it is read as this same empty string.
     QString tool;
     /// How a drag on a mark that is already selected is started: `precise`
     /// (the default) needs the press on the mark itself, `loose` moves it from
