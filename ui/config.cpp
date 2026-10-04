@@ -230,6 +230,33 @@ std::uint32_t readOptionalInRange(const QJsonObject &object, const QString &key,
     return static_cast<std::uint32_t>(rounded);
 }
 
+/// Reads a whole number in 0..`max` into `value`, and says whether the key was
+/// there and usable at all.
+///
+/// `readOptionalInRange` above cannot do this job: it reads a zero as "the file
+/// says nothing", and a level of zero is the most expensive one an encoder
+/// takes.  The two states need a flag beside the number rather than a sentinel
+/// in it.  An unusable value leaves both alone, so a typo in the file is
+/// ignored rather than carried into the editor.
+bool readOptionalWhole(const QJsonObject &object, const QString &key, std::uint32_t max,
+                       std::uint32_t &value)
+{
+    const QJsonValue raw = object.value(key);
+    if (!raw.isDouble()) {
+        return false;
+    }
+    const double number = raw.toDouble();
+    if (!std::isfinite(number)) {
+        return false;
+    }
+    const auto rounded = static_cast<long long>(number);
+    if (rounded < 0 || rounded > static_cast<long long>(max)) {
+        return false;
+    }
+    value = static_cast<std::uint32_t>(rounded);
+    return true;
+}
+
 /// Reads one of `allowed`; anything else keeps `fallback`.  The values come
 /// from a file the user can edit, so an unknown one is a typo to ignore
 /// rather than something to carry into the editor.
@@ -376,12 +403,14 @@ const std::pair<const char *, const char *> kOwnedCliKeys[] = {
     {"long", "ignore-top"},  {"long", "inject"},
     {"pin", "density"},      {"ocr", "notify"},
     {"record", "encoder"},   {"record", "encoder-backend"},
-    {"record", "fps"},       {"record", "portal"},
+    {"record", "fps"},       {"record", "bitrate"},
+    {"record", "quality"},   {"record", "portal"},
     {"record", "mic"},       {"record", "follow"},
     {"record", "notify"},    {"replay", "window"},
     {"replay", "gop"},       {"replay", "encoder"},
     {"replay", "encoder-backend"},
-    {"replay", "fps"},       {"replay", "portal"},
+    {"replay", "fps"},       {"replay", "bitrate"},
+    {"replay", "quality"},   {"replay", "portal"},
     {"replay", "mic"},       {"replay", "follow"},
     {"replay", "save-dir"},  {"replay", "notify"},
 };
@@ -441,7 +470,10 @@ EditorPreferences readEditor(const QJsonObject &editor)
     // "select" is accepted as a synonym for nothing armed: it is the name the
     // tool that went away was remembered under, and every config file written
     // before then carries it.  Reading it as a typo would silently move the
-    // user onto the first tool in the list.
+    // user onto the first tool in the list.  The toolbar has a Select button
+    // again, but it is not one of the names here: arming it is the same state
+    // as opening unarmed except for what a bare drag on a framed selection
+    // does, and no session has ever needed that difference to be remembered.
     const QString remembered =
         readChoice(editor, QStringLiteral("tool"), QStringLiteral("select"),
                    QStringList(kToolNames) << QStringLiteral("select"));
@@ -531,6 +563,10 @@ CliPreferences readCli(const QJsonObject &cli)
                                                   QString(), kEncoderBackendNames);
     preferences.recordFps =
         readOptionalInRange(recordSection, QStringLiteral("fps"), kMaxRecordFps);
+    preferences.recordBitrate =
+        readOptionalInRange(recordSection, QStringLiteral("bitrate"), kMaxBitrate);
+    preferences.recordQualitySet = readOptionalWhole(
+        recordSection, QStringLiteral("quality"), kMaxQuality, preferences.recordQuality);
     preferences.recordPortal = readFlag(recordSection, QStringLiteral("portal"), false);
     // Silences are the absent keys, so only a string asks for a microphone --
     // and the empty string is a value here rather than a missing one: it is how
@@ -557,6 +593,10 @@ CliPreferences readCli(const QJsonObject &cli)
                                                   QString(), kEncoderBackendNames);
     preferences.replayFps =
         readOptionalInRange(replaySection, QStringLiteral("fps"), kMaxRecordFps);
+    preferences.replayBitrate =
+        readOptionalInRange(replaySection, QStringLiteral("bitrate"), kMaxBitrate);
+    preferences.replayQualitySet = readOptionalWhole(
+        replaySection, QStringLiteral("quality"), kMaxQuality, preferences.replayQuality);
     preferences.replayPortal = readFlag(replaySection, QStringLiteral("portal"), false);
     const QJsonValue replayMicrophone = replaySection.value(QStringLiteral("mic"));
     if (replayMicrophone.isString()) {
@@ -696,6 +736,17 @@ QJsonObject cliJson(const CliPreferences &preferences)
     if (preferences.recordFps > 0) {
         recordSection.insert(QStringLiteral("fps"), static_cast<double>(preferences.recordFps));
     }
+    if (preferences.recordBitrate > 0) {
+        recordSection.insert(QStringLiteral("bitrate"),
+                             static_cast<double>(preferences.recordBitrate));
+    }
+    // The level is written from its own flag rather than from the number: a
+    // remembered zero is a level, and writing nothing for it would turn the
+    // most expensive setting an encoder has into "let the bitrate decide".
+    if (preferences.recordQualitySet) {
+        recordSection.insert(QStringLiteral("quality"),
+                             static_cast<double>(preferences.recordQuality));
+    }
     // Only the exception is written, for the reason the notification switch
     // above is: an absent key already means off, so a remembered `false` would
     // be a key that says nothing.
@@ -737,6 +788,16 @@ QJsonObject cliJson(const CliPreferences &preferences)
     }
     if (preferences.replayFps > 0) {
         replaySection.insert(QStringLiteral("fps"), static_cast<double>(preferences.replayFps));
+    }
+    if (preferences.replayBitrate > 0) {
+        replaySection.insert(QStringLiteral("bitrate"),
+                             static_cast<double>(preferences.replayBitrate));
+    }
+    // Written from its own flag, on the recording side's terms: a remembered
+    // zero is a level, not an absence.
+    if (preferences.replayQualitySet) {
+        replaySection.insert(QStringLiteral("quality"),
+                             static_cast<double>(preferences.replayQuality));
     }
     if (preferences.replayPortal) {
         replaySection.insert(QStringLiteral("portal"), true);

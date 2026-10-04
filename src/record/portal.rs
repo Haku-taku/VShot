@@ -226,6 +226,8 @@ fn record(
             fourcc,
             format,
             backend,
+            request.fps,
+            request.rate_control(),
         )?,
         (Shape::Dmabuf, None) => Recorder::start_dmabuf(
             &path,
@@ -234,6 +236,8 @@ fn record(
             request.encoder,
             fourcc,
             backend,
+            request.fps,
+            request.rate_control(),
         )?,
         (Shape::Software, Some(format)) => Recorder::start_mic(
             &path,
@@ -242,6 +246,8 @@ fn record(
             request.encoder,
             format,
             backend,
+            request.fps,
+            request.rate_control(),
         )?,
         (Shape::Software, None) => Recorder::start(
             &path,
@@ -249,6 +255,8 @@ fn record(
             geometry.height,
             request.encoder,
             backend,
+            request.fps,
+            request.rate_control(),
         )?,
     };
     if debug_enabled() {

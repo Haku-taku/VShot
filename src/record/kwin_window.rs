@@ -38,12 +38,13 @@ use crate::capture::window::{
     kwin_active_row, kwin_rows, CompositorWindowProvider, KwinRow, ProcessWindowProvider,
     WindowCandidate,
 };
-use crate::capture::window_copy::{Follow, Name};
+use crate::capture::window_copy::{Follow, FollowDecision, Name};
 use crate::error::{Result, VshotError};
 use crate::geometry::Size;
 use crate::model::Frame;
 
 use super::avcodec::{AudioSink, Recorder, VideoSink};
+use super::window::{FollowPolicy, WindowEnd};
 use super::{debug_enabled, prepare_output_path, RecordRequest, WindowTarget};
 
 /// How often the focused window is asked for while a `--follow` recording
@@ -99,10 +100,25 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
     let path = prepare_output_path(request)?;
     let backend = request.encoder_backend.resolve();
     let mut recorder = match mic_format {
-        Some(format) => {
-            Recorder::start_mic(&path, width, height, request.encoder, format, backend)?
-        }
-        None => Recorder::start(&path, width, height, request.encoder, backend)?,
+        Some(format) => Recorder::start_mic(
+            &path,
+            width,
+            height,
+            request.encoder,
+            format,
+            backend,
+            request.fps,
+            request.rate_control(),
+        )?,
+        None => Recorder::start(
+            &path,
+            width,
+            height,
+            request.encoder,
+            backend,
+            request.fps,
+            request.rate_control(),
+        )?,
     };
     if debug_enabled() {
         eprintln!(
@@ -124,12 +140,18 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
         &mut recorder,
         request,
         &follow,
+        // A recording moves with the focus: the new window's frames are fitted
+        // into the canvas the file was opened with.
+        FollowPolicy::Move,
         &mut window,
         first,
         &mut mic,
         &interrupted,
         |_sink| Ok(false),
     );
+    if let Ok(WindowEnd::Gone(reason)) = &outcome {
+        eprintln!("vshot: the recording ended: {reason}");
+    }
     let _ = std::fs::remove_file(super::pid_file());
 
     let finish = recorder.finish();
@@ -140,7 +162,7 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
         eprintln!("vshot: the recording could not be finished: {error}");
     }
     super::report_outcome(
-        outcome.map(|()| (recorder.frames() as usize, recorder.seconds())),
+        outcome.map(|_| (recorder.frames() as usize, recorder.seconds())),
         &path,
     )
 }
@@ -198,6 +220,75 @@ pub(super) fn open_window_capture(
     Ok((capture, window, follow, first))
 }
 
+/// The window a target names right now, without capturing it.
+///
+/// The KWin twin of `super::window::resolve_window_name`: a replay resolves its
+/// window once and keeps the labels and the handle, which is what it waits for
+/// when the window is closed and opened again.
+pub(super) fn resolve_window_name(target: &WindowTarget) -> Result<Name> {
+    let rows = kwin_rows(&crate::capture::window::ProcessWindowRunner)?;
+    if rows.is_empty() {
+        return Err(VshotError::Recording(
+            "KWin lists no windows to record".into(),
+        ));
+    }
+    let index = resolve_window(target, &rows)?;
+    Ok(name_of(&rows[index]))
+}
+
+/// Opens a KWin window session on one window of the list, by name: the head a
+/// replay's supervisor uses when it already knows which window it wants.
+///
+/// `None` is the window no longer being on screen, which the caller answers by
+/// waiting rather than by failing.  KWin's own window id decides when both
+/// sides carry one; the labels are what a window that was closed and opened
+/// again is found by.
+pub(super) fn open_named_window_capture(
+    cursor: bool,
+    wanted: &Name,
+) -> Result<Option<(crate::capture::Capturer, Window, Frame)>> {
+    let mut capture = crate::capture::Capturer::connect()?;
+    if !matches!(capture, crate::capture::Capturer::Kwin(_)) {
+        return Err(VshotError::Recording(
+            "the KWin window route needs KWin's ScreenShot2 service, and this session's              capture backend is not KWin's"
+                .into(),
+        ));
+    }
+    let rows = kwin_rows(&crate::capture::window::ProcessWindowRunner)?;
+    let index = rows
+        .iter()
+        .position(|row| name_of(row).same_as(wanted))
+        .or_else(|| {
+            rows.iter()
+                .position(|row| row.app_id == wanted.app_id && row.title == wanted.title)
+        });
+    let Some(index) = index else {
+        return Ok(None);
+    };
+    let window = Window {
+        handle: rows[index].handle.clone(),
+        app_id: rows[index].app_id.clone(),
+        title: rows[index].title.clone(),
+    };
+    if window.handle.is_empty() {
+        return Err(VshotError::Recording(
+            "KWin reported no window id for the window to record, so it cannot be aimed at;              this KWin is too old for `CaptureWindow`"
+                .into(),
+        ));
+    }
+    if debug_enabled() {
+        eprintln!(
+            "vshot: replaying the window `{}` (app_id `{}`, title `{}`, handle {})",
+            window.label(),
+            window.app_id,
+            window.title,
+            window.handle
+        );
+    }
+    let first = capture_window(&mut capture, &window, cursor)?;
+    Ok(Some((capture, window, first)))
+}
+
 /// The window a KWin recording is of.  The handle is the one KWin's
 /// `CaptureWindow` takes; the labels are what `--follow`, `--app-audio` and
 /// the messages match on.
@@ -209,17 +300,24 @@ pub(super) struct Window {
 }
 
 impl Window {
-    fn label(&self) -> String {
+    pub(super) fn label(&self) -> String {
         crate::capture::window::join_label(&self.app_id, &self.title)
     }
 
     /// The window as the toplevel-style [`Name`] the shared audio and follow
-    /// code speaks: the same app id and title, no protocol identifier.
+    /// code speaks: the same app id and title, and KWin's own window id in the
+    /// identifier's place.
+    ///
+    /// The identifier is where a compositor's stable answer to "is this the
+    /// same window?" goes, and KWin's answer is the `QUuid` its
+    /// `CaptureWindow` takes — the role the toplevel identifier plays on the
+    /// wlroots route.  The labels are still what `--app-audio` looks the pid
+    /// up by; this only sharpens the follow decisions.
     pub(super) fn as_name(&self) -> Name {
         Name {
             app_id: self.app_id.clone(),
             title: self.title.clone(),
-            identifier: String::new(),
+            identifier: self.handle.clone(),
         }
     }
 }
@@ -261,11 +359,12 @@ fn resolve_window(target: &WindowTarget, rows: &[KwinRow]) -> Result<usize> {
     }
 }
 
-fn name_of(row: &KwinRow) -> Name {
+pub(super) fn name_of(row: &KwinRow) -> Name {
     Name {
         app_id: row.app_id.clone(),
         title: row.title.clone(),
-        identifier: String::new(),
+        // KWin's window id, in the identifier's place: see `Window::as_name`.
+        identifier: row.handle.clone(),
     }
 }
 
@@ -341,14 +440,20 @@ pub(super) fn loop_over<S: VideoSink + AudioSink>(
     recorder: &mut S,
     request: &RecordRequest,
     follow: &Follow,
+    policy: FollowPolicy,
     window: &mut Window,
     first: Frame,
     mic: &mut super::pipewire_audio::Soundtrack,
     interrupted: &AtomicBool,
     mut control: impl FnMut(&mut S) -> Result<bool>,
-) -> Result<()> {
+) -> Result<WindowEnd> {
     let started = Instant::now();
     let interval = request.frame_interval();
+    // The slot the next frame is wanted in.  The grid is the *clock's*: a slot
+    // is `interval` after the one before it, never after the moment a round
+    // trip happened to land.  A grid anchored on the arrival makes every
+    // frame's length follow how slow its capture was, and that is judder on
+    // screen — see the note at the fill site below.
     let mut next_frame_at = started;
     let mut next_focus_check = (!follow.is_empty()).then(|| started + FOCUS_POLL);
     let mut timeline_ms = 0u64;
@@ -376,31 +481,70 @@ pub(super) fn loop_over<S: VideoSink + AudioSink>(
     // check that a Plasma session can fail transiently even for a client it
     // just authorized.
     let mut refusals = super::Refusals::default();
-    loop {
+    let end = loop {
         if interrupted.load(Ordering::Relaxed) {
-            break;
+            break WindowEnd::Stopped;
         }
         // A control line (a replay's save/stop) is served at a frame boundary,
         // so the session's state is consistent when it is handled.
         if control(recorder)? {
-            break;
+            break WindowEnd::Stopped;
         }
         if let Some(deadline) = next_focus_check {
             if Instant::now() >= deadline {
                 next_focus_check = Some(Instant::now() + FOCUS_POLL);
-                if let Some(frame) = follow_focus(capture, recorder, request, follow, window, mic) {
-                    // The switch already captured the new window's first
-                    // frame; using it here saves a round trip and means the
-                    // switch shows up in the file at once.
-                    pending = Some(frame);
-                    fitted_to = (0, 0);
+                match policy {
+                    FollowPolicy::Move => {
+                        if let Some(frame) =
+                            follow_focus(capture, recorder, request, follow, window, mic)
+                        {
+                            // The switch already captured the new window's
+                            // first frame; using it here saves a round trip and
+                            // means the switch shows up in the file at once.
+                            pending = Some(frame);
+                            fitted_to = (0, 0);
+                        }
+                    }
+                    // A replay opens the next window's session itself, at that
+                    // window's own size: see `super::window::FollowPolicy`.
+                    FollowPolicy::Report => {
+                        if let Some(end) = follow_report(follow, window) {
+                            break end;
+                        }
+                    }
                 }
             }
         }
         if let Some(seconds) = request.duration {
             if started.elapsed() >= Duration::from_secs(seconds) {
-                break;
+                break WindowEnd::Stopped;
             }
+        }
+        // The slots that have passed since the last frame.  The file plays on
+        // the clock's grid, so a slot with nothing new in it carries the frame
+        // before it: that is what keeps a slow round trip from stretching its
+        // own frame, and it is what puts the hold on the frame that really was
+        // not delivered rather than on whichever one the round trip landed in.
+        // The wlroots loops do the same (see `super::window::loop_over`).
+        let now = Instant::now();
+        while next_frame_at + interval <= now {
+            // Nothing has been grabbed yet, so there is nothing to repeat.
+            let Some(frame) = last_frame.as_ref() else {
+                break;
+            };
+            let duration_ms = super::cast::cover(
+                &mut covered_us,
+                &mut timeline_ms,
+                &mut last_frame_at,
+                next_frame_at,
+            );
+            let this_size = (frame.size().width, frame.size().height);
+            if this_size != fitted_to {
+                recorder.resize_fit(this_size.0, this_size.1, 0)?;
+                fitted_to = this_size;
+            }
+            recorder.frame_rgba(frame.pixels(), duration_ms)?;
+            next_frame_at += interval;
         }
         let now = Instant::now();
         if now < next_frame_at {
@@ -414,8 +558,7 @@ pub(super) fn loop_over<S: VideoSink + AudioSink>(
                 // The window went away: the file is finished properly and
                 // this is why it ends where it does.
                 Err(VshotError::WindowClosed(reason)) => {
-                    eprintln!("vshot: the recording ended: {reason}");
-                    break;
+                    break WindowEnd::Gone(reason);
                 }
                 // A refusal is KWin declining to be asked, which comes and goes
                 // with its desktop-file database; anything else is a hiccup.
@@ -455,33 +598,35 @@ pub(super) fn loop_over<S: VideoSink + AudioSink>(
         };
         consecutive_errors = 0;
         refusals.delivered();
-        let now = Instant::now();
         if !delivered_any {
             last_frame_at = started;
         }
         delivered_any = true;
-        let duration_ms = {
-            covered_us += now.saturating_duration_since(last_frame_at).as_micros() as u64;
-            last_frame_at = now;
-            let due_ms = covered_us / 1000;
-            let step = due_ms.saturating_sub(timeline_ms);
-            timeline_ms = timeline_ms.max(due_ms);
-            u32::try_from(step).unwrap_or(1).max(1)
-        };
+        // The frame belongs to the slot it was asked for, and the grid moves on
+        // by one interval *from that slot*: the screenshot's own round trip is
+        // a millisecond or two of the loop's time, not something the window
+        // did, and charging it to the frame leaves a sample table no frame rate
+        // fits.  Anchoring the grid on the arrival instead is what let a round
+        // trip that ran into the next slot push the file's own rate behind the
+        // screen's — see the note on `next_frame_at` at the top of the loop.
+        let taken_at = next_frame_at;
+        next_frame_at = taken_at + interval;
+        let duration_ms = super::cast::cover(
+            &mut covered_us,
+            &mut timeline_ms,
+            &mut last_frame_at,
+            taken_at,
+        );
         let encode_started = Instant::now();
-        // The window can change size mid-recording; one MP4 holds one frame
-        // size, so the new size is fitted into the canvas the file was opened
-        // with.  `resize_fit` records the input size the software path fits
-        // from, and the next frame is fitted into the same canvas.
+        // The window can change size mid-recording.  What that means to the
+        // sink is the sink's own answer: a file fits the new size into the
+        // canvas it was opened with, a replay's ring starts over at it.
+        // `resize_fit` records the input size the software path fits from, and
+        // the next frame is fitted into the same canvas.
         let this_size = (frame.size().width, frame.size().height);
         if this_size != fitted_to {
+            eprintln!("vshot: the window is now {}x{}", this_size.0, this_size.1);
             recorder.resize_fit(this_size.0, this_size.1, 0)?;
-            let (canvas_width, canvas_height) = VideoSink::canvas(recorder);
-            eprintln!(
-                "vshot: the window is now {}x{}; fitting it into the recording's {canvas_width}x\
-                 {canvas_height} canvas",
-                this_size.0, this_size.1,
-            );
             fitted_to = this_size;
         }
         recorder.frame_rgba(frame.pixels(), duration_ms)?;
@@ -495,7 +640,12 @@ pub(super) fn loop_over<S: VideoSink + AudioSink>(
         }
         last_frame = Some(frame);
         super::pump_soundtrack(mic, recorder)?;
-        next_frame_at = now + interval;
+    };
+
+    // A switch ends this attach rather than the session: the caller opens the
+    // window the focus moved to, at its own size.
+    if matches!(end, WindowEnd::Switch(_)) {
+        return Ok(end);
     }
 
     // The last interval — the time the last frame was on screen before the
@@ -517,7 +667,44 @@ pub(super) fn loop_over<S: VideoSink + AudioSink>(
             recorder.frame_rgba(frame.pixels(), step)?;
         }
     }
-    Ok(())
+    Ok(end)
+}
+
+/// What a *replay* is to do about the window the focus is on: the KWin twin of
+/// `super::window::follow_report`.
+///
+/// KWin lists no focused window when the focus is on the desktop rather than on
+/// one, which is no window to follow and no reason to end anything either: like
+/// a focus on a window outside the list, it leaves the session where it is.
+fn follow_report(follow: &Follow, window: &Window) -> Option<WindowEnd> {
+    let focused = match kwin_active_row(&crate::capture::window::ProcessWindowRunner) {
+        Ok(Some(row)) => row,
+        Ok(None) => return None,
+        Err(error) => {
+            if debug_enabled() {
+                eprintln!("vshot: the focused window could not be read ({error}); staying put");
+            }
+            return None;
+        }
+    };
+    let rows = match kwin_rows(&crate::capture::window::ProcessWindowRunner) {
+        Ok(rows) => rows,
+        Err(error) => {
+            eprintln!("vshot: KWin's window list could not be re-read ({error}); staying put");
+            return None;
+        }
+    };
+    let names: Vec<Name> = rows.iter().map(name_of).collect();
+    let borrowed: Vec<&Name> = names.iter().collect();
+    match follow.decide(
+        &borrowed,
+        &focused.app_id,
+        &focused.title,
+        &window.as_name(),
+    ) {
+        FollowDecision::Stay => None,
+        FollowDecision::Switch(index) => Some(WindowEnd::Switch(name_of(&rows[index]))),
+    }
 }
 
 /// Moves the capture to the followed window the focus just landed on, if any.

@@ -51,13 +51,22 @@
 //!   canvas, because the switch is the resize path with a different source:
 //!   the frames of the new window are fitted into the canvas the file was
 //!   opened with, exactly as the frames of a window that changed size are.
+//!
+//! * **A replay reads the same loop differently.**  `vshot replay start window`
+//!   runs this loop too — the frame source, the resize handling and the focus
+//!   check are the same code — but its sink is a ring at one frame size, not a
+//!   file that a later window can be fitted into.  The loop is told that with
+//!   [`FollowPolicy::Report`]: a focus that lands on another followed window
+//!   ends the attach and hands the window back to the replay's supervisor,
+//!   which opens another session there, at that window's own size.  See
+//!   [`WindowEnd`] and `record::replay`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::capture::dmabuf::DmabufFrame;
 use crate::capture::window::{CompositorWindowProvider, ProcessWindowProvider};
-use crate::capture::window_copy::{self, Capture, Follow, Name, WindowCapture};
+use crate::capture::window_copy::{self, Capture, Follow, FollowDecision, Name, WindowCapture};
 use crate::error::{Result, VshotError};
 use crate::wayland::topology::OutputInfo;
 
@@ -76,7 +85,10 @@ const POLL_WINDOW: Duration = Duration::from_millis(250);
 /// quarter of a second is far below the time it takes a person to switch
 /// windows; the frame that is a moment late comes out of the window the
 /// recording was already on, which is the frame the screen showed.
-const FOCUS_POLL: Duration = Duration::from_millis(250);
+///
+/// A replay's standby state asks the same question at the same rate: it is the
+/// same round trip, and the same answer decides whether a session opens.
+pub(super) const FOCUS_POLL: Duration = Duration::from_millis(250);
 
 /// How long a session may go without its *first* frame before the recording
 /// gives up on it.  A window on a monitor that is off, disabled or
@@ -149,6 +161,8 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
             shape.fourcc,
             format,
             backend,
+            request.fps,
+            request.rate_control(),
         )?,
         (None, _) => Recorder::start_dmabuf(
             &path,
@@ -157,6 +171,8 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
             request.encoder,
             shape.fourcc,
             backend,
+            request.fps,
+            request.rate_control(),
         )?,
     };
     if debug_enabled() {
@@ -189,15 +205,20 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
         &mut recorder,
         request,
         &follow,
+        // A recording moves with the focus: the new window's frames are fitted
+        // into the canvas the file was opened with, which is what makes one
+        // file the whole history of the followed session.
+        FollowPolicy::Move,
         source,
         mic,
         &interrupted,
-        // A recording is not a replay: a still window stays one long frame,
-        // which is both what was on screen and the cheaper answer.  Its length
-        // is carried by the last frame at the end of the loop.
-        None,
         |_sink| Ok(false),
     );
+    // The window closing ends the recording where it is; say so, because a
+    // recording that stops on its own has to explain itself.
+    if let Ok(WindowEnd::Gone(reason)) = &outcome {
+        eprintln!("vshot: the recording ended: {reason}");
+    }
     let _ = std::fs::remove_file(super::pid_file());
 
     // The trailer has to go in even when the loop failed: a file that exists
@@ -269,15 +290,16 @@ pub(super) fn resolve_window(target: &WindowTarget, names: &[&Name]) -> Result<u
     }
 }
 
-/// Connects to the compositor's window capture and starts a session on the
-/// named window, returning the capture, the shape it will deliver, and the
-/// window's own name (which a `--app-audio` replay needs to find the
-/// application's pid).
-pub(super) fn open_window_capture(
-    target: &WindowTarget,
-) -> Result<(WindowCapture, window_copy::Shape, Name)> {
-    let mut capture = WindowCapture::connect()?;
-    let toplevels = capture.toplevels()?;
+/// The window a target names right now, without opening a capture on it: the
+/// labels and the identifier a replay keeps to find it again.
+///
+/// A replay without `--follow` resolves its window once, before the ring is
+/// opened, and waits for *that* window afterwards — a game that is closed and
+/// opened again is the same command's window, and the window list it is found
+/// in has been re-read by then.
+pub(super) fn resolve_window_name(target: &WindowTarget) -> Result<Name> {
+    let mut listing = WindowCapture::connect_listing()?;
+    let toplevels = listing.toplevels()?;
     if toplevels.is_empty() {
         return Err(VshotError::Recording(
             "the compositor lists no windows to record".into(),
@@ -285,10 +307,37 @@ pub(super) fn open_window_capture(
     }
     let names: Vec<&Name> = toplevels.iter().map(|toplevel| &toplevel.name).collect();
     let index = resolve_window(target, &names)?;
+    Ok(toplevels[index].name.clone())
+}
+
+/// Opens a capture session on one window of the list, by name.
+///
+/// A replay's supervisor already knows which window it wants — the focus check
+/// or the standby state named it — so this does not resolve a target again: it
+/// looks the window up by the compositor's own identifier first and by its two
+/// labels second, exactly as [`Follow::decide`] compares them.  `None` is the
+/// window no longer being on screen, which is a race the caller handles by
+/// waiting rather than an error.
+pub(super) fn open_named_window_capture(
+    wanted: &Name,
+) -> Result<Option<(WindowCapture, window_copy::Shape, Name)>> {
+    let mut capture = WindowCapture::connect()?;
+    let toplevels = capture.toplevels()?;
+    let index = toplevels
+        .iter()
+        .position(|toplevel| toplevel.name.same_as(wanted))
+        .or_else(|| {
+            toplevels.iter().position(|toplevel| {
+                toplevel.name.app_id == wanted.app_id && toplevel.name.title == wanted.title
+            })
+        });
+    let Some(index) = index else {
+        return Ok(None);
+    };
     let toplevel = &toplevels[index];
     if debug_enabled() {
         eprintln!(
-            "vshot: recording the window `{}` (app_id `{}`, title `{}`)",
+            "vshot: replaying the window `{}` (app_id `{}`, title `{}`)",
             toplevel.label(),
             toplevel.name.app_id,
             toplevel.name.title
@@ -296,7 +345,40 @@ pub(super) fn open_window_capture(
     }
     let name = toplevel.name.clone();
     let shape = capture.start(toplevel)?;
-    Ok((capture, shape, name))
+    Ok(Some((capture, shape, name)))
+}
+
+/// Why a window frame loop stopped.
+///
+/// A recording only ever stops, and only ever for one of two reasons; a replay
+/// hands the session back instead, because it has to open another one — see
+/// [`FollowPolicy::Report`].
+pub(super) enum WindowEnd {
+    /// The stop signal, the control socket, or the requested duration.
+    Stopped,
+    /// The session is over: the window was closed, or the compositor stopped
+    /// it.  The reason is the compositor's own sentence, or ours when the end
+    /// came from this side.  A replay answers it with the standby state, where
+    /// "another window of the list, or none at all" is decided.
+    Gone(String),
+    /// The focus landed on another followed window, and a replay has to open a
+    /// session *there*: another window means another frame size, and a ring
+    /// holds one.
+    Switch(Name),
+}
+
+/// What a loop is to do with a focus report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FollowPolicy {
+    /// Move the session to the new window, in place (`record window`): the
+    /// frames of the new window are fitted into the canvas the file was opened
+    /// with, exactly as a resize is, so the file stays one history of the whole
+    /// followed session.
+    Move,
+    /// End the attach and report where the focus went (`replay start window`):
+    /// the caller opens another session, at the new window's own size, because
+    /// the ring it is filling cannot be resized without losing what it holds.
+    Report,
 }
 
 /// The frame loop.  Returns once the recording has run its course; the caller
@@ -305,17 +387,16 @@ pub(super) fn open_window_capture(
 /// The loop aims for the requested frame rate, the way the screen loop does,
 /// with one difference: this protocol's compositor holds a copy until the
 /// window's content changes, so the loop asks and waits rather than samples.
-/// A still window therefore yields long-duration frames, and the file plays
-/// back at the pace the window actually changed.
 ///
-/// `still` is what a *replay* needs on top of that: its history is measured on
-/// a timeline that only moves when a frame is encoded, so a window that sat
-/// still would freeze the timeline with it and every save would come out short
-/// by the time the window did not change.  Given an interval — the session's
-/// own frame interval — the loop sends the frame the capture is holding again
-/// once that long has passed with nothing new.  `None` — a recording — leaves
-/// the still window as one long frame, whose length the end of the loop
-/// supplies.
+/// A copy can also come back late, and by a different amount every frame: a
+/// compositor busy with input, a 4K copy, a game that has the GPU.  What the
+/// file plays on is the clock, so a slot that passes with nothing in it is
+/// filled with the frame before it rather than left to make its predecessor
+/// longer.  Lengths that follow the copy are what a player turns into judder,
+/// and the shorter the slot the sooner that starts: measured on this machine,
+/// the same 4K/160 Hz window was choppy at 160 fps and smooth at 110, because
+/// a late frame is absorbed within two slots — 12.5 ms at 160, 18.2 ms at 110
+/// — and the copy was landing around 18.
 ///
 /// The window can also change *size* while the recording runs.  One MP4
 /// holds one frame size, so the recording does not follow the new size; the
@@ -332,12 +413,12 @@ pub(super) fn loop_over<
     recorder: &mut S,
     request: &RecordRequest,
     follow: &Follow,
+    policy: FollowPolicy,
     source: Name,
     mic: super::pipewire_audio::Soundtrack,
     interrupted: &AtomicBool,
-    still: Option<Duration>,
     mut control: impl FnMut(&mut S) -> Result<bool>,
-) -> Result<()> {
+) -> Result<WindowEnd> {
     let started = Instant::now();
     let interval = request.frame_interval();
     // The soundtrack and the window are both moved through the loop, because a
@@ -372,14 +453,14 @@ pub(super) fn loop_over<
     // one's duration is measured (see the grab site).
     let mut delivered_any = false;
 
-    loop {
+    let end = loop {
         if interrupted.load(Ordering::Relaxed) {
-            break;
+            break WindowEnd::Stopped;
         }
         // A control line (a replay's save/stop) is served at a frame boundary,
         // so the session's state is consistent when it is handled.
         if control(recorder)? {
-            break;
+            break WindowEnd::Stopped;
         }
         // Following the focus: the compositor is asked at most every
         // `FOCUS_POLL`, and only a focus that lands on another *followed*
@@ -387,15 +468,30 @@ pub(super) fn loop_over<
         // source — the new window's frames are fitted into the canvas the file
         // was opened with — so the loop stays where it is on every other
         // answer, including a compositor that cannot say what has the focus.
+        //
+        // A replay cannot take that road — its ring is one frame size, and the
+        // new window would have to be shrunk into the old canvas — so it is
+        // told to report the focus instead: the attach ends here and the
+        // caller opens another session where the focus went, at that window's
+        // own size.
         if let Some(deadline) = next_focus_check {
             if Instant::now() >= deadline {
                 next_focus_check = Some(Instant::now() + FOCUS_POLL);
-                follow_focus(capture, recorder, request, follow, &mut source, &mut mic);
+                match policy {
+                    FollowPolicy::Move => {
+                        follow_focus(capture, recorder, request, follow, &mut source, &mut mic);
+                    }
+                    FollowPolicy::Report => {
+                        if let Some(end) = follow_report(capture, follow, &source) {
+                            break end;
+                        }
+                    }
+                }
             }
         }
         if let Some(seconds) = request.duration {
             if started.elapsed() >= Duration::from_secs(seconds) {
-                break;
+                break WindowEnd::Stopped;
             }
         }
         // The first frame is what says the session works at all: a window
@@ -408,10 +504,47 @@ pub(super) fn loop_over<
                 FIRST_FRAME_TIMEOUT.as_secs()
             )));
         }
+        // The request goes out *before* the sleep below, not after it.  The
+        // compositor answers a request with the window's next commit, and a
+        // commit that arrives with no request outstanding is not copied: a
+        // request sent after the sleep lands past the commit it was aiming at
+        // and the frame that comes back is the one after it.  Sleeping with
+        // the request in flight is what keeps the loop on every commit — a
+        // 160 Hz window recorded at 80 fps was every other one missed.
+        capture.arm()?;
+        // The slots that have passed since the last frame.  The file plays on
+        // the clock's grid, so a slot with nothing new in it carries the frame
+        // before it: that is what keeps a late copy from stretching its own
+        // frame, and the lateness is a different amount every frame, so the
+        // lengths it would make are judder.  A recording used to leave the
+        // still window as one long frame instead, which is cheaper and was
+        // right while the copy kept up — at 160 fps on a 4K window that has
+        // the GPU it does not, and the long frames came out at whatever
+        // spacing the copy happened to land on.
+        let now = Instant::now();
+        while delivered_any && next_frame_at + interval <= now {
+            let Some(frame) = capture.last_frame() else {
+                break;
+            };
+            let duration_ms = super::cast::cover(
+                &mut covered_us,
+                &mut timeline_ms,
+                &mut last_frame_at,
+                next_frame_at,
+            );
+            if debug_enabled() {
+                encoded += 1;
+                eprintln!(
+                    "vshot: frame {encoded}: the capture is behind, so the frame before it was \
+                     repeated to carry {duration_ms}ms of the timeline"
+                );
+            }
+            encode_window_frame(capture, recorder, &frame, duration_ms)?;
+            next_frame_at += interval;
+        }
         // Pace: sleep until this frame's slot.  A slot already past means the
         // window is changing faster than the rate asked for, and the next
         // frame goes out immediately.
-        let now = Instant::now();
         if now < next_frame_at {
             sleep_interruptible(next_frame_at - now, interrupted);
             continue;
@@ -427,10 +560,14 @@ pub(super) fn loop_over<
         // it holds if nothing new has arrived — which is what keeps the ring's
         // timeline in step with the clock, and a key-frame distance counted in
         // frames equal to the seconds it was asked for.
-        let pace = match still {
-            Some(interval) => interval.min(POLL_WINDOW),
-            None => POLL_WINDOW,
-        };
+        // How long this wait may last.  It has to be long enough that a copy
+        // the compositor stretched over the next slot still comes back as a
+        // frame rather than as a repeat: the catch-up above fills a slot that
+        // has passed with the frame before it, so calling a late copy "nothing
+        // new" would put a duplicate in the file for every frame the
+        // compositor was busy with.  Two slots is the tolerance a late frame
+        // is absorbed within, plus the one the wait itself covers.
+        let pace = (interval * (super::cast::SLOT_TOLERANCE + 1)).min(POLL_WINDOW);
         let wait = pace.min(remaining.max(Duration::from_millis(1)));
         // Whether *the loop* has delivered a frame yet.  The first frame
         // covers the time from the start of the recording to its arrival, so
@@ -443,6 +580,8 @@ pub(super) fn loop_over<
         // duration (measured: a 15-second recording came out as 27, with the
         // two switch frames carrying 5 s and 10 s).
         let first_frame = !delivered_any;
+        let slot = next_frame_at;
+        let grab_started = Instant::now();
         let frame = match capture.grab(wait, interrupted) {
             Ok(Capture::Frame(frame)) => frame,
             Ok(Capture::Idle) => {
@@ -458,39 +597,14 @@ pub(super) fn loop_over<
                 // whole still stretch.
                 super::pump_soundtrack(&mut mic, recorder)?;
                 // A compositor may hold its copy until the window's content
-                // changes (`window_copy`), so a still window answers Idle here
-                // instead of sending a frame.  A recording leaves it at that:
-                // the still window is one long frame, and the end of the loop
-                // gives it its length.  A replay cannot — its ring's timeline
-                // only moves when a frame is encoded, so the seconds the window
-                // sat still would be missing from every save.  Sending the
-                // frame the capture still holds again carries that timeline to
-                // now, exactly as the screen-cast loop does for its own.
-                let Some(interval) = still else { continue };
-                let now = Instant::now();
-                if !delivered_any || now.saturating_duration_since(last_frame_at) < interval {
-                    continue;
-                }
-                let Some(frame) = capture.last_frame() else {
-                    continue;
-                };
-                let duration_ms =
-                    super::cast::cover(&mut covered_us, &mut timeline_ms, &mut last_frame_at, now);
-                encode_window_frame(capture, recorder, &frame, duration_ms)?;
-                if debug_enabled() {
-                    encoded += 1;
-                    eprintln!(
-                        "vshot: frame {encoded}: the compositor sent nothing, so the last frame \
-                         was repeated to carry {duration_ms}ms of the timeline"
-                    );
-                }
-                // The pace is not advanced here: the next iteration's own wait
-                // is what times the next repeat, so a still window is repeated
-                // once per frame interval rather than once per interval *plus*
-                // a wait for a frame that never comes.
+                // changes (`window_copy`), so a window that is still — or a
+                // copy that has not come back yet — answers Idle here instead
+                // of sending a frame.  The slots that passed are filled at the
+                // top of the loop, where the clock's grid is settled; all this
+                // has to do is let the sound through and ask again.
                 continue;
             }
-            Ok(Capture::Interrupted) => break,
+            Ok(Capture::Interrupted) => break WindowEnd::Stopped,
             // The window was resized: the capture side has already rebuilt
             // its pool at the new size, and the encoder has to fit the new
             // frames into the canvas the file was opened with — one MP4
@@ -506,12 +620,11 @@ pub(super) fn loop_over<
                 // budget starts over.
                 consecutive_retries = 0;
                 consecutive_errors = 0;
+                // What the sink does with the new size is the sink's own
+                // answer: a file fits it into the canvas it was opened with, a
+                // replay's ring starts over at it.
+                eprintln!("vshot: the window is now {width}x{height}");
                 recorder.resize_fit(width, height, fourcc)?;
-                let (canvas_width, canvas_height) = recorder.canvas();
-                eprintln!(
-                    "vshot: the window was resized to {width}x{height}; fitting it into the \
-                     recording's {canvas_width}x{canvas_height} canvas",
-                );
                 // The picture is what a resize moves, not the sound: the audio
                 // of the moment the rebuild took is still the recording's.
                 super::pump_soundtrack(&mut mic, recorder)?;
@@ -561,10 +674,10 @@ pub(super) fn loop_over<
             Ok(Capture::Ended(reason)) => {
                 // The window closed, or the compositor stopped the session:
                 // what was recorded is real and the file is finished
-                // properly.  Say why on stderr, because a recording that
-                // stops on its own has to explain itself.
-                eprintln!("vshot: the recording ended: {reason}");
-                break;
+                // properly.  Why it ended is the caller's to say, because the
+                // caller is what knows whether this ends a file or a replay's
+                // one attach.
+                break WindowEnd::Gone(reason);
             }
             Err(error) => {
                 consecutive_errors += 1;
@@ -581,15 +694,38 @@ pub(super) fn loop_over<
             }
         };
         consecutive_errors = 0;
-        let now = Instant::now();
+        // Ask for the next frame now, before this one is encoded.  A request is
+        // answered by the window's next commit *and then* a copy of its buffer
+        // — 12.5 ms measured on a 4K window that has the GPU — and the encode
+        // of a 4K frame sits behind it in this same loop.  Arming at the top of
+        // the loop instead put the encode in front of the request, so every
+        // frame cost the copy *plus* the encode and the loop ran slower than
+        // the capture could feed it.  That is the whole reason a replay of the
+        // window — a ring, no encode — took the fix above and a recording did
+        // not.  The pool holds the delivered slot out of rotation for exactly
+        // this (see `WindowCapture::arm`).
+        capture.arm()?;
         if first_frame {
             // The first frame covers the time from the start of the recording
             // to its arrival: the window was on screen for all of it.
             last_frame_at = started;
         }
         delivered_any = true;
-        let duration_ms =
-            super::cast::cover(&mut covered_us, &mut timeline_ms, &mut last_frame_at, now);
+        // A frame belongs to the slot it was asked for, and the grid moves one
+        // slot on from there — never from the arrival.  A grid that follows
+        // the arrival has the copy's lateness for its spacing, and that is a
+        // different amount every frame: the lengths wander and a player
+        // faithfully reproduces that as judder.  `slot` is when the frame was
+        // on screen; a copy later than its slot by a whole one is absorbed by
+        // the catch-up at the top of the loop rather than by a longer frame.
+        let taken_at = slot;
+        next_frame_at = slot + interval;
+        let duration_ms = super::cast::cover(
+            &mut covered_us,
+            &mut timeline_ms,
+            &mut last_frame_at,
+            taken_at,
+        );
         let encode_started = Instant::now();
         encode_window_frame(capture, recorder, &frame, duration_ms)?;
         // The soundtrack for the interval this frame covered.
@@ -597,13 +733,22 @@ pub(super) fn loop_over<
         if debug_enabled() {
             encoded += 1;
             eprintln!(
-                "vshot: frame {encoded}: {}x{} encoded in {:.1}ms (on screen {duration_ms}ms)",
+                "vshot: frame {encoded}: {}x{} encoded in {:.1}ms (on screen {duration_ms}ms) \
+                 [grab {:.2}ms, late {:.2}ms]",
                 frame.width,
                 frame.height,
-                encode_started.elapsed().as_secs_f64() * 1000.0
+                encode_started.elapsed().as_secs_f64() * 1000.0,
+                grab_started.elapsed().as_secs_f64() * 1000.0,
+                now.saturating_duration_since(slot).as_secs_f64() * 1000.0,
             );
         }
-        next_frame_at = now + interval;
+    };
+
+    // A switch ends this attach, not the session: the ring is dropped with it
+    // and the caller opens another one, so there is no tail to write into what
+    // is about to go away.
+    if matches!(end, WindowEnd::Switch(_)) {
+        return Ok(end);
     }
 
     // The last interval — the time the last frame was on screen before the
@@ -625,7 +770,44 @@ pub(super) fn loop_over<
             encode_window_frame(capture, recorder, &frame, step)?;
         }
     }
-    Ok(())
+    Ok(end)
+}
+
+/// What a *replay* is to do about the window the focus is on.
+///
+/// `None` is "go on as you were": the focus is on the window this session is
+/// on, on a window outside the list, or on one the compositor describes so
+/// differently that it cannot be found in its own list.  Everything the check
+/// can go wrong with is read the same way — a replay that cannot ask what has
+/// the focus keeps recording what it has, which is what it did before the
+/// question was asked at all.
+///
+/// The answer that is *not* `None` is the end of this attach: the focus landed
+/// on another followed window, and the caller opens the session that belongs
+/// there — at that window's own size, because the ring this one was filling
+/// cannot be resized.
+fn follow_report(capture: &mut WindowCapture, follow: &Follow, source: &Name) -> Option<WindowEnd> {
+    let focused = match ProcessWindowProvider.active_window() {
+        Ok(focused) => focused,
+        Err(error) => {
+            if debug_enabled() {
+                eprintln!("vshot: the focused window could not be read ({error}); staying put");
+            }
+            return None;
+        }
+    };
+    let toplevels = match capture.toplevels() {
+        Ok(toplevels) => toplevels,
+        Err(error) => {
+            eprintln!("vshot: the window list could not be re-read ({error}); staying put");
+            return None;
+        }
+    };
+    let names: Vec<&Name> = toplevels.iter().map(|toplevel| &toplevel.name).collect();
+    match follow.decide(&names, &focused.app_id, &focused.title, source) {
+        FollowDecision::Stay => None,
+        FollowDecision::Switch(index) => Some(WindowEnd::Switch(toplevels[index].name.clone())),
+    }
 }
 
 /// Moves the capture to the followed window the focus just landed on, if any.

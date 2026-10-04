@@ -30,6 +30,7 @@
 //! interval: it answers [`Capture::Idle`] and leaves the request in flight, so
 //! a still window costs one long frame rather than the loop's liveness.
 
+use std::collections::VecDeque;
 use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -64,6 +65,14 @@ const CONSTRAINTS_TIMEOUT: Duration = Duration::from_secs(10);
 /// being copied into while the encoder still reads the previous ones, and a
 /// window's buffer is far smaller than a 4K output's, so four is cheap.
 const POOL_SLOTS: usize = 4;
+
+/// How many capture requests are kept in flight.  One, and the protocol says
+/// so: a second frame outstanding on the same session is the `duplicate_frame`
+/// error, measured.  That leaves the request-to-frame chain — the window's
+/// next commit, then the copy of a 4K buffer — as the floor under the capture
+/// rate: 12.5 ms on a 160 Hz window that has the GPU, which is why 160 was
+/// coming out at 80.  See [`WindowCapture::arm`].
+const PIPELINE: usize = 1;
 
 /// How long one poll waits before the loop is given a chance to notice a stop
 /// signal and the `--duration` deadline.
@@ -100,6 +109,24 @@ impl Name {
         } else {
             label
         }
+    }
+
+    /// Whether this description and another name the same window.
+    ///
+    /// The identifier decides when both carry one: it is the compositor's own
+    /// answer to "is this the same window?", and the only one that survives a
+    /// window renaming itself.  An app id and title do not — they describe
+    /// *what* the window is showing, so a browser loading a page or a game
+    /// between rounds looks like a different window to a comparison made on
+    /// them.  A description without an identifier (KWin's, which comes from a
+    /// scripting probe rather than from the toplevel list) falls back to the
+    /// two labels, which is the best a compositor that names no identifier
+    /// allows.
+    pub fn same_as(&self, other: &Name) -> bool {
+        if !self.identifier.is_empty() && !other.identifier.is_empty() {
+            return self.identifier == other.identifier;
+        }
+        self.app_id == other.app_id && self.title == other.title
     }
 }
 
@@ -229,7 +256,7 @@ struct Live {
     /// output never commits — a disabled or disconnected monitor — never gets
     /// one, and that has to be reported rather than waited on forever.
     first_wait_started: Instant,
-    pending: Option<Pending>,
+    pending: VecDeque<Pending>,
 }
 
 /// The protocol state of one connection to the compositor.
@@ -403,7 +430,7 @@ impl WindowCapture {
             last_slot: None,
             ever_had_frames: false,
             first_wait_started: Instant::now(),
-            pending: None,
+            pending: VecDeque::new(),
         });
 
         let deadline = Instant::now() + CONSTRAINTS_TIMEOUT;
@@ -593,7 +620,7 @@ impl WindowCapture {
                 "no window capture session is running".into(),
             ));
         };
-        if let Some(pending) = live.pending.take() {
+        for pending in live.pending.drain(..) {
             pending.frame.destroy();
         }
         let (fourcc, modifiers) = pick_format(&live.formats).ok_or_else(|| {
@@ -687,6 +714,96 @@ impl WindowCapture {
         Ok(())
     }
 
+    /// Submits capture requests while fewer than [`PIPELINE`] are in flight,
+    /// without waiting for an answer.
+    ///
+    /// The compositor answers a request with the source's next *commit*, and
+    /// nothing queues a commit for a client with no request outstanding: that
+    /// update is simply not copied.  A loop that sleeps between frames has to
+    /// arm *before* it sleeps — a request sent after the sleep lands past the
+    /// commit it was aiming at, and the frame that comes back is the one after
+    /// it.
+    ///
+    /// The chain a request starts is the window's next commit *and then* a
+    /// copy of its buffer, and for a 4K window that has the GPU it measured
+    /// 12.5 ms on this machine — two commit intervals of a 160 Hz screen.  A
+    /// loop that arms one interval before its slot therefore waits out the
+    /// difference on every frame and lands at half the rate it asked for; the
+    /// wait is why the frame is stamped on the clock rather than on its
+    /// arrival (see the note on `next_frame_at` in `record::window::loop_over`).
+    ///
+    /// Arming again is not an error and not a request: with [`PIPELINE`]
+    /// already in flight this does nothing.
+    pub fn arm(&mut self) -> Result<()> {
+        let Some(live) = self.state.live.as_mut() else {
+            return Err(VshotError::WaylandProtocol(
+                "no window capture session is running".into(),
+            ));
+        };
+        if live.stopped || live.pending.len() >= PIPELINE {
+            return Ok(());
+        }
+        let Some(shape) = live.shape else {
+            return Err(VshotError::WaylandProtocol(
+                "no window capture session is running".into(),
+            ));
+        };
+        // A resize whose new constraints have not been dispatched yet: the
+        // pool no longer matches the source, and `grab` is what reports it.
+        // Nothing is armed into a buffer the compositor has already refused.
+        if live.buffer_size != Some((shape.width, shape.height)) {
+            return Ok(());
+        }
+        let qh = self.event_queue.handle();
+        // Two kinds of slot are not free to write again.  An in-flight request
+        // is aimed at one: the compositor is told which buffer each request
+        // fills, and two requests aimed at one buffer would race.  The slot the
+        // last frame was delivered in is the other: the caller still holds that
+        // frame — it is being encoded, or a replay is holding it to re-send —
+        // and the loop asks for the next frame *before* it lets go, so a
+        // request landing there would have the compositor overwrite a buffer
+        // that is still being read.  Held out for one frame only: the slot of
+        // the frame after this one is free again.
+        let slots = live.slots.len();
+        let mut slot = live.next;
+        let mut tries = 0;
+        while tries < slots
+            && (live.pending.iter().any(|pending| pending.slot == slot)
+                || live.last_slot == Some(slot))
+        {
+            slot = (slot + 1) % slots.max(1);
+            tries += 1;
+        }
+        if tries >= slots {
+            return Ok(());
+        }
+        live.next = (slot + 1) % slots.max(1);
+        let frame = live.session.create_frame(&qh, ());
+        let Some(pooled) = live.slots.get(slot) else {
+            return Err(VshotError::WaylandProtocol(
+                "the window capture pool is empty".into(),
+            ));
+        };
+        frame.attach_buffer(&pooled.wl_buffer);
+        // Every frame damages the whole buffer: the compositor may use the
+        // damage to copy less, and a client that does not track damage is
+        // told to damage everything.
+        frame.damage_buffer(
+            0,
+            0,
+            i32::try_from(shape.width).unwrap_or(i32::MAX),
+            i32::try_from(shape.height).unwrap_or(i32::MAX),
+        );
+        frame.capture();
+        live.pending.push_back(Pending {
+            frame,
+            slot,
+            ready: false,
+            failed: None,
+        });
+        Ok(())
+    }
+
     /// Asks for one frame and waits up to `wait` for it.  A frame that does not
     /// arrive in time is not lost: it stays in flight and the next call picks
     /// it up (see [`Capture::Idle`]).
@@ -694,6 +811,9 @@ impl WindowCapture {
         if interrupted.load(Ordering::Relaxed) {
             return Ok(Capture::Interrupted);
         }
+        // Armed here too, so a caller that never arms explicitly still has a
+        // request in flight before it waits.
+        self.arm()?;
         let Some(live) = self.state.live.as_mut() else {
             return Err(VshotError::WaylandProtocol(
                 "no window capture session is running".into(),
@@ -745,39 +865,11 @@ impl WindowCapture {
                 fourcc,
             });
         }
-        if live.pending.is_none() {
-            let qh = self.event_queue.handle();
-            let slot = live.next;
-            let frame = live.session.create_frame(&qh, ());
-            let Some(pooled) = live.slots.get(slot) else {
-                return Err(VshotError::WaylandProtocol(
-                    "the window capture pool is empty".into(),
-                ));
-            };
-            frame.attach_buffer(&pooled.wl_buffer);
-            // Every frame damages the whole buffer: the compositor may use the
-            // damage to copy less, and a client that does not track damage is
-            // told to damage everything.
-            frame.damage_buffer(
-                0,
-                0,
-                i32::try_from(shape.width).unwrap_or(i32::MAX),
-                i32::try_from(shape.height).unwrap_or(i32::MAX),
-            );
-            frame.capture();
-            live.pending = Some(Pending {
-                frame,
-                slot,
-                ready: false,
-                failed: None,
-            });
-        }
-
         let wait = self.wait_for(Instant::now() + wait, Some(interrupted), |state| {
             state
                 .live
                 .as_ref()
-                .and_then(|live| live.pending.as_ref())
+                .and_then(|live| live.pending.front())
                 .is_some_and(|pending| pending.ready || pending.failed.is_some())
         })?;
         if matches!(wait, Wait::Interrupted) {
@@ -792,7 +884,7 @@ impl WindowCapture {
                 "the window capture session disappeared mid-frame".into(),
             ));
         };
-        let Some(pending) = live.pending.take() else {
+        let Some(pending) = live.pending.pop_front() else {
             return Ok(Capture::Idle);
         };
         pending.frame.destroy();
@@ -1193,13 +1285,34 @@ fn describe_names(names: &[&Name]) -> String {
 /// ambiguous here; what it has to name is the focused window, and there is
 /// only one of those.
 ///
-/// Following is deliberately one-way: a window outside the list never pauses
-/// or redirects the recording, it only fails to move it.  That is what makes a
-/// recording of "these two" possible on a desktop where the user keeps
-/// clicking something else.
+/// Following is one-way, and always has been: a window outside the list never
+/// pauses or redirects a session, it only fails to move it.  That is what makes
+/// "these two" possible on a desktop where the user keeps clicking something
+/// else — and it is what a *replay* wants too.  A replay cannot be *moved* the
+/// way a recording is — one ring holds one frame size, and the new window would
+/// have to be fitted into the old canvas — but it can stay: a focus outside the
+/// list leaves it recording the window it is on, so the moment a user is about
+/// to save is never the moment it stopped.  A followed replay records whenever
+/// *any* of its windows is on the screen; only all of them being gone leaves it
+/// with nothing to record, and that is the replay supervisor's state, not a
+/// report's — see [`Follow::decide`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Follow {
     filters: Vec<String>,
+}
+
+/// What a focus report means to a session that is already running.
+///
+/// The two answers are the two things a session can do with one: stay exactly
+/// where it is, or move (a recording) / restart (a replay) on the window the
+/// focus landed on.  A focus on a window outside the list is a `Stay` for both
+/// — see the note on [`Follow`] above.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FollowDecision {
+    /// Leave the session exactly where it is.
+    Stay,
+    /// Move (or restart) it on this window of the list.
+    Switch(usize),
 }
 
 impl Follow {
@@ -1272,6 +1385,34 @@ impl Follow {
         )))
     }
 
+    /// What to do about the window the focus is on, now that it has moved.
+    ///
+    /// The focus outside the whitelist is a `Stay`: following is one-way, and a
+    /// window the user clicked elsewhere only fails to move the session — what
+    /// it must not do is stop it, because the moment a user leaves a game is
+    /// exactly the moment they may want to save it.
+    ///
+    /// A followed window this compositor cannot find in its own list — the two
+    /// answers describe it differently — is a `Stay` too: the session is on a
+    /// window that is still producing frames, and tearing it down over a report
+    /// that cannot be acted on would lose the history for nothing.
+    pub fn decide(
+        &self,
+        names: &[&Name],
+        app_id: &str,
+        title: &str,
+        current: &Name,
+    ) -> FollowDecision {
+        if !self.matches(app_id, title) {
+            return FollowDecision::Stay;
+        }
+        match match_description(names, app_id, title) {
+            Ok(index) if current.same_as(names[index]) => FollowDecision::Stay,
+            Ok(index) => FollowDecision::Switch(index),
+            Err(_) => FollowDecision::Stay,
+        }
+    }
+
     /// Which window a focus check should move the recording to, or `None` to
     /// leave it exactly where it is.
     ///
@@ -1287,18 +1428,10 @@ impl Follow {
         title: &str,
         current: &Name,
     ) -> Option<usize> {
-        let index = self.focused(names, app_id, title)?;
-        let target = names[index];
-        // The compositor's own identifier would be the sharper answer, but the
-        // toplevel list has been re-read since the recording started and the
-        // two names describe the same window: the capture was started on a
-        // window of this app id and title, and the focus is on a window of the
-        // same two.  Two windows that agree on both are interchangeable to
-        // `--follow` anyway, because that is what its entries match on.
-        if target.app_id == current.app_id && target.title == current.title {
-            return None;
+        match self.decide(names, app_id, title, current) {
+            FollowDecision::Switch(index) => Some(index),
+            FollowDecision::Stay => None,
         }
-        Some(index)
     }
 }
 
@@ -1428,7 +1561,7 @@ impl Dispatch<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1, (
             ext_image_copy_capture_session_v1::Event::Done => live.constraints_done = true,
             ext_image_copy_capture_session_v1::Event::Stopped => {
                 live.stopped = true;
-                live.pending = None;
+                live.pending.clear();
             }
             ext_image_copy_capture_session_v1::Event::DmabufDevice { device } => {
                 live.dmabuf_device = device;
@@ -1449,12 +1582,13 @@ impl Dispatch<ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1, ()> f
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        let Some(pending) = state.live.as_mut().and_then(|live| live.pending.as_mut()) else {
+        let Some(pending) = state.live.as_mut().and_then(|live| {
+            live.pending
+                .iter_mut()
+                .find(|pending| &pending.frame == frame)
+        }) else {
             return;
         };
-        if &pending.frame != frame {
-            return;
-        }
         match event {
             ext_image_copy_capture_frame_v1::Event::Ready => pending.ready = true,
             ext_image_copy_capture_frame_v1::Event::Failed { reason } => {
@@ -1796,5 +1930,87 @@ mod tests {
         let follow = Follow::new(vec!["Game A".into()]);
         let error = follow.start(&names, None).unwrap_err().to_string();
         assert!(error.contains("none of the windows to follow"), "{error}");
+    }
+
+    #[test]
+    fn a_focus_outside_the_list_leaves_the_session_where_it_is() {
+        let game = window("game", "Game A");
+        let chat = window("discord", "Discord");
+        let names = [&game, &chat];
+        let follow = Follow::new(vec!["Game A".into()]);
+        // The window being recorded, still focused: nothing to do.
+        assert_eq!(
+            follow.decide(&names, "game", "Game A", &game),
+            FollowDecision::Stay
+        );
+        // The focus on a window the list does not name: still nothing to do.
+        // Following is one-way for both shapes of session — a recording keeps
+        // its file going and a replay keeps the window it is on, so the moment
+        // the user stepped away is not a hole in either of them.
+        assert_eq!(
+            follow.decide(&names, "discord", "Discord", &game),
+            FollowDecision::Stay
+        );
+        assert_eq!(follow.retarget(&names, "discord", "Discord", &game), None);
+        // A focus on the *other* followed window is a move, which is the one
+        // answer that ends an attach.
+        assert_eq!(
+            follow.decide(&names, "game", "Game A", &chat),
+            FollowDecision::Switch(0)
+        );
+    }
+
+    #[test]
+    fn a_followed_window_the_list_cannot_name_is_stayed_on() {
+        // The compositor's two answers disagree: the focus says `game`/`Game
+        // A`, and the toplevel list only has the chat window.  There is nothing
+        // to move to, and the session is still producing frames, so it stays.
+        let chat = window("discord", "Discord");
+        let current = window("game", "Game A");
+        let names = [&chat];
+        let follow = Follow::new(vec!["Game A".into()]);
+        assert_eq!(
+            follow.decide(&names, "game", "Game A", &current),
+            FollowDecision::Stay
+        );
+    }
+
+    #[test]
+    fn a_window_that_renamed_itself_is_the_window_already_recorded() {
+        // The identifier is the compositor's own answer to "the same window",
+        // and the only one a title change cannot break: a browser loading a
+        // page would otherwise read as another window and re-open the capture.
+        let current = window("mpv", "episode 1");
+        let mut renamed = current.clone();
+        renamed.title = "episode 2".to_owned();
+        let names = [&renamed];
+        let follow = Follow::new(vec!["mpv".into()]);
+        assert_eq!(
+            follow.decide(&names, "mpv", "episode 2", &current),
+            FollowDecision::Stay
+        );
+        assert_eq!(follow.retarget(&names, "mpv", "episode 2", &current), None);
+        // The same app id and title under another identifier is another window,
+        // which is what two terminals titled alike are to the compositor.
+        let other = window("mpv", "episode 2");
+        let names = [&other];
+        assert_eq!(
+            follow.decide(&names, "mpv", "episode 2", &current),
+            FollowDecision::Switch(0)
+        );
+    }
+
+    #[test]
+    fn a_follow_switch_points_at_the_focused_window() {
+        let game_a = window("game", "Game A");
+        let game_b = window("game", "Game B");
+        let names = [&game_a, &game_b];
+        let follow = Follow::new(vec!["Game A".into(), "Game B".into()]);
+        assert_eq!(
+            follow.decide(&names, "game", "Game B", &game_a),
+            FollowDecision::Switch(1)
+        );
+        // Which is the switch a recording makes in place.
+        assert_eq!(follow.retarget(&names, "game", "Game B", &game_a), Some(1));
     }
 }

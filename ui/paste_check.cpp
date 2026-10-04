@@ -427,7 +427,11 @@ void checkToolbarButton()
     // It sits on the command bar beside the tools: it is the same kind of thing
     // to click, and a second row of text buttons only made the bar taller.
     auto *confirm = surface->findChild<QPushButton *>(QStringLiteral("confirmButton"));
-    expect(confirm != nullptr && paste->parentWidget() == confirm->parentWidget(),
+    // Both on the one card.  It is an ancestor rather than the immediate parent
+    // that says so: the command buttons are children of the flow that fills the
+    // rows, which is itself the card's first item, and only the ends are still
+    // direct children of the card.
+    expect(confirm != nullptr && surface->isAncestorOf(paste) && surface->isAncestorOf(confirm),
            "the paste button shares the command bar with OK");
     if (confirm == nullptr) {
         return;
@@ -458,7 +462,8 @@ void checkToolbarButton()
     QLayout *pasteRow = rowOf(paste);
     QLayout *endsBlock = rowOf(confirm);
     auto *card = qobject_cast<QBoxLayout *>(surface->layout());
-    QLayout *column = card != nullptr && card->count() > 0 ? card->itemAt(0)->layout() : nullptr;
+    QWidget *flow = card != nullptr && card->count() > 0 ? card->itemAt(0)->widget() : nullptr;
+    QLayout *column = flow != nullptr ? flow->layout() : nullptr;
     expect(pasteRow != nullptr && pasteRow != endsBlock && column != nullptr &&
                indexOfLayout(column, pasteRow) == 1,
            "the paste button sits in the actions row, under the tools");
