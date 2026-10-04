@@ -662,6 +662,9 @@ void checkRoundTripOfEveryField()
     written.cli.recordEncoder = QStringLiteral("hevc");
     written.cli.recordEncoderBackend = QStringLiteral("nvenc");
     written.cli.recordFps = 120;
+    written.cli.recordBitrate = 150;
+    written.cli.recordQualitySet = true;
+    written.cli.recordQuality = 0;
     written.cli.recordPortal = true;
     written.cli.recordMicEnabled = true;
     written.cli.recordMic = QStringLiteral("alsa_input.pci-0000_2f_00.4.analog-stereo");
@@ -672,6 +675,9 @@ void checkRoundTripOfEveryField()
     written.cli.replayEncoder = QStringLiteral("av1");
     written.cli.replayEncoderBackend = QStringLiteral("vaapi");
     written.cli.replayFps = 24;
+    written.cli.replayBitrate = 60;
+    written.cli.replayQualitySet = true;
+    written.cli.replayQuality = 200;
     written.cli.replayPortal = true;
     written.cli.replayMicEnabled = true;
     written.cli.replayMic = QStringLiteral("alsa_input.usb");
@@ -725,6 +731,13 @@ void checkRoundTripOfEveryField()
            "cli.record.encoder-backend round-trips", read.cli.recordEncoderBackend);
     expect(read.cli.recordFps == written.cli.recordFps, "cli.record.fps round-trips",
            QString::number(read.cli.recordFps));
+    expect(read.cli.recordBitrate == written.cli.recordBitrate,
+           "cli.record.bitrate round-trips", QString::number(read.cli.recordBitrate));
+    // A remembered level of *zero* is the case the pair of fields exists for: it
+    // is a level, and a reader that spelled "unset" with a zero would lose it.
+    expect(read.cli.recordQualitySet && read.cli.recordQuality == 0,
+           "cli.record.quality round-trips a level of zero",
+           QString::number(read.cli.recordQuality));
     expect(read.cli.recordPortal, "cli.record.portal round-trips");
     expect(read.cli.recordMicEnabled && read.cli.recordMic == written.cli.recordMic,
            "cli.record.mic round-trips", read.cli.recordMic);
@@ -741,6 +754,10 @@ void checkRoundTripOfEveryField()
            "cli.replay.encoder-backend round-trips", read.cli.replayEncoderBackend);
     expect(read.cli.replayFps == written.cli.replayFps, "cli.replay.fps round-trips",
            QString::number(read.cli.replayFps));
+    expect(read.cli.replayBitrate == written.cli.replayBitrate,
+           "cli.replay.bitrate round-trips", QString::number(read.cli.replayBitrate));
+    expect(read.cli.replayQualitySet && read.cli.replayQuality == written.cli.replayQuality,
+           "cli.replay.quality round-trips", QString::number(read.cli.replayQuality));
     expect(read.cli.replayPortal, "cli.replay.portal round-trips");
     expect(read.cli.replayMicEnabled && read.cli.replayMic == written.cli.replayMic,
            "cli.replay.mic round-trips", read.cli.replayMic);
@@ -825,6 +842,23 @@ void checkRoundTripOfEveryField()
         vshot::saveConfig(probe);
         expect(!vshot::loadConfig().cli.recordMicEnabled,
                "silence is the absent key, not an empty one");
+    }
+
+    // The level's two fields: a number outside the widest encoder's range reads
+    // as "the file said nothing", and a file that says nothing about the level
+    // must not come back claiming a level of zero -- which is a level.
+    {
+        vshot::Config probe = written;
+        probe.cli.recordQualitySet = false;
+        probe.cli.recordQuality = 0;
+        probe.cli.replayQualitySet = true;
+        probe.cli.replayQuality = vshot::kMaxQuality + 1;
+        vshot::saveConfig(probe);
+        const vshot::Config defaulted = vshot::loadConfig();
+        expect(!defaulted.cli.recordQualitySet,
+               "an unnamed level is the absent key, not a level of zero");
+        expect(!defaulted.cli.replayQualitySet, "a level out of range reads as unset",
+               QString::number(defaulted.cli.replayQuality));
     }
 
     // The names the settings window offers have to be the names the loader
@@ -1037,22 +1071,38 @@ void checkTheShortcutDefaultsAreReachable()
                QStringLiteral("%1 <- %2").arg(vshot::shortcutBinding(probe.action).id,
                                               pressed.toString()));
     }
-    // The two held modifiers are read from the state of the keyboard rather
-    // than from a key press, and Qt will not parse a lone "Alt" -- so they get
+    // The held modifiers are read from the state of the keyboard rather than
+    // from a key press, and Qt will not parse a lone "Shift" -- so they get
     // their own reader and their own check.  There used to be a third, the
     // drag-selection modifier, but the drag it gated is the middle button's
     // now: a button cannot be read from the keyboard's state at all, so there
     // is nothing left here for it to be.
-    expect(keys.held(vshot::ShortcutAction::PreserveAspect, Qt::AltModifier),
+    expect(keys.held(vshot::ShortcutAction::PreserveAspect, Qt::ShiftModifier),
            "the aspect-ratio modifier is read while it is held");
-    expect(keys.held(vshot::ShortcutAction::CoarseStep, Qt::ShiftModifier),
+    expect(keys.held(vshot::ShortcutAction::CoarseStep, Qt::ControlModifier),
            "the coarse step modifier is read while it is held");
-    // A modifier that is *not* the one an action wants must not count as held:
-    // Ctrl+Alt is a Ctrl drag to the compositor, not an Alt-resize.
+    expect(keys.held(vshot::ShortcutAction::SelectMark, Qt::ControlModifier),
+           "the pick-up modifier is read while it is held");
+    // The pick-up key is the coarse step's key as well, and this is the one pair
+    // here that shares: the walk reads Ctrl off an arrow key, the pick-up reads
+    // it off a mouse press, and no gesture is both.  What has to be pinned down
+    // is that each of them still answers on its own -- a table that let the
+    // second Ctrl entry overwrite the first would leave the walk stepping one
+    // pixel, or the pick-up taking nothing.
+    expect(keys.held(vshot::ShortcutAction::CoarseStep, Qt::ControlModifier),
+           "and the coarse step has not lost its key to it");
+    // The aspect key is a different key, and answers to nothing else: Shift
+    // squares a shape, Ctrl takes a mark, and a press can mean both at once.
+    expect(!keys.held(vshot::ShortcutAction::SelectMark, Qt::ShiftModifier),
+           "the aspect key does not pick a mark up");
     expect(!keys.held(vshot::ShortcutAction::PreserveAspect, Qt::ControlModifier),
-           "a modifier that is not the bound one does not count as held");
+           "the pick-up key does not constrain a shape");
+    // A modifier that is *not* the one an action wants must not count as held:
+    // Alt is neither of these two keys, so it is held for neither.
+    expect(!keys.held(vshot::ShortcutAction::SelectMark, Qt::AltModifier),
+           "a modifier the pick-up does not answer to does not count as held");
     expect(keys.held(vshot::ShortcutAction::PreserveAspect,
-                     Qt::ControlModifier | Qt::AltModifier),
+                     Qt::ControlModifier | Qt::ShiftModifier),
            "the bound modifier still counts when another is down beside it");
 }
 

@@ -653,6 +653,15 @@ pub fn parse_hyprland_active_window(bytes: &[u8]) -> Result<ActiveWindow> {
     let value: Value = serde_json::from_slice(bytes).map_err(|error| {
         VshotError::ActiveWindowUnavailable(format!("invalid Hyprland JSON: {error}"))
     })?;
+    // An empty object is Hyprland saying the focus is not on a window at all —
+    // the desktop itself has it — which is a state rather than a broken reply,
+    // and worth its own sentence: the answer is relayed to the user by
+    // `record window active` and by a replay's standby state.
+    if value.get("at").is_none() && value.get("class").is_none() && value.get("title").is_none() {
+        return Err(VshotError::ActiveWindowUnavailable(
+            "no window has the focus".into(),
+        ));
+    }
     let at = pair_i32(&value, "at")?;
     let size = pair_u32(&value, "size")?;
     if size.0 == 0 || size.1 == 0 {

@@ -245,8 +245,9 @@ vshot-%Y%m%d-%H%M%S.mp4（先取 $XDG_VIDEOS_DIR，再取 xdg-user-dirs 那个�
 
 没能开始的录制不会留下任何文件；进程被强行杀掉时留下的文件缺少采样表。
 
-配置键：`cli.record` 提供 `encoder`、`encoder-backend`、`fps`、`portal`、`mic`、`follow` 与
-`notify`；命令行永远压过文件，记着的 `follow` 列表只在不带窗口名的 `record window` 上生效。
+配置键：`cli.record` 提供 `encoder`、`encoder-backend`、`bitrate`、`quality`、`fps`、`portal`、
+`mic`、`follow` 与 `notify`；命令行永远压过文件，记着的 `follow` 列表只在不带窗口名的
+`record window` 上生效。
 
 VSHOT_RECORD_PIDFILE 覆盖 `stop` 读的 pid 文件，VSHOT_RECORD_DEBUG=1 追踪每帧的阶段，
 VSHOT_RECORD_NO_OVERLAY=1 强制黑边走备用合成路径而不是 GPU overlay。"#,
@@ -303,9 +304,9 @@ wlroots 会话上合成器把这块矩形直接渲染进 dma-buf，与 `record m
 流拷贝，不重新编码——所以触发几乎不花时间，触发之前不落盘。`--window` 秒就是一次保存能往回
 够到的范围。
 
-`replay start` 跑起会话，`replay save` 让它写文件，`replay status` 打印它握着多少历史，
-`replay stop` 结束它。控制通道是 $XDG_RUNTIME_DIR 下的一个 socket，所以 save 与 stop 不需要
-显示器，可以直接绑快捷键：
+`replay start` 跑起会话，`replay save` 让它写文件，`replay status` 打印它握着多少历史、
+以及现在是否在录（窗口回录在名单里的窗口全都关掉时才是待机：会话还在，只是没在录），`replay stop` 结束它。
+控制通道是 $XDG_RUNTIME_DIR 下的一个 socket，所以 save 与 stop 不需要显示器，可以直接绑快捷键：
     bind = SUPER SHIFT, R, exec, vshot replay save
 
 目标与 `record` 相同，帧来自相同的捕获后端、走相同的 GPU 编码器。`--fps` 默认 30（录制默认
@@ -314,9 +315,9 @@ wlroots 会话上合成器把这块矩形直接渲染进 dma-buf，与 `record m
 一次保存从「不晚于 `now - seconds` 的最后一个关键帧」开始，所以它至少有你要求的秒数；要的比
 环里有的还多就给全部。`--background` 让会话脱离终端。
 
-配置键：`cli.replay` 提供 `window`、`encoder`、`encoder-backend`、`fps`、`gop`、`mic`、
-`follow`、`portal`、`save-dir` 与 `notify`；命令行永远压过文件，记着的 `follow` 列表只在
-不带窗口名的 `replay start window` 上生效。
+配置键：`cli.replay` 提供 `window`、`encoder`、`encoder-backend`、`bitrate`、`quality`、`fps`、
+`gop`、`mic`、`follow`、`portal`、`save-dir` 与 `notify`；命令行永远压过文件，记着的 `follow`
+列表只在不带窗口名的 `replay start window` 上生效。
 
 VSHOT_REPLAY_SOCKET 覆盖控制 socket，VSHOT_REPLAY_PIDFILE 覆盖 `replay stop` 读的 pid 文件，
 VSHOT_RECORD_DEBUG=1 追踪每一帧。"#,
@@ -349,10 +350,20 @@ Qt overlay 拖出矩形，确认之前不打开任何设备、不创建任何文
         "回录一扇窗自己的像素，而不是它所在的屏幕区域",
         r#"与 `record window` 相同的路线：合成器把窗口本身复制给你，所以被盖住、被拖到屏幕外的窗口
 也录得完整。窗口按 app id 或标题指定，`--pick` 点选，不写就是焦点那扇。窗口被缩放时会适配进
-回录的画布（缩小、居中、加黑边），因为一个环只有一个帧尺寸。"#,
+回录的画布（缩小、居中、加黑边），因为一个环只有一个帧尺寸。
+
+但不会一直录同一扇：回录只有一个环、一个帧尺寸，所以**切窗口就换一段**——按新窗口自己的尺寸
+重开，旧窗口环里的内容随之丢弃。带 `--follow` 时，名单里只要有窗口开着就录（焦点在哪扇就录哪
+扇，焦点在别处则留在当前这扇），**全部关掉**才进入待机（不抓帧、不占编码器），等其中一扇回来
+而不是结束会话。待机**不丢历史**：最近一扇窗留下的那几秒还留在内存里，`replay save` 照样写得
+出来。`replay status` 会说明当前是在录还是待机。"#,
     ),
     ("replay save", "把正在跑的会话的历史写成一个文件", ""),
-    ("replay status", "打印正在跑的会话握有多少历史", ""),
+    (
+        "replay status",
+        "打印正在跑的会话握有多少历史，以及它是不是在录：`0.0\t0\tidle` 表示还没有录过任何窗口",
+        "",
+    ),
     ("replay stop", "结束正在跑的回录会话", ""),
     (
         "ocr",
@@ -520,7 +531,7 @@ const ARGS: &[(&str, &str)] = &[
     ),
     (
         "follow",
-        "焦点在这些窗口之间移动时换源：给若干窗口名（`--follow NAME`，可重复）。只有 `record window` 与 `replay start window`，且不能与窗口 NAME 或 `--pick` 同用；不写时跟随配置里 `cli.record.follow` / `cli.replay.follow` 记着的窗口。",
+        "焦点在这些窗口之间移动时换源：给若干窗口名（`--follow NAME`，可重复）。只有 `record window` 与 `replay start window`，且不能与窗口 NAME 或 `--pick` 同用；不写时跟随配置里 `cli.record.follow` / `cli.replay.follow` 记着的窗口。**回录和录像一样是单向跟随**：焦点在哪扇就录哪扇，焦点落在别处则继续录当前这一扇（历史一律保留），焦点换到名单里的另一扇则**按那扇自己的尺寸重开一段**（旧窗口环里的内容丢弃）；名单里的窗口**全部关掉**才进入待机（不抓帧、不占编码器，环里的历史仍在，`save` 仍写得出来）。",
     ),
     (
         "no_follow",
@@ -533,6 +544,14 @@ const ARGS: &[(&str, &str)] = &[
     (
         "encoder_backend",
         "硬件编码后端：auto（默认；VAAPI 优先，其次 Vulkan，最后 NVENC）、vaapi、vulkan 或 nvenc；不写时跟随配置里的 `cli.record.encoder-backend` / `cli.replay.encoder-backend`。三者都在 GPU 的媒体引擎上编码。",
+    ),
+    (
+        "bitrate",
+        "目标码率（Mbit/s）；不写时跟随配置里的 `cli.record.bitrate` / `cli.replay.bitrate`，两者都没有时用内置的 45。",
+    ),
+    (
+        "quality",
+        "编码器的质量档位，按编码器自己的尺度：h264 与 hevc 是 0-51，av1 是 0-255，两者都是 0 最贵。写多少就是多少，**不会在编码器之间换算**。给了档位就变成「质量优先」——编码器守住这一档、最多花到目标码率，而不是把码率花完；不写时跟随配置里的 `cli.record.quality` / `cli.replay.quality`。",
     ),
     (
         "portal",

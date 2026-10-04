@@ -24,6 +24,8 @@
 #include <QBoxLayout>
 #include <QColor>
 #include <QCoreApplication>
+#include <QElapsedTimer>
+#include <QEventLoop>
 #include <QFontMetrics>
 #include <QFrame>
 #include <QGridLayout>
@@ -42,6 +44,7 @@
 #include <QString>
 #include <QStyle>
 #include <QStyleOptionButton>
+#include <QTimer>
 #include <QToolButton>
 #include <QWidget>
 
@@ -99,8 +102,26 @@ struct ToolbarParts {
     QWidget *style = nullptr;
 };
 
+// Waits for the command bar's flow to finish moving its buttons.
+//
+// The rows are filled when the panel is given its width, and a button that
+// changes row travels to the new one rather than jumping: anything that
+// measures where a button *is* has to let the transition arrive first, or it
+// reads a position the button is halfway through leaving.  Longer than the
+// transition takes, so what the assertions see is where the buttons stay.
+void waitForReflow()
+{
+    QEventLoop loop;
+    QTimer::singleShot(250, &loop, &QEventLoop::quit);
+    loop.exec();
+}
+
 ToolbarParts toolbarParts(vshot::CaptureOverlay *overlay)
 {
+    // Nothing here means anything until the panel has been laid out once: the
+    // command bar is filled from the width the card ends up with, and the width
+    // is not known until then.
+    waitForReflow();
     ToolbarParts parts;
     parts.command = overlay->findChild<QWidget *>(QStringLiteral("toolbarCommandSurface"));
     parts.style = overlay->findChild<QWidget *>(QStringLiteral("toolbarStyleRow"));
@@ -114,15 +135,24 @@ QBoxLayout *cardLayout(QWidget *command)
     return command != nullptr ? qobject_cast<QBoxLayout *>(command->layout()) : nullptr;
 }
 
-// One of the two rows of that column: 0 is the drawing tools, 1 is everything
-// that acts on the capture.
-QLayout *commandRow(QWidget *command, int index)
+// The column the two rows live in.  It is a widget of its own -- the flow that
+// fills the rows and reports the width the card asks for -- so the card's first
+// item is that widget and the column is its layout.
+QLayout *commandColumn(QWidget *command)
 {
     QBoxLayout *card = cardLayout(command);
     if (card == nullptr || card->count() < 1) {
         return nullptr;
     }
-    QLayout *column = card->itemAt(0)->layout();
+    QWidget *flow = card->itemAt(0)->widget();
+    return flow != nullptr ? flow->layout() : nullptr;
+}
+
+// One of the two rows of that column: 0 is the drawing tools, 1 is everything
+// that acts on the capture.
+QLayout *commandRow(QWidget *command, int index)
+{
+    QLayout *column = commandColumn(command);
     if (column == nullptr || column->count() <= index) {
         return nullptr;
     }
@@ -439,8 +469,7 @@ void checkCommandBarIsTwoRows()
         expect(false, "the toolbar has a command bar");
         return;
     }
-    QBoxLayout *card = cardLayout(parts.command);
-    QLayout *column = card != nullptr && card->count() > 0 ? card->itemAt(0)->layout() : nullptr;
+    QLayout *column = commandColumn(parts.command);
     expect(column != nullptr && column->count() == 2, "the command bar is two rows",
            QStringLiteral("%1 of them").arg(column != nullptr ? column->count() : -1));
     if (column == nullptr || column->count() != 2) {
@@ -477,15 +506,16 @@ void checkCommandBarIsTwoRows()
     // rest are the actions.  Every one of them is in one of the two rows: the
     // history pair is in the grid in the corner and is not counted here.
     //
-    // Eleven, not twelve: the Select tool is gone, so the ten drawing tools are
-    // joined by the eyedropper alone.
+    // Twelve: the ten drawing tools, the eyedropper, and Select -- which paints
+    // nothing but is still a tool the bar has a button for, and the one that
+    // says the editor is not drawing.
     int tools = 0;
     for (QAbstractButton *button : buttons) {
         if (!button->property("tool").toString().isEmpty()) {
             ++tools;
         }
     }
-    expect(tools == 11, "the drawing tools are among them",
+    expect(tools == 12, "the drawing tools are among them",
            QStringLiteral("%1 of them").arg(tools));
 
     auto *paste = parts.command->findChild<QToolButton *>(QStringLiteral("pasteButton"));
@@ -756,6 +786,11 @@ void checkTheEndsArePinnedToTheRight()
             }
         }
     }
+    waitForReflow();
+    // The rows have just been measured against a card that was laid out for
+    // them, so let any transition in flight finish before reading where the
+    // buttons are: a button that changed row is still on its way.
+    waitForReflow();
     expect(rightOfRows < undoRect.left(),
            "and the two rows of buttons are to their left",
            QStringLiteral("rows end at %1, the ends start at %2")
@@ -809,12 +844,133 @@ void checkTheEndsArePinnedToTheRight()
                .arg(parts.command->width()));
 }
 
+// The width a command button is laid out at: its own hint inside the size it
+// was fixed to, which is the number `QWidget::sizeHint` does not give -- a text
+// button answers with the width of its own label, and the tools are all fixed to
+// the widest label in the row.
+int buttonWidth(QAbstractButton *button)
+{
+    return button->sizeHint()
+        .expandedTo(button->minimumSize())
+        .boundedTo(button->maximumSize())
+        .width();
+}
+
+// The command bar is a flow: the first row takes every button that fits the
+// width the card actually has, and the rest wrap below it.
+//
+// The rule it replaced cut the list once, into two rows of the same length, and
+// that cut was the card's width from then on -- which is the wrong shape for a
+// card whose width follows the style row under it, because most tools leave that
+// row narrower than the buttons and a wider one used to buy nothing but a band
+// of empty card past the end of the second row.
+//
+// What is asserted is the property rather than the arrangement: the first row is
+// full, the button that opens the second row is one that would not have fitted
+// above it, and nothing overflows the row it is in.
+void checkTheFirstRowIsFilledAndTheRestWrap()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(
+        sessionFor(vshot::LogicalRect{200, 300, 800, 500}, QSize(1920, 1080)));
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    overlay->show();
+    controller.beginPresetEdit();
+    // An unarmed session: the card is the buttons' own width rather than a wide
+    // style row's, so what is measured is the flow filling what it was given.
+    controller.chooseTool(std::nullopt);
+    const ToolbarParts parts = toolbarParts(overlay);
+    if (parts.command == nullptr) {
+        expect(false, "the toolbar has a command bar");
+        return;
+    }
+    QWidget *flow = parts.command->findChild<QWidget *>(QStringLiteral("toolbarCommandFlow"));
+    QLayout *first = commandRow(parts.command, 0);
+    QLayout *second = commandRow(parts.command, 1);
+    if (flow == nullptr || first == nullptr || second == nullptr) {
+        expect(false, "the command bar is a flow of two rows");
+        return;
+    }
+    const auto buttonsIn = [](QLayout *row) {
+        QVector<QAbstractButton *> buttons;
+        for (int i = 0; i < row->count(); ++i) {
+            if (auto *button = qobject_cast<QAbstractButton *>(row->itemAt(i)->widget())) {
+                buttons.append(button);
+            }
+        }
+        return buttons;
+    };
+    const QVector<QAbstractButton *> firstRow = buttonsIn(first);
+    const QVector<QAbstractButton *> secondRow = buttonsIn(second);
+    // The two stretches that keep each row packed to the left are items of the
+    // rows too, and they are not buttons.
+    expect(firstRow.size() + secondRow.size() ==
+               flow->findChildren<QAbstractButton *>().size(),
+           "every button of the bar is on one of the two rows",
+           QStringLiteral("%1 of %2")
+               .arg(firstRow.size() + secondRow.size())
+               .arg(flow->findChildren<QAbstractButton *>().size()));
+    expect(!firstRow.isEmpty() && !secondRow.isEmpty(), "both rows carry buttons",
+           QStringLiteral("%1 and %2 of them")
+               .arg(firstRow.size())
+               .arg(secondRow.size()));
+    if (firstRow.isEmpty() || secondRow.isEmpty()) {
+        return;
+    }
+
+    const int spacing = first->spacing();
+    const auto rowWidthOf = [spacing](const QVector<QAbstractButton *> &row) {
+        int width = 0;
+        for (int i = 0; i < row.size(); ++i) {
+            width += (i == 0 ? 0 : spacing) + buttonWidth(row.at(i));
+        }
+        return width;
+    };
+    const int filled = rowWidthOf(firstRow);
+    const int wrapped = rowWidthOf(secondRow);
+    const int available = flow->width();
+    expect(filled <= available, "the first row is filled only as far as it fits",
+           QStringLiteral("row %1 in %2").arg(filled).arg(available));
+    expect(filled + spacing + buttonWidth(secondRow.constFirst()) > available,
+           "and the button that opens the second row would not have fitted in it",
+           QStringLiteral("%1 + %2 + %3 against %4")
+               .arg(filled)
+               .arg(spacing)
+               .arg(buttonWidth(secondRow.constFirst()))
+               .arg(available));
+    expect(wrapped <= available, "the wrapped buttons fit the row they wrapped to",
+           QStringLiteral("row %1 in %2").arg(wrapped).arg(available));
+    // The card's own height is the rows it has: a flow that reported one row and
+    // drew two would have the panel clip the second.
+    expect(flow->height() >=
+               firstRow.constFirst()->height() + secondRow.constFirst()->height(),
+           "and the flow is as tall as the rows it carries",
+           QStringLiteral("%1 against %2 and %3")
+               .arg(flow->height())
+               .arg(firstRow.constFirst()->height())
+               .arg(secondRow.constFirst()->height()));
+
+    // The last button of the bar is the last button on it: filling the first row
+    // reorders nothing, it only decides where the row ends.
+    expect(secondRow.constLast() == flow->findChildren<QAbstractButton *>().constLast(),
+           "and the buttons keep the order they were built in");
+}
+
 // Every button on the command bar is one size, and that size is one the label
 // of the button actually fits in.
 //
 // The size is read from the style -- the widest label the row has to draw --
 // rather than picked by hand, so the promise worth locking down is not a number:
-// it is that the eleven tools share one box, that the actions which follow them
+// it is that the twelve tools share one box, that the actions which follow them
 // are as tall as that box, that the history pair and the two ends of the capture
 // are too, and that no button is narrower or shorter than its own size hint.
 // Undo and redo were 32x28 in a 46-tall row, which is what a floating box in the
@@ -889,7 +1045,7 @@ void checkCommandBarButtonsShareOneSize()
            QStringLiteral("%1 of %2").arg(squeezed).arg(buttons.size()));
 
     // The tools are one column rather than one per row: the widest of their
-    // labels sets the width of all eleven, so a tool that lands in the lower row
+    // labels sets the width of all twelve, so a tool that lands in the lower row
     // is the same size as one in the upper and the rows read across rather than
     // stepping.  And the width it comes to is exactly the widest hint -- not
     // more: a size measured before the buttons were polished is measured in the
@@ -919,7 +1075,7 @@ void checkCommandBarButtonsShareOneSize()
                              .arg(toolSize.height());
         }
     }
-    expect(toolCount == 11, "the eleven tools are on the bar",
+    expect(toolCount == 12, "the twelve tools are on the bar",
            QStringLiteral("%1 of them").arg(toolCount));
     expect(uniform == 0, "the drawing tools are all one size", toolDetail);
     expect(!toolSize.isEmpty() && toolSize.width() == widest,
@@ -1085,11 +1241,11 @@ void checkEveryToolDrawsItsOwnIcon()
             ++blank;
         }
     }
-    expect(counted == 11, "the two rows carry the eleven tools",
+    expect(counted == 12, "the two rows carry the twelve tools",
            QStringLiteral("%1 of them").arg(counted));
     // And the eyedropper is one of them, on a row of its own choosing: a tool
     // that never made it out of the list would be counted here as a hole in the
-    // eleven.
+    // twelve.
     expect(names.contains(QStringLiteral("picker")), "with the eyedropper among them");
     expect(blank == 0, "and every one of them draws an icon",
            QStringLiteral("%1 blank").arg(blank));
@@ -1108,6 +1264,7 @@ int main(int argc, char *argv[])
     checkPinButtonAsksForTheScreen();
     checkThePinEditorOffersNoPinButton();
     checkCommandBarIsTwoRows();
+    checkTheFirstRowIsFilledAndTheRestWrap();
     checkEveryToolDrawsItsOwnIcon();
     checkCommandBarButtonsShareOneSize();
     checkTheEndsArePinnedToTheRight();

@@ -146,6 +146,8 @@ pub(super) fn run_window(request: &RecordRequest, target: &WindowTarget) -> Resu
             fourcc,
             format,
             backend,
+            request.fps,
+            request.rate_control(),
         )?,
         (Shape::Dmabuf, None) => Recorder::start_dmabuf(
             &path,
@@ -154,6 +156,8 @@ pub(super) fn run_window(request: &RecordRequest, target: &WindowTarget) -> Resu
             request.encoder,
             fourcc,
             backend,
+            request.fps,
+            request.rate_control(),
         )?,
         (Shape::Software, Some(format)) => Recorder::start_mic(
             &path,
@@ -162,6 +166,8 @@ pub(super) fn run_window(request: &RecordRequest, target: &WindowTarget) -> Resu
             request.encoder,
             format,
             backend,
+            request.fps,
+            request.rate_control(),
         )?,
         (Shape::Software, None) => Recorder::start(
             &path,
@@ -169,6 +175,8 @@ pub(super) fn run_window(request: &RecordRequest, target: &WindowTarget) -> Resu
             geometry.height,
             request.encoder,
             backend,
+            request.fps,
+            request.rate_control(),
         )?,
     };
     if debug_enabled() {
@@ -310,13 +318,28 @@ impl WindowCast {
         }
         let names: Vec<&Name> = toplevels.iter().map(|toplevel| &toplevel.name).collect();
         let index = super::window::resolve_window(target, &names)?;
-        let toplevel = &toplevels[index];
-        let window_id = window_id(&toplevel.name)?;
-        let name = toplevel.name.clone();
+        Self::open_named(&toplevels[index].name, cursor, fps, allow_dmabuf)
+    }
+
+    /// Casts one window of the list, by name.
+    ///
+    /// The service is aimed by the toplevel identifier, so a replay that knows
+    /// which window it wants does not resolve a target again: it hands the name
+    /// back and the cast is opened on the same window — a window that was closed
+    /// and opened again is a new name for the same window, which the caller
+    /// resolves.
+    pub(super) fn open_named(
+        name: &Name,
+        cursor: bool,
+        fps: u32,
+        allow_dmabuf: bool,
+    ) -> Result<Self> {
+        let window_id = window_id(name)?;
+        let name = name.clone();
         if debug_enabled() {
             eprintln!(
                 "vshot: the window `{}` (app_id `{}`, title `{}`) is cast as id {window_id}",
-                toplevel.label(),
+                name.label(),
                 name.app_id,
                 name.title
             );

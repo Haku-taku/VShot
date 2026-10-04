@@ -11,5 +11,15 @@
 # The OCR models: 30 MB of weights, fetched by the PKGBUILD rather than
 # committed. `vshot ocr` looks for them here in a source checkout.
 /models/
+# The same three weights at the paths `vshot ocr` actually reads in a source
+# checkout: the repository root, with the `src/` links pointing back at it.
+# The `/models/` rule above matches neither, so without these three the weights
+# show up as untracked and a `git add -A` would commit them.
+/vshot-det.onnx
+/vshot-rec.onnx
+/vshot-dict.txt
+/src/vshot-det.onnx
+/src/vshot-rec.onnx
+/src/vshot-dict.txt
 # The scratch area OCR work was measured in.
 /.ocr-lab/

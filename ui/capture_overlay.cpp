@@ -47,8 +47,11 @@
 #include <QPainterPath>
 #include <QPolygonF>
 #include <QProcess>
+#include <QPointer>
+#include <QPropertyAnimation>
 #include <QPushButton>
 #include <QScreen>
+#include <QSet>
 #include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QSlider>
@@ -308,6 +311,41 @@ QPointF localPoint(const OutputSession &output, const Point &point, const QSize 
         : static_cast<double>(size.height()) / static_cast<double>(surface.height);
     return QPointF((static_cast<double>(point.x) - surface.x) * sx,
                    (static_cast<double>(point.y) - surface.y) * sy);
+}
+
+// The width a command button is really laid out at: its own hint, held inside
+// the size it was fixed to.
+//
+// `QWidget::sizeHint` is not that number.  A button given one size on purpose
+// still answers with the hint its style computes -- for a text button, the width
+// of its label and icon -- and on the toolbar the two differ, because the
+// buttons are all fixed to the widest label in the row: every tool but one then
+// has a hint *narrower* than its box.  A row measured with the raw hints is a
+// row that does not exist, and a flow filled to that number overflows the row it
+// was filled into.  The bounds are the two `setFixedSize` wrote, so this is the
+// number the layout itself will use.
+int commandButtonWidth(const QAbstractButton *button)
+{
+    return button->sizeHint()
+        .expandedTo(button->minimumSize())
+        .boundedTo(button->maximumSize())
+        .width();
+}
+
+// The point a shape's drag is pulled onto while the aspect modifier is held:
+// the same distance from the anchor along both axes, in the direction the
+// pointer went.  A rectangle and an ellipse are both built from the box between
+// the anchor and the pointer, so a pointer that sits on the box's own diagonal
+// is what makes the one a square and the other a circle.  The longer of the two
+// distances is the one kept, so the shape follows the axis the pointer is
+// actually pushing on rather than collapsing when the other one stalls.
+Point squaredOff(const Point &anchor, const Point &current)
+{
+    const std::int64_t dx = static_cast<std::int64_t>(current.x) - anchor.x;
+    const std::int64_t dy = static_cast<std::int64_t>(current.y) - anchor.y;
+    const std::int64_t size = std::max(std::abs(dx), std::abs(dy));
+    return Point{static_cast<std::int32_t>(anchor.x + (dx < 0 ? -size : size)),
+                 static_cast<std::int32_t>(anchor.y + (dy < 0 ? -size : size))};
 }
 
 // The fixed device-pixel crop the magnifier shows, centred on the cursor's own
@@ -591,6 +629,8 @@ bool polylineLogicalBounds(const QVector<QPointF> &samples, LogicalRect *bounds)
 QString toolName(Tool tool)
 {
     switch (tool) {
+    case Tool::Select:
+        return QStringLiteral("select");
     case Tool::Rectangle:
         return QStringLiteral("rectangle");
     case Tool::Ellipse:
@@ -618,11 +658,17 @@ QString toolName(Tool tool)
 }
 
 /// The inverse of [`toolName`], for a name that came out of the config file.
-/// An unrecognized name is a typo in a file the user can edit, and "select" is
-/// the name the old Select tool was remembered under -- still the default in
-/// every config file written before that tool went away.  Neither names a tool
-/// there is anything to arm, so both come back empty and the session stays
-/// unarmed, which is the state that tool used to be.
+///
+/// "select" is the name the old Select tool was remembered under -- still the
+/// default in every config file written before that tool went away -- and it
+/// names the state a session opens in rather than a tool to arm: nothing
+/// drawing, the marks and the selection the only things a press can act on, and
+/// no button lit.  The toolbar has a Select button again, but arming *it* is not
+/// something the file remembers: it is the same state with one difference -- a
+/// bare drag on a framed selection moves the frame instead of reframing with it
+/// -- and nothing a session has ever done needs that difference to outlive it.
+/// An unrecognized name is a typo in a file the user can edit; it comes back
+/// empty and lands on the same state.
 std::optional<Tool> toolForName(const QString &name)
 {
     if (name == QStringLiteral("rectangle")) {
@@ -983,6 +1029,14 @@ QIcon toolbarIcon(Tool tool, const QColor &color = QColor(230, 225, 229),
     painter.setPen(QPen(color, 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
     painter.setBrush(Qt::NoBrush);
     switch (tool) {
+    case Tool::Select:
+        // The pointer itself: the one icon here that says "this takes what you
+        // point at" rather than "this paints".  Struck as an outline, so it
+        // carries the same weight as the tool icons beside it.
+        painter.drawPolygon(QPolygonF({QPointF(7, 3), QPointF(7, 18), QPointF(11, 14),
+                                       QPointF(14, 20), QPointF(17, 18.5), QPointF(14, 13),
+                                       QPointF(19, 12.5)}));
+        break;
     case Tool::Rectangle:
         painter.drawRoundedRect(QRectF(4, 5, 16, 14), 2, 2);
         break;
@@ -2825,9 +2879,9 @@ struct OverlayController::Gesture {
     Point current;
     LogicalRect origin;
     int handle = 0;
-    // Alt was down when the handle was grabbed.  It is read once, at the press:
-    // a resize that changed its mind halfway through would jump, and the key is
-    // held for the whole drag in practice anyway.
+    // The aspect key was down when the handle was grabbed.  It is read once, at
+    // the press: a resize that changed its mind halfway through would jump, and
+    // the key is held for the whole drag in practice anyway.
     bool preserveAspect = false;
     QVector<Point> points;
     // The in-progress freehand stroke, rasterized incrementally.  Re-stroking
@@ -2950,10 +3004,11 @@ public:
         // so a split along that line leaves the first row setting the card's
         // width while two thirds of the second sits empty -- and every tool added
         // since makes the first row longer and the second no shorter.  The rows
-        // are filled in order and split where they come out closest to the same
-        // length instead, which is both what keeps the card as narrow as two rows
-        // can make it and what keeps the two rows from drifting apart as buttons
-        // are added.  See `placeCommandRows`.
+        // are filled in order instead, the first one to the width the card
+        // actually has and the rest wrapped below it, which is both what keeps
+        // the card as narrow as two rows can make it and what keeps the extra
+        // width of a wider panel from becoming a band of empty card.  See
+        // `CommandFlow`.
         //
         // The ends had to be somewhere, and a row of the column was the wrong
         // place for them twice over: it made that row the height of whatever it
@@ -2966,15 +3021,15 @@ public:
         auto *cardLayout = new QHBoxLayout(toolSurface);
         cardLayout->setContentsMargins(2, 2, 2, 2);
         cardLayout->setSpacing(kRowSpacing);
-        auto *commandColumn = new QVBoxLayout();
-        commandColumn->setSpacing(kRowSpacing);
-        auto *firstRow = new QHBoxLayout();
-        firstRow->setSpacing(kRowSpacing);
-        auto *secondRow = new QHBoxLayout();
-        secondRow->setSpacing(kRowSpacing);
-        commandColumn->addLayout(firstRow);
-        commandColumn->addLayout(secondRow);
-        cardLayout->addLayout(commandColumn);
+        // The command bar itself is built once the last of its buttons is in --
+        // it measures its own width from them -- and it goes into the card here,
+        // ahead of the divider and the four ends.  No stretch follows it: the
+        // slack of the card is what the flow fills its first row with, which is
+        // the whole point of it.
+        // Select leads the row: it is the tool that paints nothing, and the
+        // button the user reaches for to stop painting -- so it sits where the
+        // hand already is rather than at the far end past every drawing tool.
+        addTool(Tool::Select);
         addTool(Tool::Rectangle);
         addTool(Tool::Ellipse);
         addTool(Tool::Arrow);
@@ -2989,7 +3044,7 @@ public:
         // reads the pixel under the click and hands the colour to the tool it was
         // armed from, which is where the pick leaves the session.
         addTool(Tool::Picker);
-        // The eleven are in, so their one size can be measured from their own
+        // The twelve are in, so their one size can be measured from their own
         // labels; the actions that follow are built at it, which is why this
         // stands between the last tool and the first action.
         sizeToolButtons();
@@ -2997,8 +3052,8 @@ public:
         // follow -- same box, same label under the same icon -- and they are not
         // modes: nothing stays selected, so they are kept out of `toolButtons_`,
         // which is what the active-state pass walks.  They are placed in the same
-        // order they are built in, after the tools, by `placeCommandRows` once
-        // the last of them is in.
+        // order they are built in, after the tools, when the flow is handed the
+        // list -- which happens once the last of them is in.
         //
         // Paste takes an image off disk through the file dialog; Ctrl+V takes
         // whatever is on the clipboard.  Both land in the same paste.
@@ -3027,7 +3082,15 @@ public:
                                    {uiTr("OCR…"), uiTr("Copied"), uiTr("Failed")});
         textButton_ = text;
         connect(text, &QToolButton::clicked, [controller = controller_] {
-            controller->beginTextSelection(nullptr);
+            // The button is a toggle: the mode it starts is the mode it ends.
+            // Pressing it again is how a user who is done with the selection
+            // gets out of it without reaching for Escape, and without a second
+            // recognition run over the same pixels.
+            if (controller->textMode_) {
+                controller->leaveTextMode();
+            } else {
+                controller->beginTextSelection(nullptr);
+            }
         });
         // The result is reported where the user is looking: the button itself,
         // which is the thing they just clicked.  The copy can be triggered by a
@@ -3078,7 +3141,14 @@ public:
             {uiTr("Translating…"), uiTr("Failed")});
         translateButton_ = translate;
         connect(translate, &QToolButton::clicked, [controller = controller_] {
-            controller->translateSelection(nullptr);
+            // The button is a toggle: a second press takes the translation back
+            // off rather than reading the same selection again and stacking a
+            // second copy of it on the first.
+            if (controller->hasPlacedTranslation()) {
+                controller->removePlacedTranslation();
+            } else {
+                controller->translateSelection(nullptr);
+            }
         });
         controller_->setTranslateResultCallback([this](TextOutcome outcome, const QString &) {
             if (translateButton_ == nullptr) {
@@ -3133,25 +3203,28 @@ public:
                                    QStringLiteral("pinButton"));
         connect(pinButton_, &QToolButton::clicked,
                 [controller = controller_] { controller->pin(); });
-        // The last button is in, so the two rows can be filled: this is the one
-        // place the split between them is decided, and it needs every button's
-        // own size to decide it.
-        placeCommandRows(firstRow, secondRow);
-        // The slack of the card -- what the style row below is wider than the
-        // two rows are -- is taken up here, between the column and the ends, so
-        // the buttons stay where the pointer left them and the ends stay in the
-        // corner however wide the panel turns out to be.
-        cardLayout->addStretch(1);
+        // The last button is in, so the command bar can be filled: this is the
+        // one place the flow is handed the buttons, and it needs every one of
+        // their own widths to measure the row it fills.
+        CommandFlow *commandFlow = buildCommandFlow();
+        cardLayout->addWidget(commandFlow);
         // One divider for the whole height of the block rather than one per row:
-        // it separates the two rows from the four ends, and there is one gap to
-        // read rather than two.  Its height is the two rows and the gap between
-        // them, which is the column's own spacing.
+        // it separates the command rows from the four ends, and there is one gap
+        // to read rather than two.  Its height is the rows themselves and the
+        // gaps between them -- which the flow decides, so it is told here rather
+        // than measured once: a panel wide enough for one row has to leave the
+        // divider one row tall, or the line runs past the buttons it separates.
         auto *endsDivider = new QFrame(toolSurface);
         endsDivider->setObjectName(QStringLiteral("toolbarDivider"));
         endsDivider->setFrameShape(QFrame::VLine);
         endsDivider->setFrameShadow(QFrame::Plain);
-        endsDivider->setFixedHeight(toolButtonHeight_ * 2 + kRowSpacing);
+        endsDivider->setFixedHeight(toolButtonHeight_ * commandFlow->rows() +
+                                    kRowSpacing * std::max(0, commandFlow->rows() - 1));
         endsDivider->setCursor(Qt::ArrowCursor);
+        commandFlow->setRowsCallback([this, endsDivider](int rows) {
+            endsDivider->setFixedHeight(toolButtonHeight_ * rows +
+                                        kRowSpacing * std::max(0, rows - 1));
+        });
         cardLayout->addWidget(endsDivider);
         // The four ends, the history pair over the two ends of the capture:
         // undo and redo on the first row, OK and Cancel under them.  Two rows of
@@ -3659,12 +3732,22 @@ public:
         // layer, so the tools are not offered while it is on.  The Text+ button
         // itself stays enabled and shows the mode is up.
         const bool textMode = controller_->textMode_;
+        // While a grab the pick-up modifier or the middle button started is being
+        // held, the panel shows Select: that is the state the editor is actually
+        // in, and the drawing tool it was armed with is not the tool in hand any
+        // more.  It lasts exactly as long as the drag does -- the state is read
+        // from the gesture -- and the armed tool is left alone underneath, so
+        // letting go puts the panel back on it without the user arming anything
+        // a second time.
+        const bool adjusting = controller_->adjustingWhatIsThere();
         for (int index = 0; index < toolButtons_.size(); ++index) {
             // An unarmed session lights no tool: the row says nothing is
             // selected, which is exactly the state a fresh capture starts in.
-            const bool active = controller_->tool_.has_value() &&
-                tools_.at(index) == *controller_->tool_;
-            setToolButtonActive(toolButtons_.at(index), tools_.at(index), active, ratio);
+            const Tool entry = tools_.at(index);
+            const bool active =
+                (controller_->tool_.has_value() && entry == *controller_->tool_) ||
+                (adjusting && entry == Tool::Select);
+            setToolButtonActive(toolButtons_.at(index), entry, active, ratio);
             toolButtons_.at(index)->setEnabled(!textMode);
         }        if (textButton_ != nullptr) {
             setButtonActive(textButton_, textMode);
@@ -3680,6 +3763,10 @@ public:
             // Translation reads the same selection the text mode works on, so
             // it is out of reach while that mode is up.
             translateButton_->setEnabled(!textMode);
+            // A translation that is up is the state a second press leaves, so
+            // the button is drawn the way the Text+ button is drawn while its
+            // mode is on: pressed, not just available.
+            setButtonActive(translateButton_, controller_->hasPlacedTranslation());
         }
         const Annotation *selected = nullptr;
         if (controller_->selectedAnnotation_ >= 0 &&
@@ -4435,6 +4522,8 @@ private:
     static QString toolLabel(Tool tool)
     {
         switch (tool) {
+        case Tool::Select:
+            return uiTr("Select");
         case Tool::Rectangle:
             return uiTr("Rect");
         case Tool::Ellipse:
@@ -4470,7 +4559,7 @@ private:
         button->setText(label);
         button->setIcon(toolbarIcon(tool, QColor(230, 225, 229), devicePixelRatioF()));
         button->setIconSize(QSize(20, 20));
-        // No size of its own: the eleven of them are sized together once the
+        // No size of its own: the twelve of them are sized together once the
         // last one is in, by `sizeToolButtons`.  A button fixed here would
         // report that fixed width back from `sizeHint`, which is the one number
         // that pass has to read.
@@ -4478,14 +4567,14 @@ private:
         button->setFocusPolicy(Qt::NoFocus);
         button->setToolTip(toolTipForTool(tool));
         button->setAccessibleName(uiTr("Tool: %1").arg(label));
-        // The tool it selects, so a check can tell the eleven drawing tools from
+        // The tool it selects, so a check can tell the twelve drawing tools from
         // the actions laid out among them -- the two kinds of button are drawn
         // the same way and the rows no longer separate them.  Empty on every
         // other button on the card.
         button->setProperty("tool", toolName(tool));
-        // Not placed here: `placeCommandRows` fills the two rows from this list
-        // once every button is in, which is what lets the split between them be
-        // taken from the buttons' own widths.
+        // Not placed here: the command flow takes the whole list once every
+        // button is in, which is what lets the row it fills be measured from the
+        // buttons' own widths.
         commandButtons_.push_back(button);
         tools_.push_back(tool);
         toolButtons_.push_back(button);
@@ -4497,6 +4586,8 @@ private:
     static QString toolTipForTool(Tool tool)
     {
         switch (tool) {
+        case Tool::Select:
+            return uiTr("Adjust what is already there, and the capture's frame");
         case Tool::Rectangle:
             return uiTr("Draw a rectangular annotation");
         case Tool::Ellipse:
@@ -4555,12 +4646,12 @@ private:
         return widest;
     }
 
-    // One size for all eleven drawing tools, taken from what each label and icon
+    // One size for all twelve drawing tools, taken from what each label and icon
     // actually asks the style for rather than from a number picked by hand.
     //
     // The hand-picked number was 48x46, chosen when the labels were the widest
     // thing in the row; measured against the labels of both languages it stood
-    // about a tenth more than any of them needed, and the eleven buttons put
+    // about a tenth more than any of them needed, and the twelve buttons put
     // that slack on the panel's width and height together.  Reading the size
     // back from the style is also what keeps a wider font -- the desktop's own,
     // which the toolbar is drawn in -- from eliding a label.
@@ -4598,6 +4689,13 @@ private:
     // to be the same number.
     static constexpr int kRowSpacing = 2;
 
+    // How long a button takes to travel from where it was to where the flow has
+    // just put it.  Long enough to read as a movement rather than a flicker, and
+    // short enough that it is over before the user has looked away from the
+    // panel they are working in -- the toolbar is a thing the eye returns to
+    // between two gestures, not something to be watched.
+    static constexpr int kReflowMs = 140;
+
     // How much room the two ends of the capture keep inside their own box: the
     // label and this much either side of it, rather than the style's own ten.
     // The constructor appends it as a stylesheet rule, and the block's width is
@@ -4626,7 +4724,7 @@ private:
     // shape, same hover and press painting from ToolCardFrame.  Kept out of
     // `toolButtons_` because nothing stays selected: a paste and a text read
     // happen and are over.  It is placed with them, in the order it is built in,
-    // by `placeCommandRows`.
+    // by the command flow.
     //
     // `alsoShows` names every label the button will show after `label`, so the
     // box is wide enough for all of them from the start.  A button that changes
@@ -4648,7 +4746,7 @@ private:
     {
         int width = 0;
         for (int i = from; i < to; ++i) {
-            width += commandButtons_.at(i)->sizeHint().width();
+            width += commandButtonWidth(commandButtons_.at(i));
         }
         if (to > from) {
             width += kRowSpacing * (to - from - 1);
@@ -4656,42 +4754,294 @@ private:
         return width;
     }
 
-    // Fills the two rows of the command bar from the one list of buttons, in the
-    // order they were built: the drawing tools first, then the actions.
+    // The two rows of the command bar, and the flow that fills them.
     //
-    // The split is taken where the wider of the two rows comes out narrowest,
-    // which is the same as taking it where the two are closest to the same
-    // length -- and that is the width the card ends up being, so it is the
-    // narrowest card two rows can make of these buttons.  Splitting by kind
-    // instead, tools on the first row and actions on the second, leaves a row
-    // three times the length of its neighbour: the first row sets the card's
-    // width while most of the second sits empty, and every tool added since makes
-    // that worse.  Taken this way the two stay level however many buttons are
-    // added.  A tie goes to the first row, so the split is stable as buttons are
-    // appended.
+    // The rows used to be cut once, when the last button went in: the split was
+    // taken where the two came out closest to the same length, and that length
+    // was the card's width from then on.  A fixed panel with a fixed set of
+    // buttons in fixed places -- which is the wrong shape for this panel, whose
+    // width is not fixed at all.  The style row underneath is a different width
+    // for every tool, and the card takes whichever of the two is wider, so a
+    // slider on the style row used to leave a band of empty card past the end of
+    // two rows that had already been cut.
     //
-    // Both rows are packed to the left rather than spread across the panel: a row
-    // with room to spare would otherwise space its own buttons evenly apart,
-    // which slides them out from under the pointer as the style row above or
-    // below changes the panel's width.  The button positions are what the user
-    // aims at, so they stay put.
-    void placeCommandRows(QHBoxLayout *first, QHBoxLayout *second)
+    // So the first row is filled with every button that fits the width the card
+    // actually has, and the rest wrap below it, in the order the buttons were
+    // built: the same list, the same order, and the row above read left to right
+    // before the row below is read at all.  That is what a flow of buttons looks
+    // like everywhere else, and it is the one arrangement the user does not have
+    // to learn twice when the panel changes size.
+    //
+    // The class exists for one reason, and it is not the filling: a layout
+    // reports the width of its own contents as the width it *wants*, so a row
+    // that had just been filled to the panel's width would ask for that width
+    // back and the panel could only ever grow.  This one reports the width the
+    // balanced split needs -- a constant, measured once from the buttons -- and
+    // lays them out at whatever width it is given.  The panel is then free to be
+    // as wide as the style row makes it, and no wider.
+    class CommandFlow final : public QWidget {
+    public:
+        CommandFlow(FloatingToolbar *panel, int balancedWidth, int rowHeight, int spacing)
+            : QWidget(panel), balancedWidth_(balancedWidth), rowHeight_(rowHeight),
+              spacing_(spacing)
+        {
+            setObjectName(QStringLiteral("toolbarCommandFlow"));
+            setCursor(Qt::ArrowCursor);
+            setSizePolicy(QSizePolicy::MinimumExpanding, QSizePolicy::Fixed);
+            setFixedHeight(rowHeight * 2 + spacing);
+            auto *column = new QVBoxLayout(this);
+            column->setContentsMargins(0, 0, 0, 0);
+            column->setSpacing(spacing);
+            first_ = new Row(this);
+            first_->setSpacing(spacing);
+            second_ = new Row(this);
+            second_->setSpacing(spacing);
+            // The stretch that keeps a row packed to the left instead of
+            // spreading its buttons evenly across whatever width it is given.
+            // It is the last item of its row for good: `reflow` inserts the
+            // buttons ahead of it rather than appending after it.
+            first_->addStretch(1);
+            second_->addStretch(1);
+            column->addLayout(first_);
+            column->addLayout(second_);
+        }
+
+        // The width and height the card asks for.  The width is the balanced
+        // split's -- what the panel is as wide as when the style row is narrower
+        // than the buttons are -- and the height is the rows it presently has.
+        QSize sizeHint() const override
+        {
+            return QSize(balancedWidth_, rowHeight_ * rows_ + spacing_ * (rows_ - 1));
+        }
+
+        QSize minimumSizeHint() const override { return sizeHint(); }
+
+        void setButtons(const QVector<QAbstractButton *> &buttons)
+        {
+            buttons_ = buttons;
+            // Into this widget rather than the panel they were built on: a
+            // button has to be a child of the widget its layout belongs to, and
+            // the two rows below are this widget's own.
+            //
+            // Nothing is placed here.  The row a button belongs in depends on the
+            // width the flow is *given*, and it has not been given one yet -- so
+            // the first reflow is the first time a button is put anywhere, which
+            // is also what makes the panel open with its buttons already in
+            // place rather than sliding into place one frame later.
+            for (QAbstractButton *button : buttons_) {
+                button->setParent(this);
+            }
+            // Filled at the width the buttons ask for, so that the rows are
+            // never empty -- a check, or anything else that asks the rows what
+            // they carry before the panel has been laid out, has to find them
+            // carrying what they will carry.
+            reflow(balancedWidth_);
+            // And then forgotten, so that the pass which places them for real --
+            // at the width the panel turned out to have rather than the one the
+            // buttons asked for -- is a placement and not a move.  The panel
+            // opening is not a transition: nothing here has been anywhere else.
+            placed_.clear();
+            requested_.clear();
+        }
+
+        int rows() const { return rows_; }
+
+        // Told how many rows the flow has come to, so the divider beside it can
+        // be as tall as they are.
+        void setRowsCallback(std::function<void(int)> callback)
+        {
+            rowsCallback_ = std::move(callback);
+        }
+
+    protected:
+        void resizeEvent(QResizeEvent *event) override
+        {
+            QWidget::resizeEvent(event);
+            reflow(width());
+        }
+
+    private:
+        // A row that moves its buttons to where they belong instead of cutting
+        // to it.  The transition is the whole point of a flow: when the panel
+        // changes width, buttons change row and everything beside them slides
+        // across, and an instant cut between the two arrangements reads as the
+        // panel flickering rather than as the buttons having moved.
+        class Row final : public QHBoxLayout {
+        public:
+            explicit Row(CommandFlow *flow) : QHBoxLayout(flow), flow_(flow) {}
+
+        protected:
+            void setGeometry(const QRect &rect) override
+            {
+                // Where every button is now, taken before the layout moves any
+                // of them: that is where a transition has to start from.
+                QVector<QPair<QWidget *, QPoint>> before;
+                before.reserve(count());
+                for (int index = 0; index < count(); ++index) {
+                    if (QWidget *widget = itemAt(index)->widget()) {
+                        before.append({widget, widget->pos()});
+                    }
+                }
+                QHBoxLayout::setGeometry(rect);
+                for (const QPair<QWidget *, QPoint> &entry : before) {
+                    flow_->settle(entry.first, entry.second);
+                }
+            }
+
+        private:
+            CommandFlow *flow_;
+        };
+
+        // Puts `widget` where the row has just decided it goes -- unless it is
+        // already there, or has never been anywhere.  Every button starts at
+        // this widget's own origin, and a transition from there is not a
+        // movement: it is the panel opening with its whole command bar sliding
+        // in from one corner.
+        void settle(QWidget *widget, const QPoint &from)
+        {
+            const QPoint target = widget->pos();
+            if (!placed_.contains(widget)) {
+                // The first time a button is put anywhere there is nothing to
+                // travel from: the base layout has just placed it, and it has
+                // never been anywhere else.
+                placed_.insert(widget);
+                requested_.insert(widget, target);
+                return;
+            }
+            const QPointer<QPropertyAnimation> previous = running_.value(widget);
+            if (previous != nullptr) {
+                if (requested_.value(widget) == target) {
+                    // A pass that wants the button where the transition already
+                    // running is carrying it: leave it to arrive.  There is
+                    // always another pass behind this one -- the layout runs
+                    // again on every change of the flow's own height -- and a
+                    // transition restarted from wherever the button has got to
+                    // would never get anywhere.
+                    return;
+                }
+                // The panel has changed shape while the button was still on its
+                // way: the transition it was making is to a place it is no
+                // longer wanted, so it is stopped and a new one starts from
+                // wherever the button has got to -- which is `from`.
+                previous->stop();
+            } else if (from == target) {
+                return;
+            }
+            requested_.insert(widget, target);
+            auto *animation = new QPropertyAnimation(widget, "pos", this);
+            animation->setDuration(kReflowMs);
+            animation->setEasingCurve(QEasingCurve::OutCubic);
+            animation->setStartValue(from);
+            animation->setEndValue(target);
+            running_.insert(widget, animation);
+            animation->start(QAbstractAnimation::DeleteWhenStopped);
+        }
+
+        // Fills the first row to `width` and wraps the rest, in the order the
+        // buttons were built.  A button goes in only if it fits whole: a row
+        // that halves the last button to use the last few pixels of its width
+        // would be a row nobody could read, and the row below is what those
+        // pixels are for.
+        void reflow(int width)
+        {
+            int split = buttons_.size();
+            int used = 0;
+            for (int index = 0; index < buttons_.size(); ++index) {
+                const int button = commandButtonWidth(buttons_.at(index));
+                const int needed = used == 0 ? button : used + spacing_ + button;
+                if (used > 0 && needed > width) {
+                    split = index;
+                    break;
+                }
+                used = needed;
+            }
+            const int rows = split < buttons_.size() ? 2 : 1;
+            // The first pass is not compared against anything: nothing has been
+            // placed yet, so there is no arrangement for this one to match.
+            if (laidOut_ && split == split_ && rows == rows_) {
+                return;
+            }
+            laidOut_ = true;
+            split_ = split;
+            rows_ = rows;
+            // Every button out and then every button back in, rather than only
+            // the ones that changed row: a button that moves *up* has to land
+            // ahead of the ones already there, and appending it to the row it is
+            // going to is what would put it at the end of that row instead.
+            for (QAbstractButton *button : buttons_) {
+                first_->removeWidget(button);
+                second_->removeWidget(button);
+            }
+            int inFirst = 0;
+            int inSecond = 0;
+            for (int index = 0; index < buttons_.size(); ++index) {
+                if (index < split_) {
+                    first_->insertWidget(inFirst++, buttons_.at(index));
+                } else {
+                    second_->insertWidget(inSecond++, buttons_.at(index));
+                }
+            }
+            setFixedHeight(rowHeight_ * rows_ + spacing_ * (rows_ - 1));
+            updateGeometry();
+            if (rowsCallback_) {
+                rowsCallback_(rows_);
+            }
+        }
+
+        QVector<QAbstractButton *> buttons_;
+        Row *first_ = nullptr;
+        Row *second_ = nullptr;
+        const int balancedWidth_;
+        const int rowHeight_;
+        const int spacing_;
+        int split_ = 0;
+        // A guess, and the right one for any set of buttons that does not fit in
+        // one row: the flow has no width to count rows with until it has been
+        // laid out, and a panel that opened one row tall and grew a moment later
+        // would jump under the pointer that is already on its way to a button.
+        int rows_ = 2;
+        // Whether `reflow` has ever placed anything, and which buttons the
+        // layout has ever put somewhere.  The second is what tells a button's
+        // first placement from a move: there is nothing to travel from the first
+        // time, and a transition there is the panel opening with its whole
+        // command bar sliding in from one corner.
+        bool laidOut_ = false;
+        QSet<QWidget *> placed_;
+        // Where each button was last asked to go, and the transition that is
+        // carrying it there if there still is one.
+        QHash<QWidget *, QPoint> requested_;
+        QHash<QWidget *, QPointer<QPropertyAnimation>> running_;
+        std::function<void(int)> rowsCallback_;
+    };
+
+    // Measures the two-row split the card is asked to be at least as wide as,
+    // then hands the buttons to the flow at that width.
+    //
+    // The balanced split is not the arrangement any more -- the flow takes its
+    // own, from the width it is given -- but the width still has to be measured
+    // from *something*, and this is the narrowest card two rows can make of
+    // these buttons: the split where the wider of the two rows comes out
+    // narrowest, which is the same as the split where the two are closest to the
+    // same length.  Splitting by kind instead -- tools above, actions below --
+    // leaves a row three times the length of its neighbour, so the first row
+    // would set the card's width while most of the second sat empty.  A tie goes
+    // to the first row, so the width is stable as buttons are appended.
+    CommandFlow *buildCommandFlow()
     {
         const int count = commandButtons_.size();
-        int split = count;
         int best = -1;
         for (int candidate = 1; candidate < count; ++candidate) {
             const int wider = std::max(rowWidth(0, candidate), rowWidth(candidate, count));
             if (best < 0 || wider < best) {
                 best = wider;
-                split = candidate;
             }
         }
-        for (int i = 0; i < count; ++i) {
-            (i < split ? first : second)->addWidget(commandButtons_.at(i));
+        if (best < 0) {
+            best = rowWidth(0, count);
         }
-        first->addStretch(1);
-        second->addStretch(1);
+        auto *flow = new CommandFlow(this, best, toolButtonHeight_, kRowSpacing);
+        flow->setButtons(commandButtons_);
+        return flow;
     }
 
     // The same button, built but not placed: the caller puts it in whatever
@@ -4725,9 +5075,9 @@ private:
     QWidget *styleRow_ = nullptr;
     QFrame *styleDivider_ = nullptr;
     QVector<QAbstractButton *> toolButtons_;
-    // Every button of the two command rows in the order they were built -- the
-    // tools, then the actions -- which is the order `placeCommandRows` fills the
-    // rows in and the list it measures the split by.
+    // Every button of the command rows in the order they were built -- the
+    // tools, then the actions -- which is the order the flow fills its rows in
+    // and the list it measures both of them by.
     QVector<QAbstractButton *> commandButtons_;
     QVector<Tool> tools_;
     // The Text+ button, whose label reports what a text selection did.  The
@@ -5133,14 +5483,16 @@ LogicalRect OverlayController::resizeSelection(LogicalRect origin, int handle, P
     std::int64_t x = current.x;
     std::int64_t y = current.y;
     if (preserveAspect && handle != 0 && handle != 9) {
-        // Alt: the corner the pointer is not on stays put and the other follows
-        // the pointer, but pulled onto the box's own diagonal so the two edges
-        // keep the ratio they started with.  The corner that is dragged is the
-        // one the handle names, so it is the one that has to be derived.
+        // The shape modifier: the corner the pointer is not on stays put and the
+        // other follows it, but pulled onto the box's own diagonal so the two
+        // edges keep the ratio they started with.  The corner that is dragged is
+        // the one the handle names, so it is the one that has to be derived.
         const bool movesLeft = handle == 1 || handle == 7 || handle == 8;
         const bool movesRight = handle == 3 || handle == 4 || handle == 5;
         const bool movesTop = handle == 1 || handle == 2 || handle == 3;
         const bool movesBottom = handle == 5 || handle == 6 || handle == 7;
+        const bool drivesX = movesLeft || movesRight;
+        const bool drivesY = movesTop || movesBottom;
         const double ratio = static_cast<double>(origin.width) /
             static_cast<double>(std::max<std::int64_t>(1, origin.height));
         // Which way the pointer went, measured from the corner that is anchored.
@@ -5148,9 +5500,20 @@ LogicalRect OverlayController::resizeSelection(LogicalRect origin, int handle, P
         const std::int64_t anchorY = movesTop ? origin.bottom() : origin.y;
         double width = static_cast<double>(std::abs(x - anchorX));
         double height = static_cast<double>(std::abs(y - anchorY));
-        // The wider travel wins, so the box tracks whichever axis the pointer is
-        // actually pushing on instead of collapsing when one of them stalls.
-        if (width < height * ratio) {
+        // Which of the two readings is the one the drag is making.  A corner
+        // drags both, so the pointer's own reading is kept for each and the
+        // longer travel wins -- the box then tracks whichever axis the pointer
+        // is actually pushing on instead of collapsing when one of them stalls.
+        // An edge drags one, and there is no second reading to be had: the ratio
+        // is what supplies the other, which is the whole of what the modifier
+        // means on an edge, and the reason it used to do nothing there -- the
+        // second axis was read from the pointer, an edge drag does not move it,
+        // and the reading was then never applied to any edge.
+        if (!drivesX) {
+            width = height * ratio;
+        } else if (!drivesY) {
+            height = width / ratio;
+        } else if (width < height * ratio) {
             width = height * ratio;
         } else {
             height = width / ratio;
@@ -5159,19 +5522,41 @@ LogicalRect OverlayController::resizeSelection(LogicalRect origin, int handle, P
                                               : boundsRight - anchorX;
         const std::int64_t limitY = movesTop ? anchorY - boundsTop
                                              : boundsBottom - anchorY;
-        width = std::min(width, static_cast<double>(std::max<std::int64_t>(0, limitX)));
-        height = std::min(height, static_cast<double>(std::max<std::int64_t>(0, limitY)));
-        // Both edges are taken from the same clamped pair, so the ratio survives
-        // the limits rather than being applied before them.
+        // The ratio survives the limits: one dimension is clamped and the other
+        // is taken back from it, rather than each being clamped on its own --
+        // which is how a box pushed into a corner came away with a different
+        // shape from the one it was dragged at.
+        double roomX = static_cast<double>(std::max<std::int64_t>(0, limitX));
+        double roomY = static_cast<double>(std::max<std::int64_t>(0, limitY));
+        if (roomY * ratio < roomX) {
+            roomX = roomY * ratio;
+        }
+        if (roomX / ratio < roomY) {
+            roomY = roomX / ratio;
+        }
+        width = std::min(width, roomX);
+        height = std::min(height, roomY);
         const std::int64_t edgeX = movesLeft ? anchorX - static_cast<std::int64_t>(width)
                                              : anchorX + static_cast<std::int64_t>(width);
         const std::int64_t edgeY = movesTop ? anchorY - static_cast<std::int64_t>(height)
                                             : anchorY + static_cast<std::int64_t>(height);
-        if (movesLeft || movesRight) {
+        if (drivesX && drivesY) {
+            // A corner: both edges are the pointer's, and the switch below puts
+            // each of them where the handle names it.
             x = edgeX;
-        }
-        if (movesTop || movesBottom) {
             y = edgeY;
+        } else {
+            // An edge: both edges come from the pair the ratio tied together, so
+            // the switch below must not be reached -- it would hold the edge the
+            // user is not dragging where it was, which is the ratio undone.
+            const std::int64_t leftEdge = movesLeft ? edgeX : anchorX;
+            const std::int64_t rightSide = movesLeft ? anchorX : edgeX + 1;
+            const std::int64_t topEdge = movesTop ? edgeY : anchorY;
+            const std::int64_t bottomSide = movesTop ? anchorY : edgeY + 1;
+            return rectFromEdges(std::min(leftEdge, rightSide - 1),
+                                 std::min(topEdge, bottomSide - 1),
+                                 std::max(rightSide, leftEdge + 1),
+                                 std::max(bottomSide, topEdge + 1));
         }
     }
     switch (handle) {
@@ -5680,9 +6065,23 @@ void OverlayController::updateDrawing(Point point)
         gesture_->points = {gesture_->anchor, bounded};
         return;
     }
-    if (gesture_->points.isEmpty() || gesture_->points.constLast().x != bounded.x ||
-        gesture_->points.constLast().y != bounded.y) {
-        gesture_->points.push_back(bounded);
+    // A shape drawn with the aspect modifier down is the square of its own drag.
+    // The rectangle and the ellipse are built from the box between the anchor
+    // and the pointer -- the preview and the mark committed on release read the
+    // same two points -- so pulling the point onto that box's diagonal here is
+    // what makes the one a square and the other a circle, and it is what makes
+    // the mark agree with the preview the user was watching.
+    //
+    // The modifier is read on every step rather than at the press, unlike a
+    // resize's: a shape is still being aimed while it is dragged, and letting go
+    // of the key is how the user says the shape no longer has to be even.
+    const bool square = (tool_ == Tool::Rectangle || tool_ == Tool::Ellipse) &&
+        shortcuts_.held(ShortcutAction::PreserveAspect, lastModifiers_);
+    const Point placed = square ? squaredOff(gesture_->anchor, bounded) : bounded;
+    gesture_->current = placed;
+    if (gesture_->points.isEmpty() || gesture_->points.constLast().x != placed.x ||
+        gesture_->points.constLast().y != placed.y) {
+        gesture_->points.push_back(placed);
     }
 }
 
@@ -6552,6 +6951,32 @@ LogicalRect OverlayController::selectionTouch() const
 
 LogicalRect OverlayController::annotationTouch() const
 {
+    const LogicalRect pointer = pointerTouch();
+    // A group drag moves every mark at once, so the step's rect is all of them:
+    // the marks as they are now and as the drag found them, because the pixels
+    // they are travelling away from are the ones the previous step painted.
+    // Asking the *selected* mark alone would leave every other mark of the set
+    // behind on the surface, one stale copy per step -- the marks are not the
+    // same size, so a single mark's rect cannot stand in for the group's.
+    if (dragAll_ && gesture_->type == Gesture::Type::MovingAnnotation) {
+        LogicalRect touched;
+        bool any = false;
+        const auto add = [&](const QVector<Annotation> &marks) {
+            for (const Annotation &mark : marks) {
+                LogicalRect bounds;
+                if (!annotationBounds(mark, &bounds)) {
+                    continue;
+                }
+                const LogicalRect grown =
+                    growBy(bounds, annotationReach(mark) + kSelectionChrome);
+                touched = any ? uniteLogical(touched, grown) : grown;
+                any = true;
+            }
+        };
+        add(annotations_);
+        add(dragSnapshot_);
+        return any ? uniteLogical(touched, pointer) : pointer;
+    }
     if (selectedAnnotation_ < 0 || selectedAnnotation_ >= annotations_.size()) {
         return LogicalRect{};
     }
@@ -6563,7 +6988,7 @@ LogicalRect OverlayController::annotationTouch() const
     // The mark's own rasterizer knows how far its pixels reach; a mark that has
     // not been painted yet has none, so the padding comes from a temporary one.
     return uniteLogical(growBy(bounds, annotationReach(annotation) + kSelectionChrome),
-                        pointerTouch());
+                        pointer);
 }
 
 LogicalRect OverlayController::drawingTouch(int pointsBefore) const
@@ -6767,12 +7192,19 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
         return;
     }
     // A loose drag still held here belongs to a press whose release never
-    // arrived (a grab lost mid-drag); this press replaces it either way.
+    // arrived (a grab lost mid-drag); this press replaces it either way.  So
+    // does a frame that was waiting for the press to travel.
     looseDrag_.reset();
+    pendingReframe_.reset();
     if (button == Qt::RightButton) {
-        // The right button is the magnifier's, not a cancel: it is the button
-        // the user holds while aiming at a pixel.  Escape is the cancel, and
-        // always was the one the overlay's own text offered.
+        // The right button carries two gestures and this is the one that starts
+        // both: the loupe is the picker the moment it is up, and whether the
+        // press was a cancel or a pick is settled on the release, by how long
+        // the button was down.  The loupe therefore cannot wait for the answer
+        // -- a picker that arrived after the user had already aimed would be a
+        // picker that arrives late -- and the tap is not punished for it either:
+        // the session it ends is ending anyway.
+        rightButtonClock_.start();
         magnifierHeld_ = true;
         endMagnifierFlash();
         pointer_ = globalPoint(overlay, local);
@@ -6787,15 +7219,19 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
         // a held modifier because the gesture is a *drag* -- the state has to be
         // on for as long as the pointer travels -- and a modifier made the user
         // hold a key down through the whole move while the left button did the
-        // work.  A middle drag on a mark's rim still picks the mark up, exactly
-        // as a left one does: the rim is a deliberate target on its own, and
-        // taking it away under this button would make the one affordance the
-        // pointer promises there the one that does not work.
+        // work.  A middle drag on a mark picks the mark up, exactly as a left
+        // one does: the mark is what the pointer is on, and the button is the
+        // one that says "this thing".
         const Point grab = globalPoint(overlay, local);
         if (selection_.has_value() && editing_) {
             const int annotationHandle =
                 selectedAnnotation_ >= 0 ? annotationHandleAt(grab) : 0;
-            const int hit = annotationHitAt(grab);
+            // By box, not by ink.  The middle button takes the mark the pointer
+            // is on, and what the pointer is on is a mark's box: an ellipse's
+            // rim or a diagonal stroke's line is a target no pointer can be held
+            // to, and asking for its ink made every other part of the same mark
+            // a dead spot this button refused to answer in.
+            const int hit = annotationHitAt(grab, true);
             if (annotationHandle != 0) {
                 beginAnnotationDrag(grab, true,
                                     shortcuts_.held(ShortcutAction::PreserveAspect,
@@ -6803,19 +7239,28 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
                 updateAll();
                 return;
             }
-            if (hit >= 0 && annotationBorderOf(hit, grab) != 0) {
-                selectAnnotation(hit);
-                beginAnnotationDrag(grab, false);
+            if (hit >= 0) {
+                // The middle button is one of the gestures that moves Ctrl+A's
+                // set: it is the button that says "this thing", and what the
+                // user picked up with Ctrl+A is every mark at once.
+                const bool moveTheSet = allSelected_;
+                if (!moveTheSet) {
+                    selectAnnotation(hit);
+                }
+                beginAnnotationDrag(grab, false, false, moveTheSet);
                 updateAll();
                 return;
             }
-            // The mark the pick-up modifier has already put under the pointer
-            // is the one this press takes, wherever it lands -- the same
-            // promise the left button makes, and the reason the mark follows a
-            // drag that started nowhere near it.  Asking the selection's body
-            // first would swallow that: the body covers nearly the whole
-            // picture, so almost every loose drag starts inside it.
-            if (looseSelect_ && selectedAnnotation_ >= 0 && !pinEdit_) {
+            // A loose drag is the mark the pick-up modifier has put in hand
+            // following the pointer from wherever it goes -- but only from a
+            // press that *is* on that mark.  Anywhere else the frame's body
+            // answers, because the middle button is the frame's own move and a
+            // mark left selected must not cost the user the one gesture that
+            // moves the frame.  The left button still drags the loose mark from
+            // anywhere at all, which is what the mode is for; this button's
+            // other job is the frame, and it has no other way in.
+            if (looseSelect_ && selectedAnnotation_ >= 0 && !pinEdit_ &&
+                annotationBoxContains(selectedAnnotation_, grab)) {
                 looseDrag_ = grab;
                 updateAll();
                 return;
@@ -6968,18 +7413,53 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
     // stretch it whether or not a modifier is down.  Neither is the rim itself:
     // see below.
     const bool picksMarkUp = pickingMarks(static_cast<int>(modifiers));
+    // Whether the press is the Select tool's.  It is read here rather than down
+    // at the branch that acts on it because the whole of that branch's meaning
+    // is "a mark under this press is picked up, body and all", and that is
+    // decided by the two tests below.
+    const bool selectArmed = selectToolArmed();
+    // The square/circle press.  A shape tool with the aspect key down is a user
+    // who has already said what this press is, and it is not "take this mark":
+    // it is a shape constrained to a square, drawn from where they pressed.  A
+    // canvas with a few marks on it is a canvas with a box under almost every
+    // point of it, so a press that let a mark answer first would be a square the
+    // user cannot draw wherever they have already drawn something.  The key
+    // means "keep the ratio" on a handle and "make it square" on a shape, and on
+    // a shape tool the drawing is what wins.
+    const bool constrainedShape = drawingAConstrainedShape(static_cast<int>(modifiers));
     {
-        const int annotationHandle = selectedAnnotation_ >= 0 ? annotationHandleAt(point) : 0;
-        const int hit = annotationHitAt(point);
+        const int annotationHandle =
+            constrainedShape || selectedAnnotation_ < 0 ? 0 : annotationHandleAt(point);
+        // The pick-up asks by box rather than by ink: see `annotationHitAt`.
+        // Ctrl+A is *not* one of these states.  A set of every mark is a
+        // selection to act on, not a mode: the user who has just pressed it can
+        // still draw, and a press that lands on a mark is the drawing tool's
+        // press like any other.  The set moves from a press that is already
+        // adjusting something -- Select in hand, the pick-up modifier, or the
+        // middle button -- which is the `moveEveryMark` below.
+        const bool pickUp = picksMarkUp || selectArmed;
+        const int hit = annotationHitAt(point, pickUp);
         // The rim of a mark the pointer is *not* on yet still counts as a hit
         // even with a tool armed, so that a mark can be picked up and moved
         // without the tool being put down first.  The body is the case that
         // cannot: there the armed tool and the pick-up are the same gesture, and
         // the tool is the one the user chose.  A rim has no such reading -- it
         // is a deliberate target on an outline, not a place to start a stroke.
+        //
+        // Select is the tool that has nothing else to be, so under it the body
+        // answers too: the mark is what the press is for, and there is no ink
+        // for it to be competing with.
         const int border = annotationBorderOf(hit, point);
         const int annotationIndex =
-            (!tool_.has_value() || picksMarkUp || border != 0) ? hit : -1;
+            constrainedShape ? -1
+                             : ((!tool_.has_value() || selectArmed || picksMarkUp || border != 0)
+                                    ? hit
+                                    : -1);
+        // Whether this press is the set's: Ctrl+A picked every mark up, and one
+        // of the adjusting gestures is what moves it.  A rim press is not one of
+        // them -- with a tool armed a rim still picks its own mark up, which is
+        // the single-mark gesture it always was.
+        const bool moveTheSet = allSelected_ && (selectArmed || picksMarkUp);
         if (annotationHandle != 0) {
             // A handle, which is the one thing that stretches: the whole of a
             // mark's edge moves it, and the eight small targets resize it.
@@ -6989,8 +7469,14 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
             return;
         }
         if (annotationIndex >= 0) {
-            selectAnnotation(annotationIndex);
-            beginAnnotationDrag(point, false);
+            // Ctrl+A's set is not replaced by the mark the press landed on --
+            // the set is what the user picked up -- but only a press that moves
+            // it keeps it: every other press is about the one mark, and takes
+            // the selection down to it.
+            if (!moveTheSet) {
+                selectAnnotation(annotationIndex);
+            }
+            beginAnnotationDrag(point, false, false, moveTheSet);
             updateAll();
             return;
         }
@@ -7010,11 +7496,39 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
             return;
         }
     }
-    if (!tool_.has_value()) {
-        // Nothing armed: the selection is adjusted, not drawn on.  The middle
-        // button drags its body; a plain drag starts a new frame over it, which
-        // is the one thing a bare drag has always meant on a capture.
-        //
+    // The pick-up modifier reaches the frame as well as the marks.  It is the
+    // editor's "take this thing and move it" key, and the frame is the largest
+    // thing on the screen to take: with a drawing tool armed there is otherwise
+    // no way to shift a selection once it has been framed without putting the
+    // tool down first, and the modifier is precisely the state in which the user
+    // has said they are not drawing.  The middle button does the same job and is
+    // the way in when nothing is armed; this is that gesture on the key the
+    // marks already answer to, so one modifier means one thing across the whole
+    // canvas.
+    //
+    // It is asked here whether or not a tool is armed, because the marks above
+    // have already had their say: a mark under this press has been taken, and
+    // this is the press that reached the frame.  Leaving it to the armed case
+    // alone meant the frame could only be taken while a tool was lit -- and with
+    // nothing armed the press fell through to the states below, where a mark
+    // left selected by the same modifier drags itself from anywhere and the
+    // frame could never be reached at all.
+    if (picksMarkUp && !selectArmed && !constrainedShape && !pinEdit_ &&
+        selection_.has_value() && editing_ && hitHandle(point) == 9) {
+        beginSelectionMove(point);
+        updateAll();
+        return;
+    }
+    // The Select tool, and the state a session opens in when nothing is armed:
+    // the selection is adjusted, not drawn on.  The two are the same press with
+    // one difference -- under Select the frame's *body* answers to a plain left
+    // press and moves, which is the one thing this tool was ever for, while an
+    // unarmed session leaves the body to the middle button so that a bare drag
+    // keeps meaning "frame this instead".  A session opens unarmed on purpose:
+    // the user who has just drawn a region and wants a different one draws it
+    // rather than hunting for a tool, and Select is the button that says "and
+    // now I am not drawing".
+    if (!tool_.has_value() || selectArmed) {
         // Loose mode is asked first, and is the one press that does not need
         // the middle button: a mark the user has just selected follows a drag
         // from anywhere, and "anywhere" includes the inside of the selection --
@@ -7037,6 +7551,14 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
             // a size change), so a bare press there has nothing to mean, and the
             // pointer does not promise one either.
             selectAnnotation(-1);
+        } else if (selectArmed && selection_.has_value() && hitHandle(point) == 9) {
+            // Select, on the frame's body.  The marks have already had their
+            // say above -- a handle of the selected one, then a body or a rim
+            // under the pointer -- so this is the press that reached nothing
+            // else, and inside the frame that means the frame.  It moves rather
+            // than reframes: the button the user is holding says they are
+            // adjusting what is there.
+            beginSelectionMove(point);
         } else {
             // A bare drag on the canvas starts a new frame over the old one.
             // That is what an unarmed drag has always meant on a capture, and
@@ -7046,8 +7568,18 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
             // first.  `startSelection` clears the old frame and puts the
             // overlay back into the framing state, so the drag that follows is
             // the same drag that made the first one.
+            //
+            // It waits for the press to travel, though, the way a loose drag
+            // does: a press that never moves is a click, and a click must not
+            // cost the user the frame.  It used to, and the cost was the double
+            // click -- the click inside the frame collapsed it to one pixel, and
+            // the second click of the pair then had nothing valid to accept, so
+            // the capture could not be taken at all.  A stray click throwing the
+            // frame away was the same defect in a quieter form: the drag that
+            // follows a click starts a new frame, and a click that goes nowhere
+            // leaves the old one standing.
             selectAnnotation(-1);
-            startSelection(point);
+            pendingReframe_ = point;
         }
         updateAll();
         return;
@@ -7178,6 +7710,31 @@ void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::
         }
         return;
     }
+    if (pendingReframe_.has_value()) {
+        // The frame a press would have thrown away is still standing, and this
+        // is the motion that decides whether it goes.  Short of the threshold it
+        // is still the click it was, and the frame stays; past it the new frame
+        // is drawn from where the button went down, which is the corner the user
+        // aimed from.
+        if (buttons == Qt::NoButton) {
+            // The button went up without a release event reaching us (a widget
+            // change, a grab lost): treat it as the click it was.
+            pendingReframe_.reset();
+        } else {
+            const std::int64_t dx = static_cast<std::int64_t>(point.x) - pendingReframe_->x;
+            const std::int64_t dy = static_cast<std::int64_t>(point.y) - pendingReframe_->y;
+            if (dx * dx + dy * dy <= 16) {
+                overlay->setCursor(Qt::CrossCursor);
+                return;
+            }
+            const Point anchor = *pendingReframe_;
+            pendingReframe_.reset();
+            startSelection(anchor);
+            updateSelection(point);
+            updateAll();
+            return;
+        }
+    }
     if (looseDrag_.has_value()) {
         // A loose drag is held back until it actually moves, so a press that
         // never travels is still a click.  Past the threshold the mark picks up
@@ -7196,7 +7753,13 @@ void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::
             }
             const Point anchor = *looseDrag_;
             looseDrag_.reset();
-            beginAnnotationDrag(anchor, false);
+            // In loose mode the selected mark follows a drag from anywhere, and
+            // with Ctrl+A the thing in hand is the whole set: under Select --
+            // the tool whose whole meaning is "adjust what is there" -- that is
+            // what the drag moves.  Under nothing at all the set is not what
+            // the loose drag is for, and it goes as it does for any other
+            // single-mark drag.
+            beginAnnotationDrag(anchor, false, false, allSelected_ && selectToolArmed());
             updateAnnotationDrag(point);
             updateTouch(annotationTouch());
             return;
@@ -7357,13 +7920,22 @@ void OverlayController::release(CaptureOverlay *overlay, const QPointF &local,
         return;
     }
     if (button == Qt::RightButton) {
-        // Letting the right button go puts the magnifier away; the gesture it
-        // was held over is untouched, which is the whole point of the button
-        // being the magnifier's rather than a cancel.
-        if (magnifierHeld_) {
-            magnifierHeld_ = false;
-            updateAll();
+        // Letting the right button go puts the magnifier away -- and settles
+        // which gesture the press was.  A tap is the cancel the button has
+        // always been: it is the session's own button, the README says so, and
+        // the user who wants the capture gone should not have to find Escape.
+        // A hold is the picker, and it has done its work while the button was
+        // down, so the gesture it was held over is untouched -- which is the
+        // whole point of reading a colour off a picture that is being drawn on.
+        const bool tap = rightButtonClock_.isValid() &&
+            rightButtonClock_.elapsed() < kRightButtonCancelMs;
+        rightButtonClock_.invalidate();
+        magnifierHeld_ = false;
+        if (tap) {
+            cancel();
+            return;
         }
+        updateAll();
         return;
     }
     if (button == Qt::MiddleButton) {
@@ -7384,6 +7956,14 @@ void OverlayController::release(CaptureOverlay *overlay, const QPointF &local,
     }
     if (textMode_) {
         textDragging_ = false;
+        return;
+    }
+    if (pendingReframe_.has_value()) {
+        // The press never travelled, so it was a click on the canvas and not a
+        // frame being drawn: the frame it would have replaced is still the
+        // frame.  Nothing to repaint -- nothing moved -- and this is the click
+        // the double click that accepts the capture begins with.
+        pendingReframe_.reset();
         return;
     }
     if (looseDrag_.has_value()) {
@@ -7496,10 +8076,12 @@ void OverlayController::doubleClick(CaptureOverlay *overlay, const QPointF &loca
 void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifiers modifiers)
 {
     Q_UNUSED(overlay);
-    // Shift itself arrives here as a key with no keycode of its own, and it is
-    // the pick-up modifier: holding it is what puts the hover frame on the mark
-    // under the pointer, so the frame has to follow the modifier and not only
-    // the pointer.  The stored bits are updated before anything acts on them so
+    // A held modifier arrives here as a key with no keycode of its own -- Ctrl,
+    // Alt and Shift all do -- and Ctrl is the pick-up modifier: holding it is
+    // what puts the hover frame on the mark under the pointer, so the frame has
+    // to follow the modifier and not only the pointer.  Shift's own case is the
+    // square a shape tool is about to draw, which the frame must likewise stop
+    // promising.  The stored bits are updated before anything acts on them so
     // that the whole of this press sees one state.
     const int bits = static_cast<int>(modifiers);
     if (bits != lastModifiers_) {
@@ -7534,6 +8116,13 @@ void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifi
             // The mode goes first: Escape leaves the text selection without
             // ending the capture, so a second Escape is what cancels it.
             leaveTextMode();
+        } else if (hasPlacedTranslation()) {
+            // The translation the Translate button placed goes the same way the
+            // text mode does, and for the same reason: it is a state the user
+            // put the picture into, so Escape leaves that state before it means
+            // "cancel the capture".  Without this the first Escape threw away
+            // the frame the translation was drawn on.
+            removePlacedTranslation();
         } else if (gesture_->type == Gesture::Type::Bezier) {
             // The pen path in progress goes first: Escape drops it without
             // ending the session, the way it drops any other in-progress
@@ -7683,7 +8272,7 @@ void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifi
         // reachable without letting go of a mark.  Which of the two a key is
         // comes from the binding: an arrow is a nudge, a letter is a walk.
         // The step modifier is read as part of the step's *size*, so it is not
-        // part of the key the step is bound to: Shift+Left is "left, ten
+        // part of the key the step is bound to: Ctrl+Left is "left, ten
         // pixels", not a key of its own.  Every comparison below therefore
         // matches with those bits taken out of both sides.
         //
@@ -7694,10 +8283,15 @@ void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifi
         // gesture rather than the committed marks: the anchor the press set
         // stays where it is and the far end follows, which is the same edit the
         // pointer would have made, made a pixel at a time.
-        const int coarse = shortcuts_.held(ShortcutAction::CoarseStep, static_cast<int>(modifiers))
-            ? static_cast<int>(Qt::ShiftModifier)
-            : 0;
-        const int step = coarse != 0 ? kCoarseCursorStep : 1;
+        // Which modifier the step is bound to comes from the binding, not from a
+        // copy of it written here: this used to spell `Qt::ShiftModifier`, so
+        // moving the step to another key left the key handler dropping the wrong
+        // modifier -- the cursor stopped hearing its own binding the moment the
+        // new modifier was down, which is exactly when a coarse step is wanted.
+        const bool coarseStep = shortcuts_.held(ShortcutAction::CoarseStep,
+                                                static_cast<int>(modifiers));
+        const int coarse = coarseStep ? shortcuts_.modifierMask(ShortcutAction::CoarseStep) : 0;
+        const int step = coarseStep ? kCoarseCursorStep : 1;
         const auto steps = [this, &pressed, coarse](ShortcutAction action) {
             return shortcuts_.matches(action, pressed, coarse);
         };
@@ -7825,6 +8419,11 @@ bool OverlayController::pickingMarks(int modifiers) const
     return shortcuts_.held(ShortcutAction::SelectMark, modifiers);
 }
 
+bool OverlayController::selectToolArmed() const
+{
+    return tool_.has_value() && *tool_ == Tool::Select;
+}
+
 void OverlayController::cycleAnnotationFocus(int step)
 {
     if (annotations_.isEmpty()) {
@@ -7867,6 +8466,30 @@ void OverlayController::selectAllAnnotations()
 void OverlayController::nudgeSelectedAnnotation(int dx, int dy)
 {
     if (selectedAnnotation_ < 0 || selectedAnnotation_ >= annotations_.size()) {
+        return;
+    }
+    // Ctrl+A put every mark in the user's hand, and the keys are the second way
+    // to move what is in it: a set that could only be dragged would leave the
+    // one-mark-at-a-time nudge as the only way to place it exactly, which is the
+    // thing picking them all up was supposed to save the user.
+    if (allSelected_ && !annotations_.isEmpty()) {
+        const QPoint together = clampedGroupTranslation(annotations_, dx, dy);
+        if (together.x() == 0 && together.y() == 0) {
+            return; // the whole set is already against the edge it was pushed at
+        }
+        if (!nudgeBase_.has_value()) {
+            nudgeBase_ = annotations_;
+            undoStack_.push_back(*nudgeBase_);
+            if (undoStack_.size() > kMaxUndoSteps) {
+                undoStack_.removeFirst();
+            }
+            redoStack_.clear();
+        }
+        for (int index = 0; index < annotations_.size(); ++index) {
+            annotations_[index] =
+                translatedAnnotation(annotations_.at(index), together.x(), together.y());
+        }
+        updateAll();
         return;
     }
     const Annotation original = annotations_.at(selectedAnnotation_);
@@ -8301,10 +8924,10 @@ void OverlayController::chooseTool(std::optional<Tool> tool)
         // The colour a pick takes has to land somewhere visible, and the picker
         // has no style of its own to hold it: it goes to the tool that was
         // armed, which is the one the user is about to draw with.  With nothing
-        // armed there is no such tool -- a session starts that way, and an
-        // unarmed session is what the old Select tool became -- so the pick goes
-        // to the pen instead, whose colour is the session's own ink.
-        pickerReturnTool_ = tool_.has_value() ? *tool_ : Tool::Pen;
+        // armed there is no such tool -- a session starts that way, and a Select
+        // is a second way to be in it, painting nothing of its own -- so the
+        // pick goes to the pen instead, whose colour is the session's own ink.
+        pickerReturnTool_ = tool_.has_value() && *tool_ != Tool::Select ? *tool_ : Tool::Pen;
     }
     tool_ = tool;
     // The mark selection belongs to the state the marks are adjusted in, and
@@ -8312,11 +8935,26 @@ void OverlayController::chooseTool(std::optional<Tool> tool)
     // the user changes the colour or the width, and arming a drawing tool lets
     // it go -- the white outline and its handles would otherwise sit under the
     // ink about to be laid down, and be read as part of it.
-    if (tool.has_value()) {
+    //
+    // Select is the one tool that is that state rather than the opposite of it,
+    // so it keeps the mark: arming it is how the user says they are done
+    // drawing, and dropping the mark they had just picked up would be the
+    // button undoing the thing it was pressed for.
+    if (tool.has_value() && *tool != Tool::Select) {
         selectedAnnotation_ = -1;
+        // Ctrl+A's set goes with it, for the same reason and one more: every
+        // mark would wear the dashed frame under the ink about to be laid down,
+        // and the set with no mark selected is a state the arrows and the drags
+        // have no answer for -- a set is something to adjust, and this is the
+        // user saying they are done adjusting.
+        allSelected_ = false;
     }
     for (CaptureOverlay *overlay : overlays_) {
-        overlay->setCursor(Qt::CrossCursor);
+        // The crosshair is the drawing tools' promise that a press starts a
+        // stroke.  Select does not keep it: there is nothing to start, and the
+        // arrow is what says the press will take what it lands on.
+        overlay->setCursor(tool.has_value() && *tool == Tool::Select ? Qt::ArrowCursor
+                                                                    : Qt::CrossCursor);
     }
     updateAll();
 }
@@ -9035,6 +9673,33 @@ bool OverlayController::translateSelection(QString *error)
     return true;
 }
 
+bool OverlayController::hasPlacedTranslation() const
+{
+    for (const Annotation &annotation : annotations_) {
+        if (annotation.kind == Annotation::Kind::Translation) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void OverlayController::removePlacedTranslation()
+{
+    QVector<Annotation> next;
+    next.reserve(annotations_.size());
+    for (const Annotation &annotation : annotations_) {
+        if (annotation.kind != Annotation::Kind::Translation) {
+            next.push_back(annotation);
+        }
+    }
+    if (next.size() == annotations_.size()) {
+        return;
+    }
+    // Through the ordinary commit path, so the step back is one Ctrl+Z the way
+    // every other change to the list is, and so the toolbar redraws from it.
+    mutateAnnotations(std::move(next));
+}
+
 bool OverlayController::computeTranslation(QVector<TranslatedLine> *lines, QString *text,
                                            QString *error)
 {
@@ -9592,8 +10257,38 @@ void OverlayController::applyStyleToSelected(
     mutateAnnotations(std::move(next));
 }
 
-int OverlayController::annotationHitAt(Point point) const
+bool OverlayController::annotationBoxContains(int index, Point point) const
 {
+    if (index < 0 || index >= annotations_.size()) {
+        return false;
+    }
+    const Annotation &annotation = annotations_.at(index);
+    LogicalRect bounds;
+    if (!annotationBounds(annotation, &bounds)) {
+        return false;
+    }
+    // The mark's own box, grown by the room its pixels take up beyond it and by
+    // the same slack the rim is grabbed with: a thick stroke is drawn centred on
+    // its path, so half of it lies outside the box the path's own points make,
+    // and a mark the user can see has to answer a click anywhere the user can
+    // see it.
+    const LogicalRect box = growBy(bounds, annotationReach(annotation) + kBorderGrab);
+    return point.x >= box.x && point.x < box.right() && point.y >= box.y
+        && point.y < box.bottom();
+}
+
+int OverlayController::annotationHitAt(Point point, bool byBox) const
+{
+    if (byBox) {
+        // Backwards, like the ink walk below: the last mark drawn is the one on
+        // top, and the one on top is the one the user can see under the pointer.
+        for (int index = annotations_.size() - 1; index >= 0; --index) {
+            if (annotationBoxContains(index, point)) {
+                return index;
+            }
+        }
+        return -1;
+    }
     const auto distanceToSegment = [](const Point &value, const Point &first,
                                       const Point &second) {
         const double vx = static_cast<double>(second.x - first.x);
@@ -9811,24 +10506,55 @@ int OverlayController::annotationBorderAt(Point point) const
     return selectedAnnotation_ >= 0 ? annotationBorderOf(selectedAnnotation_, point) : 0;
 }
 
-int OverlayController::markUnderPointer() const
+bool OverlayController::adjustingWhatIsThere() const
 {
-    // Only where a press would actually pick the mark up, so the frame is a
+    // The three drags that adjust something instead of drawing it: the frame's
+    // body, the frame's edges, and the mark's own body or edges.  A drawing
+    // gesture is not one of them -- that is the ink, and the tool being lit is
+    // the truth about it.
+    switch (gesture_->type) {
+    case Gesture::Type::Moving:
+    case Gesture::Type::Resizing:
+    case Gesture::Type::MovingAnnotation:
+    case Gesture::Type::ResizingAnnotation:
+        break;
+    default:
+        return false;
+    }
+    // Only when it is not what the panel is already saying.  Under Select the
+    // button is lit because the tool is armed, and under an unarmed session
+    // there is no tool to be wrong about: what this exists to correct is the
+    // drawing tool left lit through a grab it did not cause.
+    return tool_.has_value() && *tool_ != Tool::Select;
+}
+
+int OverlayController::markUnderPointer() const
+{    // Only where a press would actually pick the mark up, so the frame is a
     // promise the press keeps.  The rim counts on its own -- a press there
     // picks the mark up with nothing held and nothing armed -- and the body
-    // counts under the pick-up modifier, which is the state this frame exists
-    // to show.
+    // counts under the Select tool and under the pick-up modifier, which are
+    // the two states this frame exists to show.
     if (gesture_->type != Gesture::Type::None) {
         return -1;
+    }
+    // A press that would draw a square or a circle does not take a mark, so the
+    // hover must not promise one: the frame is what the press will do, and under
+    // a shape tool with the key down the press draws.
+    if (drawingAConstrainedShape(lastModifiers_)) {
+        return -1;
+    }
+    const bool bodyCounts = pickingMarks(lastModifiers_) || selectToolArmed();
+    if (bodyCounts) {
+        // The two states in which a press anywhere on a mark takes it, and the
+        // same test that press makes: the box, because a box is what a user
+        // aiming at a mark is aiming at.
+        return annotationHitAt(pointer_, true);
     }
     const int hit = annotationHitAt(pointer_);
     if (hit < 0) {
         return -1;
     }
-    if (annotationBorderOf(hit, pointer_) != 0) {
-        return hit;
-    }
-    return pickingMarks(lastModifiers_) ? hit : -1;
+    return annotationBorderOf(hit, pointer_) != 0 ? hit : -1;
 }
 
 void OverlayController::refreshMarkHover()
@@ -9963,7 +10689,67 @@ void OverlayController::deleteSelectedAnnotation()
     mutateAnnotations(std::move(next));
 }
 
-void OverlayController::beginAnnotationDrag(Point point, bool resize, bool preserveAspect)
+bool OverlayController::drawingAConstrainedShape(int modifiers) const
+{
+    if (!tool_.has_value()) {
+        return false;
+    }
+    // Only the two shapes have a constrained form to draw.  The key means
+    // "keep the ratio" on both of them -- a square or a circle rather than
+    // whatever the drag came out as -- and with a shape tool in hand that is
+    // what the user has already said the press is, so the press belongs to the
+    // drawing rather than to anything lying under it.
+    return (*tool_ == Tool::Rectangle || *tool_ == Tool::Ellipse) &&
+        shortcuts_.held(ShortcutAction::PreserveAspect, modifiers);
+}
+
+QPoint OverlayController::clampedGroupTranslation(const QVector<Annotation> &marks, int dx,
+                                                 int dy) const
+{
+    const LogicalRect &limits = annotationLimits();
+    bool anyX = false;
+    bool anyY = false;
+    std::int64_t lowX = 0;
+    std::int64_t highX = 0;
+    std::int64_t lowY = 0;
+    std::int64_t highY = 0;
+    for (const Annotation &mark : marks) {
+        LogicalRect bounds;
+        if (!annotationBounds(mark, &bounds)) {
+            continue;
+        }
+        // The same range `translatedAnnotation` gives a single mark, narrowed
+        // with every mark's own: the intersection is what they can all do at
+        // once.  An empty range is a mark that cannot be confined -- wider than
+        // the picture it is drawn on -- and such a mark only removes itself from
+        // the constraint, because it is free to travel anywhere.
+        const std::int64_t markLowX = limits.x - bounds.x;
+        const std::int64_t markHighX = limits.right() - bounds.right();
+        if (markLowX <= markHighX) {
+            lowX = anyX ? std::max(lowX, markLowX) : markLowX;
+            highX = anyX ? std::min(highX, markHighX) : markHighX;
+            anyX = true;
+        }
+        const std::int64_t markLowY = limits.y - bounds.y;
+        const std::int64_t markHighY = limits.bottom() - bounds.bottom();
+        if (markLowY <= markHighY) {
+            lowY = anyY ? std::max(lowY, markLowY) : markLowY;
+            highY = anyY ? std::min(highY, markHighY) : markHighY;
+            anyY = true;
+        }
+    }
+    QPoint moved(dx, dy);
+    if (anyX) {
+        moved.setX(static_cast<int>(std::clamp<std::int64_t>(dx, lowX, highX)));
+    }
+    if (anyY) {
+        moved.setY(static_cast<int>(std::clamp<std::int64_t>(dy, lowY, highY)));
+    }
+    return moved;
+}
+
+void OverlayController::beginAnnotationDrag(Point point, bool resize, bool preserveAspect,
+                                           bool moveEveryMark)
 {
     if (selectedAnnotation_ < 0 || selectedAnnotation_ >= annotations_.size()) {
         return;
@@ -9977,6 +10763,19 @@ void OverlayController::beginAnnotationDrag(Point point, bool resize, bool prese
     dragAnnotation_ = annotations_.at(selectedAnnotation_);
     dragSnapshot_ = annotations_;
     dragMoved_ = false;
+    // Ctrl+A is the one selection that is more than one mark, and a drag from
+    // one of them can move the set.  A stretch never does: it is one mark's edge
+    // by definition, and the handles of a group are not a thing the editor
+    // draws or offers.  Whether this drag is the set's is the caller's answer,
+    // not the selection's: see `moveEveryMark` in the header.
+    dragAll_ = moveEveryMark && !resize;
+    // A drag that is not the set's takes one mark out of the set, because that
+    // is what it is about to do: leaving the others framed would promise a
+    // selection the next motion is not going to honour.  The set is left alone
+    // when the drag *is* the set's.
+    if (!dragAll_) {
+        allSelected_ = false;
+    }
 }
 
 void OverlayController::updateAnnotationDrag(Point point)
@@ -9998,7 +10797,21 @@ void OverlayController::updateAnnotationDrag(Point point)
     if (gesture_->type == Gesture::Type::MovingAnnotation) {
         const int dx = current.x - gesture_->anchor.x;
         const int dy = current.y - gesture_->anchor.y;
-        annotations_[selectedAnnotation_] = translatedAnnotation(dragAnnotation_, dx, dy);
+        if (dragAll_) {
+            // One delta for the whole set, so the marks keep their places
+            // relative to each other.  Clamping them one at a time instead would
+            // let the first mark reach the edge while the rest kept sliding, and
+            // the group would come apart under the pointer.  The delta the set
+            // can make is inside every mark's own range, so the per-mark clamp
+            // inside `translatedAnnotation` has nothing left to do.
+            const QPoint together = clampedGroupTranslation(dragSnapshot_, dx, dy);
+            for (int index = 0; index < annotations_.size(); ++index) {
+                annotations_[index] =
+                    translatedAnnotation(dragSnapshot_.at(index), together.x(), together.y());
+            }
+        } else {
+            annotations_[selectedAnnotation_] = translatedAnnotation(dragAnnotation_, dx, dy);
+        }
     } else {
         LogicalRect originalBounds;
         if (!annotationBounds(dragAnnotation_, &originalBounds)) {
@@ -10016,6 +10829,7 @@ void OverlayController::finishAnnotationDrag(CaptureOverlay *overlay, Point poin
     updateAnnotationDrag(point);
     const bool moved = dragMoved_;
     gesture_->type = Gesture::Type::None;
+    dragAll_ = false;
     if (!moved) {
         // A plain click selects every annotation.  Text editing is explicitly a
         // double-click action so a selected label can still receive style edits.
@@ -11206,7 +12020,38 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
             }
         }
         painter->fillPath(veil, QColor(0, 0, 0, 80));
-    } else if (!pinEdit_) {
+    } else if (pinEdit_) {
+        // The pin editor draws the picture too, and that is a reversal worth
+        // spelling out.  It used not to: the pinned window is on screen
+        // underneath this surface showing the very same image, so drawing it
+        // again looked like a second copy on screen for nothing.
+        //
+        // But a transparent surface does not own what shows through it.  It is
+        // the compositor that puts something there, and a compositor is free to
+        // put something else -- one user's layer rules blur every layer surface
+        // whose pixels rise above an alpha threshold, and the text-selection
+        // highlight is exactly that, a translucent bar.  The characters under it
+        // came out as a wash of the bar's own colour while the rest of the pin
+        // stayed sharp, because the rest of this surface is transparent and the
+        // bar was over pixels this process never drew.  A surface that carries
+        // its own pixels cannot be altered that way, which is why the region
+        // editor never had the problem.
+        //
+        // The copy is opaque and covers the pin's own image rect, so there is
+        // still one picture on screen: what the user sees is the frame this
+        // editor is annotating.  The pin's rim and its shadow are outside the
+        // rect and stay the pin's own.
+        //
+        // Drawn straight rather than through the composite cache below.  That
+        // cache exists because a repaint walks a whole frame, and the pin is
+        // *dragged*: the rect the image goes in changes from frame to frame
+        // while that happens, so a composite keyed on the rect would rebuild a
+        // whole-surface image per frame to save a single blit.  The rect is
+        // `imageArea`, which follows the position the daemon has confirmed --
+        // the same one the marks are clipped to -- so picture and marks move
+        // together.
+        painter->drawImage(imageRect, output.image);
+    } else {
         // The frozen image and the veil over it do not change between repaints
         // (only the selection does), so they are composed once and blitted;
         // drawing them directly walks the whole frame twice per repaint.  The
@@ -11559,7 +12404,8 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
     // mark up is not a tool change.  So it has to be read here as what it is, or
     // the modifier that exists to hand the user a mark would be the one state in
     // which the mark's handles never appear.
-    const bool chromeArmed = !tool_.has_value() || pickingMarks(lastModifiers_);
+    const bool chromeArmed = !tool_.has_value() || *tool_ == Tool::Select ||
+        pickingMarks(lastModifiers_);
     if (chromeArmed && selectedAnnotation_ >= 0 &&
         selectedAnnotation_ < annotations_.size() &&
         (gesture_->type == Gesture::Type::None ||
@@ -11587,6 +12433,33 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
                 for (const QPointF &corner : corners) {
                     painter->drawRect(QRectF(corner.x() - 4, corner.y() - 4, 8, 8));
                 }
+            }
+        }
+    }
+
+    // "Select every mark" has to be something the user can see.  The action is
+    // reachable from the keyboard whatever tool is armed, and what it decides is
+    // which marks the next style change or delete reaches -- so without a frame
+    // per mark the key looks like it did nothing at all, and the one action that
+    // saves picking marks off a canvas one by one is the one nobody would think
+    // to try twice.  The frame is the same dashed box as the selected mark's and
+    // carries no handles: the set is a set, not one target, and the handles
+    // belong to the one mark a drag would actually move.  That is also why this
+    // is not gated on the tool the chrome above is gated on: a frame drawn around
+    // every mark is not the manipulator's chrome and cannot be mistaken for the
+    // ink, it is the answer to "what will the next key reach".
+    if (allSelected_ && (gesture_->type == Gesture::Type::None ||
+                         gesture_->type == Gesture::Type::MovingAnnotation ||
+                         gesture_->type == Gesture::Type::ResizingAnnotation)) {
+        painter->setPen(QPen(Qt::white, 1.0, Qt::DashLine));
+        painter->setBrush(Qt::NoBrush);
+        for (int index = 0; index < annotations_.size(); ++index) {
+            if (index == selectedAnnotation_) {
+                continue; // the one with the handles, drawn above
+            }
+            LogicalRect bounds;
+            if (annotationBounds(annotations_.at(index), &bounds)) {
+                painter->drawRect(localRect(output, bounds, overlay->size()));
             }
         }
     }
@@ -11713,7 +12586,14 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
     // showing it while drawing covers the ink the user is placing, which is
     // exactly what pixel-level annotating needs to see.  Moving, resizing and
     // framing are the drags that aim at pixels already on the screen.
-    const bool dragging = loupeGesture != Gesture::Type::None &&
+    //
+    // A press that is still waiting to find out whether it is a frame or a click
+    // counts as a framing drag: the button is down and the user is aiming at
+    // pixels, which is the whole of what the loupe is for.  It is the gesture
+    // `Selecting` one motion later, so leaving it out would make the magnifier
+    // appear a few pixels into every frame instead of at the press.
+    const bool dragging = (loupeGesture != Gesture::Type::None ||
+                           pendingReframe_.has_value()) &&
         loupeGesture != Gesture::Type::Bezier && loupeGesture != Gesture::Type::Drawing;
     // The pin editor drags the pinned image itself around the screen, and a
     // magnifier there would follow the very picture it is magnifying: the loupe
@@ -12661,40 +13541,25 @@ void OverlayController::drawLoupe(CaptureOverlay *overlay, QPainter *painter)
     // one: the pin editor's output is zoomed, and a scale truncated to 0 would
     // pin every sample to the frame's first pixel.
     const double scale = outputScale(output);
-    // A region capture's frame is the *whole* frozen output, not the selection
-    // the user framed, so counting from the output's origin alone would let the
-    // loupe read the desktop beside the capture.  What the magnifier is for is
-    // the pixels of the picture being annotated, so the sample is held inside
-    // that picture: a cursor past its edge reads the edge pixel, which is the
-    // same thing the loupe does at the frame's own border.  In the pin editor
-    // the frame *is* the picture, and the two are the same rect.
+    // The loupe reads the pixel the pointer is on, wherever in the output that
+    // is.  It used to be held inside the selection the user had framed, on the
+    // reasoning that the selection is the picture being annotated -- but the
+    // magnifier is aim, not authorship: it is what the user reads to place a
+    // mark, to find the pixel a colour came from, and to see what is beside the
+    // frame before deciding the frame is where they want it.  A pointer that had
+    // crossed the selection's edge kept showing the edge pixel instead, and the
+    // colour pill read that same edge pixel out as the colour under the cursor,
+    // which is the one number on screen that has to be the truth.
     //
-    // Only a *committed* picture bounds the sample.  While the user is still
-    // framing the selection, `selection_` is the rect being dragged into
-    // existence -- a press and a move to the same point leaves it one pixel
-    // across -- and holding the loupe inside that would pin every sample to a
-    // single pixel for the whole drag, which is the one time the magnifier is
-    // read most.  Until the selection is made, the frame is the picture.
-    const bool bounded = !pinEdit_ && editing_ && selection_.has_value();
-    const LogicalRect &picture = bounded ? *selection_ : image;
-    const int minX = std::clamp(static_cast<int>(std::floor((picture.x - image.x) * scale)), 0,
-                                sourceWidth - 1);
-    const int minY = std::clamp(static_cast<int>(std::floor((picture.y - image.y) * scale)), 0,
-                                sourceHeight - 1);
-    const int maxX = std::clamp(
-        static_cast<int>(std::ceil((picture.x + static_cast<std::int64_t>(picture.width) - image.x) *
-                                   scale)) -
-            1,
-        minX, sourceWidth - 1);
-    const int maxY = std::clamp(
-        static_cast<int>(std::ceil((picture.y + static_cast<std::int64_t>(picture.height) - image.y) *
-                                   scale)) -
-            1,
-        minY, sourceHeight - 1);
+    // The frame is the whole frozen output, so the cursor can leave it only by
+    // leaving the screen; the crop's own edge replication covers that, as it
+    // covers the frame's border.
     const int centerX =
-        std::clamp(static_cast<int>(std::floor((pointer_.x - image.x) * scale)), minX, maxX);
+        std::clamp(static_cast<int>(std::floor((pointer_.x - image.x) * scale)), 0,
+                   sourceWidth - 1);
     const int centerY =
-        std::clamp(static_cast<int>(std::floor((pointer_.y - image.y) * scale)), minY, maxY);
+        std::clamp(static_cast<int>(std::floor((pointer_.y - image.y) * scale)), 0,
+                   sourceHeight - 1);
     const qreal radius = kLoupeDiameter / 2.0;
 
     QPointF center = local + QPointF(radius * 1.1, radius * 1.1);
@@ -13294,6 +14159,39 @@ void CaptureOverlay::closeEvent(QCloseEvent *event)
         controller_->cancel();
     }
     event->accept();
+}
+
+bool CaptureOverlay::event(QEvent *event)
+{
+    // Tab and Backtab are taken here rather than in `keyPressEvent` because
+    // `QWidget::event` answers them itself: it reads either spelling as "move the
+    // focus", tries it, and only falls through to `keyPressEvent` when no widget
+    // will take the focus -- which is not the state the editor is in, the style
+    // row alone having sliders and a spin box.  So both spellings were being
+    // spent before the binding that names them was ever asked, and "next mark"
+    // and "previous mark" were the two actions that could not be reached from
+    // the keyboard at all.
+    //
+    // These are delivered to the overlay itself, so nothing that *should* keep
+    // Tab loses it: the inline text editor is a child with the focus of its own,
+    // and a key event goes to the focused widget rather than to its parent.
+    //
+    // Only a press is taken.  The release that follows belongs to whatever the
+    // press did, and swallowing it here would leave the widget under it -- the
+    // inline editor is the one that matters -- waiting for a key-up that never
+    // comes.
+    if (event->type() == QEvent::KeyPress) {
+        auto *keyEvent = static_cast<QKeyEvent *>(event);
+        const int key = keyEvent->key();
+        if (key == Qt::Key_Tab || key == Qt::Key_Backtab) {
+            if (controller_ != nullptr) {
+                controller_->key(this, key, keyEvent->modifiers());
+            }
+            event->accept();
+            return true;
+        }
+    }
+    return QWidget::event(event);
 }
 
 void CaptureOverlay::wantKeyboard()

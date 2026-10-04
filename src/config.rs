@@ -127,6 +127,14 @@ pub struct RecordDefaults {
     /// is paced by the capture source, so a rate above the output's refresh is
     /// a rate it never reaches rather than an error.
     pub fps: Option<u32>,
+    /// The target bitrate `--bitrate` falls back to, in Mbit/s.  Unset means
+    /// the built-in 45, which is what a recording should use unless it has a
+    /// reason not to.
+    pub bitrate: Option<u32>,
+    /// The encoder level `--quality` falls back to, on the codec's own scale
+    /// (0-51 for H.264 and HEVC, 0-255 for AV1).  Unset means the target
+    /// bitrate decides alone.
+    pub quality: Option<u16>,
     /// Whether a recording goes through the desktop portal without
     /// `--portal`.  `null` (the default) keeps the compositor's own
     /// protocols; `--no-portal` overrides a remembered `true`.
@@ -166,6 +174,12 @@ pub struct ReplayDefaults {
     /// is paced by the capture source, so a rate above the output's refresh is
     /// a rate it never reaches rather than an error.
     pub fps: Option<u32>,
+    /// The target bitrate `--bitrate` falls back to, in Mbit/s; the recording
+    /// side's `record.bitrate` has the same meaning.  A ring is held in
+    /// memory, so this is the knob that decides what a long `--window` costs.
+    pub bitrate: Option<u32>,
+    /// The encoder level `--quality` falls back to, as `record.quality`.
+    pub quality: Option<u16>,
     /// The key-frame distance in seconds (1-10): a smaller value makes a save
     /// start closer to the requested edge at the cost of a bigger ring.
     pub gop: Option<u64>,

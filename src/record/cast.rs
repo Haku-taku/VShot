@@ -268,16 +268,13 @@ pub(super) fn loop_over<S: VideoSink + AudioSink>(
                 );
                 break;
             }
-            // A window that was resized: the encoder is told to fit the new
-            // frames into the canvas the file was opened with, and the
-            // recording goes on.  The stream keeps delivering the new size
-            // from here, so the loop's own idea of the shape moves with it.
+            // A window that was resized: the encoder is told about the new
+            // size, and what it does with it is its own answer — a file fits
+            // it into the canvas it was opened with, a replay's ring starts
+            // over at it.  The stream keeps delivering the new size from here,
+            // so the loop's own idea of the shape moves with it.
+            eprintln!("vshot: the screen cast changed to {frame_width}x{frame_height}");
             sink.resize_fit(frame_width, frame_height, fourcc_for(frame.spa_format())?)?;
-            let (canvas_width, canvas_height) = sink.canvas();
-            eprintln!(
-                "vshot: the screen cast changed to {frame_width}x{frame_height}; fitting it into \
-                 the recording's {canvas_width}x{canvas_height} canvas"
-            );
             geometry.width = frame_width;
             geometry.height = frame_height;
             geometry.spa_format = frame.spa_format();
@@ -399,6 +396,17 @@ pub(super) fn cover(
     *timeline_ms = (*timeline_ms).max(due_ms);
     u32::try_from(step).unwrap_or(1).max(1)
 }
+
+/// How long a loop waits for the frame of the slot it is in, as a multiple of
+/// the interval.
+///
+/// Two intervals, because what the wait has to absorb is a copy that ran into
+/// the *next* slot — a compositor busy with input, a 4K copy, a game that has
+/// the GPU.  A wait this long is what lets a late copy come back as a frame
+/// rather than as a repeat: a loop fills a slot that has passed with the frame
+/// before it, so calling a copy that is merely late "nothing new" would put a
+/// duplicate in the file for every frame the capture was busy with.
+pub(super) const SLOT_TOLERANCE: u32 = 2;
 
 /// The DRM name for the byte order a `SPA_VIDEO_FORMAT_*` stands for, which is
 /// what the encoder's dma-buf import takes.  Only the two layouts a screen
